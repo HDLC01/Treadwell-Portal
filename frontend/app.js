@@ -142,9 +142,10 @@ function renderSummary(s) {
   if (s.exclusions) rows.push(["Exclusions", s.exclusions]);
   if (s.proposal_date) rows.push(["Proposal date", s.proposal_date]);
   if (s.site_visit_date) rows.push(["Site visit", s.site_visit_date]);
-  $("summary-body").innerHTML = rows.length
-    ? rows.map(([k, v]) => `<div><div class="lbl" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.5px;color:var(--muted-fg);font-weight:700">${esc(k)}</div><div>${esc(v)}</div></div>`).join("")
-    : '<p class="muted">See the official PDF below for full details.</p>';
+  const band = '<div class="doc-band"><div class="doc-brand">TREADWELL</div><div class="doc-sub">Industrial Flooring Solutions</div></div>';
+  $("summary-body").innerHTML = band + (rows.length
+    ? rows.map(([k, v]) => `<div><div class="label-caps">${esc(k)}</div><div>${esc(v)}</div></div>`).join("")
+    : '<p class="muted">See the official PDF below for full details.</p>');
 }
 
 function renderOptions(options, addons, approved) {
