@@ -65,7 +65,7 @@ def _client_ip(request: Request) -> str:
 def _set_session_cookie(resp: Response, token: str) -> None:
     resp.set_cookie(
         config.SESSION_COOKIE, token, max_age=config.SESSION_TTL_HOURS * 3600,
-        httponly=True, samesite="lax", secure=config.IS_PROD, path="/",
+        httponly=True, samesite="lax", secure=config.COOKIE_SECURE, path="/",
     )
 
 
@@ -122,10 +122,13 @@ async def api_request_code(token: str, request: Request) -> JSONResponse:
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
     # Generic success regardless of match (don't leak whether the email is on file).
+    dev_code = None
     if email and email == (p["customer_email"] or "").strip().lower():
         code = ca.issue_code(p["proposal_id"], email)
         email_sender.send_otp(p["customer_email"], code, p.get("project_name") or "your proposal")
-    return _json({"ok": True})
+        if config.SHOW_OTP:  # staging only — never set in prod
+            dev_code = code
+    return _json({"ok": True, "dev_code": dev_code})
 
 
 @app.post("/api/portal/{token}/verify-code")

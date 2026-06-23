@@ -55,9 +55,14 @@ $("email-form").addEventListener("submit", async (e) => {
   if (!email) { alertBox($("verify-alert"), "error", "Please enter your email."); return; }
   const btn = $("send-code-btn");
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending…';
-  await api("POST", "/request-code", { email });
+  const { data } = await api("POST", "/request-code", { email });
   btn.disabled = false; btn.textContent = "Send my code";
-  alertBox($("verify-alert"), "info", "If that email is on file, a 6-digit code is on its way. Enter it below.");
+  if (data && data.dev_code) {
+    alertBox($("verify-alert"), "info", `Staging — your code is ${data.dev_code}. (In production this is emailed.)`);
+    $("code").value = data.dev_code;
+  } else {
+    alertBox($("verify-alert"), "info", "If that email is on file, a 6-digit code is on its way. Enter it below.");
+  }
   hide($("email-form")); show($("code-form")); $("code").focus();
   $("_lastEmail") || (window._lastEmail = email);
 });

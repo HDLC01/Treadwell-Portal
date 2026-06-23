@@ -47,5 +47,10 @@ DROPBOX_ENABLED = bool(_env("DROPBOX_REFRESH_TOKEN") or _env("DROPBOX_ACCESS_TOK
 # ── Misc ──────────────────────────────────────────────────────────────────────
 ENVIRONMENT = _env("ENVIRONMENT", "development")
 IS_PROD = ENVIRONMENT == "production"
-# Apply the dev seed (stand-in `drafts` + sample proposal) on startup. LOCAL ONLY.
+# Apply the dev seed (stand-in `drafts` + sample proposal) on startup. NOT prod.
 DEV_SEED = _env("DEV_SEED", "false").lower() == "true"
+# Secure cookie when served over HTTPS (staging + prod), regardless of ENVIRONMENT.
+COOKIE_SECURE = PUBLIC_BASE_URL.lower().startswith("https")
+# Staging-only convenience: surface the OTP on-screen so testers can sign in
+# without a live email provider. HARD-disabled in production.
+SHOW_OTP = (_env("PORTAL_SHOW_OTP", "false").lower() == "true") and not IS_PROD

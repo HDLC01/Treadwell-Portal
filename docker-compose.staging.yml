@@ -1,0 +1,38 @@
+# VPS staging: self-contained (own Postgres + dev seed) so staging.portal is live
+# and demoable before the shared-DB wiring + Resend. App on 127.0.0.1:8899.
+# OTP is shown on-screen (PORTAL_SHOW_OTP) since email isn't wired on staging yet.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: treadwell-portal-staging-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: portal
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: portal
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal -d portal"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    build: .
+    container_name: treadwell-portal-staging
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8899:8898"
+    environment:
+      DATABASE_URL: postgresql://portal:portal@db:5432/portal
+      PUBLIC_BASE_URL: https://staging.portal.wetreadwell.com
+      ENVIRONMENT: staging
+      DEV_SEED: "true"
+      PORTAL_SHOW_OTP: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata_staging:
