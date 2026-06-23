@@ -1,0 +1,38 @@
+# Local dev: Postgres + the portal app. Prod points DATABASE_URL at the shared
+# Supabase Postgres instead and drops the local db service (see deploy/).
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: treadwell-portal-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: portal
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: portal
+    ports:
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal -d portal"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    build: .
+    container_name: treadwell-portal
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8898:8898"
+    environment:
+      DATABASE_URL: postgresql://portal:portal@db:5432/portal
+      PUBLIC_BASE_URL: http://localhost:8898
+      ENVIRONMENT: development
+      DEV_SEED: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

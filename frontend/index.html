@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Treadwell — Your Proposal</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230F172A'/%3E%3Ctext x='16' y='23' font-size='20' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='700'%3ET%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <span class="brand">TREADWELL</span>
+    <span class="tag" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      Secure proposal portal
+    </span>
+  </header>
+
+  <main class="wrap" id="app">
+    <!-- Loading -->
+    <section id="loading" class="card" aria-busy="true" aria-label="Loading">
+      <div class="skeleton line" style="width:60%"></div>
+      <div class="skeleton line" style="width:90%"></div>
+      <div class="skeleton line" style="width:80%"></div>
+    </section>
+
+    <!-- Verify (email one-time code) -->
+    <section id="verify" class="card hidden" aria-labelledby="verify-h">
+      <h1 id="verify-h">View your proposal</h1>
+      <p class="muted">For your security, confirm it's you. We'll email a one-time code to the address on file (<span id="email-hint">your email</span>).</p>
+      <div id="verify-alert" role="alert" aria-live="polite"></div>
+
+      <form id="email-form" class="stack" novalidate>
+        <div class="field">
+          <label for="email">Your email <span class="req">*</span></label>
+          <input id="email" name="email" type="email" autocomplete="email" inputmode="email" required placeholder="you@company.com">
+        </div>
+        <button class="btn btn-primary btn-block" type="submit" id="send-code-btn">Send my code</button>
+      </form>
+
+      <form id="code-form" class="stack hidden" novalidate>
+        <div class="field">
+          <label for="code">Enter the 6-digit code</label>
+          <input id="code" name="code" class="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]*" placeholder="······">
+          <p class="help">Check your inbox. The code expires shortly. <button type="button" id="resend" class="btn btn-secondary" style="min-height:auto;padding:2px 8px;font-size:.8rem;margin-left:6px">Resend</button></p>
+        </div>
+        <button class="btn btn-primary btn-block" type="submit" id="verify-code-btn">View proposal</button>
+      </form>
+    </section>
+
+    <!-- Portal -->
+    <section id="portal" class="hidden">
+      <div class="card">
+        <div class="spread">
+          <div>
+            <h1 id="p-title">Your Proposal</h1>
+            <p class="muted" id="p-sub" style="margin:0"></p>
+          </div>
+          <span class="badge" id="p-status-badge"></span>
+        </div>
+      </div>
+
+      <!-- Status tracker -->
+      <div class="card">
+        <h2>Status</h2>
+        <div class="tracker" id="tracker"></div>
+      </div>
+
+      <!-- Approved confirmation -->
+      <div class="card alert success hidden" id="approved-banner" role="status"></div>
+
+      <!-- Proposal summary -->
+      <div class="card" id="summary-card">
+        <h2>Proposal summary</h2>
+        <div id="summary-body" class="stack"></div>
+      </div>
+
+      <!-- Pricing options -->
+      <div class="card" id="options-card">
+        <h2>Pricing</h2>
+        <p class="muted small" id="options-help"></p>
+        <div id="options"></div>
+        <div id="addons" class="small muted" style="margin-top:12px"></div>
+      </div>
+
+      <!-- Official PDF -->
+      <div class="card hidden" id="pdf-card">
+        <h2>Official proposal document</h2>
+        <a class="btn btn-secondary" id="pdf-link" href="#" target="_blank" rel="noopener">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+          View / download PDF
+        </a>
+      </div>
+
+      <!-- Approve -->
+      <div class="card" id="approve-card">
+        <h2>Approve this proposal</h2>
+        <div id="approve-alert" role="alert" aria-live="polite"></div>
+        <form id="approve-form" class="stack" novalidate>
+          <div class="field">
+            <label for="ap-name">Full name <span class="req">*</span></label>
+            <input id="ap-name" type="text" autocomplete="name" required>
+          </div>
+          <div class="field">
+            <label for="ap-title">Title</label>
+            <input id="ap-title" type="text" autocomplete="organization-title">
+          </div>
+          <div class="field" id="ap-option-field">
+            <label for="ap-option">Option you're approving <span class="req">*</span></label>
+            <select id="ap-option"></select>
+          </div>
+          <p class="small muted">By approving, you confirm acceptance of the selected option's total. Date is recorded automatically.</p>
+          <button class="btn btn-primary btn-block" type="submit" id="approve-btn">Approve proposal</button>
+        </form>
+      </div>
+
+      <!-- Q&A -->
+      <div class="card" id="qa-card">
+        <h2>Questions</h2>
+        <p class="muted small">Ask anything about your proposal — our team is notified and replies here.</p>
+        <div class="thread" id="thread"></div>
+        <div id="qa-alert" role="alert" aria-live="polite"></div>
+        <form id="qa-form" class="stack" novalidate>
+          <div class="field">
+            <label for="qa-body">Your question</label>
+            <textarea id="qa-body" placeholder="Type your question…"></textarea>
+          </div>
+          <button class="btn btn-secondary" type="submit" id="qa-btn">Send question</button>
+        </form>
+      </div>
+
+      <!-- Deposit (after approval) -->
+      <div class="card hidden" id="deposit-card">
+        <h2>Submit your deposit</h2>
+        <div id="deposit-alert" role="alert" aria-live="polite"></div>
+        <div class="row" role="tablist" aria-label="Deposit method">
+          <button class="btn btn-secondary" id="tab-ach" type="button" aria-pressed="true">Pay by ACH</button>
+          <button class="btn btn-secondary" id="tab-check" type="button" aria-pressed="false">Pay by check</button>
+        </div>
+
+        <form id="ach-form" class="stack" style="margin-top:16px" novalidate>
+          <div class="alert info">We never store your full account number — only the last 4 digits for reference. Your details are sent securely to our team.</div>
+          <div class="field"><label for="ach-acct-name">Name on account <span class="req">*</span></label><input id="ach-acct-name" type="text" required></div>
+          <div class="field"><label for="ach-bank">Bank name</label><input id="ach-bank" type="text"></div>
+          <div class="field"><label for="ach-last4">Account number — last 4 digits</label><input id="ach-last4" type="text" inputmode="numeric" maxlength="4" placeholder="6789"></div>
+          <div class="field"><label for="ach-note">Note (optional)</label><textarea id="ach-note"></textarea></div>
+          <button class="btn btn-primary btn-block" type="submit" id="ach-btn">Submit ACH details</button>
+        </form>
+
+        <div id="check-instructions" class="stack hidden" style="margin-top:16px">
+          <div class="alert info">Make the check payable to <strong>Treadwell</strong> and mail it to the address below. Your deposit will show as Received once we confirm it.</div>
+          <p id="check-address" class="num"></p>
+          <button class="btn btn-primary btn-block" id="check-ack" type="button">I've mailed my check</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
