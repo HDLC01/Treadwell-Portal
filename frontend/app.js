@@ -1,5 +1,8 @@
 "use strict";
-// Treadwell Customer Proposal Portal — frontend controller (vanilla JS).
+// Treadwell Customer Proposal Portal — proposal page (/p/<token>).
+// Account model: access requires a session whose email matches this proposal.
+// If not signed in -> show the shared login (auth.js). If signed in as a
+// different email -> "wrong account" message.
 
 const TOKEN = (location.pathname.match(/\/p\/([^/]+)/) || [])[1] || "";
 const $ = (id) => document.getElementById(id);
@@ -18,15 +21,10 @@ async function api(method, path, body) {
   return { ok: res.ok && data.ok !== false, status: res.status, data };
 }
 
-function alertBox(el, kind, msg) {
-  if (!el) return;
-  el.className = `alert ${kind}`;
-  el.textContent = msg;
-  show(el);
-}
-function clearAlert(el) { if (el) { el.textContent = ""; el.className = ""; hide(el); } }
+function alertBox(el, kind, msg) { if (!el) return; el.className = `alert ${kind}`; el.textContent = msg; show(el); }
+function clearAlert(el) { if (el) { el.textContent = ""; el.className = "hidden"; } }
 
-let STATE = null; // last view model
+let STATE = null;
 
 // ── boot ──────────────────────────────────────────────────────────────────────
 (async function boot() {
@@ -34,60 +32,44 @@ let STATE = null; // last view model
   const { ok, data } = await api("GET", "");
   hide($("loading"));
   if (!ok && data.error === "not_found") { renderNotFound(); return; }
-  $("email-hint").textContent = data.email_hint || "your email";
   if (data.authed && data.view) { renderPortal(data.view); }
-  else { show($("verify")); }
+  else if (data.wrong_account) { renderWrongAccount(); }
+  else { renderGate(); }
 })();
 
 function renderNotFound() {
   hide($("loading"));
-  const c = document.createElement("section");
-  c.className = "card";
-  c.innerHTML = '<h1>Link not found</h1><p class="muted">This proposal link is invalid or has expired. Please contact your Treadwell representative for a new link.</p>';
-  $("app").appendChild(c);
+  const g = $("gate"); show(g);
+  g.innerHTML = '<div class="card login-card"><h1>Link not found</h1><p class="muted">This proposal link is invalid or has expired. Please contact your Treadwell representative.</p></div>';
 }
 
-// ── verify flow ─────────────────────────────────────────────────────────────────
-$("email-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearAlert($("verify-alert"));
-  const email = $("email").value.trim();
-  if (!email) { alertBox($("verify-alert"), "error", "Please enter your email."); return; }
-  const btn = $("send-code-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending…';
-  const { data } = await api("POST", "/request-code", { email });
-  btn.disabled = false; btn.textContent = "Send my code";
-  if (data && data.dev_code) {
-    alertBox($("verify-alert"), "info", `Staging — your code is ${data.dev_code}. (In production this is emailed.)`);
-    $("code").value = data.dev_code;
-  } else {
-    alertBox($("verify-alert"), "info", "If that email is on file, a 6-digit code is on its way. Enter it below.");
-  }
-  hide($("email-form")); show($("code-form")); $("code").focus();
-  $("_lastEmail") || (window._lastEmail = email);
-});
+function renderGate() {
+  const g = $("gate"); show(g);
+  TWLogin.renderLogin(g, {
+    onSuccess: async () => {
+      const fresh = await api("GET", "");
+      if (fresh.data.authed && fresh.data.view) { hide(g); renderPortal(fresh.data.view); }
+      else { renderWrongAccount(); }
+    },
+  });
+}
 
-$("resend").addEventListener("click", async () => {
-  await api("POST", "/request-code", { email: window._lastEmail || $("email").value.trim() });
-  alertBox($("verify-alert"), "info", "A new code has been sent.");
-});
+function renderWrongAccount() {
+  const g = $("gate"); show(g); hide($("portal"));
+  g.innerHTML =
+    '<div class="card login-card"><h1>Different account</h1>' +
+    '<p class="muted">You\'re signed in with an email that isn\'t on this proposal. View your own projects, or sign in with the email this proposal was sent to.</p>' +
+    '<div class="stack">' +
+    '<a class="btn btn-primary btn-block" href="/">View your projects</a>' +
+    '<button class="btn btn-secondary btn-block" id="wa-logout">Use a different account</button>' +
+    '</div></div>';
+  $("wa-logout").addEventListener("click", async () => {
+    await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+    location.reload();
+  });
+}
 
-$("code-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearAlert($("verify-alert"));
-  const code = $("code").value.trim();
-  if (code.length < 6) { alertBox($("verify-alert"), "error", "Enter the 6-digit code."); return; }
-  const btn = $("verify-code-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Verifying…';
-  const { ok, data } = await api("POST", "/verify-code", { email: window._lastEmail || "", code });
-  btn.disabled = false; btn.textContent = "View proposal";
-  if (!ok) { alertBox($("verify-alert"), "error", data.error || "Incorrect code."); return; }
-  const fresh = await api("GET", "");
-  hide($("verify"));
-  renderPortal(fresh.data.view);
-});
-
-// ── portal ───────────────────────────────────────────────────────────────────────
+// ── portal render ───────────────────────────────────────────────────────────────
 const ICON_CHECK = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
 const ICON_DOT = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>';
 
@@ -96,17 +78,14 @@ function renderPortal(vm) {
   show($("portal"));
   $("p-title").textContent = vm.project_name || "Your Proposal";
   $("p-sub").textContent = vm.city_state || "";
-
   const approved = vm.status.proposal === "approved";
 
-  // top badge
   const badge = $("p-status-badge");
   if (approved) { badge.className = "badge done"; badge.textContent = "Approved"; }
   else { badge.className = "badge warn"; badge.textContent = "Awaiting your approval"; }
 
   renderTracker(vm.status);
 
-  // approved banner
   if (approved && vm.approved && vm.approved.name) {
     const a = vm.approved;
     $("approved-banner").innerHTML = `Approved by <strong>${esc(a.name)}</strong>${a.title ? ", " + esc(a.title) : ""} on ${esc(a.date || "")} — <strong>${esc(a.option || "")}</strong> at <strong>${money(a.total)}</strong>.`;
@@ -124,14 +103,14 @@ function renderPortal(vm) {
 
 function renderTracker(st) {
   const steps = [
-    { key: "proposal", label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
-    { key: "deposit", label: "Deposit", done: st.deposit === "received", val: st.deposit === "received" ? "Received" : "Pending" },
-    { key: "schedule", label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
+    { label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
+    { label: "Deposit", done: st.deposit === "received", val: st.deposit === "received" ? "Received" : "Pending" },
+    { label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
   ];
   $("tracker").innerHTML = steps.map((s) => `
     <div class="step ${s.done ? "is-done" : ""}">
       <div class="lbl">${s.label}</div>
-      <div class="val" style="color:${s.done ? "var(--success)" : "var(--muted-fg)"}">${s.done ? ICON_CHECK : ICON_DOT}${s.val}</div>
+      <div class="val" style="color:${s.done ? "var(--success)" : "var(--secondary)"}">${s.done ? ICON_CHECK : ICON_DOT}${s.val}</div>
     </div>`).join("");
 }
 
@@ -158,7 +137,6 @@ function renderOptions(options, addons, approved) {
       ${o.system_desc ? `<div class="meta">${esc(o.system_desc)}</div>` : ""}
       ${o.diff != null && o.diff !== 0 ? `<div class="meta">${o.diff > 0 ? "+" : ""}${money(o.diff)} vs base bid</div>` : ""}
     </div>`).join("");
-  // selectable (only matters for approval)
   let selected = 0;
   wrap.querySelectorAll(".option").forEach((el) => {
     el.addEventListener("click", () => {
@@ -168,11 +146,8 @@ function renderOptions(options, addons, approved) {
       const sel = $("ap-option"); if (sel) sel.value = options[selected].label;
     });
   });
-  // add-ons
   $("addons").innerHTML = (addons && addons.length)
-    ? "Optional add-ons: " + addons.map((a) => `${esc(a.label)} (${money(a.amount)})`).join(" · ")
-    : "";
-  // populate approve option select
+    ? "Optional add-ons: " + addons.map((a) => `${esc(a.label)} (${money(a.amount)})`).join(" · ") : "";
   const sel = $("ap-option");
   sel.innerHTML = options.map((o) => `<option value="${esc(o.label)}">${esc(o.label)} — ${money(o.total)}</option>`).join("");
   if (options.length === 1) hide($("ap-option-field"));
@@ -184,26 +159,6 @@ function renderPdf(has) {
   $("pdf-link").href = `/api/portal/${TOKEN}/pdf`;
 }
 
-// ── approve ────────────────────────────────────────────────────────────────────
-$("approve-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearAlert($("approve-alert"));
-  const name = $("ap-name").value.trim();
-  if (!name) { alertBox($("approve-alert"), "error", "Please enter your full name."); $("ap-name").focus(); return; }
-  const option_label = $("ap-option").value || (STATE.options[0] && STATE.options[0].label);
-  const btn = $("approve-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
-  const { ok, data } = await api("POST", "/approve", {
-    name, title: $("ap-title").value.trim(), option_label, date: new Date().toISOString().slice(0, 10),
-  });
-  btn.disabled = false; btn.textContent = "Approve proposal";
-  if (!ok) { alertBox($("approve-alert"), "error", data.error || "Could not approve. Please try again."); return; }
-  const fresh = await api("GET", "");
-  renderPortal(fresh.data.view);
-  window.scrollTo({ top: 0, behavior: "smooth" });
-});
-
-// ── Q&A ─────────────────────────────────────────────────────────────────────────
 function renderThread(qs) {
   const t = $("thread");
   if (!qs.length) { t.innerHTML = '<p class="muted small">No questions yet.</p>'; return; }
@@ -215,13 +170,34 @@ function renderThread(qs) {
     </div>`).join("");
 }
 
+function setupDeposit() {
+  $("check-address").textContent = "Treadwell — Attn: Accounts Receivable (mailing address provided by your representative)";
+  const tabAch = $("tab-ach"), tabCheck = $("tab-check");
+  const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-form")); hide($("check-instructions")); };
+  const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-form")); show($("check-instructions")); };
+  tabAch.onclick = showAch; tabCheck.onclick = showCheck;
+}
+
+// ── actions (handlers attach once; elements exist in the hidden #portal) ──────────
+$("approve-form").addEventListener("submit", async (e) => {
+  e.preventDefault(); clearAlert($("approve-alert"));
+  const name = $("ap-name").value.trim();
+  if (!name) { alertBox($("approve-alert"), "error", "Please enter your full name."); $("ap-name").focus(); return; }
+  const option_label = $("ap-option").value || (STATE.options[0] && STATE.options[0].label);
+  const btn = $("approve-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const { ok, data } = await api("POST", "/approve", { name, title: $("ap-title").value.trim(), option_label, date: new Date().toISOString().slice(0, 10) });
+  btn.disabled = false; btn.textContent = "Approve proposal";
+  if (!ok) { alertBox($("approve-alert"), "error", data.error || "Could not approve. Please try again."); return; }
+  const fresh = await api("GET", "");
+  renderPortal(fresh.data.view);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
 $("qa-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearAlert($("qa-alert"));
+  e.preventDefault(); clearAlert($("qa-alert"));
   const body = $("qa-body").value.trim();
   if (!body) return;
-  const btn = $("qa-btn");
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending…';
+  const btn = $("qa-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending…';
   const { ok, data } = await api("POST", "/questions", { body });
   btn.disabled = false; btn.textContent = "Send question";
   if (!ok) { alertBox($("qa-alert"), "error", data.error || "Could not send. Try again."); return; }
@@ -231,18 +207,8 @@ $("qa-form").addEventListener("submit", async (e) => {
   alertBox($("qa-alert"), "success", "Sent — our team has been notified and will reply here.");
 });
 
-// ── deposit ───────────────────────────────────────────────────────────────────────
-function setupDeposit() {
-  $("check-address").textContent = "Treadwell — Attn: Accounts Receivable (mailing address provided by your representative)";
-  const tabAch = $("tab-ach"), tabCheck = $("tab-check");
-  const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-form")); hide($("check-instructions")); };
-  const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-form")); show($("check-instructions")); };
-  tabAch.onclick = showAch; tabCheck.onclick = showCheck;
-}
-
 $("ach-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearAlert($("deposit-alert"));
+  e.preventDefault(); clearAlert($("deposit-alert"));
   const account_name = $("ach-acct-name").value.trim();
   if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name on the account."); return; }
   const btn = $("ach-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';

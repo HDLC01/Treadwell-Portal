@@ -1,15 +1,17 @@
-"""Customer auth: unguessable proposal token + email one-time code + session.
+"""Customer auth (account model).
 
-The proposal link (/p/<token>) is unguessable. To act on a proposal the
-customer proves control of the on-file email by entering a 6-digit code mailed
-to that address. A successful code mints an opaque, DB-backed session stored in
-an HttpOnly cookie scoped to that one proposal.
+A customer proves control of their email — via a 6-digit code mailed to it, or
+via Google Sign-In — and gets an EMAIL-scoped session (HttpOnly cookie) that
+grants access to every proposal on that email. The /p/<token> link is a
+convenient deep-link, not the access gate.
 """
 from __future__ import annotations
 
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
+
+import httpx
 
 import config
 import db
@@ -32,19 +34,19 @@ def new_session_token() -> str:
 
 
 def new_proposal_token() -> str:
-    """Unguessable token for a published proposal's URL (used by the admin side)."""
+    """Unguessable token for a published proposal's deep-link (used by admin)."""
     return secrets.token_urlsafe(24)
 
 
-def issue_code(proposal_id: str, email: str) -> str:
+# ── email one-time code ─────────────────────────────────────────────────────────
+def issue_code(email: str) -> str:
     code = generate_code()
-    db.upsert_login_code(proposal_id, email, hash_code(code), now() + timedelta(minutes=config.OTP_TTL_MINUTES))
+    db.upsert_login_code(email, hash_code(code), now() + timedelta(minutes=config.OTP_TTL_MINUTES))
     return code
 
 
-def verify_code(proposal_id: str, code: str) -> tuple[bool, str]:
-    """Returns (ok, reason)."""
-    row = db.get_login_code(proposal_id)
+def verify_code(email: str, code: str) -> tuple[bool, str]:
+    row = db.get_login_code(email)
     if not row:
         return False, "No code requested. Request a new code."
     if row["expires_at"] <= now():
@@ -52,23 +54,44 @@ def verify_code(proposal_id: str, code: str) -> tuple[bool, str]:
     if row["attempts"] >= config.OTP_MAX_ATTEMPTS:
         return False, "Too many attempts. Request a new code."
     if hash_code(code.strip()) != row["code_hash"]:
-        db.bump_login_attempts(proposal_id)
+        db.bump_login_attempts(email)
         return False, "Incorrect code. Please try again."
     return True, ""
 
 
-def start_session(proposal_id: str, email: str) -> str:
+# ── Google Sign-In ───────────────────────────────────────────────────────────────
+def verify_google_idtoken(id_token: str) -> str | None:
+    """Verify a Google ID token via Google's tokeninfo endpoint. Returns the
+    verified, lower-cased email if the token is valid, the audience matches our
+    client id, and the email is verified — else None."""
+    if not (config.GOOGLE_CLIENT_ID and id_token):
+        return None
+    try:
+        r = httpx.get("https://oauth2.googleapis.com/tokeninfo", params={"id_token": id_token}, timeout=10)
+        if r.status_code != 200:
+            return None
+        claims = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if claims.get("aud") != config.GOOGLE_CLIENT_ID:
+        return None
+    if str(claims.get("email_verified")).lower() != "true":
+        return None
+    email = (claims.get("email") or "").strip().lower()
+    return email or None
+
+
+# ── session ──────────────────────────────────────────────────────────────────────
+def start_session(email: str) -> str:
     token = new_session_token()
-    db.create_session(token, proposal_id, email, now() + timedelta(hours=config.SESSION_TTL_HOURS))
-    db.clear_login_code(proposal_id)
+    db.create_session(token, email, now() + timedelta(hours=config.SESSION_TTL_HOURS))
+    db.clear_login_code(email)
     return token
 
 
-def session_for(cookie_value: str | None, proposal_id: str) -> dict | None:
-    """Return the session row iff it's valid AND scoped to this proposal."""
+def session_email(cookie_value: str | None) -> str | None:
+    """Return the verified email of a valid session, else None."""
     if not cookie_value:
         return None
     sess = db.get_session(cookie_value)
-    if not sess or sess["proposal_id"] != proposal_id:
-        return None
-    return sess
+    return sess["email"] if sess else None

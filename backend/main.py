@@ -1,13 +1,14 @@
 """Treadwell Customer Proposal Portal — FastAPI app (customer side only).
 
-Serves the static portal frontend and the token/OTP-gated customer API. The
-admin side is the proposal tool; both share one Postgres database.
+Account model: a customer signs in (email code or Google), proving control of
+their email, and gets an EMAIL-scoped session that grants access to every
+proposal on that email. The /p/<token> link is a convenient deep-link, not the
+access gate. The admin side is the proposal tool; both share one Postgres DB.
 """
 from __future__ import annotations
 
 import logging
-import os
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,7 +34,6 @@ BACKEND_DIR = Path(__file__).resolve().parent
 
 @app.on_event("startup")
 def _startup() -> None:
-    """Apply the portal schema (idempotent) and, locally, the dev seed."""
     try:
         db.run_script((BACKEND_DIR / "schema.sql").read_text(encoding="utf-8"))
         if config.DEV_SEED:
@@ -48,15 +48,6 @@ def _json(data: dict, status: int = 200) -> JSONResponse:
     return JSONResponse(status_code=status, content=data)
 
 
-def _mask_email(email: str) -> str:
-    try:
-        local, domain = email.split("@", 1)
-    except ValueError:
-        return "your email"
-    head = local[0] if local else ""
-    return f"{head}{'•' * max(len(local) - 1, 3)}@{domain}"
-
-
 def _client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
     return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")) or ""
@@ -69,14 +60,34 @@ def _set_session_cookie(resp: Response, token: str) -> None:
     )
 
 
-def _require_session(request: Request, proposal_id: str) -> Optional[dict]:
-    return ca.session_for(request.cookies.get(config.SESSION_COOKIE), proposal_id)
+def _session_email(request: Request) -> Optional[str]:
+    return ca.session_email(request.cookies.get(config.SESSION_COOKIE))
 
 
-# ── health + static ─────────────────────────────────────────────────────────────
+def _can_access(request: Request, proposal: dict) -> bool:
+    se = _session_email(request)
+    return bool(se and se == (proposal.get("customer_email") or "").strip().lower())
+
+
+def _proposal_card(row: dict) -> dict:
+    return {
+        "token": row["token"],
+        "project_name": row.get("project_name") or "Your Proposal",
+        "proposal_status": row.get("proposal_status"),
+        "deposit_status": row.get("deposit_status"),
+        "schedule_status": row.get("schedule_status"),
+    }
+
+
+# ── health, static pages, public config ───────────────────────────────────────
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True}
+
+
+@app.get("/")
+def root() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "login.html")
 
 
 @app.get("/p/{token}")
@@ -84,25 +95,82 @@ def portal_page(token: str) -> FileResponse:
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
-@app.get("/")
-def root() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "landing.html")
+@app.get("/api/public-config")
+def public_config() -> JSONResponse:
+    return _json({"ok": True, "google_client_id": config.GOOGLE_CLIENT_ID or None})
 
 
-# ── customer API ──────────────────────────────────────────────────────────────
+# ── global auth (account login) ───────────────────────────────────────────────
+@app.post("/api/auth/request-code")
+async def auth_request_code(request: Request) -> JSONResponse:
+    email = ((await request.json()).get("email") or "").strip().lower()
+    if not email:
+        return _json({"ok": False, "error": "Enter your email."}, 400)
+    if not db.email_has_proposal(email):
+        return _json({"ok": False, "error": "no_project"})  # 200: a normal outcome, not an error
+    code = ca.issue_code(email)
+    email_sender.send_otp(email, code, "your Treadwell proposal")
+    return _json({"ok": True, "dev_code": code if config.SHOW_OTP else None})
+
+
+@app.post("/api/auth/verify-code")
+async def auth_verify_code(request: Request) -> JSONResponse:
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    ok, reason = ca.verify_code(email, (body.get("code") or "").strip())
+    if not ok:
+        return _json({"ok": False, "error": reason}, 400)
+    resp = _json({"ok": True, "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(email)]})
+    _set_session_cookie(resp, ca.start_session(email))
+    return resp
+
+
+@app.post("/api/auth/google")
+async def auth_google(request: Request) -> JSONResponse:
+    if not config.GOOGLE_AUTH_ENABLED:
+        return _json({"ok": False, "error": "Google sign-in isn't enabled."}, 400)
+    email = ca.verify_google_idtoken((await request.json()).get("credential") or "")
+    if not email:
+        return _json({"ok": False, "error": "Could not verify your Google sign-in."}, 401)
+    if not db.email_has_proposal(email):
+        return _json({"ok": False, "error": "no_project", "email": email})  # 200: normal outcome
+    resp = _json({"ok": True, "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(email)]})
+    _set_session_cookie(resp, ca.start_session(email))
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout() -> JSONResponse:
+    resp = _json({"ok": True})
+    resp.delete_cookie(config.SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.get("/api/me/proposals")
+def me_proposals(request: Request) -> JSONResponse:
+    se = _session_email(request)
+    if not se:
+        # 200 (not 401) so the logged-out probe doesn't log a console error.
+        return _json({"ok": True, "authed": False, "proposals": []})
+    return _json({"ok": True, "authed": True, "email": se,
+                  "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(se)]})
+
+
+# ── per-proposal (email-scoped access) ────────────────────────────────────────
 @app.get("/api/portal/{token}")
 def api_get_portal(token: str, request: Request) -> JSONResponse:
     p = db.get_proposal_by_token(token)
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
-    sess = _require_session(request, p["proposal_id"])
-    base = {"ok": True, "authed": bool(sess), "project_name": p.get("project_name") or "Your Proposal",
-            "email_hint": _mask_email(p["customer_email"])}
-    if not sess:
+    se = _session_email(request)
+    authed = bool(se and se == (p.get("customer_email") or "").strip().lower())
+    base = {"ok": True, "authed": authed, "project_name": p.get("project_name") or "Your Proposal",
+            "wrong_account": bool(se and not authed)}
+    if not authed:
         return _json(base)
     data = db.get_draft_data(p["proposal_id"]) or {}
     db.mark_viewed(p["proposal_id"])
-    p = db.get_proposal(p["proposal_id"])  # refresh status after view
+    p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]
     base["view"] = vm
@@ -114,56 +182,27 @@ def _q(row: dict) -> dict:
             "created_at": row["created_at"].isoformat() if row.get("created_at") else None}
 
 
-@app.post("/api/portal/{token}/request-code")
-async def api_request_code(token: str, request: Request) -> JSONResponse:
+def _require(request: Request, token: str):
+    """Return the proposal row if the session email may access it, else None."""
     p = db.get_proposal_by_token(token)
-    if not p:
-        return _json({"ok": False, "error": "not_found"}, 404)
-    body = await request.json()
-    email = (body.get("email") or "").strip().lower()
-    # Generic success regardless of match (don't leak whether the email is on file).
-    dev_code = None
-    if email and email == (p["customer_email"] or "").strip().lower():
-        code = ca.issue_code(p["proposal_id"], email)
-        email_sender.send_otp(p["customer_email"], code, p.get("project_name") or "your proposal")
-        if config.SHOW_OTP:  # staging only — never set in prod
-            dev_code = code
-    return _json({"ok": True, "dev_code": dev_code})
-
-
-@app.post("/api/portal/{token}/verify-code")
-async def api_verify_code(token: str, request: Request) -> JSONResponse:
-    p = db.get_proposal_by_token(token)
-    if not p:
-        return _json({"ok": False, "error": "not_found"}, 404)
-    body = await request.json()
-    code = (body.get("code") or "").strip()
-    ok, reason = ca.verify_code(p["proposal_id"], code)
-    if not ok:
-        return _json({"ok": False, "error": reason}, 400)
-    session_token = ca.start_session(p["proposal_id"], p["customer_email"])
-    resp = _json({"ok": True})
-    _set_session_cookie(resp, session_token)
-    return resp
+    if not p or not _can_access(request, p):
+        return None
+    return p
 
 
 @app.post("/api/portal/{token}/questions")
 async def api_post_question(token: str, request: Request) -> JSONResponse:
-    p = db.get_proposal_by_token(token)
+    p = _require(request, token)
     if not p:
-        return _json({"ok": False, "error": "not_found"}, 404)
-    sess = _require_session(request, p["proposal_id"])
-    if not sess:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    body = await request.json()
-    text = (body.get("body") or "").strip()
+    text = ((await request.json()).get("body") or "").strip()
     if not text:
         return _json({"ok": False, "error": "empty"}, 400)
-    row = db.add_question(p["proposal_id"], "customer", sess["email"], text[:4000])
+    row = db.add_question(p["proposal_id"], "customer", _session_email(request), text[:4000])
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"New proposal question — {p.get('project_name')}",
-        f"<p><strong>{sess['email']}</strong> asked a question on "
+        f"<p><strong>{_session_email(request)}</strong> asked a question on "
         f"<strong>{p.get('project_name')}</strong>:</p><blockquote>{text}</blockquote>"
         f'<p>Answer it in the proposal tool. <a href="{link}">Portal link</a></p>',
     )
@@ -172,11 +211,8 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
 
 @app.post("/api/portal/{token}/approve")
 async def api_approve(token: str, request: Request) -> JSONResponse:
-    p = db.get_proposal_by_token(token)
+    p = _require(request, token)
     if not p:
-        return _json({"ok": False, "error": "not_found"}, 404)
-    sess = _require_session(request, p["proposal_id"])
-    if not sess:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await request.json()
     name = (body.get("name") or "").strip()
@@ -187,15 +223,12 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
 
     data = db.get_draft_data(p["proposal_id"]) or {}
     options = proposals.pricing_options(data)
-    # Authoritative total comes from the server-side option (prevents tampering).
     chosen = next((o for o in options if o["label"] == option_label), None)
     if chosen is None and len(options) == 1:
-        chosen = options[0]
-        option_label = chosen["label"]
+        chosen, option_label = options[0], options[0]["label"]
     if chosen is None:
         return _json({"ok": False, "error": "Please choose which option you're approving."}, 400)
     total = chosen["total"]
-
     try:
         approved_date = date.fromisoformat(body["date"]) if body.get("date") else date.today()
     except (ValueError, TypeError):
@@ -214,18 +247,15 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     )
     try:
         automations.run_on_approval(p, project_name)
-    except Exception as exc:  # noqa: BLE001 — automations must never block approval
+    except Exception as exc:  # noqa: BLE001
         log.error("approval automations failed: %s", exc)
     return _json({"ok": True})
 
 
 @app.post("/api/portal/{token}/deposit")
 async def api_deposit(token: str, request: Request) -> JSONResponse:
-    p = db.get_proposal_by_token(token)
+    p = _require(request, token)
     if not p:
-        return _json({"ok": False, "error": "not_found"}, 404)
-    sess = _require_session(request, p["proposal_id"])
-    if not sess:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await request.json()
     method = (body.get("method") or "").strip().lower()
@@ -234,7 +264,6 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     account_name = (body.get("account_name") or "").strip() or None
     bank_name = (body.get("bank_name") or "").strip() or None
     note = (body.get("note") or "").strip() or None
-    # SECURITY: never store the full account number — only the last 4.
     last4 = "".join(ch for ch in (body.get("account_last4") or "") if ch.isdigit())[-4:]
     masked_ref = f"••••{last4}" if last4 else None
 
@@ -253,14 +282,11 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
 
 @app.get("/api/portal/{token}/pdf")
 def api_pdf(token: str, request: Request):
-    p = db.get_proposal_by_token(token)
+    p = _require(request, token)
     if not p:
-        return _json({"ok": False, "error": "not_found"}, 404)
-    if not _require_session(request, p["proposal_id"]):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     if not p.get("pdf_path"):
         return _json({"ok": False, "error": "no_pdf"}, 404)
-    # pdf_path is a Supabase Storage URL (signed/public) captured at publish time.
     return RedirectResponse(p["pdf_path"])
 
 
@@ -270,8 +296,7 @@ async def api_notify(request: Request) -> JSONResponse:
     if not config.SERVICE_TOKEN or request.headers.get("x-service-token") != config.SERVICE_TOKEN:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await request.json()
-    proposal_id = body.get("proposal_id")
-    p = db.get_proposal(proposal_id) if proposal_id else None
+    p = db.get_proposal(body.get("proposal_id")) if body.get("proposal_id") else None
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     kind = body.get("type")
@@ -286,6 +311,15 @@ async def api_notify(request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
-# Static assets (styles.css, js/, landing) — mounted last so /api and /p win.
+# Static assets — mounted last so /api, /, /p win.
 if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="static")
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+@app.get("/{asset}")
+def asset(asset: str):
+    """Serve top-level static assets (styles.css, app.js, auth.js)."""
+    f = FRONTEND_DIR / asset
+    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "favicon.ico"}:
+        return FileResponse(f)
+    return _json({"ok": False, "error": "not_found"}, 404)

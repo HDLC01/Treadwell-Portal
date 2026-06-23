@@ -69,6 +69,20 @@ def get_proposal(proposal_id: str) -> Optional[dict[str, Any]]:
     return q1("select * from public.portal_proposals where proposal_id = %s", (proposal_id,))
 
 
+def list_proposals_by_email(email: str) -> list[dict[str, Any]]:
+    """All proposals tied to a (verified) customer email — the account view."""
+    return qall(
+        "select * from public.portal_proposals where lower(customer_email) = lower(%s) "
+        "order by created_at desc",
+        (email,),
+    )
+
+
+def email_has_proposal(email: str) -> bool:
+    row = q1("select 1 from public.portal_proposals where lower(customer_email) = lower(%s) limit 1", (email,))
+    return row is not None
+
+
 def mark_viewed(proposal_id: str) -> None:
     execute(
         "update public.portal_proposals set viewed_at = coalesce(viewed_at, now()), "
@@ -136,34 +150,34 @@ def add_deposit(proposal_id, method, account_name, bank_name, masked_ref, note) 
     )
 
 
-# ── OTP login codes ──────────────────────────────────────────────────────────────
-def upsert_login_code(proposal_id: str, email: str, code_hash: str, expires_at) -> None:
+# ── OTP login codes (keyed by email) ──────────────────────────────────────────
+def upsert_login_code(email: str, code_hash: str, expires_at) -> None:
     execute(
-        "insert into public.portal_login_codes (proposal_id, email, code_hash, expires_at, attempts) "
-        "values (%s,%s,%s,%s,0) "
-        "on conflict (proposal_id) do update set email=excluded.email, code_hash=excluded.code_hash, "
+        "insert into public.portal_login_codes (email, code_hash, expires_at, attempts) "
+        "values (%s,%s,%s,0) "
+        "on conflict (email) do update set code_hash=excluded.code_hash, "
         "expires_at=excluded.expires_at, attempts=0, created_at=now()",
-        (proposal_id, email, code_hash, expires_at),
+        (email.lower(), code_hash, expires_at),
     )
 
 
-def get_login_code(proposal_id: str) -> Optional[dict[str, Any]]:
-    return q1("select * from public.portal_login_codes where proposal_id=%s", (proposal_id,))
+def get_login_code(email: str) -> Optional[dict[str, Any]]:
+    return q1("select * from public.portal_login_codes where email=%s", (email.lower(),))
 
 
-def bump_login_attempts(proposal_id: str) -> None:
-    execute("update public.portal_login_codes set attempts = attempts + 1 where proposal_id=%s", (proposal_id,))
+def bump_login_attempts(email: str) -> None:
+    execute("update public.portal_login_codes set attempts = attempts + 1 where email=%s", (email.lower(),))
 
 
-def clear_login_code(proposal_id: str) -> None:
-    execute("delete from public.portal_login_codes where proposal_id=%s", (proposal_id,))
+def clear_login_code(email: str) -> None:
+    execute("delete from public.portal_login_codes where email=%s", (email.lower(),))
 
 
-# ── Sessions ────────────────────────────────────────────────────────────────────
-def create_session(session_token: str, proposal_id: str, email: str, expires_at) -> None:
+# ── Sessions (email-scoped) ─────────────────────────────────────────────────────
+def create_session(session_token: str, email: str, expires_at) -> None:
     execute(
-        "insert into public.portal_sessions (session_token, proposal_id, email, expires_at) values (%s,%s,%s,%s)",
-        (session_token, proposal_id, email, expires_at),
+        "insert into public.portal_sessions (session_token, email, expires_at) values (%s,%s,%s)",
+        (session_token, email.lower(), expires_at),
     )
 
 

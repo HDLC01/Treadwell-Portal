@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Treadwell — Proposal Portal</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23C8102E'/%3E%3Ctext x='16' y='23' font-size='20' font-family='Inter,Arial,sans-serif' fill='white' text-anchor='middle' font-weight='900'%3ET%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <span class="brand">TREADWELL</span>
+    <span class="tag" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      Secure proposal portal
+    </span>
+  </header>
+
+  <main class="wrap" id="app">
+    <section id="loading" class="card login-card" aria-busy="true">
+      <div class="skeleton line" style="width:55%"></div>
+      <div class="skeleton line" style="width:90%"></div>
+    </section>
+    <div id="login-target" class="hidden"></div>
+    <div id="project-list" class="hidden"></div>
+  </main>
+
+  <script src="/auth.js"></script>
+  <script>
+    "use strict";
+    const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const $ = (id) => document.getElementById(id);
+
+    function handleProposals(proposals) {
+      $("login-target").classList.add("hidden");
+      if (!proposals || !proposals.length) { showLogin(); return; }
+      if (proposals.length === 1) { location.href = "/p/" + proposals[0].token; return; }
+      const list = $("project-list");
+      list.classList.remove("hidden");
+      list.innerHTML = '<div class="card"><h1>Your projects</h1>' +
+        '<p class="muted">Choose a project to view.</p>' +
+        proposals.map((p) => {
+          const done = p.proposal_status === "approved";
+          return `<a class="proj-row" href="/p/${encodeURIComponent(p.token)}">` +
+            `<span class="pname">${esc(p.project_name)}</span>` +
+            `<span class="badge ${done ? "done" : "warn"}">${done ? "Approved" : "Awaiting approval"}</span></a>`;
+        }).join("") + "</div>";
+    }
+
+    function showLogin() {
+      $("project-list").classList.add("hidden");
+      const t = $("login-target");
+      t.classList.remove("hidden");
+      TWLogin.renderLogin(t, { onSuccess: handleProposals });
+    }
+
+    // Already signed in? Skip straight to projects.
+    fetch("/api/me/proposals", { credentials: "same-origin" })
+      .then((r) => r.json()).then((d) => {
+        $("loading").classList.add("hidden");
+        if (d && d.ok && d.proposals && d.proposals.length) handleProposals(d.proposals);
+        else showLogin();
+      }).catch(() => { $("loading").classList.add("hidden"); showLogin(); });
+  </script>
+</body>
+</html>

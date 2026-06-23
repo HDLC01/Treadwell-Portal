@@ -52,25 +52,26 @@ create table if not exists public.portal_approvals (
   ip           text
 );
 
--- Email one-time codes (customer auth). One active row per proposal.
+-- Email one-time codes (customer auth) — keyed by EMAIL (account login, not
+-- per-proposal). One active code per email.
 create table if not exists public.portal_login_codes (
-  proposal_id  text primary key references public.portal_proposals(proposal_id) on delete cascade,
-  email        text not null,
+  email        text primary key,
   code_hash    text not null,
   expires_at   timestamptz not null,
   attempts     int not null default 0,
   created_at   timestamptz not null default now()
 );
 
--- Issued customer sessions (opaque cookie -> this row; revocable).
+-- Issued customer sessions — EMAIL-scoped (grants access to every proposal on
+-- that email). Opaque cookie -> this row; revocable.
 create table if not exists public.portal_sessions (
   session_token text primary key,
-  proposal_id   text not null references public.portal_proposals(proposal_id) on delete cascade,
   email         text not null,
   expires_at    timestamptz not null,
   created_at    timestamptz not null default now()
 );
-create index if not exists portal_sessions_proposal_idx on public.portal_sessions(proposal_id);
+create index if not exists portal_sessions_email_idx on public.portal_sessions(email);
+create index if not exists portal_proposals_email_idx on public.portal_proposals(lower(customer_email));
 
 -- Deposit intake. NEVER store raw bank numbers — only a masked reference.
 create table if not exists public.portal_deposits (

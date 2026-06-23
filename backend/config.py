@@ -41,6 +41,12 @@ DEPOSIT_NOTIFY_EMAILS = [
     if e.strip()
 ]
 
+# ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
+# A Google OAuth *Web Client ID* (public). The button only renders when set; the
+# backend verifies the returned Google ID token and matches email to the proposal.
+GOOGLE_CLIENT_ID = _env("GOOGLE_CLIENT_ID")
+GOOGLE_AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
+
 # ── Dropbox (folder creation on approval — optional/graceful) ─────────────────
 DROPBOX_ENABLED = bool(_env("DROPBOX_REFRESH_TOKEN") or _env("DROPBOX_ACCESS_TOKEN"))
 
