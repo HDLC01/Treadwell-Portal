@@ -15,6 +15,13 @@ window.TWLogin = (function () {
 
   const NO_PROJECT = "You don't have an existing project with this email.";
 
+  function errMsg(d) {
+    if (!d) return "Something went wrong.";
+    if (d.error === "no_project") return NO_PROJECT;
+    if (d.error === "rate_limited") return "Too many requests — please wait " + (d.retry_after ? d.retry_after + "s" : "a moment") + " and try again.";
+    return d.error || "Something went wrong.";
+  }
+
   function renderLogin(target, opts) {
     target.innerHTML = `
       <div class="card login-card">
@@ -66,7 +73,7 @@ window.TWLogin = (function () {
       if (!ok) {
         alert("error", data.error === "no_project"
           ? (data.email ? `${NO_PROJECT.slice(0, -1)} (${data.email}).` : NO_PROJECT)
-          : (data.error || "Google sign-in failed."));
+          : errMsg(data));
         return;
       }
       opts.onSuccess(data.proposals || []);
@@ -80,7 +87,7 @@ window.TWLogin = (function () {
       const b = $("lg-send"); b.disabled = true; b.innerHTML = '<span class="spinner"></span> Sending…';
       const { ok, data } = await api("/api/auth/request-code", { email });
       b.disabled = false; b.textContent = "Send my code";
-      if (!ok) { alert("error", data.error === "no_project" ? NO_PROJECT : (data.error || "Could not send a code.")); return; }
+      if (!ok) { alert("error", errMsg(data)); return; }
       if (data.dev_code) { alert("info", `Staging — your code is ${data.dev_code}. (In production this is emailed.)`); $("lg-code").value = data.dev_code; }
       else { alert("info", "We emailed you a 6-digit code. Enter it below."); }
       $("lg-email-form").classList.add("hidden");
@@ -101,7 +108,7 @@ window.TWLogin = (function () {
       const b = $("lg-verify"); b.disabled = true; b.innerHTML = '<span class="spinner"></span> Verifying…';
       const { ok, data } = await api("/api/auth/verify-code", { email: lastEmail, code });
       b.disabled = false; b.textContent = "View my proposal";
-      if (!ok) { alert("error", data.error || "Incorrect code."); return; }
+      if (!ok) { alert("error", errMsg(data)); return; }
       opts.onSuccess(data.proposals || []);
     });
   }

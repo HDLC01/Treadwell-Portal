@@ -7,10 +7,13 @@ access gate. The admin side is the proposal tool; both share one Postgres DB.
 """
 from __future__ import annotations
 
+import hmac
+import html
 import logging
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -22,6 +25,7 @@ import customer_auth as ca
 import db
 import email_sender
 import proposals
+import ratelimit
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("portal")
@@ -30,6 +34,18 @@ app = FastAPI(title="Treadwell Customer Proposal Portal", docs_url=None, redoc_u
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 BACKEND_DIR = Path(__file__).resolve().parent
+ALLOWED_HOST = urlparse(config.PUBLIC_BASE_URL).netloc
+
+CSP = (
+    "default-src 'self'; "
+    "script-src 'self' https://accounts.google.com https://www.gstatic.com; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self' https://accounts.google.com; "
+    "frame-src https://accounts.google.com; "
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+)
 
 
 @app.on_event("startup")
@@ -38,6 +54,7 @@ def _startup() -> None:
         db.run_script((BACKEND_DIR / "schema.sql").read_text(encoding="utf-8"))
         if config.DEV_SEED:
             db.run_script((BACKEND_DIR / "staging" / "dev_seed.sql").read_text(encoding="utf-8"))
+        db.cleanup_expired()
         log.info("schema applied%s", " + dev seed" if config.DEV_SEED else "")
     except Exception as exc:  # noqa: BLE001
         log.error("startup schema apply failed: %s", exc)
@@ -48,9 +65,20 @@ def _json(data: dict, status: int = 200) -> JSONResponse:
     return JSONResponse(status_code=status, content=data)
 
 
+async def _body(request: Request) -> dict:
+    try:
+        return await request.json()
+    except Exception:  # noqa: BLE001 — malformed/empty body
+        return {}
+
+
 def _client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
     return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")) or ""
+
+
+def _cap(v, n: int) -> str:
+    return (v or "").strip()[:n]
 
 
 def _set_session_cookie(resp: Response, token: str) -> None:
@@ -79,6 +107,34 @@ def _proposal_card(row: dict) -> dict:
     }
 
 
+# ── middleware: CSRF/origin backstop + security headers ───────────────────────
+@app.middleware("http")
+async def _security(request: Request, call_next):
+    # CSRF backstop: state-changing API POSTs (except the service endpoint, which
+    # has its own token) must originate from our own site.
+    if request.method == "POST" and request.url.path.startswith("/api/") and request.url.path != "/api/notify":
+        ref = request.headers.get("origin") or request.headers.get("referer") or ""
+        if ref:
+            host = urlparse(ref).netloc
+            req_host = request.headers.get("host", "")
+            if host not in (req_host, ALLOWED_HOST):
+                return _json({"ok": False, "error": "bad_origin"}, 403)
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = CSP
+    if config.COOKIE_SECURE:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    log.error("unhandled error on %s %s: %s", request.method, request.url.path, exc)
+    return _json({"ok": False, "error": "server_error"}, 500)
+
+
 # ── health, static pages, public config ───────────────────────────────────────
 @app.get("/healthz")
 def healthz() -> dict:
@@ -103,11 +159,18 @@ def public_config() -> JSONResponse:
 # ── global auth (account login) ───────────────────────────────────────────────
 @app.post("/api/auth/request-code")
 async def auth_request_code(request: Request) -> JSONResponse:
-    email = ((await request.json()).get("email") or "").strip().lower()
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP, config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "rate_limited"}, 429)
+    email = ((await _body(request)).get("email") or "").strip().lower()
     if not email:
         return _json({"ok": False, "error": "Enter your email."}, 400)
     if not db.email_has_proposal(email):
-        return _json({"ok": False, "error": "no_project"})  # 200: a normal outcome, not an error
+        return _json({"ok": False, "error": "no_project"})  # 200: a normal outcome
+    allowed, wait = ratelimit.allow_otp(
+        email, config.OTP_REQUESTS_PER_EMAIL, config.RATE_WINDOW_SEC, config.OTP_REQUEST_COOLDOWN_SEC
+    )
+    if not allowed:
+        return _json({"ok": False, "error": "rate_limited", "retry_after": wait}, 429)
     code = ca.issue_code(email)
     email_sender.send_otp(email, code, "your Treadwell proposal")
     return _json({"ok": True, "dev_code": code if config.SHOW_OTP else None})
@@ -115,7 +178,9 @@ async def auth_request_code(request: Request) -> JSONResponse:
 
 @app.post("/api/auth/verify-code")
 async def auth_verify_code(request: Request) -> JSONResponse:
-    body = await request.json()
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP, config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "rate_limited"}, 429)
+    body = await _body(request)
     email = (body.get("email") or "").strip().lower()
     ok, reason = ca.verify_code(email, (body.get("code") or "").strip())
     if not ok:
@@ -127,9 +192,11 @@ async def auth_verify_code(request: Request) -> JSONResponse:
 
 @app.post("/api/auth/google")
 async def auth_google(request: Request) -> JSONResponse:
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP, config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "rate_limited"}, 429)
     if not config.GOOGLE_AUTH_ENABLED:
         return _json({"ok": False, "error": "Google sign-in isn't enabled."}, 400)
-    email = ca.verify_google_idtoken((await request.json()).get("credential") or "")
+    email = ca.verify_google_idtoken((await _body(request)).get("credential") or "")
     if not email:
         return _json({"ok": False, "error": "Could not verify your Google sign-in."}, 401)
     if not db.email_has_proposal(email):
@@ -140,7 +207,10 @@ async def auth_google(request: Request) -> JSONResponse:
 
 
 @app.post("/api/auth/logout")
-def auth_logout() -> JSONResponse:
+def auth_logout(request: Request) -> JSONResponse:
+    tok = request.cookies.get(config.SESSION_COOKIE)
+    if tok:
+        db.delete_session(tok)  # actually revoke, not just drop the cookie
     resp = _json({"ok": True})
     resp.delete_cookie(config.SESSION_COOKIE, path="/")
     return resp
@@ -150,7 +220,6 @@ def auth_logout() -> JSONResponse:
 def me_proposals(request: Request) -> JSONResponse:
     se = _session_email(request)
     if not se:
-        # 200 (not 401) so the logged-out probe doesn't log a console error.
         return _json({"ok": True, "authed": False, "proposals": []})
     return _json({"ok": True, "authed": True, "email": se,
                   "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(se)]})
@@ -173,6 +242,7 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]
+    vm["check_address"] = config.CHECK_ADDRESS
     base["view"] = vm
     return _json(base)
 
@@ -195,15 +265,17 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    text = ((await request.json()).get("body") or "").strip()
+    text = _cap((await _body(request)).get("body"), 4000)
     if not text:
         return _json({"ok": False, "error": "empty"}, 400)
-    row = db.add_question(p["proposal_id"], "customer", _session_email(request), text[:4000])
+    who = _session_email(request)
+    row = db.add_question(p["proposal_id"], "customer", who, text)
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"New proposal question — {p.get('project_name')}",
-        f"<p><strong>{_session_email(request)}</strong> asked a question on "
-        f"<strong>{p.get('project_name')}</strong>:</p><blockquote>{text}</blockquote>"
+        f"<p><strong>{html.escape(who or '')}</strong> asked a question on "
+        f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
+        f"<blockquote>{html.escape(text)}</blockquote>"
         f'<p>Answer it in the proposal tool. <a href="{link}">Portal link</a></p>',
     )
     return _json({"ok": True, "question": _q(row)})
@@ -214,10 +286,10 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    body = await request.json()
-    name = (body.get("name") or "").strip()
-    title = (body.get("title") or "").strip()
-    option_label = (body.get("option_label") or "").strip()
+    body = await _body(request)
+    name = _cap(body.get("name"), 120)
+    title = _cap(body.get("title"), 120)
+    option_label = _cap(body.get("option_label"), 200)
     if not name:
         return _json({"ok": False, "error": "Name is required."}, 400)
 
@@ -241,9 +313,9 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
-        f"<p><strong>{name}</strong>{(', ' + title) if title else ''} approved "
-        f"<strong>{option_label}</strong> at <strong>${total:,.2f}</strong> on {approved_date}.</p>"
-        f'<p>Project: {project_name}. <a href="{link}">Portal link</a></p>',
+        f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
+        f"<strong>{html.escape(option_label)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}.</p>"
+        f'<p>Project: {html.escape(project_name)}. <a href="{link}">Portal link</a></p>',
     )
     try:
         automations.run_on_approval(p, project_name)
@@ -257,13 +329,13 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    body = await request.json()
+    body = await _body(request)
     method = (body.get("method") or "").strip().lower()
     if method not in ("ach", "check"):
         return _json({"ok": False, "error": "Choose ACH or check."}, 400)
-    account_name = (body.get("account_name") or "").strip() or None
-    bank_name = (body.get("bank_name") or "").strip() or None
-    note = (body.get("note") or "").strip() or None
+    account_name = _cap(body.get("account_name"), 120) or None
+    bank_name = _cap(body.get("bank_name"), 120) or None
+    note = _cap(body.get("note"), 1000) or None
     last4 = "".join(ch for ch in (body.get("account_last4") or "") if ch.isdigit())[-4:]
     masked_ref = f"••••{last4}" if last4 else None
 
@@ -272,8 +344,9 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     label = "ACH details submitted" if method == "ach" else "Paying by check"
     email_sender.notify_team(
         f"Deposit {('info' if method == 'ach' else 'method')} submitted — {project_name}",
-        f"<p>{label} for <strong>{project_name}</strong>.</p>"
-        f"<p>Account name: {account_name or '—'} · Bank: {bank_name or '—'} · Ref: {masked_ref or '—'}</p>"
+        f"<p>{label} for <strong>{html.escape(project_name)}</strong>.</p>"
+        f"<p>Account name: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
+        f"Ref: {masked_ref or '—'}</p>"
         f"<p>Confirm receipt internally, then mark the deposit Received in the proposal tool.</p>",
         recipients=config.DEPOSIT_NOTIFY_EMAILS,
     )
@@ -293,9 +366,10 @@ def api_pdf(token: str, request: Request):
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
 @app.post("/api/notify")
 async def api_notify(request: Request) -> JSONResponse:
-    if not config.SERVICE_TOKEN or request.headers.get("x-service-token") != config.SERVICE_TOKEN:
+    presented = request.headers.get("x-service-token") or ""
+    if not config.SERVICE_TOKEN or not hmac.compare_digest(presented, config.SERVICE_TOKEN):
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    body = await request.json()
+    body = await _body(request)
     p = db.get_proposal(body.get("proposal_id")) if body.get("proposal_id") else None
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
@@ -318,8 +392,8 @@ if FRONTEND_DIR.exists():
 
 @app.get("/{asset}")
 def asset(asset: str):
-    """Serve top-level static assets (styles.css, app.js, auth.js)."""
+    """Serve top-level static assets."""
     f = FRONTEND_DIR / asset
-    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "favicon.ico"}:
+    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js", "favicon.ico"}:
         return FileResponse(f)
     return _json({"ok": False, "error": "not_found"}, 404)

@@ -27,6 +27,15 @@ OTP_TTL_MINUTES = int(_env("PORTAL_OTP_TTL_MINUTES", "10"))
 OTP_MAX_ATTEMPTS = int(_env("PORTAL_OTP_MAX_ATTEMPTS", "5"))
 SESSION_COOKIE = "portal_session"
 
+# ── Rate limiting (in-process sliding window; single uvicorn worker) ──────────
+OTP_REQUEST_COOLDOWN_SEC = int(_env("PORTAL_OTP_COOLDOWN_SEC", "45"))   # min gap between codes for one email
+OTP_REQUESTS_PER_EMAIL = int(_env("PORTAL_OTP_PER_EMAIL", "5"))         # per window
+RATE_WINDOW_SEC = int(_env("PORTAL_RATE_WINDOW_SEC", "900"))            # 15 min
+RATE_REQUESTS_PER_IP = int(_env("PORTAL_RATE_PER_IP", "40"))            # auth POSTs per IP per window
+
+# ── Deposit (shown to the customer; exact instructions provided by Treadwell) ──
+CHECK_ADDRESS = _env("PORTAL_CHECK_ADDRESS", "Treadwell — Attn: Accounts Receivable (mailing address provided by your representative)")
+
 # ── Service token (admin proposal tool -> this portal /api/notify) ────────────
 SERVICE_TOKEN = _env("SERVICE_TOKEN")
 

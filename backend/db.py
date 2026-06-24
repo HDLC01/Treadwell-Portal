@@ -186,3 +186,13 @@ def get_session(session_token: str) -> Optional[dict[str, Any]]:
         "select * from public.portal_sessions where session_token=%s and expires_at > now()",
         (session_token,),
     )
+
+
+def delete_session(session_token: str) -> None:
+    execute("delete from public.portal_sessions where session_token=%s", (session_token,))
+
+
+def cleanup_expired() -> None:
+    """Purge expired sessions + login codes so the tables don't grow unbounded."""
+    execute("delete from public.portal_sessions where expires_at <= now()")
+    execute("delete from public.portal_login_codes where expires_at <= now()")

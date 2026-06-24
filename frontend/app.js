@@ -15,10 +15,23 @@ const money = (n) => (n == null ? "" : new Intl.NumberFormat("en-US", { style: "
 async function api(method, path, body) {
   const opts = { method, headers: {}, credentials: "same-origin" };
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
-  const res = await fetch(`/api/portal/${TOKEN}${path}`, opts);
+  let res;
+  try { res = await fetch(`/api/portal/${TOKEN}${path}`, opts); }
+  catch { return { ok: false, status: 0, data: {} }; }   // network failure
   let data = {};
   try { data = await res.json(); } catch {}
   return { ok: res.ok && data.ok !== false, status: res.status, data };
+}
+
+// If a mid-session action 401s, the session expired — tell the user and reload
+// to the login gate. Returns true if it handled an expiry.
+function handleExpired(res, alertEl) {
+  if (res.status === 401) {
+    alertBox(alertEl, "info", "Your session expired — please sign in again.");
+    setTimeout(() => location.reload(), 1400);
+    return true;
+  }
+  return false;
 }
 
 function alertBox(el, kind, msg) { if (!el) return; el.className = `alert ${kind}`; el.textContent = msg; show(el); }
@@ -29,8 +42,10 @@ let STATE = null;
 // ── boot ──────────────────────────────────────────────────────────────────────
 (async function boot() {
   if (!TOKEN) { renderNotFound(); return; }
-  const { ok, data } = await api("GET", "");
+  const res = await api("GET", "");
   hide($("loading"));
+  if (res.status === 0 || res.status >= 500) { renderError(); return; }
+  const { ok, data } = res;
   if (!ok && data.error === "not_found") { renderNotFound(); return; }
   if (data.authed && data.view) { renderPortal(data.view); }
   else if (data.wrong_account) { renderWrongAccount(); }
@@ -41,6 +56,12 @@ function renderNotFound() {
   hide($("loading"));
   const g = $("gate"); show(g);
   g.innerHTML = '<div class="card login-card"><h1>Link not found</h1><p class="muted">This proposal link is invalid or has expired. Please contact your Treadwell representative.</p></div>';
+}
+
+function renderError() {
+  const g = $("gate"); show(g);
+  g.innerHTML = '<div class="card login-card"><h1>Something went wrong</h1><p class="muted">We couldn\'t load your proposal right now. Please try again in a moment.</p><button class="btn btn-primary" id="err-retry">Retry</button></div>';
+  $("err-retry").addEventListener("click", () => location.reload());
 }
 
 function renderGate() {
@@ -129,7 +150,13 @@ function renderSummary(s) {
 
 function renderOptions(options, addons, approved) {
   const wrap = $("options");
-  if (!options || !options.length) { hide($("options-card")); return; }
+  if (!options || !options.length) {
+    $("options-help").textContent = "";
+    wrap.innerHTML = '<p class="muted">Your pricing is being finalized — your Treadwell rep will follow up. You can still ask questions below.</p>';
+    $("addons").innerHTML = "";
+    if (!approved) hide($("approve-card"));
+    return;
+  }
   $("options-help").textContent = options.length > 1 ? "Choose the option you'd like when you approve." : "";
   wrap.innerHTML = options.map((o, i) => `
     <div class="option ${i === 0 ? "selected" : ""}" data-i="${i}">
@@ -171,7 +198,7 @@ function renderThread(qs) {
 }
 
 function setupDeposit() {
-  $("check-address").textContent = "Treadwell — Attn: Accounts Receivable (mailing address provided by your representative)";
+  $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
   const tabAch = $("tab-ach"), tabCheck = $("tab-check");
   const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-form")); hide($("check-instructions")); };
   const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-form")); show($("check-instructions")); };
@@ -185,8 +212,10 @@ $("approve-form").addEventListener("submit", async (e) => {
   if (!name) { alertBox($("approve-alert"), "error", "Please enter your full name."); $("ap-name").focus(); return; }
   const option_label = $("ap-option").value || (STATE.options[0] && STATE.options[0].label);
   const btn = $("approve-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
-  const { ok, data } = await api("POST", "/approve", { name, title: $("ap-title").value.trim(), option_label, date: new Date().toISOString().slice(0, 10) });
+  const res = await api("POST", "/approve", { name, title: $("ap-title").value.trim(), option_label, date: new Date().toISOString().slice(0, 10) });
   btn.disabled = false; btn.textContent = "Approve proposal";
+  if (handleExpired(res, $("approve-alert"))) return;
+  const { ok, data } = res;
   if (!ok) { alertBox($("approve-alert"), "error", data.error || "Could not approve. Please try again."); return; }
   const fresh = await api("GET", "");
   renderPortal(fresh.data.view);
@@ -198,8 +227,10 @@ $("qa-form").addEventListener("submit", async (e) => {
   const body = $("qa-body").value.trim();
   if (!body) return;
   const btn = $("qa-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending…';
-  const { ok, data } = await api("POST", "/questions", { body });
+  const res = await api("POST", "/questions", { body });
   btn.disabled = false; btn.textContent = "Send question";
+  if (handleExpired(res, $("qa-alert"))) return;
+  const { ok, data } = res;
   if (!ok) { alertBox($("qa-alert"), "error", data.error || "Could not send. Try again."); return; }
   $("qa-body").value = "";
   STATE.questions = (STATE.questions || []).concat([data.question]);
@@ -212,18 +243,22 @@ $("ach-form").addEventListener("submit", async (e) => {
   const account_name = $("ach-acct-name").value.trim();
   if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name on the account."); return; }
   const btn = $("ach-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
-  const { ok, data } = await api("POST", "/deposit", {
+  const res = await api("POST", "/deposit", {
     method: "ach", account_name, bank_name: $("ach-bank").value.trim(),
     account_last4: $("ach-last4").value.trim(), note: $("ach-note").value.trim(),
   });
   btn.disabled = false; btn.textContent = "Submit ACH details";
+  if (handleExpired(res, $("deposit-alert"))) return;
+  const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
   alertBox($("deposit-alert"), "success", "Thank you — your deposit details were sent securely. We'll mark it Received once confirmed.");
 });
 
 $("check-ack").addEventListener("click", async () => {
   clearAlert($("deposit-alert"));
-  const { ok, data } = await api("POST", "/deposit", { method: "check" });
+  const res = await api("POST", "/deposit", { method: "check" });
+  if (handleExpired(res, $("deposit-alert"))) return;
+  const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
   alertBox($("deposit-alert"), "success", "Thanks for letting us know — we'll mark your deposit Received once the check arrives.");
 });
