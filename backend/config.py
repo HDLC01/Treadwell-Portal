@@ -69,6 +69,11 @@ ENVIRONMENT = _env("ENVIRONMENT", "development")
 IS_PROD = ENVIRONMENT == "production"
 # Apply the dev seed (stand-in `drafts` + sample proposal) on startup. NOT prod.
 DEV_SEED = _env("DEV_SEED", "false").lower() == "true"
+# Apply schema.sql (DDL) on startup. Convenient for local/staging, where the app
+# connects as the table owner. In prod the portal connects as the least-privilege
+# `portal_app` role (no DDL rights) and schema is applied out-of-band via
+# migration (security_prod.sql + schema.sql) — so default OFF in prod. Overridable.
+APPLY_SCHEMA_ON_BOOT = _env("PORTAL_APPLY_SCHEMA_ON_BOOT", "false" if IS_PROD else "true").lower() == "true"
 # Secure cookie when served over HTTPS (staging + prod), regardless of ENVIRONMENT.
 COOKIE_SECURE = PUBLIC_BASE_URL.lower().startswith("https")
 # Staging-only convenience: surface the OTP on-screen so testers can sign in

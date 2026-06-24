@@ -52,13 +52,15 @@ CSP = (
 @app.on_event("startup")
 def _startup() -> None:
     try:
-        db.run_script((BACKEND_DIR / "schema.sql").read_text(encoding="utf-8"))
+        if config.APPLY_SCHEMA_ON_BOOT:
+            db.run_script((BACKEND_DIR / "schema.sql").read_text(encoding="utf-8"))
         if config.DEV_SEED:
             db.run_script((BACKEND_DIR / "staging" / "dev_seed.sql").read_text(encoding="utf-8"))
         db.cleanup_expired()
-        log.info("schema applied%s", " + dev seed" if config.DEV_SEED else "")
+        log.info("startup ok (schema_apply=%s%s)", config.APPLY_SCHEMA_ON_BOOT,
+                 " + dev seed" if config.DEV_SEED else "")
     except Exception as exc:  # noqa: BLE001
-        log.error("startup schema apply failed: %s", exc)
+        log.error("startup failed: %s", exc)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

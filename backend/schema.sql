@@ -84,3 +84,18 @@ create table if not exists public.portal_deposits (
   note          text,
   submitted_at  timestamptz not null default now()
 );
+
+-- ── Row Level Security ────────────────────────────────────────────────────────
+-- Enable RLS on every portal_* table so they are NOT exposed through the public
+-- (anon) REST API of the shared database. Idempotent: ENABLE on an already-
+-- enabled table is a no-op. The portal's backend is unaffected because it
+-- connects either as the table owner (local/staging — owners bypass RLS) or as a
+-- least-privilege role with explicit policies (prod — see security_prod.sql);
+-- only the anon/public API path is denied. Matches drafts/events/profiles, which
+-- already have RLS enabled.
+alter table public.portal_proposals   enable row level security;
+alter table public.portal_questions   enable row level security;
+alter table public.portal_approvals   enable row level security;
+alter table public.portal_login_codes enable row level security;
+alter table public.portal_sessions    enable row level security;
+alter table public.portal_deposits    enable row level security;
