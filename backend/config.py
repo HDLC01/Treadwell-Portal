@@ -39,6 +39,11 @@ CHECK_ADDRESS = _env("PORTAL_CHECK_ADDRESS", "Treadwell — Attn: Accounts Recei
 # ── Service token (admin proposal tool -> this portal /api/notify) ────────────
 SERVICE_TOKEN = _env("SERVICE_TOKEN")
 
+# ── Proposal tool (renders the real Treadwell proposal PDF on demand) ─────────
+# When set, the portal fetches the official PDF from the proposal tool's
+# SERVICE_TOKEN-gated /api/admin/proposal-pdf and serves it to the customer.
+PROPOSAL_TOOL_URL = _env("PROPOSAL_TOOL_URL").rstrip("/")
+
 # ── Email (Resend) ────────────────────────────────────────────────────────────
 RESEND_API_KEY = _env("RESEND_API_KEY")
 EMAIL_FROM = _env("EMAIL_FROM", "Treadwell <noreply@wetreadwell.com>")

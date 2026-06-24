@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -243,6 +244,8 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]
     vm["check_address"] = config.CHECK_ADDRESS
+    if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
+        vm["has_pdf"] = True
     base["view"] = vm
     return _json(base)
 
@@ -358,9 +361,24 @@ def api_pdf(token: str, request: Request):
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    if not p.get("pdf_path"):
-        return _json({"ok": False, "error": "no_pdf"}, 404)
-    return RedirectResponse(p["pdf_path"])
+    # Preferred: render the real Treadwell PDF on demand from the proposal tool.
+    if config.PROPOSAL_TOOL_URL and config.SERVICE_TOKEN:
+        try:
+            r = httpx.get(
+                config.PROPOSAL_TOOL_URL + "/api/admin/proposal-pdf",
+                params={"draft_id": p["proposal_id"]},
+                headers={"X-Service-Token": config.SERVICE_TOKEN},
+                timeout=90,
+            )
+            if r.status_code == 200:
+                return Response(content=r.content, media_type="application/pdf",
+                                headers={"Content-Disposition": 'inline; filename="proposal.pdf"'})
+            log.info("proposal-pdf upstream %s for %s", r.status_code, p["proposal_id"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("proposal-pdf fetch failed: %s", exc)
+    if p.get("pdf_path"):  # fallback: a stored Storage URL (prod option)
+        return RedirectResponse(p["pdf_path"])
+    return _json({"ok": False, "error": "no_pdf"}, 404)
 
 
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
