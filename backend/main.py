@@ -385,6 +385,128 @@ async def api_notify(request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
+# ── admin API (proposal tool -> portal; SERVICE_TOKEN-gated, server-to-server) ─
+def _admin_ok(request: Request) -> bool:
+    presented = request.headers.get("x-service-token") or ""
+    return bool(config.SERVICE_TOKEN and hmac.compare_digest(presented, config.SERVICE_TOKEN))
+
+
+@app.post("/api/admin/publish")
+async def admin_publish(request: Request) -> JSONResponse:
+    """Publish a proposal to the portal: read the draft (shared DB), mint a token
+    (or reuse), upsert the portal_proposals row, email the customer the link."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    draft_id = (body.get("draft_id") or "").strip()
+    data = db.get_draft_data(draft_id)
+    if data is None:
+        return _json({"ok": False, "error": "draft_not_found"}, 404)
+    email = (data.get("contact_email") or "").strip().lower()
+    if not email:
+        return _json({"ok": False, "error": "no_contact_email"}, 400)  # can't publish without a customer email
+    name = _cap(data.get("contact_name"), 120)
+    project = _cap(data.get("project_name"), 200) or "Your Proposal"
+    pdf_path = (body.get("pdf_path") or "").strip() or None
+    by = _cap(body.get("by"), 120) or None
+
+    existing = db.get_proposal(draft_id)
+    if existing:
+        token = existing["token"]
+        db.update_portal_proposal(draft_id, email, name, project, pdf_path)
+    else:
+        token = ca.new_proposal_token()
+        db.create_portal_proposal(draft_id, token, email, name, project, pdf_path, by)
+    link = f"{config.PUBLIC_BASE_URL}/p/{token}"
+    email_sender.send_portal_link(email, name, link, project)
+    return _json({"ok": True, "token": token, "url": link, "customer_email": email})
+
+
+@app.get("/api/admin/pipeline")
+def admin_pipeline(request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    out = []
+    for r in db.list_all_portal_proposals():
+        out.append({
+            "proposal_id": r["proposal_id"], "token": r["token"],
+            "customer_email": r["customer_email"], "customer_name": r.get("customer_name"),
+            "project_name": r.get("project_name"), "proposal_status": r["proposal_status"],
+            "deposit_status": r["deposit_status"], "schedule_status": r["schedule_status"],
+            "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
+        })
+    return _json({"ok": True, "proposals": out})
+
+
+@app.get("/api/admin/proposal/{proposal_id}")
+def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    appr = db.latest_approval(proposal_id)
+    return _json({
+        "ok": True,
+        "proposal": {
+            "proposal_id": p["proposal_id"], "token": p["token"],
+            "url": f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
+            "customer_email": p["customer_email"], "customer_name": p.get("customer_name"),
+            "project_name": p.get("project_name"), "proposal_status": p["proposal_status"],
+            "deposit_status": p["deposit_status"], "schedule_status": p["schedule_status"],
+        },
+        "approval": ({
+            "name": appr["name"], "title": appr.get("title"),
+            "date": appr["approved_date"].isoformat() if appr.get("approved_date") else None,
+            "total": float(appr["total"]) if appr.get("total") is not None else None,
+            "option": appr.get("option_label"),
+        } if appr else None),
+        "questions": [_q(q) for q in db.list_questions(proposal_id)],
+        "deposits": [{
+            "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
+            "masked_ref": d.get("masked_ref"), "note": d.get("note"),
+            "submitted_at": d["submitted_at"].isoformat() if d.get("submitted_at") else None,
+        } for d in db.list_deposits(proposal_id)],
+    })
+
+
+@app.post("/api/admin/proposal/{proposal_id}/reply")
+async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    text = _cap(body.get("body"), 4000)
+    if not text:
+        return _json({"ok": False, "error": "empty"}, 400)
+    db.add_question(proposal_id, "staff", _cap(body.get("by"), 120) or "Treadwell", text)
+    email_sender.send_reply_notification(p["customer_email"], f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
+                                         p.get("project_name") or "your proposal")
+    return _json({"ok": True})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/deposit-received")
+def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    db.set_deposit_status(proposal_id, "received")
+    return _json({"ok": True})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/scheduled")
+def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    db.set_schedule_status(proposal_id, "scheduled")
+    return _json({"ok": True})
+
+
 # Static assets — mounted last so /api, /, /p win.
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")

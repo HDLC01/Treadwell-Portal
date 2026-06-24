@@ -49,3 +49,24 @@ values
   ('dev-proposal-acme', 'dev-token-acme-7Yx2Qn4PpL9', 'customer@example.com',
    'Jordan Rivera', 'Acme Distribution Warehouse', 'sent')
 on conflict (proposal_id) do nothing;
+
+-- An UNPUBLISHED draft (no portal_proposals row) so the admin publish flow can
+-- be exercised: POST /api/admin/publish {draft_id:'dev-proposal-unpublished'}.
+insert into public.drafts (id, data, owner_email)
+values (
+  'dev-proposal-unpublished',
+  '{
+    "project_name": "Bluebird Cold Storage — Floor Refresh",
+    "city_state": "Lenexa, KS",
+    "contact_name": "Dana Owner",
+    "contact_email": "owner@example.com",
+    "work_type": "epoxy",
+    "system_name": "Treadwell Standard Epoxy",
+    "texture": "Smooth",
+    "scope_notes": "Re-coat ~4,000 SF of existing warehouse floor: light diamond grind, patch, and a standard epoxy build coat.",
+    "exclusions": "Moisture mitigation, deep concrete repair, and moving stored product.",
+    "computed_bid": { "full_bid": { "total_base_bid": 31200, "per_sf": 7.80 } }
+  }'::jsonb,
+  'estimator@wetreadwell.com'
+)
+on conflict (id) do update set data = excluded.data;

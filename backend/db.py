@@ -83,6 +83,48 @@ def email_has_proposal(email: str) -> bool:
     return row is not None
 
 
+# ── admin (publish + pipeline) ──────────────────────────────────────────────────
+def create_portal_proposal(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by) -> None:
+    execute(
+        "insert into public.portal_proposals "
+        "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by) "
+        "values (%s,%s,%s,%s,%s,%s,%s)",
+        (proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by),
+    )
+
+
+def update_portal_proposal(proposal_id, customer_email, customer_name, project_name, pdf_path) -> None:
+    execute(
+        "update public.portal_proposals set customer_email=%s, customer_name=%s, project_name=%s, "
+        "pdf_path=coalesce(%s, pdf_path), updated_at=now() where proposal_id=%s",
+        (customer_email, customer_name, project_name, pdf_path, proposal_id),
+    )
+
+
+def list_all_portal_proposals() -> list[dict[str, Any]]:
+    return qall(
+        "select proposal_id, token, customer_email, customer_name, project_name, proposal_status, "
+        "deposit_status, schedule_status, approved_total, created_at from public.portal_proposals "
+        "order by created_at desc"
+    )
+
+
+def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
+    return qall(
+        "select method, account_name, bank_name, masked_ref, note, submitted_at "
+        "from public.portal_deposits where proposal_id=%s order by submitted_at desc",
+        (proposal_id,),
+    )
+
+
+def latest_approval(proposal_id: str) -> Optional[dict[str, Any]]:
+    return q1(
+        "select name, title, approved_date, total, option_label, signed_at "
+        "from public.portal_approvals where proposal_id=%s order by signed_at desc limit 1",
+        (proposal_id,),
+    )
+
+
 def mark_viewed(proposal_id: str) -> None:
     execute(
         "update public.portal_proposals set viewed_at = coalesce(viewed_at, now()), "
