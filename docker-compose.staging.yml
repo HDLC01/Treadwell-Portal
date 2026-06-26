@@ -6,6 +6,7 @@
 services:
   app:
     build: .
+    image: treadwell-portal-staging:latest   # pinned so prod can `up -d` a prebuilt image (no on-box build)
     container_name: treadwell-portal-staging
     restart: unless-stopped
     ports:
