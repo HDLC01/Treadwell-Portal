@@ -1,0 +1,38 @@
+# VPS PRODUCTION — SHARED DB with the proposal tool (one source of truth).
+# The portal connects to the SAME Supabase Postgres the proposal tool uses, but as
+# the least-privilege portal_app role (read-only on `drafts`, read/write on the
+# portal_* tables only). DEV_SEED is OFF; OTP is NEVER shown on-screen in prod.
+#
+# Secrets live in .env on the VPS (chmod 600, NEVER committed):
+#   DATABASE_URL, SERVICE_TOKEN, RESEND_API_KEY, EMAIL_FROM.
+# Non-secret config is inline below.
+#
+# Deploy: build off-box + ship the prebuilt image via deploy/ship-prod.sh (the 2GB
+# VPS browns out on on-box builds). The image is pinned (no `build:`) so `up -d`
+# loads the shipped image and never triggers a build.
+services:
+  app:
+    image: treadwell-portal:latest
+    container_name: treadwell-portal
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8898:8898"
+    env_file:
+      - .env
+    environment:
+      PUBLIC_BASE_URL: https://portal.wetreadwell.com
+      ENVIRONMENT: production
+      DEV_SEED: "false"
+      PORTAL_SHOW_OTP: "false"
+      NOTIFY_EMAILS: bids@wetreadwell.com
+      # Reach the proposal tool over the shared docker network (avoids the public
+      # nginx hairpin/502); both containers are on treadwell_default. The proposal
+      # tool reaches back at http://treadwell-portal:8898 (this container_name).
+      PROPOSAL_TOOL_URL: "http://treadwell-proposal-tool:8888"
+    networks:
+      - shared
+
+networks:
+  shared:
+    external: true
+    name: treadwell_default

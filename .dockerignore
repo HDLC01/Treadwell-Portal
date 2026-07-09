@@ -1,0 +1,18 @@
+# Keep secrets and cruft OUT of the build context / image.
+# The Dockerfile COPYs backend/ wholesale, so a stray backend/.env would otherwise
+# be baked into the image. These patterns prevent that.
+**/.env
+**/.env.*
+!**/.env.example
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+.venv/
+venv/
+node_modules/
+.DS_Store
+**/*.log
+.playwright-mcp/
+deploy/
+docker-compose*.yml
