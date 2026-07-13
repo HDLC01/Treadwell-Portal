@@ -49,7 +49,8 @@ create table if not exists public.portal_approvals (
   total        numeric,
   option_label text,
   signed_at    timestamptz not null default now(),
-  ip           text
+  ip           text,
+  approver_email text                               -- which verified recipient clicked Approve
 );
 
 -- Email one-time codes (customer auth) — keyed by EMAIL (account login, not
@@ -85,6 +86,32 @@ create table if not exists public.portal_deposits (
   submitted_at  timestamptz not null default now()
 );
 
+-- Every email allowed to access a proposal — INCLUDES the primary customer_email.
+-- Reconciled on each publish (see admin_publish). Backfilled below so existing
+-- proposals keep working. This is what lets a proposal be sent to (and opened +
+-- approved by) more than one person; auth lookups union this with customer_email.
+create table if not exists public.portal_proposal_recipients (
+  id           bigint generated always as identity primary key,
+  proposal_id  text not null references public.portal_proposals(proposal_id) on delete cascade,
+  email        text not null,
+  added_by     text,
+  added_at     timestamptz not null default now()
+);
+create unique index if not exists portal_recipients_unique_idx
+  on public.portal_proposal_recipients (proposal_id, lower(email));
+create index if not exists portal_recipients_email_idx
+  on public.portal_proposal_recipients (lower(email));
+
+-- Audit which verified email approved (approvals predate multi-recipient; add for
+-- existing DBs — the create-table above already has it for fresh installs).
+alter table public.portal_approvals add column if not exists approver_email text;
+
+-- Backfill: every existing proposal's primary contact is a recipient. Idempotent
+-- (the unique index makes the ON CONFLICT a no-op on re-run / staging reboot).
+insert into public.portal_proposal_recipients (proposal_id, email)
+select proposal_id, lower(customer_email) from public.portal_proposals
+on conflict do nothing;
+
 -- ── Row Level Security ────────────────────────────────────────────────────────
 -- Enable RLS on every portal_* table so they are NOT exposed through the public
 -- (anon) REST API of the shared database. Idempotent: ENABLE on an already-
@@ -99,3 +126,4 @@ alter table public.portal_approvals   enable row level security;
 alter table public.portal_login_codes enable row level security;
 alter table public.portal_sessions    enable row level security;
 alter table public.portal_deposits    enable row level security;
+alter table public.portal_proposal_recipients enable row level security;

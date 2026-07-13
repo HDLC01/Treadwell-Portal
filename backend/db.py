@@ -70,17 +70,87 @@ def get_proposal(proposal_id: str) -> Optional[dict[str, Any]]:
 
 
 def list_proposals_by_email(email: str) -> list[dict[str, Any]]:
-    """All proposals tied to a (verified) customer email — the account view."""
+    """All proposals tied to a (verified) email — the account/dashboard view.
+    Matches the primary customer_email OR any added recipient, so a person sent
+    several proposals (as primary on some, extra recipient on others) sees them
+    all. Both legs are index-served (customer_email idx + recipients email idx)."""
     return qall(
-        "select * from public.portal_proposals where lower(customer_email) = lower(%s) "
-        "order by created_at desc",
-        (email,),
+        "select * from public.portal_proposals where proposal_id in ("
+        "  select proposal_id from public.portal_proposals where lower(customer_email) = lower(%s)"
+        "  union"
+        "  select proposal_id from public.portal_proposal_recipients where lower(email) = lower(%s)"
+        ") order by created_at desc",
+        (email, email),
     )
 
 
 def email_has_proposal(email: str) -> bool:
-    row = q1("select 1 from public.portal_proposals where lower(customer_email) = lower(%s) limit 1", (email,))
+    row = q1(
+        "select 1 from public.portal_proposals where lower(customer_email) = lower(%s) "
+        "union all "
+        "select 1 from public.portal_proposal_recipients where lower(email) = lower(%s) limit 1",
+        (email, email),
+    )
     return row is not None
+
+
+def email_can_access(proposal_id: str, email: str) -> bool:
+    """True if `email` is the primary contact OR an added recipient of this proposal."""
+    row = q1(
+        "select 1 from public.portal_proposals "
+        "where proposal_id = %s and lower(customer_email) = lower(%s) "
+        "union all "
+        "select 1 from public.portal_proposal_recipients "
+        "where proposal_id = %s and lower(email) = lower(%s) limit 1",
+        (proposal_id, email, proposal_id, email),
+    )
+    return row is not None
+
+
+# ── portal_proposal_recipients (multi-recipient access) ──────────────────────
+def get_recipients(proposal_id: str) -> list[str]:
+    return [r["email"] for r in qall(
+        "select email from public.portal_proposal_recipients "
+        "where proposal_id = %s order by added_at, id",
+        (proposal_id,),
+    )]
+
+
+def add_recipient(proposal_id: str, email: str, added_by: Optional[str] = None) -> None:
+    execute(
+        "insert into public.portal_proposal_recipients (proposal_id, email, added_by) "
+        "values (%s,%s,%s) on conflict do nothing",
+        (proposal_id, email.strip().lower(), added_by),
+    )
+
+
+def remove_recipient(proposal_id: str, email: str) -> None:
+    execute(
+        "delete from public.portal_proposal_recipients "
+        "where proposal_id = %s and lower(email) = lower(%s)",
+        (proposal_id, email),
+    )
+
+
+def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] = None) -> None:
+    """Replace the recipient set in one transaction: drop rows not in `emails`,
+    insert the rest (retained rows keep their added_at). `emails` must be
+    non-empty and already lowercased/deduped by the caller."""
+    emails = [e.strip().lower() for e in emails if e and e.strip()]
+    if not emails:
+        return
+    with pool().connection() as conn:
+        conn.execute(
+            "delete from public.portal_proposal_recipients "
+            "where proposal_id = %s and lower(email) <> all(%s)",
+            (proposal_id, emails),
+        )
+        for e in emails:
+            conn.execute(
+                "insert into public.portal_proposal_recipients (proposal_id, email, added_by) "
+                "values (%s,%s,%s) on conflict do nothing",
+                (proposal_id, e, added_by),
+            )
 
 
 # ── admin (publish + pipeline) ──────────────────────────────────────────────────
@@ -119,7 +189,7 @@ def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
 
 def latest_approval(proposal_id: str) -> Optional[dict[str, Any]]:
     return q1(
-        "select name, title, approved_date, total, option_label, signed_at "
+        "select name, title, approved_date, total, option_label, signed_at, approver_email "
         "from public.portal_approvals where proposal_id=%s order by signed_at desc limit 1",
         (proposal_id,),
     )
@@ -175,11 +245,12 @@ def add_question(proposal_id: str, author_kind: str, author_email: Optional[str]
 
 
 # ── Approvals ───────────────────────────────────────────────────────────────────
-def add_approval(proposal_id, name, title, approved_date, total, option_label, ip) -> None:
+def add_approval(proposal_id, name, title, approved_date, total, option_label, ip, approver_email=None) -> None:
     execute(
-        "insert into public.portal_approvals (proposal_id, name, title, approved_date, total, option_label, ip) "
-        "values (%s,%s,%s,%s,%s,%s,%s)",
-        (proposal_id, name, title, approved_date, total, option_label, ip),
+        "insert into public.portal_approvals "
+        "(proposal_id, name, title, approved_date, total, option_label, ip, approver_email) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (proposal_id, name, title, approved_date, total, option_label, ip, approver_email),
     )
 
 

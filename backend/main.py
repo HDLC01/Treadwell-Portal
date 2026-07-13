@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 import html
 import logging
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
@@ -97,7 +98,40 @@ def _session_email(request: Request) -> Optional[str]:
 
 def _can_access(request: Request, proposal: dict) -> bool:
     se = _session_email(request)
-    return bool(se and se == (proposal.get("customer_email") or "").strip().lower())
+    if not se:
+        return False
+    if se == (proposal.get("customer_email") or "").strip().lower():
+        return True                                   # primary contact — no extra query
+    return db.email_can_access(proposal["proposal_id"], se)   # added recipient?
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_RECIPIENTS = 10
+
+
+def _clean_emails(raw):
+    """Validate an optional recipients list from the admin-publish body.
+    Returns (None, None) when the key is absent (legacy caller), (list, None)
+    when clean (lowercased, trimmed, deduped, order-preserving), or
+    (None, error_str) on bad input. The regex forbids whitespace, so a value
+    can't smuggle newlines/headers into the Resend `to` list."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, list):
+        return None, "emails_must_be_list"
+    out, seen = [], set()
+    for e in raw:
+        if not isinstance(e, str):
+            return None, "invalid_email"
+        e = e.strip().lower()
+        if not e:
+            continue
+        if len(e) > 254 or not _EMAIL_RE.match(e):
+            return None, "invalid_email"
+        if e not in seen:
+            seen.add(e)
+            out.append(e)
+    return out, None
 
 
 def _proposal_card(row: dict) -> dict:
@@ -235,7 +269,7 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     se = _session_email(request)
-    authed = bool(se and se == (p.get("customer_email") or "").strip().lower())
+    authed = _can_access(request, p)                  # primary OR added recipient
     base = {"ok": True, "authed": authed, "project_name": p.get("project_name") or "Your Proposal",
             "wrong_account": bool(se and not authed)}
     if not authed:
@@ -311,7 +345,9 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     except (ValueError, TypeError):
         approved_date = date.today()
 
-    db.add_approval(p["proposal_id"], name, title, approved_date, total, option_label, _client_ip(request))
+    approver = _session_email(request)
+    db.add_approval(p["proposal_id"], name, title, approved_date, total, option_label,
+                    _client_ip(request), approver)
     db.set_approved(p["proposal_id"], total, option_label, name, title, approved_date)
 
     project_name = p.get("project_name") or "proposal"
@@ -319,7 +355,8 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
         f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
-        f"<strong>{html.escape(option_label)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}.</p>"
+        f"<strong>{html.escape(option_label)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
+        f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
         f'<p>Project: {html.escape(project_name)}. <a href="{link}">Portal link</a></p>',
     )
     try:
@@ -395,11 +432,15 @@ async def api_notify(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "not_found"}, 404)
     kind = body.get("type")
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+    primary = (p.get("customer_email") or "").strip().lower()
+    project = p.get("project_name") or "your proposal"
+    recipients = db.get_recipients(p["proposal_id"]) or ([primary] if primary else [])
     if kind == "published":
-        email_sender.send_portal_link(p["customer_email"], p.get("customer_name") or "", link,
-                                      p.get("project_name") or "your proposal")
+        for e in recipients:
+            email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project)
     elif kind == "reply":
-        email_sender.send_reply_notification(p["customer_email"], link, p.get("project_name") or "your proposal")
+        for e in recipients:
+            email_sender.send_reply_notification(e, link, project)
     else:
         return _json({"ok": False, "error": "unknown_type"}, 400)
     return _json({"ok": True})
@@ -422,9 +463,24 @@ async def admin_publish(request: Request) -> JSONResponse:
     data = db.get_draft_data(draft_id)
     if data is None:
         return _json({"ok": False, "error": "draft_not_found"}, 404)
-    email = (data.get("contact_email") or "").strip().lower()
-    if not email:
-        return _json({"ok": False, "error": "no_contact_email"}, 400)  # can't publish without a customer email
+
+    extras, err = _clean_emails(body.get("emails"))
+    if err:
+        return _json({"ok": False, "error": err}, 400)
+    contact = (data.get("contact_email") or "").strip().lower()
+    # Union semantics: the intake contact is ALWAYS a recipient (the Files-screen
+    # modal never removes it — it only adds). `emails` absent → legacy behavior.
+    if extras:
+        recipients = ([contact] if contact else []) + [e for e in extras if e != contact]
+        primary = contact or recipients[0]     # no intake email → first added address is primary
+    else:
+        recipients = None                       # legacy call: don't touch the extra recipients
+        primary = contact
+    if not primary:
+        return _json({"ok": False, "error": "no_contact_email"}, 400)  # can't publish to nobody
+    if recipients is not None and len(recipients) > MAX_RECIPIENTS:
+        return _json({"ok": False, "error": "too_many_recipients"}, 400)
+
     name = _cap(data.get("contact_name"), 120)
     project = _cap(data.get("project_name"), 200) or "Your Proposal"
     pdf_path = (body.get("pdf_path") or "").strip() or None
@@ -433,13 +489,30 @@ async def admin_publish(request: Request) -> JSONResponse:
     existing = db.get_proposal(draft_id)
     if existing:
         token = existing["token"]
-        db.update_portal_proposal(draft_id, email, name, project, pdf_path)
+        db.update_portal_proposal(draft_id, primary, name, project, pdf_path)
     else:
         token = ca.new_proposal_token()
-        db.create_portal_proposal(draft_id, token, email, name, project, pdf_path, by)
+        db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by)
+
+    # Reconcile the recipient set.
+    if recipients is None:                      # legacy call — preserve exact old semantics
+        if existing:
+            old = (existing.get("customer_email") or "").strip().lower()
+            if old and old != primary:
+                db.remove_recipient(draft_id, old)   # replaced primary loses access (as today)
+        db.add_recipient(draft_id, primary, by)
+        send_list = db.get_recipients(draft_id) or [primary]
+    else:
+        db.set_recipients(draft_id, recipients, by)  # revokes any extra dropped from the list
+        send_list = recipients
+
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
-    email_sender.send_portal_link(email, name, link, project)
-    return _json({"ok": True, "token": token, "url": link, "customer_email": email})
+    # One send per recipient (keeps _thread_headers per-recipient; recipients
+    # never see each other's addresses). Only the primary gets the name greeting.
+    emailed = [e for e in send_list
+               if email_sender.send_portal_link(e, name if e == primary else "", link, project)]
+    return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
+                  "recipients": send_list, "emailed": emailed})
 
 
 @app.get("/api/admin/pipeline")
@@ -474,12 +547,13 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "customer_email": p["customer_email"], "customer_name": p.get("customer_name"),
             "project_name": p.get("project_name"), "proposal_status": p["proposal_status"],
             "deposit_status": p["deposit_status"], "schedule_status": p["schedule_status"],
+            "recipients": db.get_recipients(proposal_id),
         },
         "approval": ({
             "name": appr["name"], "title": appr.get("title"),
             "date": appr["approved_date"].isoformat() if appr.get("approved_date") else None,
             "total": float(appr["total"]) if appr.get("total") is not None else None,
-            "option": appr.get("option_label"),
+            "option": appr.get("option_label"), "approver_email": appr.get("approver_email"),
         } if appr else None),
         "questions": [_q(q) for q in db.list_questions(proposal_id)],
         "deposits": [{
@@ -502,8 +576,10 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
     if not text:
         return _json({"ok": False, "error": "empty"}, 400)
     db.add_question(proposal_id, "staff", _cap(body.get("by"), 120) or "Treadwell", text)
-    email_sender.send_reply_notification(p["customer_email"], f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
-                                         p.get("project_name") or "your proposal")
+    link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+    project = p.get("project_name") or "your proposal"
+    for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
+        email_sender.send_reply_notification(e, link, project)
     return _json({"ok": True})
 
 

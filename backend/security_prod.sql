@@ -44,7 +44,8 @@ create policy portal_app_read_drafts on public.drafts
 --    anon/public REST role.
 grant select, insert, update, delete on
   public.portal_proposals, public.portal_questions, public.portal_approvals,
-  public.portal_login_codes, public.portal_sessions, public.portal_deposits
+  public.portal_login_codes, public.portal_sessions, public.portal_deposits,
+  public.portal_proposal_recipients
   to portal_app;
 
 drop policy if exists portal_app_rw on public.portal_proposals;
@@ -59,6 +60,8 @@ drop policy if exists portal_app_rw on public.portal_sessions;
 create policy portal_app_rw on public.portal_sessions    for all to portal_app using (true) with check (true);
 drop policy if exists portal_app_rw on public.portal_deposits;
 create policy portal_app_rw on public.portal_deposits    for all to portal_app using (true) with check (true);
+drop policy if exists portal_app_rw on public.portal_proposal_recipients;
+create policy portal_app_rw on public.portal_proposal_recipients for all to portal_app using (true) with check (true);
 
 -- NOTE: portal_app is deliberately granted NOTHING on public.events or
 -- public.profiles, and only SELECT (no write) on public.drafts. Do not widen.
