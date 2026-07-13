@@ -3,6 +3,7 @@ message to stdout instead of sending, so the full flow is testable offline.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import httpx
@@ -14,7 +15,18 @@ log = logging.getLogger("portal.email")
 _RESEND_URL = "https://api.resend.com/emails"
 
 
-def _send(to: list[str], subject: str, html: str) -> bool:
+def _thread_headers(email: str) -> dict[str, str]:
+    """Group every portal email to one customer into a single inbox thread, so the
+    login code always lands in the same conversation as the proposal link (and is
+    never shown on a web page). A stable per-recipient anchor in References/In-Reply-To
+    makes Gmail and most clients thread the proposal, the code, and reply notices
+    together."""
+    anchor = hashlib.sha1((email or "").strip().lower().encode()).hexdigest()[:24]
+    mid = f"<treadwell-portal.{anchor}@wetreadwell.com>"
+    return {"References": mid, "In-Reply-To": mid}
+
+
+def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None = None) -> bool:
     to = [t for t in to if t]
     if not to:
         return False
@@ -22,10 +34,13 @@ def _send(to: list[str], subject: str, html: str) -> bool:
         log.warning("[email:dev] would send to=%s subject=%r\n%s", to, subject, html)
         return True
     try:
+        payload: dict = {"from": config.EMAIL_FROM, "to": to, "subject": subject, "html": html}
+        if headers:
+            payload["headers"] = headers
         resp = httpx.post(
             _RESEND_URL,
             headers={"Authorization": f"Bearer {config.RESEND_API_KEY}"},
-            json={"from": config.EMAIL_FROM, "to": to, "subject": subject, "html": html},
+            json=payload,
             timeout=15,
         )
         resp.raise_for_status()
@@ -51,7 +66,8 @@ def send_otp(email: str, code: str, project_name: str) -> bool:
         f'<p style="font-size:30px;font-weight:800;letter-spacing:6px;margin:16px 0">{code}</p>'
         f'<p style="color:#64748b">This code expires in {config.OTP_TTL_MINUTES} minutes.</p>'
     )
-    return _send([email], "Your Treadwell proposal access code", _wrap("Your access code", body))
+    return _send([email], "Your Treadwell proposal access code", _wrap("Your access code", body),
+                 _thread_headers(email))
 
 
 def send_portal_link(email: str, name: str, url: str, project_name: str) -> bool:
@@ -62,7 +78,8 @@ def send_portal_link(email: str, name: str, url: str, project_name: str) -> bool
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
-    return _send([email], f"Your Treadwell proposal — {project_name}", _wrap("Your proposal is ready", body))
+    return _send([email], f"Your Treadwell proposal — {project_name}", _wrap("Your proposal is ready", body),
+                 _thread_headers(email))
 
 
 def send_reply_notification(email: str, url: str, project_name: str) -> bool:
@@ -71,7 +88,8 @@ def send_reply_notification(email: str, url: str, project_name: str) -> bool:
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
     )
-    return _send([email], f"New reply on your proposal — {project_name}", _wrap("You have a new reply", body))
+    return _send([email], f"New reply on your proposal — {project_name}", _wrap("You have a new reply", body),
+                 _thread_headers(email))
 
 
 def notify_team(subject: str, body_html: str, recipients: list[str] | None = None) -> bool:

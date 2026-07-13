@@ -2,7 +2,9 @@
 # The portal connects to the proposal tool's staging Postgres (treadwell-staging-db
 # on the treadwell-staging_default network), reads real `drafts`, and owns the
 # portal_* tables in that same DB. DEV_SEED is OFF so it never injects stand-in
-# drafts into the real table. OTP is shown on-screen (no email wired on staging).
+# drafts into the real table. OTP is delivered by EMAIL (Resend wired via .env) and
+# is NOT shown on-screen — mirrors prod. Secrets (RESEND_API_KEY, EMAIL_FROM) live in
+# .env on the VPS, never committed.
 services:
   app:
     build: .
@@ -11,12 +13,14 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8899:8898"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://postgres:staging_pg_pw@treadwell-staging-db:5432/treadwell
       PUBLIC_BASE_URL: https://staging.portal.wetreadwell.com
       ENVIRONMENT: staging
       DEV_SEED: "false"
-      PORTAL_SHOW_OTP: "true"
+      PORTAL_SHOW_OTP: "false"
       SERVICE_TOKEN: "stg-svc-3a9f2c7e1b4d8650"
       # Reach the proposal tool over the shared docker network (avoids the public
       # nginx hairpin/502); both are on treadwell-staging_default.
