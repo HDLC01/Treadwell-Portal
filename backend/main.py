@@ -111,7 +111,10 @@ def _can_access(request: Request, proposal: dict) -> bool:
     return db.email_can_access(proposal["proposal_id"], se)   # added recipient?
 
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Dot-separated domain labels that exclude '.', so the label class never overlaps
+# the '.' separator — linear-time (the old [^@\s]+\.[^@\s]+ form backtracked
+# polynomially: a ReDoS on length-bounded but attacker-shaped input).
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")
 MAX_RECIPIENTS = 10
 
 
