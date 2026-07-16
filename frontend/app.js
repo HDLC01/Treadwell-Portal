@@ -120,6 +120,15 @@ function renderPortal(vm) {
   renderChat(STATE.messages);
   setupDeposit();
 
+  // Pre-fill the approver name from the contact we already have — editable, so a
+  // different signer can overwrite. Only when empty, so a poll refetch (or the
+  // customer's in-progress typing) is never clobbered. Blank when we truly have
+  // no name on file.
+  if (!approved) {
+    const nm = $("ap-name");
+    if (nm && !nm.value && vm.customer_name) nm.value = vm.customer_name;
+  }
+
   LAST_STATUS = statusKey(vm.status);
   applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
   startPolling();
