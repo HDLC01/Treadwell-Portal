@@ -35,6 +35,8 @@ def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None
         return True
     try:
         payload: dict = {"from": config.EMAIL_FROM, "to": to, "subject": subject, "html": html}
+        if config.EMAIL_REPLY_TO:
+            payload["reply_to"] = config.EMAIL_REPLY_TO   # stray replies reach a monitored inbox, not noreply
         if headers:
             payload["headers"] = headers
         resp = httpx.post(
@@ -87,6 +89,8 @@ def send_reply_notification(email: str, url: str, project_name: str) -> bool:
         f'<p>Treadwell replied to your question on the proposal for <strong>{project_name}</strong>.</p>'
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
+        f'<p style="color:#64748b;font-size:13px">Reply right on your proposal page (button above) so our '
+        f'team sees it fastest.</p>'
     )
     return _send([email], f"New reply on your proposal — {project_name}", _wrap("You have a new reply", body),
                  _thread_headers(email))
