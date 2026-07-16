@@ -690,6 +690,7 @@ async def admin_publish(request: Request) -> JSONResponse:
 def admin_pipeline(request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    unread = db.unread_counts()
     out = []
     for r in db.list_all_portal_proposals():
         out.append({
@@ -700,6 +701,7 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "contacts_status": r.get("contacts_status") or "pending",
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
             "deposit_amount": float(r["deposit_amount"]) if r.get("deposit_amount") is not None else None,
+            "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
         })
     return _json({"ok": True, "proposals": out})
 

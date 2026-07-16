@@ -180,6 +180,22 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
     )
 
 
+def unread_counts() -> dict[str, int]:
+    """Per-proposal count of customer messages awaiting a staff reply — customer
+    text messages newer than the last staff TEXT reply. System/card rows, though
+    author_kind='staff', are msg_type!='text' so they never count as a reply.
+    One aggregate query for the whole board (no N+1)."""
+    rows = qall(
+        "select q.proposal_id as pid, count(*) as n "
+        "from public.portal_questions q "
+        "where q.author_kind='customer' and q.msg_type='text' "
+        "and q.id > coalesce((select max(s.id) from public.portal_questions s "
+        "  where s.proposal_id=q.proposal_id and s.author_kind='staff' and s.msg_type='text'), 0) "
+        "group by q.proposal_id"
+    )
+    return {r["pid"]: int(r["n"]) for r in rows}
+
+
 def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     return qall(
         "select method, account_name, bank_name, masked_ref, note, submitted_at "
