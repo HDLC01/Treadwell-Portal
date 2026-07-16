@@ -29,6 +29,11 @@ services:
       # nginx hairpin/502); both containers are on treadwell_default. The proposal
       # tool reaches back at http://treadwell-portal:8898 (this container_name).
       PROPOSAL_TOOL_URL: "http://treadwell-proposal-tool:8888"
+      # Inbound email capture (Resend receiving). Per-proposal Reply-To =
+      # <token>@piaxenoizh.resend.app → prod webhook → CRM thread. RESEND_WEBHOOK_SECRET
+      # lives in .env on the VPS. Captured replies are forwarded to the team below.
+      RESEND_INBOUND_DOMAIN: "piaxenoizh.resend.app"
+      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com,will@wetreadwell.com,kyle@wetreadwell.com"
     networks:
       - shared
 
