@@ -29,6 +29,9 @@ services:
       # the STAGING staff tool (the config default is prod) so staging test emails
       # don't deep-link a staging-only proposal_id into the prod board (would 404).
       PROPOSAL_TOOL_PUBLIC_URL: "https://staging.proposals.wetreadwell.com"
+      # Reply-To for notification emails on staging (per Hanz, for now). Stray
+      # customer replies reach this inbox until inbound->CRM capture is built.
+      EMAIL_REPLY_TO: "hanz@wetreadwell.com"
     networks:
       - shared
 
