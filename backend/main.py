@@ -501,8 +501,25 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
 # re-trigger it — so memoize the rendered bytes per proposal for a short TTL.
 _PDF_CACHE: dict[str, tuple[float, bytes]] = {}
 _PDF_TTL = 600.0   # seconds
+_PDF_CACHE_MAX = 64   # hard cap — PDFs are multi-MB; the VPS is RAM-constrained
 _PDF_HEADERS = {"Content-Disposition": 'inline; filename="proposal.pdf"',
                 "Cache-Control": "private, max-age=600"}
+
+
+def _pdf_cache_put(pid: str, content: bytes) -> None:
+    """Store rendered bytes, sweeping expired entries and enforcing a hard cap so
+    the cache can't grow unbounded (a bare dict would retain every viewed PDF for
+    the life of the process)."""
+    now = time.monotonic()
+    for k in [k for k, (exp, _) in _PDF_CACHE.items() if exp <= now]:
+        _PDF_CACHE.pop(k, None)
+    while len(_PDF_CACHE) >= _PDF_CACHE_MAX:
+        _PDF_CACHE.pop(next(iter(_PDF_CACHE)), None)   # evict oldest-inserted
+    _PDF_CACHE[pid] = (now + _PDF_TTL, content)
+
+
+def _pdf_cache_drop(pid: str) -> None:
+    _PDF_CACHE.pop(pid, None)
 
 
 @app.post("/api/portal/{token}/contacts")
@@ -560,7 +577,7 @@ def api_pdf(token: str, request: Request):
                 timeout=90,
             )
             if r.status_code == 200:
-                _PDF_CACHE[pid] = (time.monotonic() + _PDF_TTL, r.content)
+                _pdf_cache_put(pid, r.content)
                 return Response(content=r.content, media_type="application/pdf", headers=_PDF_HEADERS)
             log.info("proposal-pdf upstream %s for %s", r.status_code, pid)
         except Exception as exc:  # noqa: BLE001
@@ -640,6 +657,7 @@ async def admin_publish(request: Request) -> JSONResponse:
     if existing:
         token = existing["token"]
         db.update_portal_proposal(draft_id, primary, name, project, pdf_path)
+        _pdf_cache_drop(draft_id)   # a re-publish may have changed the document — don't serve a stale render
     else:
         token = ca.new_proposal_token()
         db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by)
@@ -778,6 +796,8 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
             amount = round(float(body["amount"]), 2)
     except (TypeError, ValueError):
         return _json({"ok": False, "error": "invalid_amount"}, 400)
+    if amount is not None and amount <= 0:
+        return _json({"ok": False, "error": "invalid_amount"}, 400)   # no negative/zero deposit requests
     if amount is None:
         amount = (float(p["deposit_amount"]) if p.get("deposit_amount") is not None
                   else proposals.deposit_amount(p.get("approved_total")))

@@ -25,6 +25,10 @@ services:
       # Reach the proposal tool over the shared docker network (avoids the public
       # nginx hairpin/502); both are on treadwell-staging_default.
       PROPOSAL_TOOL_URL: "http://treadwell-staging:8888"
+      # PUBLIC staff-tool URL for staff-notification "Reply in Portal" links. Must be
+      # the STAGING staff tool (the config default is prod) so staging test emails
+      # don't deep-link a staging-only proposal_id into the prod board (would 404).
+      PROPOSAL_TOOL_PUBLIC_URL: "https://staging.proposals.wetreadwell.com"
     networks:
       - shared
 

@@ -121,7 +121,7 @@ function renderPortal(vm) {
   setupDeposit();
 
   LAST_STATUS = statusKey(vm.status);
-  applyHashView();
+  applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
   startPolling();
 }
 
@@ -311,17 +311,17 @@ function renderMsg(m) {
 // ── chat ⇄ proposal view toggle (hash-driven) ─────────────────────────────────
 function openProposal() { location.hash = "proposal"; }
 
-function applyHashView() {
+function applyHashView(scroll) {
   const wantProposal = location.hash.replace("#", "") === "proposal";
   if (wantProposal) {
     hide($("chat-view")); show($("proposal-view"));
     mountPdf();
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (scroll) window.scrollTo({ top: 0, behavior: "smooth" });   // only on a user nav, not a poll refetch
   } else {
     show($("chat-view")); hide($("proposal-view"));
   }
 }
-window.addEventListener("hashchange", applyHashView);
+window.addEventListener("hashchange", () => applyHashView(true));
 
 // ── PDF iframe: mount lazily on first proposal-view entry (upstream render is a
 // full docx + LibreOffice pass; never trigger it on the chat landing) ──────────
@@ -342,12 +342,17 @@ function mountPdf() {
 // ── polling: pull new chat messages + detect status changes ───────────────────
 let POLL_TIMER = null;
 let LAST_STATUS = "";
-const statusKey = (st) => `${st.proposal}|${st.deposit}|${st.schedule}`;
+const statusKey = (st) => `${st.proposal}|${st.deposit}|${st.contacts}|${st.schedule}`;
 const maxMsgId = () => (STATE && STATE.messages || []).reduce((m, x) => Math.max(m, x.id || 0), 0);
 
 async function pollOnce() {
   if (document.hidden || !STATE) return;
   const res = await api("GET", `/messages?after=${maxMsgId()}`);
+  if (res.status === 401) {   // session expired — stop hammering + surface it
+    if (POLL_TIMER) { clearInterval(POLL_TIMER); POLL_TIMER = null; }
+    handleExpired(res, $("qa-alert"));
+    return;
+  }
   if (!res.ok) return;
   const { messages, status } = res.data;
   if (messages && messages.length) {
@@ -407,7 +412,13 @@ $("qa-form").addEventListener("submit", async (e) => {
   const { ok, data } = res;
   if (!ok) { alertBox($("qa-alert"), "error", data.error || "Could not send. Try again."); return; }
   ta.value = ""; ta.style.height = "";
-  if (data.message) { STATE.messages = (STATE.messages || []).concat([data.message]); renderChat(STATE.messages); }
+  if (data.message) {   // dedup: a concurrent poll may have already appended this id
+    const have = new Set((STATE.messages || []).map((m) => m.id));
+    if (!have.has(data.message.id)) {
+      STATE.messages = (STATE.messages || []).concat([data.message]);
+      renderChat(STATE.messages);
+    }
+  }
 });
 
 $("contacts-add").addEventListener("click", () => {

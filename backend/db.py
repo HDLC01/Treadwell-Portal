@@ -175,8 +175,8 @@ def update_portal_proposal(proposal_id, customer_email, customer_name, project_n
 def list_all_portal_proposals() -> list[dict[str, Any]]:
     return qall(
         "select proposal_id, token, customer_email, customer_name, project_name, proposal_status, "
-        "deposit_status, schedule_status, approved_total, created_at from public.portal_proposals "
-        "order by created_at desc"
+        "deposit_status, contacts_status, schedule_status, approved_total, deposit_amount, created_at "
+        "from public.portal_proposals order by created_at desc"
     )
 
 
