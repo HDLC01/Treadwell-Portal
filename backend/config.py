@@ -58,11 +58,11 @@ DEPOSIT_NOTIFY_EMAILS = [
     for e in _env("DEPOSIT_NOTIFY_EMAILS", ",".join(NOTIFY_EMAILS)).split(",")
     if e.strip()
 ]
-# Where a customer reply to a notification email lands. Emails are sent From a
-# noreply address; without a Reply-To a stray reply vanishes. Point this at a
-# MONITORED inbox so a human sees it until inbound→CRM capture exists. Defaults
-# to the first team-notify address; override with EMAIL_REPLY_TO in the env.
-EMAIL_REPLY_TO = _env("EMAIL_REPLY_TO", NOTIFY_EMAILS[0] if NOTIFY_EMAILS else "")
+# Optional Reply-To for notification emails (empty by default → no Reply-To, so
+# replies go to the noreply From address). Set EMAIL_REPLY_TO in the env to a
+# MONITORED inbox only if you want stray customer replies to reach a human until
+# inbound→CRM capture exists. NOT auto-defaulted to bids@ or any team address.
+EMAIL_REPLY_TO = _env("EMAIL_REPLY_TO", "")
 
 # ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
 # A Google OAuth *Web Client ID* (public). The button only renders when set; the
