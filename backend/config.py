@@ -73,7 +73,9 @@ EMAIL_REPLY_TO = _env("EMAIL_REPLY_TO", "")
 # set). INBOUND_FORWARD_EMAIL gets a copy of every captured reply.
 RESEND_INBOUND_DOMAIN = _env("RESEND_INBOUND_DOMAIN", "")
 RESEND_WEBHOOK_SECRET = _env("RESEND_WEBHOOK_SECRET", "")
-INBOUND_FORWARD_EMAIL = _env("INBOUND_FORWARD_EMAIL", "")
+# Comma-separated list — every address here gets a copy of each captured
+# customer email reply (with Reply-To set to the customer).
+INBOUND_FORWARD_EMAILS = [e.strip() for e in _env("INBOUND_FORWARD_EMAIL", "").split(",") if e.strip()]
 
 # ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
 # A Google OAuth *Web Client ID* (public). The button only renders when set; the

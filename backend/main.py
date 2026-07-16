@@ -717,8 +717,8 @@ async def api_inbound_resend(request: Request):
     )
     link = _staff_link(pid)
     try:
-        if config.INBOUND_FORWARD_EMAIL:
-            email_sender._send([config.INBOUND_FORWARD_EMAIL],
+        if config.INBOUND_FORWARD_EMAILS:
+            email_sender._send(config.INBOUND_FORWARD_EMAILS,
                                f"Customer email reply — {project}",
                                email_sender._wrap("Customer replied by email",
                                                   fwd_html + f'<p><a href="{link}">Open in the proposal tool</a></p>'),

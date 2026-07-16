@@ -34,7 +34,7 @@ services:
       # signing secret (RESEND_WEBHOOK_SECRET) lives in .env on the VPS. Every
       # captured reply is also forwarded to INBOUND_FORWARD_EMAIL (per Hanz).
       RESEND_INBOUND_DOMAIN: "piaxenoizh.resend.app"
-      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com"
+      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com,will@wetreadwell.com"
     networks:
       - shared
 
