@@ -92,6 +92,19 @@ def send_reply_notification(email: str, url: str, project_name: str) -> bool:
                  _thread_headers(email))
 
 
+def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None) -> bool:
+    amt = f" of <strong>${amount:,.2f}</strong>" if amount is not None else ""
+    body = (
+        f'<p>Thank you for approving your proposal for <strong>{project_name}</strong>.</p>'
+        f'<p>A deposit{amt} is now requested to reserve your place on our schedule — '
+        f'your deposit invoice will follow shortly.</p>'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
+        f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
+    )
+    return _send([email], f"Deposit requested — {project_name}", _wrap("Deposit requested", body),
+                 _thread_headers(email))
+
+
 def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit) -> list[str]:
     """Pure recipient resolution for team notifications. Configured DB rows win;
     a 'deposit' alert prefers deposit-kind rows, then general rows, then the
@@ -115,8 +128,15 @@ def _resolve_notify(kind: str) -> list[str]:
 
 
 def notify_team(subject: str, body_html: str, kind: str = "general",
-                recipients: list[str] | None = None) -> bool:
+                recipients: list[str] | None = None, reply_link: str | None = None) -> bool:
     """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
-    `kind` from the configurable table with env fallback."""
+    `kind` from the configurable table with env fallback. `reply_link` appends a
+    "Reply in Portal" button that deep-links staff to the proposal in the staff
+    tool (so they answer in-portal, not by replying to the email)."""
     to = recipients if recipients is not None else _resolve_notify(kind)
+    if reply_link:
+        body_html += (
+            f'<p style="margin-top:16px"><a href="{reply_link}" style="background:#0ea5e9;color:#fff;'
+            f'padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">Reply in Portal</a></p>'
+        )
     return _send(to, subject, _wrap(subject, body_html))

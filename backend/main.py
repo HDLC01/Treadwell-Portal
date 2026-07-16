@@ -178,6 +178,12 @@ def _contact(row: dict) -> dict:
             "phone": row.get("phone"), "label": row.get("label")}
 
 
+def _staff_link(proposal_id: str) -> str:
+    """Deep-link a staff notification email into the proposal in the staff tool
+    (so staff answer in-portal rather than replying to the email)."""
+    return f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={proposal_id}"
+
+
 def _proposal_card(row: dict) -> dict:
     return {
         "token": row["token"],
@@ -369,13 +375,12 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "empty"}, 400)
     who = _session_email(request)
     row = db.add_message(p["proposal_id"], "customer", who, text, msg_type="text")
-    link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"New proposal question — {p.get('project_name')}",
         f"<p><strong>{html.escape(who or '')}</strong> asked a question on "
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
-        f"<blockquote>{html.escape(text)}</blockquote>"
-        f'<p>Answer it in the proposal tool. <a href="{link}">Portal link</a></p>',
+        f"<blockquote>{html.escape(text)}</blockquote>",
+        reply_link=_staff_link(p["proposal_id"]),
     )
     return _json({"ok": True, "question": _q(row), "message": _msg(row)})
 
@@ -446,14 +451,14 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     db.add_message(p["proposal_id"], "staff", None,
                    f"Approved by {name} — {sel_txt}. Total ${total:,.2f}.", msg_type="system")
 
-    link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
         f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
         f"<strong>{html.escape(option_summary)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
         f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
         f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>"
-        f'<p>Project: {html.escape(project_name)}. <a href="{link}">Portal link</a></p>',
+        f"<p>Project: {html.escape(project_name)}.</p>",
+        reply_link=_staff_link(p["proposal_id"]),
     )
     try:
         automations.run_on_approval(p, project_name)
@@ -486,7 +491,7 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         f"<p>Account name: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
         f"Ref: {masked_ref or '—'}</p>"
         f"<p>Confirm receipt internally, then mark the deposit Received in the proposal tool.</p>",
-        kind="deposit",
+        kind="deposit", reply_link=_staff_link(p["proposal_id"]),
     )
     return _json({"ok": True})
 
@@ -523,7 +528,6 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
     db.add_message(p["proposal_id"], "staff", None,
                    f"Project contacts received ({len(contacts)}): {names}.", msg_type="system")
     project = p.get("project_name") or "your proposal"
-    link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     rows = "".join(
         "<li><strong>{}</strong> — {} · {} · {}</li>".format(
             html.escape(c["role"].replace("_", " ").title()), html.escape(c["name"]),
@@ -531,8 +535,8 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         for c in contacts)
     email_sender.notify_team(
         f"Project contacts submitted — {project}",
-        f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>"
-        f'<p><a href="{link}">Portal link</a></p>',
+        f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
+        reply_link=_staff_link(p["proposal_id"]),
     )
     return _json({"ok": True})
 
@@ -701,6 +705,7 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "contacts_status": p.get("contacts_status") or "pending",
             "approved_total": float(p["approved_total"]) if p.get("approved_total") is not None else None,
             "deposit_amount": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
+            "deposit_requested_at": p["deposit_requested_at"].isoformat() if p.get("deposit_requested_at") else None,
             "recipients": db.get_recipients(proposal_id),
         },
         "contacts": [_contact(c) for c in db.list_contacts(proposal_id)],
@@ -752,6 +757,42 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
                    "Deposit received — thank you! Please add your project contacts so we can schedule the work.",
                    msg_type="system")
     return _json({"ok": True})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/deposit-request")
+async def admin_deposit_request(proposal_id: str, request: Request) -> JSONResponse:
+    """Staff-triggered (NEVER auto-sent): after internal review, push a deposit
+    request into the customer chat + email them. Requires an approved proposal."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    if p.get("proposal_status") != "approved":
+        return _json({"ok": False, "error": "not_approved"}, 400)
+    body = await _body(request)
+    # Amount: explicit override wins; else the stored 25% auto-calc; else derive it.
+    amount = None
+    try:
+        if body.get("amount") is not None:
+            amount = round(float(body["amount"]), 2)
+    except (TypeError, ValueError):
+        return _json({"ok": False, "error": "invalid_amount"}, 400)
+    if amount is None:
+        amount = (float(p["deposit_amount"]) if p.get("deposit_amount") is not None
+                  else proposals.deposit_amount(p.get("approved_total")))
+
+    msg = (f"Deposit requested: ${amount:,.2f}. Your deposit invoice will follow shortly."
+           if amount is not None else "Deposit requested. Your deposit invoice will follow shortly.")
+    db.add_message(proposal_id, "staff", None, msg, msg_type="deposit_request",
+                   meta={"amount": amount} if amount is not None else None)
+    db.set_deposit_requested(proposal_id)
+
+    link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+    project = p.get("project_name") or "your proposal"
+    for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
+        email_sender.send_deposit_request(e, link, project, amount)
+    return _json({"ok": True, "amount": amount})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/scheduled")

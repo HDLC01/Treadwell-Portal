@@ -160,6 +160,7 @@ where not exists (select 1 from public.portal_notify_recipients);
 -- approved_options null → single-option fallback everywhere.
 alter table public.portal_proposals add column if not exists approved_options jsonb;
 alter table public.portal_proposals add column if not exists deposit_amount numeric;
+alter table public.portal_proposals add column if not exists deposit_requested_at timestamptz;
 alter table public.portal_approvals add column if not exists options jsonb;
 
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──

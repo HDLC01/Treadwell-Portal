@@ -224,6 +224,13 @@ def set_deposit_status(proposal_id: str, status: str) -> None:
     )
 
 
+def set_deposit_requested(proposal_id: str) -> None:
+    execute(
+        "update public.portal_proposals set deposit_requested_at=now(), updated_at=now() where proposal_id=%s",
+        (proposal_id,),
+    )
+
+
 def set_schedule_status(proposal_id: str, status: str) -> None:
     execute(
         "update public.portal_proposals set schedule_status=%s, updated_at=now() where proposal_id=%s",

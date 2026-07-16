@@ -43,6 +43,10 @@ SERVICE_TOKEN = _env("SERVICE_TOKEN")
 # When set, the portal fetches the official PDF from the proposal tool's
 # SERVICE_TOKEN-gated /api/admin/proposal-pdf and serves it to the customer.
 PROPOSAL_TOOL_URL = _env("PROPOSAL_TOOL_URL").rstrip("/")
+# PUBLIC-facing URL of the staff proposal tool — used in staff notification
+# emails' "Reply in Portal" link. PROPOSAL_TOOL_URL above is the internal Docker
+# hostname (unreachable from a browser), so this is a separate, browsable URL.
+PROPOSAL_TOOL_PUBLIC_URL = _env("PROPOSAL_TOOL_PUBLIC_URL", "https://proposals.wetreadwell.com").rstrip("/")
 
 # ── Email (Resend) ────────────────────────────────────────────────────────────
 RESEND_API_KEY = _env("RESEND_API_KEY")
