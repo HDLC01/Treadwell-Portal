@@ -46,6 +46,6 @@ def test_build_view_model_shape():
     data = {"project_name": "P", "computed_bid": {"full_bid": {"total_base_bid": 100}}}
     vm = proposals.build_view_model(row, data)
     assert vm["project_name"] == "P"
-    assert vm["status"] == {"proposal": "sent", "deposit": "pending", "schedule": "pending"}
+    assert vm["status"] == {"proposal": "sent", "deposit": "pending", "contacts": "pending", "schedule": "pending"}
     assert len(vm["options"]) == 1 and vm["options"][0]["total"] == 100.0
     assert vm["has_pdf"] is False

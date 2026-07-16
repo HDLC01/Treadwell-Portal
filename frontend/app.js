@@ -116,6 +116,7 @@ function renderPortal(vm) {
 
   renderOptions(vm.options, vm.addons, approved);
   renderPdf(vm.has_pdf);
+  renderContacts(vm);
   renderChat(STATE.messages);
   setupDeposit();
 
@@ -140,6 +141,7 @@ function renderTracker(st) {
   const steps = [
     { label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
     { label: "Deposit", done: st.deposit === "received", val: st.deposit === "received" ? "Received" : "Pending" },
+    { label: "Contact info", done: st.contacts === "received", val: st.contacts === "received" ? "Received" : "Pending" },
     { label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
   ];
   $("tracker").innerHTML = steps.map((s) => `
@@ -208,6 +210,56 @@ function renderThankYou(a) {
     ? `Deposit due: ${money(dep)} (25% of ${money(a.total)}).`
     : "";
   show($("thankyou-card"));
+}
+
+// ── project contacts (visible after approval; emphasized once deposit received) ─
+let CONTACT_ROWS = [];
+
+function renderContacts(vm) {
+  const card = $("contacts-card");
+  if (vm.status.proposal !== "approved") { hide(card); return; }
+  show(card);
+  card.classList.toggle("emphasized", vm.status.deposit === "received" && vm.status.contacts !== "received");
+  const submitted = vm.status.contacts === "received";
+  $("contacts-help").textContent = submitted
+    ? "We've got your contacts — you can update them any time before scheduling."
+    : "Add the people we should coordinate with. A primary contact is required; add accounts-payable or billing contacts if they differ.";
+  if (!CONTACT_ROWS.length) {
+    CONTACT_ROWS = (vm.contacts && vm.contacts.length)
+      ? vm.contacts.map((c) => ({ role: c.role, name: c.name || "", email: c.email || "", phone: c.phone || "" }))
+      : [{ role: "primary", name: vm.customer_name || "", email: "", phone: "" }];
+  }
+  drawContacts();
+}
+
+function drawContacts() {
+  const list = $("contacts-list");
+  list.innerHTML = CONTACT_ROWS.map(contactRow).join("");
+  list.querySelectorAll("[data-remove]").forEach((b) =>
+    b.addEventListener("click", () => { CONTACT_ROWS.splice(+b.dataset.remove, 1); drawContacts(); }));
+  list.querySelectorAll("[data-field]").forEach((el) => {
+    const upd = () => { CONTACT_ROWS[+el.dataset.i][el.dataset.field] = el.value; };
+    el.addEventListener("input", upd); el.addEventListener("change", upd);
+  });
+}
+
+function contactRow(c, i) {
+  const isPrimary = i === 0;
+  const head = isPrimary
+    ? '<span class="contact-role">Primary contact</span>'
+    : `<select data-field="role" data-i="${i}" class="contact-role-sel">
+         <option value="accounts_payable" ${c.role === "accounts_payable" ? "selected" : ""}>Accounts payable</option>
+         <option value="other" ${c.role !== "accounts_payable" ? "selected" : ""}>Other</option>
+       </select>
+       <button class="linkbtn contact-remove" type="button" data-remove="${i}">Remove</button>`;
+  return `<div class="contact-row">
+    <div class="contact-row-head">${head}</div>
+    <div class="contact-grid">
+      <input data-field="name" data-i="${i}" type="text" placeholder="Name *" value="${esc(c.name || "")}">
+      <input data-field="email" data-i="${i}" type="email" placeholder="Email" value="${esc(c.email || "")}">
+      <input data-field="phone" data-i="${i}" type="tel" placeholder="Phone" value="${esc(c.phone || "")}">
+    </div>
+  </div>`;
 }
 
 function renderPdf(has) {
@@ -356,6 +408,32 @@ $("qa-form").addEventListener("submit", async (e) => {
   if (!ok) { alertBox($("qa-alert"), "error", data.error || "Could not send. Try again."); return; }
   ta.value = ""; ta.style.height = "";
   if (data.message) { STATE.messages = (STATE.messages || []).concat([data.message]); renderChat(STATE.messages); }
+});
+
+$("contacts-add").addEventListener("click", () => {
+  CONTACT_ROWS.push({ role: "other", name: "", email: "", phone: "" });
+  drawContacts();
+});
+
+$("contacts-submit").addEventListener("click", async () => {
+  clearAlert($("contacts-alert"));
+  const primaryName = ((CONTACT_ROWS[0] && CONTACT_ROWS[0].name) || "").trim();
+  if (!primaryName) { alertBox($("contacts-alert"), "error", "Please enter your primary contact's name."); return; }
+  const contacts = CONTACT_ROWS
+    .map((c, i) => ({
+      role: i === 0 ? "primary" : (c.role === "accounts_payable" ? "accounts_payable" : "other"),
+      name: (c.name || "").trim(), email: (c.email || "").trim(), phone: (c.phone || "").trim(),
+    }))
+    .filter((c, i) => i === 0 || c.name);   // keep primary; drop blank extras
+  const btn = $("contacts-submit"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const res = await api("POST", "/contacts", { contacts });
+  btn.disabled = false; btn.textContent = "Submit contacts";
+  if (handleExpired(res, $("contacts-alert"))) return;
+  const { ok, data } = res;
+  if (!ok) { alertBox($("contacts-alert"), "error", data.error || "Could not submit your contacts."); return; }
+  alertBox($("contacts-alert"), "success", "Thank you — your contacts were sent to our team.");
+  const fresh = await api("GET", "");
+  if (fresh.ok && fresh.data.view) { CONTACT_ROWS = []; renderPortal(fresh.data.view); }
 });
 
 // Enter sends; Shift+Enter makes a newline. Auto-grow the composer up to a cap.

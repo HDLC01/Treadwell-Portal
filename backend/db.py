@@ -231,6 +231,36 @@ def set_schedule_status(proposal_id: str, status: str) -> None:
     )
 
 
+# ── Project contacts (collected after the deposit) ──────────────────────────────
+def list_contacts(proposal_id: str) -> list[dict[str, Any]]:
+    return qall(
+        "select id, role, name, email, phone, label, submitted_by, created_at "
+        "from public.portal_contacts where proposal_id=%s "
+        "order by case role when 'primary' then 0 when 'accounts_payable' then 1 else 2 end, id",
+        (proposal_id,),
+    )
+
+
+def replace_contacts(proposal_id: str, contacts: list[dict[str, Any]], submitted_by: Optional[str] = None) -> None:
+    """Atomically replace the whole contact set and flip contacts_status to
+    'received'. `contacts` is a list of {role, name, email, phone, label} dicts.
+    Delete + inserts + status update share one transaction (the connection
+    context commits on success, rolls back on error)."""
+    with pool().connection() as conn:
+        conn.execute("delete from public.portal_contacts where proposal_id=%s", (proposal_id,))
+        for c in contacts:
+            conn.execute(
+                "insert into public.portal_contacts (proposal_id, role, name, email, phone, label, submitted_by) "
+                "values (%s,%s,%s,%s,%s,%s,%s)",
+                (proposal_id, c.get("role") or "other", c.get("name"),
+                 c.get("email"), c.get("phone"), c.get("label"), submitted_by),
+            )
+        conn.execute(
+            "update public.portal_proposals set contacts_status='received', updated_at=now() where proposal_id=%s",
+            (proposal_id,),
+        )
+
+
 # ── Chat thread (portal_questions is the unified message thread) ────────────────
 def list_questions(proposal_id: str) -> list[dict[str, Any]]:
     """Plain text messages only — the back-compat set the current customer view

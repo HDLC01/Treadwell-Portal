@@ -140,6 +140,44 @@ def _clean_emails(raw):
     return out, None
 
 
+_VALID_CONTACT_ROLES = ("primary", "accounts_payable", "other")
+MAX_CONTACTS = 10
+
+
+def _clean_contacts(raw):
+    """Validate the customer contacts payload. Returns (list, None) on success or
+    (None, error_code). Requires at least one 'primary' with a name; caps at
+    MAX_CONTACTS; validates any supplied email; trims + length-caps every field."""
+    if not isinstance(raw, list) or not raw:
+        return None, "no_contacts"
+    if len(raw) > MAX_CONTACTS:
+        return None, "too_many"
+    out, has_primary = [], False
+    for c in raw:
+        if not isinstance(c, dict):
+            return None, "invalid_contact"
+        role = (c.get("role") or "other").strip().lower()
+        if role not in _VALID_CONTACT_ROLES:
+            return None, "invalid_role"
+        name = _cap(c.get("name"), 120)
+        if not name:
+            return None, "name_required"
+        email = (c.get("email") or "").strip().lower()
+        if email and (len(email) > 254 or not _EMAIL_RE.match(email)):
+            return None, "invalid_email"
+        has_primary = has_primary or role == "primary"
+        out.append({"role": role, "name": name, "email": email or None,
+                    "phone": _cap(c.get("phone"), 40) or None, "label": _cap(c.get("label"), 120) or None})
+    if not has_primary:
+        return None, "primary_required"
+    return out, None
+
+
+def _contact(row: dict) -> dict:
+    return {"role": row["role"], "name": row["name"], "email": row.get("email"),
+            "phone": row.get("phone"), "label": row.get("label")}
+
+
 def _proposal_card(row: dict) -> dict:
     return {
         "token": row["token"],
@@ -292,6 +330,7 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]   # text-only (legacy UI)
     vm["messages"] = [_msg(m) for m in db.list_messages(p["proposal_id"])]   # full chat thread (chat UI)
+    vm["contacts"] = [_contact(c) for c in db.list_contacts(p["proposal_id"])]
     vm["check_address"] = config.CHECK_ADDRESS
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
@@ -354,7 +393,8 @@ def api_messages(token: str, request: Request) -> JSONResponse:
         after = 0
     msgs = [_msg(m) for m in db.list_messages(p["proposal_id"], after)]
     return _json({"ok": True, "messages": msgs, "status": {
-        "proposal": p["proposal_status"], "deposit": p["deposit_status"], "schedule": p["schedule_status"]}})
+        "proposal": p["proposal_status"], "deposit": p["deposit_status"],
+        "contacts": p.get("contacts_status") or "pending", "schedule": p["schedule_status"]}})
 
 
 @app.post("/api/portal/{token}/approve")
@@ -458,6 +498,43 @@ _PDF_CACHE: dict[str, tuple[float, bytes]] = {}
 _PDF_TTL = 600.0   # seconds
 _PDF_HEADERS = {"Content-Disposition": 'inline; filename="proposal.pdf"',
                 "Cache-Control": "private, max-age=600"}
+
+
+@app.post("/api/portal/{token}/contacts")
+async def api_contacts(token: str, request: Request) -> JSONResponse:
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    contacts, err = _clean_contacts((await _body(request)).get("contacts"))
+    if err:
+        msg = {
+            "no_contacts": "Please add at least your primary contact.",
+            "primary_required": "A primary contact is required.",
+            "name_required": "Each contact needs a name.",
+            "invalid_email": "One of the email addresses looks invalid.",
+            "invalid_role": "Invalid contact role.",
+            "too_many": f"Please list at most {MAX_CONTACTS} contacts.",
+        }.get(err, "Please check the contact details.")
+        return _json({"ok": False, "error": msg}, 400)
+    who = _session_email(request)
+    db.replace_contacts(p["proposal_id"], contacts, who)
+
+    names = ", ".join(c["name"] for c in contacts)
+    db.add_message(p["proposal_id"], "staff", None,
+                   f"Project contacts received ({len(contacts)}): {names}.", msg_type="system")
+    project = p.get("project_name") or "your proposal"
+    link = f"{config.PUBLIC_BASE_URL}/p/{token}"
+    rows = "".join(
+        "<li><strong>{}</strong> — {} · {} · {}</li>".format(
+            html.escape(c["role"].replace("_", " ").title()), html.escape(c["name"]),
+            html.escape(c.get("email") or "—"), html.escape(c.get("phone") or "—"))
+        for c in contacts)
+    email_sender.notify_team(
+        f"Project contacts submitted — {project}",
+        f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>"
+        f'<p><a href="{link}">Portal link</a></p>',
+    )
+    return _json({"ok": True})
 
 
 @app.get("/api/portal/{token}/pdf")
@@ -598,6 +675,7 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "customer_email": r["customer_email"], "customer_name": r.get("customer_name"),
             "project_name": r.get("project_name"), "proposal_status": r["proposal_status"],
             "deposit_status": r["deposit_status"], "schedule_status": r["schedule_status"],
+            "contacts_status": r.get("contacts_status") or "pending",
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
             "deposit_amount": float(r["deposit_amount"]) if r.get("deposit_amount") is not None else None,
         })
@@ -620,10 +698,12 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "customer_email": p["customer_email"], "customer_name": p.get("customer_name"),
             "project_name": p.get("project_name"), "proposal_status": p["proposal_status"],
             "deposit_status": p["deposit_status"], "schedule_status": p["schedule_status"],
+            "contacts_status": p.get("contacts_status") or "pending",
             "approved_total": float(p["approved_total"]) if p.get("approved_total") is not None else None,
             "deposit_amount": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
             "recipients": db.get_recipients(proposal_id),
         },
+        "contacts": [_contact(c) for c in db.list_contacts(proposal_id)],
         "approval": ({
             "name": appr["name"], "title": appr.get("title"),
             "date": appr["approved_date"].isoformat() if appr.get("approved_date") else None,
@@ -667,6 +747,10 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
     if not db.get_proposal(proposal_id):
         return _json({"ok": False, "error": "not_found"}, 404)
     db.set_deposit_status(proposal_id, "received")
+    # Prompt the customer, in-thread, for the project contacts we now need.
+    db.add_message(proposal_id, "staff", None,
+                   "Deposit received — thank you! Please add your project contacts so we can schedule the work.",
+                   msg_type="system")
     return _json({"ok": True})
 
 

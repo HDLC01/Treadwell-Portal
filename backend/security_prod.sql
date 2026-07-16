@@ -68,5 +68,10 @@ grant select, insert, update, delete on public.portal_notify_recipients to porta
 drop policy if exists portal_app_rw on public.portal_notify_recipients;
 create policy portal_app_rw on public.portal_notify_recipients for all to portal_app using (true) with check (true);
 
+-- V1 revamp: project contacts collected after the deposit (portal-owned).
+grant select, insert, update, delete on public.portal_contacts to portal_app;
+drop policy if exists portal_app_rw on public.portal_contacts;
+create policy portal_app_rw on public.portal_contacts for all to portal_app using (true) with check (true);
+
 -- NOTE: portal_app is deliberately granted NOTHING on public.events or
 -- public.profiles, and only SELECT (no write) on public.drafts. Do not widen.

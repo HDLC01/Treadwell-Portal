@@ -130,7 +130,7 @@ textarea { min-height: 96px; resize: vertical; }
 .badge.done { background: var(--success-bg); color: var(--success); }
 
 /* Status tracker */
-.tracker { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.tracker { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .tracker .step { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 14px; background: var(--surface-low); }
 .tracker .step .lbl { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary); font-weight: 700; }
 .tracker .step .val { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; font-weight: 700; font-size: .95rem; }
@@ -213,6 +213,17 @@ textarea { min-height: 96px; resize: vertical; }
 }
 .back-link:hover { color: var(--primary-bright); }
 
+/* project contacts */
+#contacts-card.emphasized { border: 2px solid var(--primary); box-shadow: 0 0 0 3px var(--primary-tint); }
+.contact-row { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 12px; background: var(--surface-low); }
+.contact-row + .contact-row { margin-top: 10px; }
+.contact-row-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.contact-role { font-weight: 700; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--primary); }
+.contact-role-sel { width: auto; margin: 0; padding: 4px 8px; min-height: 34px; }
+.contact-remove { color: var(--secondary); }
+.contact-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.contact-grid input { margin: 0; }
+
 /* embedded proposal PDF */
 .pdf-frame-wrap {
   position: relative; width: 100%; height: min(78vh, 900px);
@@ -251,9 +262,10 @@ textarea { min-height: 96px; resize: vertical; }
 
 .hidden { display: none !important; }
 
+@media (max-width: 620px) { .tracker { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 420px) {
-  .tracker { grid-template-columns: 1fr; }
   h1 { font-size: 1.55rem; }
+  .contact-grid { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }

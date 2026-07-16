@@ -116,6 +116,7 @@ def build_view_model(proposal_row: dict[str, Any], data: dict[str, Any]) -> dict
         "status": {
             "proposal": proposal_row.get("proposal_status"),
             "deposit": proposal_row.get("deposit_status"),
+            "contacts": proposal_row.get("contacts_status") or "pending",
             "schedule": proposal_row.get("schedule_status"),
         },
         "approved": {

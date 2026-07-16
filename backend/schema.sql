@@ -162,6 +162,25 @@ alter table public.portal_proposals add column if not exists approved_options js
 alter table public.portal_proposals add column if not exists deposit_amount numeric;
 alter table public.portal_approvals add column if not exists options jsonb;
 
+-- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
+-- After the deposit, the customer supplies project contacts (primary required,
+-- plus optional accounts-payable / billing). contacts_status gates the new
+-- 4-step tracker (Proposal → Deposit → Contact info → Schedule).
+alter table public.portal_proposals add column if not exists contacts_status text
+  not null default 'pending' check (contacts_status in ('pending','received'));
+create table if not exists public.portal_contacts (
+  id           bigint generated always as identity primary key,
+  proposal_id  text not null references public.portal_proposals(proposal_id) on delete cascade,
+  role         text not null default 'other' check (role in ('primary','accounts_payable','other')),
+  name         text not null,
+  email        text,
+  phone        text,
+  label        text,
+  submitted_by text,
+  created_at   timestamptz not null default now()
+);
+create index if not exists portal_contacts_proposal_idx on public.portal_contacts(proposal_id);
+
 -- ── Row Level Security ────────────────────────────────────────────────────────
 -- Enable RLS on every portal_* table so they are NOT exposed through the public
 -- (anon) REST API of the shared database. Idempotent: ENABLE on an already-
@@ -178,3 +197,4 @@ alter table public.portal_sessions    enable row level security;
 alter table public.portal_deposits    enable row level security;
 alter table public.portal_proposal_recipients enable row level security;
 alter table public.portal_notify_recipients enable row level security;
+alter table public.portal_contacts enable row level security;
