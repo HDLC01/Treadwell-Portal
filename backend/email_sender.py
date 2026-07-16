@@ -92,5 +92,31 @@ def send_reply_notification(email: str, url: str, project_name: str) -> bool:
                  _thread_headers(email))
 
 
-def notify_team(subject: str, body_html: str, recipients: list[str] | None = None) -> bool:
-    return _send(recipients or config.NOTIFY_EMAILS, subject, _wrap(subject, body_html))
+def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit) -> list[str]:
+    """Pure recipient resolution for team notifications. Configured DB rows win;
+    a 'deposit' alert prefers deposit-kind rows, then general rows, then the
+    deposit env list; a 'general' alert uses general rows then the general env
+    list. Empty DB → env fallback, so the feature is safe before anyone
+    configures recipients."""
+    if kind == "deposit":
+        return list(deposit_rows or general_rows or env_deposit)
+    return list(general_rows or env_general)
+
+
+def _resolve_notify(kind: str) -> list[str]:
+    general, deposit = [], []
+    try:
+        import db  # local import: avoid a hard DB dependency at module import time
+        for r in db.list_notify_recipients():
+            (deposit if r.get("kind") == "deposit" else general).append(r["email"])
+    except Exception as exc:  # noqa: BLE001 — DB down / table missing → env fallback
+        log.warning("notify-recipient lookup failed (%s); using env fallback", exc)
+    return resolve_notify_recipients(general, deposit, kind, config.NOTIFY_EMAILS, config.DEPOSIT_NOTIFY_EMAILS)
+
+
+def notify_team(subject: str, body_html: str, kind: str = "general",
+                recipients: list[str] | None = None) -> bool:
+    """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
+    `kind` from the configurable table with env fallback."""
+    to = recipients if recipients is not None else _resolve_notify(kind)
+    return _send(to, subject, _wrap(subject, body_html))

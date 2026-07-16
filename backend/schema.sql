@@ -112,6 +112,45 @@ insert into public.portal_proposal_recipients (proposal_id, email)
 select proposal_id, lower(customer_email) from public.portal_proposals
 on conflict do nothing;
 
+-- ── V1 revamp: unified chat thread + configurable team-notify recipients ──────
+-- portal_questions becomes the single chat thread. msg_type distinguishes plain
+-- customer/staff text from system-generated cards; meta carries per-type payload
+-- (e.g. a deposit_request's amount). Existing rows default to 'text', so the
+-- current thread is unchanged. System/card rows use author_kind='staff' (the
+-- author_kind check has no 'system' value — msg_type is the real discriminator).
+alter table public.portal_questions add column if not exists msg_type text not null default 'text'
+  check (msg_type in ('text','proposal_card','deposit_request','system'));
+alter table public.portal_questions add column if not exists meta jsonb;
+
+-- Backfill one proposal_card per published proposal so existing threads open with
+-- the proposal card at the top (created_at = the proposal's, so it sorts first).
+-- Idempotent via the not-exists guard.
+insert into public.portal_questions (proposal_id, author_kind, body, msg_type, created_at)
+select p.proposal_id, 'staff', 'Your proposal is ready to review.', 'proposal_card', p.created_at
+from public.portal_proposals p
+where not exists (
+  select 1 from public.portal_questions q
+  where q.proposal_id = p.proposal_id and q.msg_type = 'proposal_card'
+);
+
+-- Configurable internal notification recipients (question / approval / deposit
+-- alerts). Net-new: previously env-only. notify_team reads this and falls back to
+-- the env lists when empty. Seeded ONLY when the table has never held rows (a
+-- not-exists guard, NOT on-conflict) so staff deletions survive a boot re-run.
+create table if not exists public.portal_notify_recipients (
+  id         bigint generated always as identity primary key,
+  email      text not null,
+  kind       text not null default 'general' check (kind in ('general','deposit')),
+  added_by   text,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists portal_notify_recipients_unique_idx
+  on public.portal_notify_recipients (kind, lower(email));
+insert into public.portal_notify_recipients (email, kind)
+select v.email, 'general'
+from (values ('kyle@wetreadwell.com'), ('kylene@wetreadwell.com'), ('rj@wetreadwell.com')) as v(email)
+where not exists (select 1 from public.portal_notify_recipients);
+
 -- ── Row Level Security ────────────────────────────────────────────────────────
 -- Enable RLS on every portal_* table so they are NOT exposed through the public
 -- (anon) REST API of the shared database. Idempotent: ENABLE on an already-
@@ -127,3 +166,4 @@ alter table public.portal_login_codes enable row level security;
 alter table public.portal_sessions    enable row level security;
 alter table public.portal_deposits    enable row level security;
 alter table public.portal_proposal_recipients enable row level security;
+alter table public.portal_notify_recipients enable row level security;

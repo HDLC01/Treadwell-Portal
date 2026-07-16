@@ -63,5 +63,10 @@ create policy portal_app_rw on public.portal_deposits    for all to portal_app u
 drop policy if exists portal_app_rw on public.portal_proposal_recipients;
 create policy portal_app_rw on public.portal_proposal_recipients for all to portal_app using (true) with check (true);
 
+-- V1 revamp: configurable team-notify recipients (portal-owned).
+grant select, insert, update, delete on public.portal_notify_recipients to portal_app;
+drop policy if exists portal_app_rw on public.portal_notify_recipients;
+create policy portal_app_rw on public.portal_notify_recipients for all to portal_app using (true) with check (true);
+
 -- NOTE: portal_app is deliberately granted NOTHING on public.events or
 -- public.profiles, and only SELECT (no write) on public.drafts. Do not widen.

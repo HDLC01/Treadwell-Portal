@@ -278,7 +278,8 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     db.mark_viewed(p["proposal_id"])
     p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
-    vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]
+    vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]   # text-only (legacy UI)
+    vm["messages"] = [_msg(m) for m in db.list_messages(p["proposal_id"])]   # full chat thread (chat UI)
     vm["check_address"] = config.CHECK_ADDRESS
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
@@ -288,6 +289,14 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
 
 def _q(row: dict) -> dict:
     return {"author_kind": row["author_kind"], "body": row["body"],
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None}
+
+
+def _msg(row: dict) -> dict:
+    """A chat-thread message (any msg_type). Superset of _q with the id (for
+    incremental polling), msg_type, and meta payload."""
+    return {"id": row.get("id"), "author_kind": row["author_kind"], "body": row["body"],
+            "msg_type": row.get("msg_type") or "text", "meta": row.get("meta"),
             "created_at": row["created_at"].isoformat() if row.get("created_at") else None}
 
 
@@ -308,7 +317,7 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
     if not text:
         return _json({"ok": False, "error": "empty"}, 400)
     who = _session_email(request)
-    row = db.add_question(p["proposal_id"], "customer", who, text)
+    row = db.add_message(p["proposal_id"], "customer", who, text, msg_type="text")
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"New proposal question — {p.get('project_name')}",
@@ -317,7 +326,23 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<blockquote>{html.escape(text)}</blockquote>"
         f'<p>Answer it in the proposal tool. <a href="{link}">Portal link</a></p>',
     )
-    return _json({"ok": True, "question": _q(row)})
+    return _json({"ok": True, "question": _q(row), "message": _msg(row)})
+
+
+@app.get("/api/portal/{token}/messages")
+def api_messages(token: str, request: Request) -> JSONResponse:
+    """The chat thread for the customer view + incremental polling. `after` is the
+    highest message id the client already has (0 = full thread)."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    try:
+        after = int(request.query_params.get("after") or 0)
+    except (ValueError, TypeError):
+        after = 0
+    msgs = [_msg(m) for m in db.list_messages(p["proposal_id"], after)]
+    return _json({"ok": True, "messages": msgs, "status": {
+        "proposal": p["proposal_status"], "deposit": p["deposit_status"], "schedule": p["schedule_status"]}})
 
 
 @app.post("/api/portal/{token}/approve")
@@ -390,7 +415,7 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         f"<p>Account name: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
         f"Ref: {masked_ref or '—'}</p>"
         f"<p>Confirm receipt internally, then mark the deposit Received in the proposal tool.</p>",
-        recipients=config.DEPOSIT_NOTIFY_EMAILS,
+        kind="deposit",
     )
     return _json({"ok": True})
 
@@ -493,6 +518,9 @@ async def admin_publish(request: Request) -> JSONResponse:
     else:
         token = ca.new_proposal_token()
         db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by)
+        # Seed the chat thread with the proposal card (first publish only).
+        db.add_message(draft_id, "staff", None, "Your proposal is ready to review.",
+                       msg_type="proposal_card")
 
     # Reconcile the recipient set.
     if recipients is None:                      # legacy call — preserve exact old semantics
@@ -555,7 +583,8 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "total": float(appr["total"]) if appr.get("total") is not None else None,
             "option": appr.get("option_label"), "approver_email": appr.get("approver_email"),
         } if appr else None),
-        "questions": [_q(q) for q in db.list_questions(proposal_id)],
+        "questions": [_q(q) for q in db.list_questions(proposal_id)],   # text-only (legacy drawer)
+        "messages": [_msg(m) for m in db.list_messages(proposal_id)],   # full thread (revamped drawer)
         "deposits": [{
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
             "masked_ref": d.get("masked_ref"), "note": d.get("note"),
@@ -600,6 +629,44 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
     if not db.get_proposal(proposal_id):
         return _json({"ok": False, "error": "not_found"}, 404)
     db.set_schedule_status(proposal_id, "scheduled")
+    return _json({"ok": True})
+
+
+# ── admin: configurable team-notification recipients ──────────────────────────
+_MAX_NOTIFY_RECIPIENTS = 20
+
+
+@app.get("/api/admin/notify-recipients")
+def admin_notify_list(request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    return _json({"ok": True, "recipients": [
+        {"id": r["id"], "email": r["email"], "kind": r["kind"], "added_by": r.get("added_by")}
+        for r in db.list_notify_recipients()]})
+
+
+@app.post("/api/admin/notify-recipients")
+async def admin_notify_add(request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    email = (body.get("email") or "").strip().lower()
+    kind = (body.get("kind") or "general").strip().lower()
+    if kind not in ("general", "deposit"):
+        return _json({"ok": False, "error": "invalid_kind"}, 400)
+    if len(email) > 254 or not _EMAIL_RE.match(email):
+        return _json({"ok": False, "error": "invalid_email"}, 400)
+    if len(db.list_notify_recipients()) >= _MAX_NOTIFY_RECIPIENTS:
+        return _json({"ok": False, "error": "too_many"}, 400)
+    db.add_notify_recipient(email, kind, _cap(body.get("by"), 120) or None)
+    return _json({"ok": True})
+
+
+@app.delete("/api/admin/notify-recipients/{rid}")
+def admin_notify_delete(rid: int, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    db.delete_notify_recipient(rid)
     return _json({"ok": True})
 
 

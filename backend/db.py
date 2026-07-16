@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 import config
@@ -227,21 +228,61 @@ def set_schedule_status(proposal_id: str, status: str) -> None:
     )
 
 
-# ── Q&A ────────────────────────────────────────────────────────────────────────
+# ── Chat thread (portal_questions is the unified message thread) ────────────────
 def list_questions(proposal_id: str) -> list[dict[str, Any]]:
+    """Plain text messages only — the back-compat set the current customer view
+    and the staff drawer render as Q&A bubbles. Cards/system messages come from
+    list_messages (msg_type-aware consumers)."""
     return qall(
         "select id, author_kind, author_email, body, created_at "
-        "from public.portal_questions where proposal_id=%s order by created_at asc",
+        "from public.portal_questions where proposal_id=%s and msg_type='text' order by created_at asc, id asc",
         (proposal_id,),
     )
 
 
-def add_question(proposal_id: str, author_kind: str, author_email: Optional[str], body: str) -> dict[str, Any]:
-    return q1(
-        "insert into public.portal_questions (proposal_id, author_kind, author_email, body) "
-        "values (%s,%s,%s,%s) returning id, author_kind, author_email, body, created_at",
-        (proposal_id, author_kind, author_email, body),
+def list_messages(proposal_id: str, after_id: int = 0) -> list[dict[str, Any]]:
+    """The full chat thread (all msg_types) for the chat-first UI + polling.
+    `after_id` > 0 returns only newer rows (monotonic id) for incremental polls."""
+    return qall(
+        "select id, author_kind, author_email, body, msg_type, meta, created_at "
+        "from public.portal_questions where proposal_id=%s and id > %s order by created_at asc, id asc",
+        (proposal_id, int(after_id or 0)),
     )
+
+
+def add_message(proposal_id: str, author_kind: str, author_email: Optional[str], body: str,
+                msg_type: str = "text", meta: Optional[dict] = None) -> dict[str, Any]:
+    return q1(
+        "insert into public.portal_questions (proposal_id, author_kind, author_email, body, msg_type, meta) "
+        "values (%s,%s,%s,%s,%s,%s) "
+        "returning id, author_kind, author_email, body, msg_type, meta, created_at",
+        (proposal_id, author_kind, author_email, body, msg_type, Jsonb(meta) if meta is not None else None),
+    )
+
+
+def add_question(proposal_id: str, author_kind: str, author_email: Optional[str], body: str) -> dict[str, Any]:
+    """Back-compat wrapper — a plain text message."""
+    return add_message(proposal_id, author_kind, author_email, body, msg_type="text")
+
+
+# ── Team notification recipients (configurable; falls back to env when empty) ───
+def list_notify_recipients() -> list[dict[str, Any]]:
+    return qall(
+        "select id, email, kind, added_by, created_at from public.portal_notify_recipients "
+        "order by kind, lower(email)"
+    )
+
+
+def add_notify_recipient(email: str, kind: str, added_by: Optional[str] = None) -> None:
+    execute(
+        "insert into public.portal_notify_recipients (email, kind, added_by) values (%s,%s,%s) "
+        "on conflict (kind, lower(email)) do nothing",
+        (email.strip().lower(), kind, added_by),
+    )
+
+
+def delete_notify_recipient(rid: int) -> None:
+    execute("delete from public.portal_notify_recipients where id=%s", (rid,))
 
 
 # ── Approvals ───────────────────────────────────────────────────────────────────
