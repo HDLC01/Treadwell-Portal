@@ -82,6 +82,14 @@ def test_strip_gmail_quote():
     assert inbound.strip_quoted(txt) == "Sounds good, let's proceed."
 
 
+def test_strip_gmail_wrapped_attribution():
+    # Gmail wraps the "On … <email>" attribution onto its own line with "wrote:"
+    # on the next line — the first line ends with <email>, not "wrote:".
+    txt = ("Ok, thanks.\n\nOn Fri, Jul 17, 2026 at 1:59 AM Treadwell "
+           "<proposals@notify.wetreadwell.com>\nwrote:")
+    assert inbound.strip_quoted(txt) == "Ok, thanks."
+
+
 def test_strip_angle_quotes_and_outlook():
     assert inbound.strip_quoted("Yes.\n> earlier message") == "Yes."
     assert inbound.strip_quoted("Ok!\n-----Original Message-----\nFrom: a@b") == "Ok!"

@@ -61,10 +61,11 @@ def find_token(recipients, domain: str) -> str | None:
 
 
 _QUOTE_STARTS = (
-    re.compile(r"^On .{1,200} wrote:\s*$"),
+    re.compile(r"^On .{1,250} wrote:\s*$"),           # Gmail attribution (single line)
+    re.compile(r"^On .{1,250}<[^>]+>\s*$"),           # Gmail attribution wrapped — first line ends with <email>
     re.compile(r"^-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE),
-    re.compile(r"^_{5,}\s*$"),                      # Outlook divider
-    re.compile(r"^From:\s.+", re.IGNORECASE),        # Outlook header block
+    re.compile(r"^_{5,}\s*$"),                        # Outlook divider
+    re.compile(r"^From:\s.+", re.IGNORECASE),          # Outlook header block
     re.compile(r"^Sent:\s.+", re.IGNORECASE),
 )
 
