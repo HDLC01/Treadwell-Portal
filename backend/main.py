@@ -11,6 +11,7 @@ import hmac
 import html
 import logging
 import re
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional
@@ -45,9 +46,14 @@ CSP = (
     "font-src 'self' https://fonts.gstatic.com; "
     "img-src 'self' data:; "
     "connect-src 'self' https://accounts.google.com; "
-    "frame-src https://accounts.google.com; "
+    "frame-src 'self' https://accounts.google.com; "   # 'self' lets the proposal page embed its own PDF iframe
     "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 )
+
+# The official PDF is served same-origin and embedded in an <iframe> on the
+# customer's own proposal page. Every other response stays DENY / frame-ancestors
+# 'none'; only this one path may be framed, and only by us.
+_PDF_CSP = "frame-ancestors 'self'"
 
 
 @app.on_event("startup")
@@ -158,9 +164,15 @@ async def _security(request: Request, call_next):
                 return _json({"ok": False, "error": "bad_origin"}, 403)
     resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = CSP
+    path = request.url.path
+    if path.startswith("/api/portal/") and path.endswith("/pdf"):
+        # The one framable path: the customer's own proposal page embeds it.
+        resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+        resp.headers["Content-Security-Policy"] = _PDF_CSP
+    else:
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Content-Security-Policy"] = CSP
     if config.COOKIE_SECURE:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
@@ -420,24 +432,37 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
+# The upstream render is a full docx + LibreOffice pass (seconds). The customer
+# viewer mounts the iframe lazily, but a reload or a second recipient would
+# re-trigger it — so memoize the rendered bytes per proposal for a short TTL.
+_PDF_CACHE: dict[str, tuple[float, bytes]] = {}
+_PDF_TTL = 600.0   # seconds
+_PDF_HEADERS = {"Content-Disposition": 'inline; filename="proposal.pdf"',
+                "Cache-Control": "private, max-age=600"}
+
+
 @app.get("/api/portal/{token}/pdf")
 def api_pdf(token: str, request: Request):
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    pid = p["proposal_id"]
+    hit = _PDF_CACHE.get(pid)
+    if hit and hit[0] > time.monotonic():
+        return Response(content=hit[1], media_type="application/pdf", headers=_PDF_HEADERS)
     # Preferred: render the real Treadwell PDF on demand from the proposal tool.
     if config.PROPOSAL_TOOL_URL and config.SERVICE_TOKEN:
         try:
             r = httpx.get(
                 config.PROPOSAL_TOOL_URL + "/api/admin/proposal-pdf",
-                params={"draft_id": p["proposal_id"]},
+                params={"draft_id": pid},
                 headers={"X-Service-Token": config.SERVICE_TOKEN},
                 timeout=90,
             )
             if r.status_code == 200:
-                return Response(content=r.content, media_type="application/pdf",
-                                headers={"Content-Disposition": 'inline; filename="proposal.pdf"'})
-            log.info("proposal-pdf upstream %s for %s", r.status_code, p["proposal_id"])
+                _PDF_CACHE[pid] = (time.monotonic() + _PDF_TTL, r.content)
+                return Response(content=r.content, media_type="application/pdf", headers=_PDF_HEADERS)
+            log.info("proposal-pdf upstream %s for %s", r.status_code, pid)
         except Exception as exc:  # noqa: BLE001
             log.warning("proposal-pdf fetch failed: %s", exc)
     if p.get("pdf_path"):  # fallback: a stored Storage URL (prod option)

@@ -29,77 +29,92 @@
 
     <!-- Proposal (shown once authed) -->
     <section id="portal" class="hidden">
-      <div class="card">
-        <div class="spread">
-          <div>
-            <h1 id="p-title">Your Proposal</h1>
-            <p class="muted" id="p-sub" style="margin:0"></p>
+
+      <!-- ── CHAT VIEW (default landing) ─────────────────────────────────── -->
+      <div id="chat-view">
+        <div class="card chat-head">
+          <div class="spread">
+            <div>
+              <h1 id="p-title">Your Proposal</h1>
+              <p class="muted" id="p-sub" style="margin:0"></p>
+            </div>
+            <span class="badge" id="p-status-badge"></span>
           </div>
-          <span class="badge" id="p-status-badge"></span>
         </div>
-      </div>
 
-      <div class="card">
-        <h2>Status</h2>
-        <div class="tracker" id="tracker"></div>
-      </div>
+        <div class="chat-thread" id="chat-thread" aria-live="polite" aria-label="Conversation with Treadwell"></div>
 
-      <div class="card alert success hidden" id="approved-banner" role="status"></div>
-
-      <div class="card" id="summary-card">
-        <h2>Proposal summary</h2>
-        <div id="summary-body" class="stack"></div>
-      </div>
-
-      <div class="card" id="options-card">
-        <h2>Pricing</h2>
-        <p class="muted small" id="options-help"></p>
-        <div id="options"></div>
-        <div id="addons" class="small muted" style="margin-top:12px"></div>
-      </div>
-
-      <div class="card hidden" id="pdf-card">
-        <h2>Official proposal document</h2>
-        <a class="btn btn-secondary" id="pdf-link" href="#" target="_blank" rel="noopener">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-          View / download PDF
-        </a>
-      </div>
-
-      <div class="card" id="approve-card">
-        <h2>Approve this proposal</h2>
-        <div id="approve-alert" role="alert" aria-live="polite"></div>
-        <form id="approve-form" class="stack" novalidate>
-          <div class="field">
-            <label for="ap-name">Full name <span class="req">*</span></label>
-            <input id="ap-name" type="text" autocomplete="name" required>
+        <form id="qa-form" class="composer" novalidate>
+          <div id="qa-alert" role="alert" aria-live="polite"></div>
+          <div class="composer-row">
+            <textarea id="qa-body" rows="1" placeholder="Message Treadwell…" aria-label="Message"></textarea>
+            <button class="btn btn-primary" type="submit" id="qa-btn">Send</button>
           </div>
-          <div class="field">
-            <label for="ap-title">Title</label>
-            <input id="ap-title" type="text" autocomplete="organization-title">
-          </div>
-          <div class="field" id="ap-option-field">
-            <label for="ap-option">Option you're approving <span class="req">*</span></label>
-            <select id="ap-option"></select>
-          </div>
-          <p class="small muted">By approving, you confirm acceptance of the selected option's total. Date is recorded automatically.</p>
-          <button class="btn btn-primary btn-block" type="submit" id="approve-btn">Approve proposal</button>
         </form>
       </div>
 
-      <div class="card" id="qa-card">
-        <h2>Questions</h2>
-        <p class="muted small">Ask anything about your proposal — our team is notified and replies here.</p>
-        <div class="thread" id="thread"></div>
-        <div id="qa-alert" role="alert" aria-live="polite"></div>
-        <form id="qa-form" class="stack" novalidate>
-          <div class="field">
-            <label for="qa-body">Your question</label>
-            <textarea id="qa-body" placeholder="Type your question…"></textarea>
+      <!-- ── PROPOSAL VIEW (opened from the chat card) ───────────────────── -->
+      <div id="proposal-view" class="hidden">
+        <button class="back-link" id="back-to-chat" type="button">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+          Back to chat
+        </button>
+
+        <div class="card">
+          <div class="spread">
+            <div>
+              <h1 id="pv-title">Your Proposal</h1>
+              <p class="muted" id="pv-sub" style="margin:0"></p>
+            </div>
+            <span class="badge" id="pv-status-badge"></span>
           </div>
-          <button class="btn btn-secondary" type="submit" id="qa-btn">Send question</button>
-        </form>
-      </div>
+        </div>
+
+        <div class="card">
+          <h2>Status</h2>
+          <div class="tracker" id="tracker"></div>
+        </div>
+
+        <div class="card alert success hidden" id="approved-banner" role="status"></div>
+
+        <div class="card hidden" id="pdf-card">
+          <h2>Official proposal document</h2>
+          <div class="pdf-frame-wrap" id="pdf-frame-wrap">
+            <div class="pdf-loading" id="pdf-loading"><span class="spinner"></span> Loading your proposal document…</div>
+          </div>
+          <a class="btn btn-secondary" id="pdf-link" href="#" target="_blank" rel="noopener" style="margin-top:12px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+            Open full PDF
+          </a>
+        </div>
+
+        <div class="card" id="options-card">
+          <h2>Pricing</h2>
+          <p class="muted small" id="options-help"></p>
+          <div id="options"></div>
+          <div id="addons" class="small muted" style="margin-top:12px"></div>
+        </div>
+
+        <div class="card" id="approve-card">
+          <h2>Approve this proposal</h2>
+          <div id="approve-alert" role="alert" aria-live="polite"></div>
+          <form id="approve-form" class="stack" novalidate>
+            <div class="field">
+              <label for="ap-name">Full name <span class="req">*</span></label>
+              <input id="ap-name" type="text" autocomplete="name" required>
+            </div>
+            <div class="field">
+              <label for="ap-title">Title</label>
+              <input id="ap-title" type="text" autocomplete="organization-title">
+            </div>
+            <div class="field" id="ap-option-field">
+              <label for="ap-option">Option you're approving <span class="req">*</span></label>
+              <select id="ap-option"></select>
+            </div>
+            <p class="small muted">By approving, you confirm acceptance of the selected option's total. Date is recorded automatically.</p>
+            <button class="btn btn-primary btn-block" type="submit" id="approve-btn">Approve proposal</button>
+          </form>
+        </div>
 
       <div class="card hidden" id="deposit-card">
         <h2>Submit your deposit</h2>
@@ -124,6 +139,7 @@
           <button class="btn btn-primary btn-block" id="check-ack" type="button">I've mailed my check</button>
         </div>
       </div>
+      </div><!-- /#proposal-view -->
     </section>
   </main>
 

@@ -96,15 +96,11 @@ const ICON_DOT = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="curre
 
 function renderPortal(vm) {
   STATE = vm;
+  STATE.messages = vm.messages || [];
   show($("portal"));
-  $("p-title").textContent = vm.project_name || "Your Proposal";
-  $("p-sub").textContent = vm.city_state || "";
   const approved = vm.status.proposal === "approved";
 
-  const badge = $("p-status-badge");
-  if (approved) { badge.className = "badge done"; badge.textContent = "Approved"; }
-  else { badge.className = "badge warn"; badge.textContent = "Awaiting your approval"; }
-
+  setHeader(vm, approved);
   renderTracker(vm.status);
 
   if (approved && vm.approved && vm.approved.name) {
@@ -115,11 +111,26 @@ function renderPortal(vm) {
     show($("deposit-card"));
   }
 
-  renderSummary(vm.summary);
   renderOptions(vm.options, vm.addons, approved);
   renderPdf(vm.has_pdf);
-  renderThread(vm.questions || []);
+  renderChat(STATE.messages);
   setupDeposit();
+
+  LAST_STATUS = statusKey(vm.status);
+  applyHashView();
+  startPolling();
+}
+
+function setHeader(vm, approved) {
+  const title = vm.project_name || "Your Proposal";
+  const sub = vm.city_state || "";
+  $("p-title").textContent = title; $("pv-title").textContent = title;
+  $("p-sub").textContent = sub; $("pv-sub").textContent = sub;
+  for (const id of ["p-status-badge", "pv-status-badge"]) {
+    const b = $(id);
+    if (approved) { b.className = "badge done"; b.textContent = "Approved"; }
+    else { b.className = "badge warn"; b.textContent = "Awaiting your approval"; }
+  }
 }
 
 function renderTracker(st) {
@@ -133,19 +144,6 @@ function renderTracker(st) {
       <div class="lbl">${s.label}</div>
       <div class="val" style="color:${s.done ? "var(--success)" : "var(--secondary)"}">${s.done ? ICON_CHECK : ICON_DOT}${s.val}</div>
     </div>`).join("");
-}
-
-function renderSummary(s) {
-  const rows = [];
-  if (s.system_name) rows.push(["System", s.system_name + (s.texture ? ` · ${s.texture}` : "")]);
-  if (s.scope_notes) rows.push(["Scope", s.scope_notes]);
-  if (s.exclusions) rows.push(["Exclusions", s.exclusions]);
-  if (s.proposal_date) rows.push(["Proposal date", s.proposal_date]);
-  if (s.site_visit_date) rows.push(["Site visit", s.site_visit_date]);
-  const band = '<div class="doc-band"><div class="doc-brand">TREADWELL</div><div class="doc-sub">Industrial Flooring Solutions</div></div>';
-  $("summary-body").innerHTML = band + (rows.length
-    ? rows.map(([k, v]) => `<div><div class="label-caps">${esc(k)}</div><div>${esc(v)}</div></div>`).join("")
-    : '<p class="muted">See the official PDF below for full details.</p>');
 }
 
 function renderOptions(options, addons, approved) {
@@ -186,15 +184,103 @@ function renderPdf(has) {
   $("pdf-link").href = `/api/portal/${TOKEN}/pdf`;
 }
 
-function renderThread(qs) {
-  const t = $("thread");
-  if (!qs.length) { t.innerHTML = '<p class="muted small">No questions yet.</p>'; return; }
-  t.innerHTML = qs.map((q) => `
-    <div class="msg ${q.author_kind === "customer" ? "customer" : "staff"}">
-      <div class="who">${q.author_kind === "customer" ? "You" : "Treadwell"}</div>
-      <div>${esc(q.body)}</div>
-      <div class="when">${q.created_at ? new Date(q.created_at).toLocaleString() : ""}</div>
-    </div>`).join("");
+// ── chat thread ──────────────────────────────────────────────────────────────
+function renderChat(msgs) {
+  const t = $("chat-thread");
+  if (!msgs || !msgs.length) {
+    t.innerHTML = '<p class="muted small chat-empty">Your conversation with Treadwell will appear here.</p>';
+    return;
+  }
+  const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 60;
+  t.innerHTML = msgs.map(renderMsg).join("");
+  t.querySelectorAll("[data-open-proposal]").forEach((el) => el.addEventListener("click", openProposal));
+  if (atBottom) t.scrollTop = t.scrollHeight;   // keep pinned to newest unless the user scrolled up
+}
+
+function renderMsg(m) {
+  const when = m.created_at ? new Date(m.created_at).toLocaleString() : "";
+  if (m.msg_type === "proposal_card") {
+    return `<div class="chat-card proposal">
+      <div class="cc-title">Your proposal is ready</div>
+      <div class="cc-body">${esc(m.body || "")}</div>
+      <button class="btn btn-primary" type="button" data-open-proposal>View proposal</button>
+    </div>`;
+  }
+  if (m.msg_type === "deposit_request") {
+    const amt = m.meta && m.meta.amount != null ? money(m.meta.amount) : "";
+    return `<div class="chat-card deposit">
+      <div class="cc-title">Deposit requested${amt ? ` — <span class="cc-amt">${amt}</span>` : ""}</div>
+      <div class="cc-body">${esc(m.body || "")}</div>
+    </div>`;
+  }
+  if (m.msg_type === "system") {
+    return `<div class="chat-system">${esc(m.body || "")}</div>`;
+  }
+  const mine = m.author_kind === "customer";
+  return `<div class="msg ${mine ? "customer" : "staff"}">
+    <div class="who">${mine ? "You" : "Treadwell"}</div>
+    <div>${esc(m.body || "")}</div>
+    <div class="when">${when}</div>
+  </div>`;
+}
+
+// ── chat ⇄ proposal view toggle (hash-driven) ─────────────────────────────────
+function openProposal() { location.hash = "proposal"; }
+
+function applyHashView() {
+  const wantProposal = location.hash.replace("#", "") === "proposal";
+  if (wantProposal) {
+    hide($("chat-view")); show($("proposal-view"));
+    mountPdf();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  } else {
+    show($("chat-view")); hide($("proposal-view"));
+  }
+}
+window.addEventListener("hashchange", applyHashView);
+
+// ── PDF iframe: mount lazily on first proposal-view entry (upstream render is a
+// full docx + LibreOffice pass; never trigger it on the chat landing) ──────────
+let PDF_MOUNTED = false;
+function mountPdf() {
+  if (PDF_MOUNTED || !STATE || !STATE.has_pdf) return;
+  PDF_MOUNTED = true;
+  const wrap = $("pdf-frame-wrap");
+  const ifr = document.createElement("iframe");
+  ifr.className = "pdf-frame";
+  ifr.title = "Proposal PDF";
+  ifr.setAttribute("loading", "lazy");
+  ifr.addEventListener("load", () => { const l = $("pdf-loading"); if (l) l.remove(); });
+  ifr.src = `/api/portal/${TOKEN}/pdf`;
+  wrap.appendChild(ifr);
+}
+
+// ── polling: pull new chat messages + detect status changes ───────────────────
+let POLL_TIMER = null;
+let LAST_STATUS = "";
+const statusKey = (st) => `${st.proposal}|${st.deposit}|${st.schedule}`;
+const maxMsgId = () => (STATE && STATE.messages || []).reduce((m, x) => Math.max(m, x.id || 0), 0);
+
+async function pollOnce() {
+  if (document.hidden || !STATE) return;
+  const res = await api("GET", `/messages?after=${maxMsgId()}`);
+  if (!res.ok) return;
+  const { messages, status } = res.data;
+  if (messages && messages.length) {
+    const have = new Set((STATE.messages || []).map((m) => m.id));
+    const fresh = messages.filter((m) => !have.has(m.id));
+    if (fresh.length) { STATE.messages = (STATE.messages || []).concat(fresh); renderChat(STATE.messages); }
+  }
+  if (status && statusKey(status) !== LAST_STATUS) {
+    const full = await api("GET", "");   // status moved elsewhere — refresh tracker + cards
+    if (full.ok && full.data.view) renderPortal(full.data.view);
+  }
+}
+
+function startPolling() {
+  if (POLL_TIMER) return;
+  POLL_TIMER = setInterval(pollOnce, 12000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
 }
 
 function setupDeposit() {
@@ -222,20 +308,30 @@ $("approve-form").addEventListener("submit", async (e) => {
   window.scrollTo({ top: 0, behavior: "smooth" });
 });
 
+$("back-to-chat").addEventListener("click", () => { location.hash = "chat"; });
+
 $("qa-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("qa-alert"));
-  const body = $("qa-body").value.trim();
+  const ta = $("qa-body");
+  const body = ta.value.trim();
   if (!body) return;
-  const btn = $("qa-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending…';
+  const btn = $("qa-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   const res = await api("POST", "/questions", { body });
-  btn.disabled = false; btn.textContent = "Send question";
+  btn.disabled = false; btn.textContent = "Send";
   if (handleExpired(res, $("qa-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("qa-alert"), "error", data.error || "Could not send. Try again."); return; }
-  $("qa-body").value = "";
-  STATE.questions = (STATE.questions || []).concat([data.question]);
-  renderThread(STATE.questions);
-  alertBox($("qa-alert"), "success", "Sent — our team has been notified and will reply here.");
+  ta.value = ""; ta.style.height = "";
+  if (data.message) { STATE.messages = (STATE.messages || []).concat([data.message]); renderChat(STATE.messages); }
+});
+
+// Enter sends; Shift+Enter makes a newline. Auto-grow the composer up to a cap.
+$("qa-body").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("qa-form").requestSubmit(); }
+});
+$("qa-body").addEventListener("input", (e) => {
+  const ta = e.target; ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 140) + "px";
 });
 
 $("ach-form").addEventListener("submit", async (e) => {

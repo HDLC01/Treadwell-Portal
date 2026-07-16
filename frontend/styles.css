@@ -161,6 +161,58 @@ textarea { min-height: 96px; resize: vertical; }
 .msg.staff { align-self: flex-start; background: var(--surface-high); color: var(--fg); }
 .msg .when { font-size: .68rem; opacity: .75; margin-top: 4px; }
 
+/* Chat-first landing */
+.chat-head { position: sticky; top: 0; z-index: 5; }
+.chat-thread {
+  display: flex; flex-direction: column; gap: 10px;
+  min-height: 200px; max-height: min(58vh, 620px); overflow-y: auto;
+  padding: 8px 2px; margin-bottom: 12px;
+}
+.chat-empty { align-self: center; margin: auto 0; }
+.chat-system {
+  align-self: center; text-align: center; color: var(--secondary);
+  font-size: .8rem; background: var(--surface-low); border: 1px solid var(--surface-highest);
+  border-radius: 999px; padding: 5px 14px; max-width: 90%;
+}
+.chat-card {
+  align-self: flex-start; max-width: 92%; background: var(--surface);
+  border: 1px solid var(--surface-highest); border-left: 4px solid var(--primary);
+  border-radius: var(--radius-lg); padding: 14px 16px; box-shadow: var(--shadow-sm);
+}
+.chat-card.deposit { border-left-color: var(--success); }
+.chat-card .cc-title { font-weight: 800; margin-bottom: 4px; }
+.chat-card .cc-body { color: var(--secondary); font-size: .9rem; margin-bottom: 12px; }
+.chat-card .cc-amt { color: var(--success); font-variant-numeric: tabular-nums; }
+.chat-card .btn { min-height: 40px; padding: 0 18px; }
+
+/* sticky composer */
+.composer { position: sticky; bottom: 0; background: var(--bg); padding-top: 6px; }
+.composer-row { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea {
+  flex: 1; resize: none; min-height: 46px; max-height: 140px; margin: 0; line-height: 1.4;
+}
+.composer .btn { min-height: 46px; flex: none; }
+
+/* back link (proposal view) */
+.back-link {
+  display: inline-flex; align-items: center; gap: 4px; background: none; border: none;
+  color: var(--primary); font: inherit; font-weight: 700; font-size: .9rem;
+  cursor: pointer; padding: 6px 2px; margin-bottom: 4px;
+}
+.back-link:hover { color: var(--primary-bright); }
+
+/* embedded proposal PDF */
+.pdf-frame-wrap {
+  position: relative; width: 100%; height: min(78vh, 900px);
+  border: 1px solid var(--surface-highest); border-radius: var(--radius); overflow: hidden; background: var(--surface-low);
+}
+.pdf-frame { width: 100%; height: 100%; border: 0; display: block; }
+.pdf-loading {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px;
+  color: var(--secondary); font-size: .9rem;
+}
+.pdf-loading .spinner { border-color: var(--surface-highest); border-top-color: var(--primary); }
+
 /* Alerts */
 .alert { padding: 12px 14px; border-radius: var(--radius); font-size: .9rem; margin-bottom: 12px; }
 .alert.error { background: var(--error-bg); color: #93000A; border: 1px solid #F4B8B4; }
