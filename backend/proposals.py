@@ -53,6 +53,41 @@ def pricing_options(data: dict[str, Any]) -> list[dict[str, Any]]:
     return options
 
 
+DEPOSIT_PCT = 0.25   # V1: deposit invoice is 25% of the approved total
+
+
+def deposit_amount(total) -> float | None:
+    t = _num(total)
+    return None if t is None else round(t * DEPOSIT_PCT, 2)
+
+
+def resolve_selection(data: dict[str, Any], labels) -> tuple[list[dict[str, Any]], float]:
+    """Validate a customer's chosen option labels against the published pricing
+    options and sum SERVER-SIDE. Returns (chosen_options, total). Raises
+    ValueError on empty / unknown / duplicate labels. The total is always the
+    server's — a client-supplied total is never trusted."""
+    by_label: dict[str, dict[str, Any]] = {}
+    for o in pricing_options(data):
+        by_label.setdefault(o["label"], o)   # first wins if the source repeats a label
+    if not labels:
+        raise ValueError("no_selection")
+    seen: set[str] = set()
+    chosen: list[dict[str, Any]] = []
+    for raw in labels:
+        lbl = (raw or "").strip()
+        if not lbl:
+            raise ValueError("invalid_option")
+        if lbl in seen:
+            raise ValueError("duplicate_option")
+        opt = by_label.get(lbl)
+        if opt is None:
+            raise ValueError("unknown_option")
+        seen.add(lbl)
+        chosen.append(opt)
+    total = round(sum(o["total"] for o in chosen), 2)
+    return chosen, total
+
+
 def addons(data: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for line in (data.get("price_lines") or []):
@@ -88,7 +123,9 @@ def build_view_model(proposal_row: dict[str, Any], data: dict[str, Any]) -> dict
             "title": proposal_row.get("approved_title"),
             "date": proposal_row.get("approved_date").isoformat() if proposal_row.get("approved_date") else None,
             "total": _num(proposal_row.get("approved_total")),
-            "option": proposal_row.get("approved_option"),
+            "option": proposal_row.get("approved_option"),        # denormalized ", "-joined summary
+            "options": proposal_row.get("approved_options"),      # jsonb label list (None on pre-revamp rows)
+            "deposit_amount": _num(proposal_row.get("deposit_amount")),
         },
         "has_pdf": bool(proposal_row.get("pdf_path")),
     }

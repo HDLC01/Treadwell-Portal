@@ -77,6 +77,13 @@
 
         <div class="card alert success hidden" id="approved-banner" role="status"></div>
 
+        <div class="card hidden" id="thankyou-card">
+          <h2>Thank you!</h2>
+          <p>Your deposit invoice is on its way — expect it within about 24 hours.</p>
+          <p id="thankyou-deposit" class="num" style="margin:0"></p>
+          <p class="muted small" style="margin-top:10px">Your project can be scheduled once your deposit is received.</p>
+        </div>
+
         <div class="card hidden" id="pdf-card">
           <h2>Official proposal document</h2>
           <div class="pdf-frame-wrap" id="pdf-frame-wrap">
@@ -107,11 +114,7 @@
               <label for="ap-title">Title</label>
               <input id="ap-title" type="text" autocomplete="organization-title">
             </div>
-            <div class="field" id="ap-option-field">
-              <label for="ap-option">Option you're approving <span class="req">*</span></label>
-              <select id="ap-option"></select>
-            </div>
-            <p class="small muted">By approving, you confirm acceptance of the selected option's total. Date is recorded automatically.</p>
+            <p class="small muted">By approving, you confirm acceptance of the option(s) selected above and their combined total. Date is recorded automatically.</p>
             <button class="btn btn-primary btn-block" type="submit" id="approve-btn">Approve proposal</button>
           </form>
         </div>

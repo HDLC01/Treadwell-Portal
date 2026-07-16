@@ -365,35 +365,54 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     body = await _body(request)
     name = _cap(body.get("name"), 120)
     title = _cap(body.get("title"), 120)
-    option_label = _cap(body.get("option_label"), 200)
     if not name:
         return _json({"ok": False, "error": "Name is required."}, 400)
 
     data = db.get_draft_data(p["proposal_id"]) or {}
     options = proposals.pricing_options(data)
-    chosen = next((o for o in options if o["label"] == option_label), None)
-    if chosen is None and len(options) == 1:
-        chosen, option_label = options[0], options[0]["label"]
-    if chosen is None:
-        return _json({"ok": False, "error": "Please choose which option you're approving."}, 400)
-    total = chosen["total"]
+
+    # Multi-select (option_labels[]) is the V1 path; option_label (single string)
+    # is the legacy body. A single-option proposal auto-selects its only option.
+    raw = body.get("option_labels")
+    if isinstance(raw, list):
+        labels = [_cap(x, 200) for x in raw if isinstance(x, str) and x.strip()]
+    else:
+        single = _cap(body.get("option_label"), 200)
+        labels = [single] if single else []
+    if not labels and len(options) == 1:
+        labels = [options[0]["label"]]
+    try:
+        chosen, total = proposals.resolve_selection(data, labels)
+    except ValueError:
+        return _json({"ok": False, "error": "Please choose at least one option you're approving."}, 400)
+
+    label_list = [o["label"] for o in chosen]
+    option_summary = ", ".join(label_list)   # denormalized so legacy consumers keep working
+    deposit = proposals.deposit_amount(total)
     try:
         approved_date = date.fromisoformat(body["date"]) if body.get("date") else date.today()
     except (ValueError, TypeError):
         approved_date = date.today()
 
     approver = _session_email(request)
-    db.add_approval(p["proposal_id"], name, title, approved_date, total, option_label,
-                    _client_ip(request), approver)
-    db.set_approved(p["proposal_id"], total, option_label, name, title, approved_date)
+    db.add_approval(p["proposal_id"], name, title, approved_date, total, option_summary,
+                    _client_ip(request), approver, options=label_list)
+    db.set_approved(p["proposal_id"], total, option_summary, name, title, approved_date,
+                    options=label_list, deposit_amount=deposit)
 
     project_name = p.get("project_name") or "proposal"
+    # A system line in the chat thread records the approval for both sides.
+    sel_txt = "; ".join(f"{o['label']} (${o['total']:,.2f})" for o in chosen)
+    db.add_message(p["proposal_id"], "staff", None,
+                   f"Approved by {name} — {sel_txt}. Total ${total:,.2f}.", msg_type="system")
+
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
         f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
-        f"<strong>{html.escape(option_label)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
+        f"<strong>{html.escape(option_summary)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
         f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
+        f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>"
         f'<p>Project: {html.escape(project_name)}. <a href="{link}">Portal link</a></p>',
     )
     try:
@@ -580,6 +599,7 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "project_name": r.get("project_name"), "proposal_status": r["proposal_status"],
             "deposit_status": r["deposit_status"], "schedule_status": r["schedule_status"],
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
+            "deposit_amount": float(r["deposit_amount"]) if r.get("deposit_amount") is not None else None,
         })
     return _json({"ok": True, "proposals": out})
 
@@ -600,13 +620,16 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "customer_email": p["customer_email"], "customer_name": p.get("customer_name"),
             "project_name": p.get("project_name"), "proposal_status": p["proposal_status"],
             "deposit_status": p["deposit_status"], "schedule_status": p["schedule_status"],
+            "approved_total": float(p["approved_total"]) if p.get("approved_total") is not None else None,
+            "deposit_amount": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
             "recipients": db.get_recipients(proposal_id),
         },
         "approval": ({
             "name": appr["name"], "title": appr.get("title"),
             "date": appr["approved_date"].isoformat() if appr.get("approved_date") else None,
             "total": float(appr["total"]) if appr.get("total") is not None else None,
-            "option": appr.get("option_label"), "approver_email": appr.get("approver_email"),
+            "option": appr.get("option_label"), "options": appr.get("options"),
+            "approver_email": appr.get("approver_email"),
         } if appr else None),
         "questions": [_q(q) for q in db.list_questions(proposal_id)],   # text-only (legacy drawer)
         "messages": [_msg(m) for m in db.list_messages(proposal_id)],   # full thread (revamped drawer)

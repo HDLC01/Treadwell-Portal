@@ -105,10 +105,13 @@ function renderPortal(vm) {
 
   if (approved && vm.approved && vm.approved.name) {
     const a = vm.approved;
+    // Lock the selection to what was actually approved (jsonb list; fall back to
+    // the denormalized single summary for pre-revamp approvals).
+    SELECTED = new Set(a.options && a.options.length ? a.options : (a.option ? [a.option] : []));
     $("approved-banner").innerHTML = `Approved by <strong>${esc(a.name)}</strong>${a.title ? ", " + esc(a.title) : ""} on ${esc(a.date || "")} — <strong>${esc(a.option || "")}</strong> at <strong>${money(a.total)}</strong>.`;
     show($("approved-banner"));
     hide($("approve-card"));
-    show($("deposit-card"));
+    renderThankYou(a);
   }
 
   renderOptions(vm.options, vm.addons, approved);
@@ -146,36 +149,65 @@ function renderTracker(st) {
     </div>`).join("");
 }
 
+// Selected pricing option labels (multi-select). Persists across re-renders.
+let SELECTED = new Set();
+let CUR_OPTIONS = [];
+
 function renderOptions(options, addons, approved) {
+  CUR_OPTIONS = options || [];
   const wrap = $("options");
   if (!options || !options.length) {
     $("options-help").textContent = "";
-    wrap.innerHTML = '<p class="muted">Your pricing is being finalized — your Treadwell rep will follow up. You can still ask questions below.</p>';
+    wrap.innerHTML = '<p class="muted">Your pricing is being finalized — your Treadwell rep will follow up. You can still message us below.</p>';
     $("addons").innerHTML = "";
     if (!approved) hide($("approve-card"));
     return;
   }
-  $("options-help").textContent = options.length > 1 ? "Choose the option you'd like when you approve." : "";
-  wrap.innerHTML = options.map((o, i) => `
-    <div class="option ${i === 0 ? "selected" : ""}" data-i="${i}">
-      <div class="top"><span class="name">${esc(o.label)}</span><span class="price">${money(o.total)}</span></div>
-      ${o.system_desc ? `<div class="meta">${esc(o.system_desc)}</div>` : ""}
-      ${o.diff != null && o.diff !== 0 ? `<div class="meta">${o.diff > 0 ? "+" : ""}${money(o.diff)} vs base bid</div>` : ""}
-    </div>`).join("");
-  let selected = 0;
-  wrap.querySelectorAll(".option").forEach((el) => {
-    el.addEventListener("click", () => {
+  // Default selection (pre-approval only): the base option, else the first.
+  if (!approved && !SELECTED.size) {
+    const base = options.find((o) => o.is_base) || options[0];
+    SELECTED = new Set([base.label]);
+  }
+  $("options-help").textContent = approved
+    ? "" : (options.length > 1 ? "Select every option you'd like to approve — your total updates below." : "");
+  wrap.innerHTML = options.map((o) => {
+    const on = SELECTED.has(o.label);
+    return `<label class="option opt-check ${on ? "selected" : ""}">
+      <input type="checkbox" ${on ? "checked" : ""} ${approved ? "disabled" : ""} data-label="${esc(o.label)}">
+      <span class="opt-main">
+        <span class="top"><span class="name">${esc(o.label)}</span><span class="price">${money(o.total)}</span></span>
+        ${o.system_desc ? `<span class="meta">${esc(o.system_desc)}</span>` : ""}
+        ${o.diff != null && o.diff !== 0 ? `<span class="meta">${o.diff > 0 ? "+" : ""}${money(o.diff)} vs base bid</span>` : ""}
+      </span>
+    </label>`;
+  }).join("") + '<div class="selected-total" id="selected-total"></div>';
+  wrap.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+    cb.addEventListener("change", () => {
       if (approved) return;
-      selected = +el.dataset.i;
-      wrap.querySelectorAll(".option").forEach((x) => x.classList.toggle("selected", +x.dataset.i === selected));
-      const sel = $("ap-option"); if (sel) sel.value = options[selected].label;
+      if (cb.checked) SELECTED.add(cb.dataset.label); else SELECTED.delete(cb.dataset.label);
+      cb.closest(".option").classList.toggle("selected", cb.checked);
+      updateSelectedTotal();
     });
   });
   $("addons").innerHTML = (addons && addons.length)
     ? "Optional add-ons: " + addons.map((a) => `${esc(a.label)} (${money(a.amount)})`).join(" · ") : "";
-  const sel = $("ap-option");
-  sel.innerHTML = options.map((o) => `<option value="${esc(o.label)}">${esc(o.label)} — ${money(o.total)}</option>`).join("");
-  if (options.length === 1) hide($("ap-option-field"));
+  updateSelectedTotal();
+}
+
+function updateSelectedTotal() {
+  const total = CUR_OPTIONS.filter((o) => SELECTED.has(o.label)).reduce((s, o) => s + o.total, 0);
+  const el = $("selected-total");
+  if (el) el.innerHTML = `<span>Selected total</span><strong>${money(total)}</strong>`;
+  const btn = $("approve-btn");
+  if (btn && !btn.dataset.locked) btn.disabled = SELECTED.size === 0;
+}
+
+function renderThankYou(a) {
+  const dep = a.deposit_amount;
+  $("thankyou-deposit").textContent = dep != null
+    ? `Deposit due: ${money(dep)} (25% of ${money(a.total)}).`
+    : "";
+  show($("thankyou-card"));
 }
 
 function renderPdf(has) {
@@ -296,10 +328,11 @@ $("approve-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("approve-alert"));
   const name = $("ap-name").value.trim();
   if (!name) { alertBox($("approve-alert"), "error", "Please enter your full name."); $("ap-name").focus(); return; }
-  const option_label = $("ap-option").value || (STATE.options[0] && STATE.options[0].label);
-  const btn = $("approve-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
-  const res = await api("POST", "/approve", { name, title: $("ap-title").value.trim(), option_label, date: new Date().toISOString().slice(0, 10) });
-  btn.disabled = false; btn.textContent = "Approve proposal";
+  const option_labels = [...SELECTED];
+  if (!option_labels.length) { alertBox($("approve-alert"), "error", "Please select at least one option to approve."); return; }
+  const btn = $("approve-btn"); btn.dataset.locked = "1"; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const res = await api("POST", "/approve", { name, title: $("ap-title").value.trim(), option_labels, date: new Date().toISOString().slice(0, 10) });
+  delete btn.dataset.locked; btn.disabled = false; btn.textContent = "Approve proposal";
   if (handleExpired(res, $("approve-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("approve-alert"), "error", data.error || "Could not approve. Please try again."); return; }

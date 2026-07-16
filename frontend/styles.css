@@ -150,7 +150,19 @@ textarea { min-height: 96px; resize: vertical; }
 .option .top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .option .name { font-weight: 700; color: var(--fg); }
 .option .price { font-size: 1.3rem; font-weight: 700; color: var(--primary); font-variant-numeric: tabular-nums; }
-.option .meta { font-size: .85rem; color: var(--secondary); margin-top: 4px; }
+.option .meta { font-size: .85rem; color: var(--secondary); margin-top: 4px; display: block; }
+
+/* multi-select checkbox variant */
+.option.opt-check { display: flex; align-items: flex-start; gap: 12px; }
+.option.opt-check input[type="checkbox"] { width: 20px; height: 20px; margin: 2px 0 0; flex: none; accent-color: var(--primary); cursor: pointer; }
+.option.opt-check input[type="checkbox"]:disabled { cursor: default; }
+.option.opt-check .opt-main { flex: 1; min-width: 0; }
+.selected-total {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  margin-top: 14px; padding-top: 14px; border-top: 2px solid var(--surface-highest);
+  font-weight: 700;
+}
+.selected-total strong { font-size: 1.35rem; color: var(--primary); font-variant-numeric: tabular-nums; }
 
 /* Q&A thread */
 .thread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }

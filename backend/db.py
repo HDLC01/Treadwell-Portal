@@ -190,7 +190,7 @@ def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
 
 def latest_approval(proposal_id: str) -> Optional[dict[str, Any]]:
     return q1(
-        "select name, title, approved_date, total, option_label, signed_at, approver_email "
+        "select name, title, approved_date, total, option_label, options, signed_at, approver_email "
         "from public.portal_approvals where proposal_id=%s order by signed_at desc limit 1",
         (proposal_id,),
     )
@@ -205,12 +205,15 @@ def mark_viewed(proposal_id: str) -> None:
     )
 
 
-def set_approved(proposal_id: str, total, option_label, name, title, approved_date) -> None:
+def set_approved(proposal_id: str, total, option_label, name, title, approved_date,
+                 options=None, deposit_amount=None) -> None:
     execute(
         "update public.portal_proposals set proposal_status='approved', approved_at=now(), "
-        "approved_total=%s, approved_option=%s, approved_name=%s, approved_title=%s, approved_date=%s, "
+        "approved_total=%s, approved_option=%s, approved_options=%s, deposit_amount=%s, "
+        "approved_name=%s, approved_title=%s, approved_date=%s, "
         "updated_at=now() where proposal_id=%s",
-        (total, option_label, name, title, approved_date, proposal_id),
+        (total, option_label, Jsonb(options) if options is not None else None, deposit_amount,
+         name, title, approved_date, proposal_id),
     )
 
 
@@ -286,12 +289,14 @@ def delete_notify_recipient(rid: int) -> None:
 
 
 # ── Approvals ───────────────────────────────────────────────────────────────────
-def add_approval(proposal_id, name, title, approved_date, total, option_label, ip, approver_email=None) -> None:
+def add_approval(proposal_id, name, title, approved_date, total, option_label, ip,
+                 approver_email=None, options=None) -> None:
     execute(
         "insert into public.portal_approvals "
-        "(proposal_id, name, title, approved_date, total, option_label, ip, approver_email) "
-        "values (%s,%s,%s,%s,%s,%s,%s,%s)",
-        (proposal_id, name, title, approved_date, total, option_label, ip, approver_email),
+        "(proposal_id, name, title, approved_date, total, option_label, ip, approver_email, options) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (proposal_id, name, title, approved_date, total, option_label, ip, approver_email,
+         Jsonb(options) if options is not None else None),
     )
 
 

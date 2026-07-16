@@ -151,6 +151,17 @@ select v.email, 'general'
 from (values ('kyle@wetreadwell.com'), ('kylene@wetreadwell.com'), ('rj@wetreadwell.com')) as v(email)
 where not exists (select 1 from public.portal_notify_recipients);
 
+-- ── V1 revamp: multi-select pricing → summed approval + 25% deposit ───────────
+-- A customer may now approve MULTIPLE published options. approved_options holds
+-- the selected label list (jsonb) and approved_total their server-computed sum.
+-- approved_option (text) is kept as a denormalized ", "-joined summary so every
+-- existing consumer (customer banner, staff drawer, board) keeps working.
+-- deposit_amount is the auto-calc (25% of approved_total). Pre-revamp rows have
+-- approved_options null → single-option fallback everywhere.
+alter table public.portal_proposals add column if not exists approved_options jsonb;
+alter table public.portal_proposals add column if not exists deposit_amount numeric;
+alter table public.portal_approvals add column if not exists options jsonb;
+
 -- ── Row Level Security ────────────────────────────────────────────────────────
 -- Enable RLS on every portal_* table so they are NOT exposed through the public
 -- (anon) REST API of the shared database. Idempotent: ENABLE on an already-
