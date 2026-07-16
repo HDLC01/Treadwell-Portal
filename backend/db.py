@@ -66,6 +66,12 @@ def get_proposal_by_token(token: str) -> Optional[dict[str, Any]]:
     return q1("select * from public.portal_proposals where token = %s", (token,))
 
 
+def get_proposal_by_token_ci(token: str) -> Optional[dict[str, Any]]:
+    """Case-insensitive token lookup — fallback for inbound email, where some
+    mail systems lowercase the address local part that carries our token."""
+    return q1("select * from public.portal_proposals where lower(token) = lower(%s)", (token,))
+
+
 def get_proposal(proposal_id: str) -> Optional[dict[str, Any]]:
     return q1("select * from public.portal_proposals where proposal_id = %s", (proposal_id,))
 
@@ -319,6 +325,17 @@ def add_message(proposal_id: str, author_kind: str, author_email: Optional[str],
 def add_question(proposal_id: str, author_kind: str, author_email: Optional[str], body: str) -> dict[str, Any]:
     """Back-compat wrapper — a plain text message."""
     return add_message(proposal_id, author_kind, author_email, body, msg_type="text")
+
+
+def has_email_message(proposal_id: str, email_id: str) -> bool:
+    """Dedup for inbound email: has this Resend email_id already been inserted?
+    (email_id is stable across Svix retries AND dashboard re-sends; scoping by
+    proposal_id keeps the scan on the proposal index.)"""
+    return q1(
+        "select 1 as x from public.portal_questions "
+        "where proposal_id=%s and meta->>'email_id' = %s limit 1",
+        (proposal_id, email_id),
+    ) is not None
 
 
 # ── Team notification recipients (configurable; falls back to env when empty) ───

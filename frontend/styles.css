@@ -172,6 +172,10 @@ textarea { min-height: 96px; resize: vertical; }
 .msg.customer .who { color: var(--primary-tint); }
 .msg.staff { align-self: flex-start; background: var(--surface-high); color: var(--fg); }
 .msg .when { font-size: .68rem; opacity: .75; margin-top: 4px; }
+.msg .via-email {
+  font-size: .6rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  border: 1px solid currentColor; border-radius: 999px; padding: 1px 6px; margin-left: 4px; opacity: .85;
+}
 
 /* Chat-first landing */
 .chat-head { position: sticky; top: 0; z-index: 5; }

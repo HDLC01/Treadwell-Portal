@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hmac
 import html
+import json
 import logging
 import re
 import time
 from datetime import date
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -27,6 +29,7 @@ import config
 import customer_auth as ca
 import db
 import email_sender
+import inbound
 import proposals
 import ratelimit
 
@@ -200,9 +203,11 @@ def _proposal_card(row: dict) -> dict:
 # ── middleware: CSRF/origin backstop + security headers ───────────────────────
 @app.middleware("http")
 async def _security(request: Request, call_next):
-    # CSRF backstop: state-changing API POSTs (except the service endpoint, which
-    # has its own token) must originate from our own site.
-    if request.method == "POST" and request.url.path.startswith("/api/") and request.url.path != "/api/notify":
+    # CSRF backstop: state-changing API POSTs must originate from our own site —
+    # except the server-to-server endpoints with their own auth (/api/notify:
+    # service token; /api/inbound/resend: svix signature).
+    if (request.method == "POST" and request.url.path.startswith("/api/")
+            and request.url.path not in ("/api/notify", "/api/inbound/resend")):
         ref = request.headers.get("origin") or request.headers.get("referer") or ""
         if ref:
             host = urlparse(ref).netloc
@@ -605,15 +610,123 @@ async def api_notify(request: Request) -> JSONResponse:
     primary = (p.get("customer_email") or "").strip().lower()
     project = p.get("project_name") or "your proposal"
     recipients = db.get_recipients(p["proposal_id"]) or ([primary] if primary else [])
+    rt = email_sender.proposal_reply_to(p["token"])
     if kind == "published":
         for e in recipients:
-            email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project)
+            email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project,
+                                          reply_to=rt)
     elif kind == "reply":
         for e in recipients:
-            email_sender.send_reply_notification(e, link, project)
+            email_sender.send_reply_notification(e, link, project, reply_to=rt)
     else:
         return _json({"ok": False, "error": "unknown_type"}, 400)
     return _json({"ok": True})
+
+
+# ── inbound email (Resend receiving webhook) → CRM chat thread ─────────────────
+@app.post("/api/inbound/resend")
+async def api_inbound_resend(request: Request):
+    """Resend `email.received` webhook. Auth = svix signature (no session/token).
+    Flow: verify → match the proposal by the token in the recipient address →
+    dedup → fetch the body from Resend → insert as a customer chat message →
+    forward a copy + notify the team (best-effort). Non-2xx makes Svix retry, so
+    only pre-insert failures return errors."""
+    if not config.RESEND_WEBHOOK_SECRET:
+        return _json({"ok": False, "error": "not_configured"}, 503)
+    raw = await request.body()
+    if not inbound.verify_svix(
+        config.RESEND_WEBHOOK_SECRET,
+        request.headers.get("svix-id") or "",
+        request.headers.get("svix-timestamp") or "",
+        request.headers.get("svix-signature") or "",
+        raw,
+    ):
+        return _json({"ok": False, "error": "bad_signature"}, 401)
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return _json({"ok": False, "error": "bad_json"}, 400)
+    if event.get("type") != "email.received":
+        return _json({"ok": True, "ignored": "event_type"})
+
+    data = event.get("data") or {}
+    email_id = (data.get("email_id") or "").strip()
+    if not email_id:
+        return _json({"ok": True, "ignored": "no_email_id"})
+    rcpts = []
+    for key in ("to", "cc", "bcc"):
+        v = data.get(key)
+        rcpts += v if isinstance(v, list) else ([v] if v else [])
+    if data.get("received_for"):
+        rcpts.append(data["received_for"])
+    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAIN)
+    p = (db.get_proposal_by_token(token) or db.get_proposal_by_token_ci(token)) if token else None
+    if not p:
+        log.info("inbound: no proposal match (token=%r)", token)
+        return _json({"ok": True, "ignored": "no_match"})
+    pid = p["proposal_id"]
+    if db.has_email_message(pid, email_id):
+        return _json({"ok": True, "ignored": "duplicate"})
+
+    # Fetch the body (webhook is metadata-only). Failure → 500 so Svix retries;
+    # nothing has been inserted yet, so the retry is safe.
+    try:
+        r = httpx.get(f"https://api.resend.com/emails/receiving/{email_id}",
+                      headers={"Authorization": f"Bearer {config.RESEND_API_KEY}"}, timeout=10)
+        r.raise_for_status()
+        full = r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("inbound: body fetch failed for %s: %s", email_id, exc)
+        return _json({"ok": False, "error": "fetch_failed"}, 500)
+
+    text = (full.get("text") or "")[:100_000]
+    if not text.strip():
+        html_body = (full.get("html") or "")[:300_000]
+        text = html.unescape(re.sub(r"<[^>]{0,300}>", " ", html_body))
+    body_txt = _cap(inbound.strip_quoted(text), 4000)
+    names = [(_cap(a.get("filename"), 120) or "attachment")
+             for a in (data.get("attachments") or [])[:10] if isinstance(a, dict)]
+    if names:
+        body_txt = (body_txt + "\n" + "\n".join(f"[Attachment: {n}]" for n in names)).strip()
+    if not body_txt:
+        body_txt = "(empty email)"
+
+    from_email = (parseaddr(str(data.get("from") or ""))[1] or "").strip().lower()
+    authorized = set(e.lower() for e in (db.get_recipients(pid) or []))
+    authorized.add((p.get("customer_email") or "").strip().lower())
+    verified = bool(from_email) and from_email in authorized
+    project = p.get("project_name") or "proposal"
+    subject = _cap(data.get("subject"), 200)
+
+    if verified:
+        # The insert is the idempotency anchor: after this line, retries dedup.
+        db.add_message(pid, "customer", from_email, body_txt, msg_type="text",
+                       meta={"source": "email", "email_id": email_id, "from": from_email})
+    else:
+        # Never let an unverified From speak as the customer in the thread —
+        # staff still see it via the forward + team notification below.
+        log.warning("inbound: unverified sender %r for proposal %s", from_email, pid)
+
+    flag = "" if verified else "<p><strong>⚠ UNVERIFIED SENDER — not added to the portal thread.</strong></p>"
+    esc_body = html.escape(body_txt).replace("\n", "<br>")
+    fwd_html = (
+        f"{flag}<p><strong>{html.escape(from_email or 'unknown')}</strong> replied by email on "
+        f"<strong>{html.escape(project)}</strong>"
+        f"{(' — ' + html.escape(subject)) if subject else ''}:</p>"
+        f"<blockquote>{esc_body}</blockquote>"
+    )
+    link = _staff_link(pid)
+    try:
+        if config.INBOUND_FORWARD_EMAIL:
+            email_sender._send([config.INBOUND_FORWARD_EMAIL],
+                               f"Customer email reply — {project}",
+                               email_sender._wrap("Customer replied by email",
+                                                  fwd_html + f'<p><a href="{link}">Open in the proposal tool</a></p>'),
+                               reply_to=from_email or None)   # reply from your inbox goes to the customer
+        email_sender.notify_team(f"Customer email reply — {project}", fwd_html, reply_link=link)
+    except Exception as exc:  # noqa: BLE001 — the CRM insert already happened
+        log.error("inbound: forward/notify failed: %s", exc)
+    return _json({"ok": True, "verified": verified})
 
 
 # ── admin API (proposal tool -> portal; SERVICE_TOKEN-gated, server-to-server) ─
@@ -683,8 +796,9 @@ async def admin_publish(request: Request) -> JSONResponse:
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     # One send per recipient (keeps _thread_headers per-recipient; recipients
     # never see each other's addresses). Only the primary gets the name greeting.
+    rt = email_sender.proposal_reply_to(token)
     emailed = [e for e in send_list
-               if email_sender.send_portal_link(e, name if e == primary else "", link, project)]
+               if email_sender.send_portal_link(e, name if e == primary else "", link, project, reply_to=rt)]
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
                   "recipients": send_list, "emailed": emailed})
 
@@ -763,8 +877,9 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
     db.add_question(proposal_id, "staff", _cap(body.get("by"), 120) or "Treadwell", text)
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     project = p.get("project_name") or "your proposal"
+    rt = email_sender.proposal_reply_to(p["token"])
     for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_reply_notification(e, link, project)
+        email_sender.send_reply_notification(e, link, project, reply_to=rt)
     return _json({"ok": True})
 
 
@@ -815,8 +930,9 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
 
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     project = p.get("project_name") or "your proposal"
+    rt = email_sender.proposal_reply_to(p["token"])
     for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_deposit_request(e, link, project, amount)
+        email_sender.send_deposit_request(e, link, project, amount, reply_to=rt)
     return _json({"ok": True, "amount": amount})
 
 

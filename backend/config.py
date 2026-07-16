@@ -50,7 +50,9 @@ PROPOSAL_TOOL_PUBLIC_URL = _env("PROPOSAL_TOOL_PUBLIC_URL", "https://proposals.w
 
 # ── Email (Resend) ────────────────────────────────────────────────────────────
 RESEND_API_KEY = _env("RESEND_API_KEY")
-EMAIL_FROM = _env("EMAIL_FROM", "Treadwell <noreply@wetreadwell.com>")
+# From address — deliberately NOT "noreply" (confusing for customers); replies
+# are routed via the per-proposal Reply-To (see RESEND_INBOUND_DOMAIN below).
+EMAIL_FROM = _env("EMAIL_FROM", "Treadwell <proposals@notify.wetreadwell.com>")
 # Comma-separated recipient lists.
 NOTIFY_EMAILS = [e.strip() for e in _env("NOTIFY_EMAILS", "bids@wetreadwell.com").split(",") if e.strip()]
 DEPOSIT_NOTIFY_EMAILS = [
@@ -63,6 +65,15 @@ DEPOSIT_NOTIFY_EMAILS = [
 # MONITORED inbox only if you want stray customer replies to reach a human until
 # inbound→CRM capture exists. NOT auto-defaulted to bids@ or any team address.
 EMAIL_REPLY_TO = _env("EMAIL_REPLY_TO", "")
+
+# ── Inbound email (Resend receiving) → CRM chat thread ────────────────────────
+# When RESEND_INBOUND_DOMAIN is set, per-proposal customer emails get
+# Reply-To: <proposal-token>@<domain> so an email reply routes back to Resend,
+# which webhooks POST /api/inbound/resend (armed only when the signing secret is
+# set). INBOUND_FORWARD_EMAIL gets a copy of every captured reply.
+RESEND_INBOUND_DOMAIN = _env("RESEND_INBOUND_DOMAIN", "")
+RESEND_WEBHOOK_SECRET = _env("RESEND_WEBHOOK_SECRET", "")
+INBOUND_FORWARD_EMAIL = _env("INBOUND_FORWARD_EMAIL", "")
 
 # ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
 # A Google OAuth *Web Client ID* (public). The button only renders when set; the

@@ -26,7 +26,8 @@ def _thread_headers(email: str) -> dict[str, str]:
     return {"References": mid, "In-Reply-To": mid}
 
 
-def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None = None) -> bool:
+def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None = None,
+          reply_to: str | None = None) -> bool:
     to = [t for t in to if t]
     if not to:
         return False
@@ -35,8 +36,11 @@ def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None
         return True
     try:
         payload: dict = {"from": config.EMAIL_FROM, "to": to, "subject": subject, "html": html}
-        if config.EMAIL_REPLY_TO:
-            payload["reply_to"] = config.EMAIL_REPLY_TO   # stray replies reach a monitored inbox, not noreply
+        # Explicit per-message reply_to (e.g. the per-proposal inbound-capture
+        # address) wins over the global EMAIL_REPLY_TO fallback.
+        effective_reply_to = reply_to or config.EMAIL_REPLY_TO
+        if effective_reply_to:
+            payload["reply_to"] = effective_reply_to
         if headers:
             payload["headers"] = headers
         resp = httpx.post(
@@ -72,7 +76,17 @@ def send_otp(email: str, code: str, project_name: str) -> bool:
                  _thread_headers(email))
 
 
-def send_portal_link(email: str, name: str, url: str, project_name: str) -> bool:
+def proposal_reply_to(token: str) -> str | None:
+    """The per-proposal inbound-capture Reply-To (token@receiving-domain), or
+    None when inbound receiving isn't configured. An email reply to this address
+    routes through Resend's webhook back into the proposal's CRM thread."""
+    if not (config.RESEND_INBOUND_DOMAIN and token):
+        return None
+    return f"{token}@{config.RESEND_INBOUND_DOMAIN}"
+
+
+def send_portal_link(email: str, name: str, url: str, project_name: str,
+                     reply_to: str | None = None) -> bool:
     body = (
         f'<p>Hi {name or "there"},</p>'
         f'<p>Your proposal for <strong>{project_name}</strong> is ready to review.</p>'
@@ -81,22 +95,28 @@ def send_portal_link(email: str, name: str, url: str, project_name: str) -> bool
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
     return _send([email], f"Your Treadwell proposal — {project_name}", _wrap("Your proposal is ready", body),
-                 _thread_headers(email))
+                 _thread_headers(email), reply_to=reply_to)
 
 
-def send_reply_notification(email: str, url: str, project_name: str) -> bool:
+def send_reply_notification(email: str, url: str, project_name: str,
+                            reply_to: str | None = None) -> bool:
+    # Only advertise reply-by-email when inbound capture is armed (reply_to set);
+    # otherwise steer to the portal so nothing dead-ends.
+    nudge = ("You can reply right on your proposal page, or simply reply to this email."
+             if reply_to else
+             "Reply right on your proposal page (button above) so our team sees it fastest.")
     body = (
         f'<p>Treadwell replied to your question on the proposal for <strong>{project_name}</strong>.</p>'
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
-        f'<p style="color:#64748b;font-size:13px">Reply right on your proposal page (button above) so our '
-        f'team sees it fastest.</p>'
+        f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
     )
     return _send([email], f"New reply on your proposal — {project_name}", _wrap("You have a new reply", body),
-                 _thread_headers(email))
+                 _thread_headers(email), reply_to=reply_to)
 
 
-def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None) -> bool:
+def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None,
+                         reply_to: str | None = None) -> bool:
     amt = f" of <strong>${amount:,.2f}</strong>" if amount is not None else ""
     body = (
         f'<p>Thank you for approving your proposal for <strong>{project_name}</strong>.</p>'
@@ -106,7 +126,7 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
     )
     return _send([email], f"Deposit requested — {project_name}", _wrap("Deposit requested", body),
-                 _thread_headers(email))
+                 _thread_headers(email), reply_to=reply_to)
 
 
 def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit) -> list[str]:

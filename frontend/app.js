@@ -310,8 +310,9 @@ function renderMsg(m) {
     return `<div class="chat-system">${esc(m.body || "")}</div>`;
   }
   const mine = m.author_kind === "customer";
+  const viaEmail = m.meta && m.meta.source === "email";
   return `<div class="msg ${mine ? "customer" : "staff"}">
-    <div class="who">${mine ? "You" : "Treadwell"}</div>
+    <div class="who">${mine ? "You" : "Treadwell"}${viaEmail ? ' <span class="via-email">via email</span>' : ""}</div>
     <div>${esc(m.body || "")}</div>
     <div class="when">${when}</div>
   </div>`;

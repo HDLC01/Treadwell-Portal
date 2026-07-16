@@ -163,6 +163,13 @@ alter table public.portal_proposals add column if not exists deposit_amount nume
 alter table public.portal_proposals add column if not exists deposit_requested_at timestamptz;
 alter table public.portal_approvals add column if not exists options jsonb;
 
+-- Inbound email capture: one chat row per received email (meta.email_id is the
+-- Resend received-email id). Partial unique index = idempotency backstop for
+-- concurrent webhook retries; the handler also checks before inserting.
+create unique index if not exists portal_questions_email_uidx
+  on public.portal_questions ((meta->>'email_id'))
+  where meta->>'email_id' is not null;
+
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,
 -- plus optional accounts-payable / billing). contacts_status gates the new
