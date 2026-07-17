@@ -138,7 +138,11 @@
         </div>
 
         <div id="ach-pane" style="margin-top:16px">
-          <div class="alert info">Send a bank transfer (ACH or wire) from your bank for the amount below, and include the reference in the memo so we can match it. Then let us know you've sent it.</div>
+          <div class="alert success hidden" id="deposit-recorded">
+            <span id="deposit-recorded-msg"></span>
+            <button class="linkbtn" id="deposit-resend" type="button" style="margin-left:6px">Update or resend</button>
+          </div>
+          <div class="alert info" id="deposit-intro">Send a bank transfer (ACH or wire) from your bank for the amount below, and include the reference in the memo so we can match it. Then let us know you've sent it.</div>
           <div id="deposit-instructions" class="deposit-instructions"></div>
           <form id="ach-form" class="stack" style="margin-top:16px" novalidate>
             <div class="field"><label for="ach-acct-name">Name on the account you sent from <span class="req">*</span></label><input id="ach-acct-name" type="text" autocomplete="name" required></div>

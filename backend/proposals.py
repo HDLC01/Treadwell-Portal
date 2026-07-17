@@ -66,7 +66,7 @@ def deposit_ref(proposal_id: str) -> str:
     staff can match the deposit on the bank statement at a glance. Deterministic
     from the proposal id (not secret)."""
     alnum = "".join(ch for ch in (proposal_id or "") if ch.isalnum())
-    return ("TW-" + alnum[:6].upper()) if alnum else "TW-DEPOSIT"
+    return ("TW-" + alnum[:8].upper()) if alnum else "TW-DEPOSIT"   # 8 chars → ~256x fewer collisions than 6
 
 
 def resolve_selection(data: dict[str, Any], labels) -> tuple[list[dict[str, Any]], float]:

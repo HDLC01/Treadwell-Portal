@@ -356,10 +356,18 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm["messages"] = [_msg(m) for m in db.list_messages(p["proposal_id"])]   # full chat thread (chat UI)
     vm["contacts"] = [_contact(c) for c in db.list_contacts(p["proposal_id"])]
     vm["check_address"] = config.CHECK_ADDRESS
+    _deps = db.list_deposits(p["proposal_id"])   # newest first
+    _latest = _deps[0] if _deps else None
     vm["deposit"] = {
         "due": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
         "ref": proposals.deposit_ref(p["proposal_id"]),
         "instructions": _deposit_instructions(),
+        # so the customer sees a "recorded" state on reload instead of a blank
+        # form they might resubmit (deposit_status only flips when staff confirm).
+        "submitted": bool(_latest),
+        "submitted_method": _latest["method"] if _latest else None,
+        "submitted_sent_date": (_latest["sent_date"].isoformat()
+                                if _latest and _latest.get("sent_date") else None),
     }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True

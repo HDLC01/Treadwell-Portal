@@ -420,6 +420,18 @@ function setupDeposit() {
   $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
   const sd = $("ach-sent-date"); if (sd && !sd.value) sd.value = new Date().toISOString().slice(0, 10);
 
+  // If a deposit was already submitted (and not yet marked received), show a
+  // recorded state instead of a fresh form — so a reload / second device doesn't
+  // invite an accidental duplicate submission. "Update or resend" reveals the form.
+  const recorded = $("deposit-recorded"), form = $("ach-form");
+  if (dep.submitted) {
+    const when = dep.submitted_sent_date ? ` sent ${dep.submitted_sent_date}` : "";
+    const meth = dep.submitted_method === "check" ? "check" : "bank transfer";
+    $("deposit-recorded-msg").textContent = `Thanks — we've recorded your ${meth}${when}. We'll mark your deposit Received once it lands in our account.`;
+    show(recorded); hide(form);
+  } else { hide(recorded); show(form); }
+  $("deposit-resend").onclick = () => { hide(recorded); show(form); };
+
   const tabAch = $("tab-ach"), tabCheck = $("tab-check");
   const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-pane")); hide($("check-instructions")); };
   const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-pane")); show($("check-instructions")); };
@@ -515,7 +527,8 @@ $("ach-form").addEventListener("submit", async (e) => {
   if (handleExpired(res, $("deposit-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
-  hide($("ach-form"));
+  const fresh = await api("GET", "");   // refetch → recorded state (prevents accidental re-submit)
+  if (fresh.ok && fresh.data.view) renderPortal(fresh.data.view);
   alertBox($("deposit-alert"), "success", "Thank you — we've noted your transfer. We'll mark your deposit Received once it lands in our account.");
 });
 
@@ -525,5 +538,7 @@ $("check-ack").addEventListener("click", async () => {
   if (handleExpired(res, $("deposit-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
+  const fresh = await api("GET", "");
+  if (fresh.ok && fresh.data.view) renderPortal(fresh.data.view);
   alertBox($("deposit-alert"), "success", "Thanks for letting us know — we'll mark your deposit Received once the check arrives.");
 });

@@ -3,8 +3,8 @@ reference staff use to reconcile a customer's bank transfer. Pure logic."""
 import proposals
 
 
-def test_ref_first_six_alnum_uppercased():
-    assert proposals.deposit_ref("8dbe3385-be1d-4081-bdd5-96a51868187d") == "TW-8DBE33"
+def test_ref_first_eight_alnum_uppercased():
+    assert proposals.deposit_ref("8dbe3385-be1d-4081-bdd5-96a51868187d") == "TW-8DBE3385"
 
 
 def test_ref_strips_non_alnum():
