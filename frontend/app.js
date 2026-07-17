@@ -352,7 +352,9 @@ function mountPdf() {
   ifr.className = "pdf-frame";
   ifr.title = "Proposal PDF";
   ifr.addEventListener("load", () => { const l = $("pdf-loading"); if (l) l.remove(); });
-  ifr.src = `/api/portal/${TOKEN}/pdf`;
+  // #view=FitH opens the native viewer fit-to-width (readable) instead of its
+  // tiny default zoom; keep the toolbar so the customer can zoom/print/download.
+  ifr.src = `/api/portal/${TOKEN}/pdf#view=FitH`;
   wrap.appendChild(ifr);
 }
 
@@ -371,7 +373,8 @@ function mountInlinePdf() {
   ifr.setAttribute("tabindex", "-1");
   ifr.setAttribute("aria-hidden", "true");
   ifr.addEventListener("load", () => { const l = $("pdf-inline-loading"); if (l) l.remove(); });
-  ifr.src = `/api/portal/${TOKEN}/pdf`;
+  // Clean, full-width page teaser: hide the viewer toolbar, fit to width.
+  ifr.src = `/api/portal/${TOKEN}/pdf#toolbar=0&view=FitH`;
   wrap.appendChild(ifr);
 }
 function openPdfModal() {
