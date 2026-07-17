@@ -41,6 +41,12 @@ def pricing_options(data: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         base = ((data.get("computed_bid") or {}).get("full_bid") or {})
         total = _num(base.get("total_base_bid"))
+        if total is None:
+            # New pricing model (2026 refactor): the proposal tool stores the
+            # all-in, tax-inclusive base bid under `proposal_lump_sum` and nulls
+            # `computed_bid`. Without this fallback a base-only proposal (the
+            # common case) shows no options → "pricing is being finalized".
+            total = _num(data.get("proposal_lump_sum"))
         if total is not None:
             options.append({"label": "Base Bid", "total": total,
                             "system_desc": data.get("system_name") or "", "is_base": True})

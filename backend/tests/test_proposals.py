@@ -22,6 +22,22 @@ def test_pricing_options_base_only():
     assert opts[0]["label"] == "Base Bid" and opts[0]["total"] == 21937.0
 
 
+def test_pricing_options_proposal_lump_sum_fallback():
+    # New 2026 shape: base bid lives in proposal_lump_sum, computed_bid is nulled.
+    data = {"proposal_lump_sum": 32985, "computed_bid": None, "system_name": "Treadwell Polished Concrete"}
+    opts = proposals.pricing_options(data)
+    assert len(opts) == 1
+    assert opts[0]["label"] == "Base Bid" and opts[0]["total"] == 32985.0
+    assert opts[0]["system_desc"] == "Treadwell Polished Concrete" and opts[0]["is_base"] is True
+
+
+def test_pricing_options_computed_bid_wins_over_lump_sum():
+    # When the legacy shape is present it takes precedence (no double-count).
+    data = {"computed_bid": {"full_bid": {"total_base_bid": 100}}, "proposal_lump_sum": 999}
+    opts = proposals.pricing_options(data)
+    assert len(opts) == 1 and opts[0]["total"] == 100.0
+
+
 def test_pricing_options_alternate_appended():
     data = {"computed_bid": {"full_bid": {"total_base_bid": 100}},
             "alternate_computed_bid": {"full_bid": {"total_base_bid": 200}}, "alternate_label": "Alt"}
