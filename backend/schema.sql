@@ -170,6 +170,12 @@ create unique index if not exists portal_questions_email_uidx
   on public.portal_questions ((meta->>'email_id'))
   where meta->>'email_id' is not null;
 
+-- Deposit confirmation (customer-push bank transfer): when the customer tells us
+-- they've sent the transfer, capture the date they sent it and an optional bank
+-- trace/confirmation number to help staff match it on the statement.
+alter table public.portal_deposits add column if not exists sent_date date;
+alter table public.portal_deposits add column if not exists trace_ref text;
+
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,
 -- plus optional accounts-payable / billing). contacts_status gates the new

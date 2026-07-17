@@ -217,6 +217,15 @@ textarea { min-height: 96px; resize: vertical; }
 }
 .back-link:hover { color: var(--primary-bright); }
 
+/* deposit bank-transfer instructions */
+.deposit-instructions { border: 1px solid var(--surface-highest); border-radius: var(--radius); overflow: hidden; }
+.di-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--surface-highest); }
+.di-row:first-child { border-top: none; }
+.di-row .di-k { flex: 0 0 42%; font-size: .8rem; color: var(--secondary); font-weight: 600; }
+.di-row .di-v { flex: 1; font-weight: 700; font-variant-numeric: tabular-nums; word-break: break-word; }
+.di-row .di-copy { flex: none; background: none; border: 1px solid var(--outline-variant); color: var(--primary); font: inherit; font-size: .72rem; font-weight: 700; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.di-row .di-copy:hover { background: var(--surface-low); }
+
 /* project contacts */
 #contacts-card.emphasized { border: 2px solid var(--primary); box-shadow: 0 0 0 3px var(--primary-tint); }
 .contact-row { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 12px; background: var(--surface-low); }

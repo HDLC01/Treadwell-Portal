@@ -120,8 +120,8 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
     amt = f" of <strong>${amount:,.2f}</strong>" if amount is not None else ""
     body = (
         f'<p>Thank you for approving your proposal for <strong>{project_name}</strong>.</p>'
-        f'<p>A deposit{amt} is now requested to reserve your place on our schedule — '
-        f'your deposit invoice will follow shortly.</p>'
+        f'<p>A deposit{amt} reserves your place on our schedule. Open your proposal for the '
+        f'bank-transfer instructions and the reference to include with your payment.</p>'
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
     )

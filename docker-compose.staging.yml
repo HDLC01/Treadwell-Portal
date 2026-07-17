@@ -37,6 +37,12 @@ services:
       # Staging forwards to Hanz only (per Hanz — don't email Will on staging).
       # will@wetreadwell.com gets added to this list on PROD, not here.
       INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com"
+      # PLACEHOLDER bank-transfer details so the deposit card renders on staging.
+      # Prod uses Treadwell's real details set in /opt/treadwell-portal/.env.
+      PORTAL_DEPOSIT_BENEFICIARY: "Treadwell LLC (TEST)"
+      PORTAL_DEPOSIT_BANK: "Test Bank, N.A. (staging)"
+      PORTAL_DEPOSIT_ROUTING: "000000000"
+      PORTAL_DEPOSIT_ACCOUNT: "TEST-000123456"
     networks:
       - shared
 

@@ -61,6 +61,14 @@ def deposit_amount(total) -> float | None:
     return None if t is None else round(t * DEPOSIT_PCT, 2)
 
 
+def deposit_ref(proposal_id: str) -> str:
+    """Short, human-matchable reference for the customer's bank-transfer memo, so
+    staff can match the deposit on the bank statement at a glance. Deterministic
+    from the proposal id (not secret)."""
+    alnum = "".join(ch for ch in (proposal_id or "") if ch.isalnum())
+    return ("TW-" + alnum[:6].upper()) if alnum else "TW-DEPOSIT"
+
+
 def resolve_selection(data: dict[str, Any], labels) -> tuple[list[dict[str, Any]], float]:
     """Validate a customer's chosen option labels against the published pricing
     options and sum SERVER-SIDE. Returns (chosen_options, total). Raises

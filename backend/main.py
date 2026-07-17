@@ -190,6 +190,16 @@ def _staff_link(proposal_id: str) -> str:
     return f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={proposal_id}"
 
 
+def _deposit_instructions() -> Optional[dict]:
+    """Treadwell's bank-transfer beneficiary details for the deposit card, or None
+    when not fully configured (the card then shows a rep-will-follow-up fallback).
+    The customer pushes the transfer to these — we never collect their account."""
+    if all((config.DEPOSIT_BENEFICIARY, config.DEPOSIT_BANK, config.DEPOSIT_ROUTING, config.DEPOSIT_ACCOUNT)):
+        return {"beneficiary": config.DEPOSIT_BENEFICIARY, "bank": config.DEPOSIT_BANK,
+                "routing": config.DEPOSIT_ROUTING, "account": config.DEPOSIT_ACCOUNT}
+    return None
+
+
 def _proposal_card(row: dict) -> dict:
     return {
         "token": row["token"],
@@ -346,6 +356,11 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm["messages"] = [_msg(m) for m in db.list_messages(p["proposal_id"])]   # full chat thread (chat UI)
     vm["contacts"] = [_contact(c) for c in db.list_contacts(p["proposal_id"])]
     vm["check_address"] = config.CHECK_ADDRESS
+    vm["deposit"] = {
+        "due": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
+        "ref": proposals.deposit_ref(p["proposal_id"]),
+        "instructions": _deposit_instructions(),
+    }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
     base["view"] = vm
@@ -487,18 +502,33 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     account_name = _cap(body.get("account_name"), 120) or None
     bank_name = _cap(body.get("bank_name"), 120) or None
     note = _cap(body.get("note"), 1000) or None
+    trace_ref = _cap(body.get("trace_ref"), 60) or None
+    # account_last4 is optional and only ever stored masked (never the full number).
     last4 = "".join(ch for ch in (body.get("account_last4") or "") if ch.isdigit())[-4:]
     masked_ref = f"••••{last4}" if last4 else None
+    try:
+        sent_date = date.fromisoformat(body["sent_date"]) if body.get("sent_date") else None
+    except (ValueError, TypeError):
+        sent_date = None
 
-    db.add_deposit(p["proposal_id"], method, account_name, bank_name, masked_ref, note)
+    db.add_deposit(p["proposal_id"], method, account_name, bank_name, masked_ref, note,
+                   sent_date=sent_date, trace_ref=trace_ref)
     project_name = p.get("project_name") or "proposal"
-    label = "ACH details submitted" if method == "ach" else "Paying by check"
+    ref = proposals.deposit_ref(p["proposal_id"])
+    # A system line records it in the chat so both sides see the deposit is in flight.
+    who = account_name or "The customer"
+    action = f"sent a bank transfer{f' on {sent_date}' if sent_date else ''}" if method == "ach" else "is mailing a check"
+    db.add_message(p["proposal_id"], "staff", None,
+                   f"Deposit initiated — {who} {action} (ref {ref}). We'll confirm once it clears.",
+                   msg_type="system")
     email_sender.notify_team(
-        f"Deposit {('info' if method == 'ach' else 'method')} submitted — {project_name}",
-        f"<p>{label} for <strong>{html.escape(project_name)}</strong>.</p>"
-        f"<p>Account name: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
-        f"Ref: {masked_ref or '—'}</p>"
-        f"<p>Confirm receipt internally, then mark the deposit Received in the proposal tool.</p>",
+        f"Deposit {'sent' if method == 'ach' else 'method'} — {project_name} ({ref})",
+        f"<p>{'Bank transfer sent' if method == 'ach' else 'Paying by check'} for "
+        f"<strong>{html.escape(project_name)}</strong> — match reference <strong>{html.escape(ref)}</strong> "
+        f"on the statement.</p>"
+        f"<p>From: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
+        f"Sent: {sent_date or '—'} · Trace: {html.escape(trace_ref or '—')}{f' · Acct {masked_ref}' if masked_ref else ''}</p>"
+        f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]),
     )
     return _json({"ok": True})
@@ -855,9 +885,12 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
         } if appr else None),
         "questions": [_q(q) for q in db.list_questions(proposal_id)],   # text-only (legacy drawer)
         "messages": [_msg(m) for m in db.list_messages(proposal_id)],   # full thread (revamped drawer)
+        "deposit_ref": proposals.deposit_ref(proposal_id),
         "deposits": [{
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
             "masked_ref": d.get("masked_ref"), "note": d.get("note"),
+            "sent_date": d["sent_date"].isoformat() if d.get("sent_date") else None,
+            "trace_ref": d.get("trace_ref"),
             "submitted_at": d["submitted_at"].isoformat() if d.get("submitted_at") else None,
         } for d in db.list_deposits(proposal_id)],
     })

@@ -129,24 +129,29 @@
         </div>
 
       <div class="card hidden" id="deposit-card">
-        <h2>Submit your deposit</h2>
+        <h2>Send your deposit</h2>
+        <p class="muted small" id="deposit-due-line"></p>
         <div id="deposit-alert" role="alert" aria-live="polite"></div>
         <div class="row" role="tablist" aria-label="Deposit method">
-          <button class="btn btn-secondary" id="tab-ach" type="button" aria-pressed="true">Pay by ACH</button>
+          <button class="btn btn-secondary" id="tab-ach" type="button" aria-pressed="true">Bank transfer</button>
           <button class="btn btn-secondary" id="tab-check" type="button" aria-pressed="false">Pay by check</button>
         </div>
 
-        <form id="ach-form" class="stack" style="margin-top:16px" novalidate>
-          <div class="alert info">We never store your full account number — only the last 4 digits for reference. Your details are sent securely to our team.</div>
-          <div class="field"><label for="ach-acct-name">Name on account <span class="req">*</span></label><input id="ach-acct-name" type="text" required></div>
-          <div class="field"><label for="ach-bank">Bank name</label><input id="ach-bank" type="text"></div>
-          <div class="field"><label for="ach-last4">Account number — last 4 digits</label><input id="ach-last4" type="text" inputmode="numeric" maxlength="4" placeholder="6789"></div>
-          <div class="field"><label for="ach-note">Note (optional)</label><textarea id="ach-note"></textarea></div>
-          <button class="btn btn-primary btn-block" type="submit" id="ach-btn">Submit ACH details</button>
-        </form>
+        <div id="ach-pane" style="margin-top:16px">
+          <div class="alert info">Send a bank transfer (ACH or wire) from your bank for the amount below, and include the reference in the memo so we can match it. Then let us know you've sent it.</div>
+          <div id="deposit-instructions" class="deposit-instructions"></div>
+          <form id="ach-form" class="stack" style="margin-top:16px" novalidate>
+            <div class="field"><label for="ach-acct-name">Name on the account you sent from <span class="req">*</span></label><input id="ach-acct-name" type="text" autocomplete="name" required></div>
+            <div class="field"><label for="ach-bank">Your bank</label><input id="ach-bank" type="text"></div>
+            <div class="field"><label for="ach-sent-date">Date sent</label><input id="ach-sent-date" type="date"></div>
+            <div class="field"><label for="ach-trace">Confirmation / trace number (optional)</label><input id="ach-trace" type="text"></div>
+            <div class="field"><label for="ach-note">Note (optional)</label><textarea id="ach-note"></textarea></div>
+            <button class="btn btn-primary btn-block" type="submit" id="ach-btn">I've sent the transfer</button>
+          </form>
+        </div>
 
         <div id="check-instructions" class="stack hidden" style="margin-top:16px">
-          <div class="alert info">Make the check payable to <strong>Treadwell</strong> and mail it to the address below. Your deposit will show as Received once we confirm it.</div>
+          <div class="alert info">Make the check payable to <strong>Treadwell</strong>, include reference <strong id="check-ref"></strong> on the memo line, and mail it to the address below. Your deposit shows as Received once we confirm it.</div>
           <p id="check-address" class="num"></p>
           <button class="btn btn-primary btn-block" id="check-ack" type="button">I've mailed my check</button>
         </div>

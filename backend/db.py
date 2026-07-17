@@ -204,7 +204,7 @@ def unread_counts() -> dict[str, int]:
 
 def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     return qall(
-        "select method, account_name, bank_name, masked_ref, note, submitted_at "
+        "select method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, submitted_at "
         "from public.portal_deposits where proposal_id=%s order by submitted_at desc",
         (proposal_id,),
     )
@@ -371,11 +371,13 @@ def add_approval(proposal_id, name, title, approved_date, total, option_label, i
 
 
 # ── Deposits ─────────────────────────────────────────────────────────────────────
-def add_deposit(proposal_id, method, account_name, bank_name, masked_ref, note) -> None:
+def add_deposit(proposal_id, method, account_name, bank_name, masked_ref, note,
+                sent_date=None, trace_ref=None) -> None:
     execute(
-        "insert into public.portal_deposits (proposal_id, method, account_name, bank_name, masked_ref, note) "
-        "values (%s,%s,%s,%s,%s,%s)",
-        (proposal_id, method, account_name, bank_name, masked_ref, note),
+        "insert into public.portal_deposits "
+        "(proposal_id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (proposal_id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref),
     )
 
 

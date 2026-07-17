@@ -120,6 +120,10 @@ function renderPortal(vm) {
   renderChat(STATE.messages);
   setupDeposit();
 
+  // Deposit card: shown once approved, until the deposit is marked received.
+  if (approved && vm.status.deposit !== "received") show($("deposit-card"));
+  else hide($("deposit-card"));
+
   // Pre-fill the approver name from the contact we already have — editable, so a
   // different signer can overwrite. Only when empty, so a poll refetch (or the
   // customer's in-progress typing) is never clobbered. Blank when we truly have
@@ -383,10 +387,42 @@ function startPolling() {
 }
 
 function setupDeposit() {
+  const dep = (STATE && STATE.deposit) || {};
+  const due = dep.due != null ? money(dep.due) : null;
+  const ref = dep.ref || "";
+  $("deposit-due-line").textContent = due
+    ? `Deposit due: ${due} (25% of your total). Reference: ${ref}`
+    : (ref ? `Reference: ${ref}` : "");
+  if ($("check-ref")) $("check-ref").textContent = ref;
+
+  const box = $("deposit-instructions");
+  if (dep.instructions) {
+    const i = dep.instructions;
+    const rows = [
+      ["Amount to send", due || "—"],
+      ["Reference (put in the memo)", ref],
+      ["Beneficiary", i.beneficiary],
+      ["Bank", i.bank],
+      ["Routing number", i.routing],
+      ["Account number", i.account],
+    ];
+    box.innerHTML = rows.map(([k, v]) => `<div class="di-row">
+      <span class="di-k">${esc(k)}</span><span class="di-v">${esc(v)}</span>
+      <button class="di-copy" type="button" data-copy="${esc(v)}">Copy</button></div>`).join("");
+    box.querySelectorAll(".di-copy").forEach((b) => b.addEventListener("click", () => {
+      if (navigator.clipboard) navigator.clipboard.writeText(b.dataset.copy).catch(() => {});
+      const t = b.textContent; b.textContent = "Copied"; setTimeout(() => { b.textContent = t; }, 1200);
+    }));
+  } else {
+    box.innerHTML = '<p class="muted small">Your Treadwell representative will send you the bank-transfer details. You can still confirm below once you\'ve sent it.</p>';
+  }
+
   $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
+  const sd = $("ach-sent-date"); if (sd && !sd.value) sd.value = new Date().toISOString().slice(0, 10);
+
   const tabAch = $("tab-ach"), tabCheck = $("tab-check");
-  const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-form")); hide($("check-instructions")); };
-  const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-form")); show($("check-instructions")); };
+  const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-pane")); hide($("check-instructions")); };
+  const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-pane")); show($("check-instructions")); };
   tabAch.onclick = showAch; tabCheck.onclick = showCheck;
 }
 
@@ -469,17 +505,18 @@ $("qa-body").addEventListener("input", (e) => {
 $("ach-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("deposit-alert"));
   const account_name = $("ach-acct-name").value.trim();
-  if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name on the account."); return; }
+  if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name on the account you sent from."); return; }
   const btn = $("ach-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
   const res = await api("POST", "/deposit", {
     method: "ach", account_name, bank_name: $("ach-bank").value.trim(),
-    account_last4: $("ach-last4").value.trim(), note: $("ach-note").value.trim(),
+    sent_date: $("ach-sent-date").value || "", trace_ref: $("ach-trace").value.trim(), note: $("ach-note").value.trim(),
   });
-  btn.disabled = false; btn.textContent = "Submit ACH details";
+  btn.disabled = false; btn.textContent = "I've sent the transfer";
   if (handleExpired(res, $("deposit-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
-  alertBox($("deposit-alert"), "success", "Thank you — your deposit details were sent securely. We'll mark it Received once confirmed.");
+  hide($("ach-form"));
+  alertBox($("deposit-alert"), "success", "Thank you — we've noted your transfer. We'll mark your deposit Received once it lands in our account.");
 });
 
 $("check-ack").addEventListener("click", async () => {
