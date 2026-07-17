@@ -430,27 +430,8 @@ function setupDeposit() {
     : (ref ? `Reference: ${ref}` : "");
   if ($("check-ref")) $("check-ref").textContent = ref;
 
-  const box = $("deposit-instructions");
-  if (dep.instructions) {
-    const i = dep.instructions;
-    const rows = [
-      ["Amount to send", due || "—"],
-      ["Reference (put in the memo)", ref],
-      ["Beneficiary", i.beneficiary],
-      ["Bank", i.bank],
-      ["Routing number", i.routing],
-      ["Account number", i.account],
-    ];
-    box.innerHTML = rows.map(([k, v]) => `<div class="di-row">
-      <span class="di-k">${esc(k)}</span><span class="di-v">${esc(v)}</span>
-      <button class="di-copy" type="button" data-copy="${esc(v)}">Copy</button></div>`).join("");
-    box.querySelectorAll(".di-copy").forEach((b) => b.addEventListener("click", () => {
-      if (navigator.clipboard) navigator.clipboard.writeText(b.dataset.copy).catch(() => {});
-      const t = b.textContent; b.textContent = "Copied"; setTimeout(() => { b.textContent = t; }, 1200);
-    }));
-  } else {
-    box.innerHTML = '<p class="muted small">Your Treadwell representative will send you the bank-transfer details. You can still confirm below once you\'ve sent it.</p>';
-  }
+  // No pre-configured Treadwell bank details are displayed — the customer records
+  // where they sent the transfer in the ACH form ("Where you sent it").
 
   $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
   // "Date sent" starts blank — don't prefill today's date (the customer may have
@@ -459,14 +440,14 @@ function setupDeposit() {
   // If a deposit was already submitted (and not yet marked received), show a
   // recorded state instead of a fresh form — so a reload / second device doesn't
   // invite an accidental duplicate submission. "Update or resend" reveals the form.
-  const recorded = $("deposit-recorded"), form = $("ach-form");
+  const recorded = $("deposit-recorded"), form = $("ach-form"), intro = $("deposit-intro");
   if (dep.submitted) {
     const when = dep.submitted_sent_date ? ` sent ${dep.submitted_sent_date}` : "";
     const meth = dep.submitted_method === "check" ? "check" : "bank transfer";
     $("deposit-recorded-msg").textContent = `Thanks — we've recorded your ${meth}${when}. We'll mark your deposit Received once it lands in our account.`;
-    show(recorded); hide(form);
-  } else { hide(recorded); show(form); }
-  $("deposit-resend").onclick = () => { hide(recorded); show(form); };
+    show(recorded); hide(form); hide(intro);   // hide the "send + record below" intro once recorded
+  } else { hide(recorded); show(form); show(intro); }
+  $("deposit-resend").onclick = () => { hide(recorded); show(form); show(intro); };
 
   const tabAch = $("tab-ach"), tabCheck = $("tab-check");
   const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-pane")); hide($("check-instructions")); };
@@ -564,6 +545,10 @@ $("ach-form").addEventListener("submit", async (e) => {
   const res = await api("POST", "/deposit", {
     method: "ach", account_name, bank_name: $("ach-bank").value.trim(),
     sent_date: $("ach-sent-date").value || "", trace_ref: $("ach-trace").value.trim(), note: $("ach-note").value.trim(),
+    sent_to_beneficiary: $("ach-sent-to-beneficiary").value.trim(),
+    sent_to_bank: $("ach-sent-to-bank").value.trim(),
+    sent_to_routing: $("ach-sent-to-routing").value.trim(),
+    sent_to_account: $("ach-sent-to-account").value.trim(),
   });
   btn.disabled = false; btn.textContent = "I've sent the transfer";
   if (handleExpired(res, $("deposit-alert"))) return;

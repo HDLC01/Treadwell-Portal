@@ -176,6 +176,14 @@ create unique index if not exists portal_questions_email_uidx
 alter table public.portal_deposits add column if not exists sent_date date;
 alter table public.portal_deposits add column if not exists trace_ref text;
 
+-- Self-recorded transfer: the customer types WHERE they sent the deposit (the
+-- destination account details) so staff can reconcile it. No pre-configured
+-- Treadwell bank details live in the app anymore.
+alter table public.portal_deposits add column if not exists sent_to_beneficiary text;
+alter table public.portal_deposits add column if not exists sent_to_bank text;
+alter table public.portal_deposits add column if not exists sent_to_routing text;
+alter table public.portal_deposits add column if not exists sent_to_account text;
+
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,
 -- plus optional accounts-payable / billing). contacts_status gates the new

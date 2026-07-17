@@ -361,7 +361,8 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm["deposit"] = {
         "due": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
         "ref": proposals.deposit_ref(p["proposal_id"]),
-        "instructions": _deposit_instructions(),
+        # No pre-configured Treadwell bank details are shown; the customer records
+        # where they sent the transfer themselves (see the ACH form).
         # so the customer sees a "recorded" state on reload instead of a blank
         # form they might resubmit (deposit_status only flips when staff confirm).
         "submitted": bool(_latest),
@@ -511,6 +512,13 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     bank_name = _cap(body.get("bank_name"), 120) or None
     note = _cap(body.get("note"), 1000) or None
     trace_ref = _cap(body.get("trace_ref"), 60) or None
+    # Customer-recorded destination ("where you sent it"). This is Treadwell's own
+    # receiving account (self-reported by the customer for reconciliation), not the
+    # customer's account — the source account number is still never collected.
+    sent_to_beneficiary = _cap(body.get("sent_to_beneficiary"), 120) or None
+    sent_to_bank = _cap(body.get("sent_to_bank"), 120) or None
+    sent_to_routing = _cap(body.get("sent_to_routing"), 40) or None
+    sent_to_account = _cap(body.get("sent_to_account"), 40) or None
     # account_last4 is optional and only ever stored masked (never the full number).
     last4 = "".join(ch for ch in (body.get("account_last4") or "") if ch.isdigit())[-4:]
     masked_ref = f"••••{last4}" if last4 else None
@@ -520,7 +528,9 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         sent_date = None
 
     db.add_deposit(p["proposal_id"], method, account_name, bank_name, masked_ref, note,
-                   sent_date=sent_date, trace_ref=trace_ref)
+                   sent_date=sent_date, trace_ref=trace_ref,
+                   sent_to_beneficiary=sent_to_beneficiary, sent_to_bank=sent_to_bank,
+                   sent_to_routing=sent_to_routing, sent_to_account=sent_to_account)
     project_name = p.get("project_name") or "proposal"
     ref = proposals.deposit_ref(p["proposal_id"])
     # A system line records it in the chat so both sides see the deposit is in flight.
@@ -536,7 +546,10 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         f"on the statement.</p>"
         f"<p>From: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
         f"Sent: {sent_date or '—'} · Trace: {html.escape(trace_ref or '—')}{f' · Acct {masked_ref}' if masked_ref else ''}</p>"
-        f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
+        + (f"<p>Sent to (customer-recorded): {html.escape(sent_to_beneficiary or '—')} · "
+           f"Bank: {html.escape(sent_to_bank or '—')} · Routing: {html.escape(sent_to_routing or '—')} · "
+           f"Acct: {html.escape(sent_to_account or '—')}</p>" if method == "ach" else "")
+        + f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]),
     )
     return _json({"ok": True})
@@ -899,6 +912,8 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "masked_ref": d.get("masked_ref"), "note": d.get("note"),
             "sent_date": d["sent_date"].isoformat() if d.get("sent_date") else None,
             "trace_ref": d.get("trace_ref"),
+            "sent_to_beneficiary": d.get("sent_to_beneficiary"), "sent_to_bank": d.get("sent_to_bank"),
+            "sent_to_routing": d.get("sent_to_routing"), "sent_to_account": d.get("sent_to_account"),
             "submitted_at": d["submitted_at"].isoformat() if d.get("submitted_at") else None,
         } for d in db.list_deposits(proposal_id)],
     })

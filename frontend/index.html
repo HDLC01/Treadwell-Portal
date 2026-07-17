@@ -146,9 +146,14 @@
             <span id="deposit-recorded-msg"></span>
             <button class="linkbtn" id="deposit-resend" type="button" style="margin-left:6px">Update or resend</button>
           </div>
-          <div class="alert info" id="deposit-intro">Send a bank transfer (ACH or wire) from your bank for the amount below, and include the reference in the memo so we can match it. Then let us know you've sent it.</div>
-          <div id="deposit-instructions" class="deposit-instructions"></div>
+          <div class="alert info" id="deposit-intro">Your Treadwell representative will send you the bank details to transfer the deposit to. Send it for the amount shown above and put the reference in the transfer memo. Once you've sent it, record the details below so we can match it.</div>
           <form id="ach-form" class="stack" style="margin-top:16px" novalidate>
+            <p class="deposit-section-label">Where you sent it</p>
+            <div class="field"><label for="ach-sent-to-beneficiary">Beneficiary / account name</label><input id="ach-sent-to-beneficiary" type="text"></div>
+            <div class="field"><label for="ach-sent-to-bank">Bank</label><input id="ach-sent-to-bank" type="text"></div>
+            <div class="field"><label for="ach-sent-to-routing">Routing number</label><input id="ach-sent-to-routing" type="text" inputmode="numeric" autocomplete="off"></div>
+            <div class="field"><label for="ach-sent-to-account">Account number</label><input id="ach-sent-to-account" type="text" inputmode="numeric" autocomplete="off"></div>
+            <p class="deposit-section-label">Your details</p>
             <div class="field"><label for="ach-acct-name">Name on the account you sent from <span class="req">*</span></label><input id="ach-acct-name" type="text" autocomplete="name" required></div>
             <div class="field"><label for="ach-bank">Your bank</label><input id="ach-bank" type="text"></div>
             <div class="field"><label for="ach-sent-date">Date sent</label><input id="ach-sent-date" type="date"></div>
