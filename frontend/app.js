@@ -278,7 +278,10 @@ function contactRow(c, i) {
 function renderPdf(has) {
   if (!has) { hide($("pdf-card")); return; }
   show($("pdf-card"));
-  $("pdf-link").href = `/api/portal/${TOKEN}/pdf`;
+  const src = `/api/portal/${TOKEN}/pdf`;
+  $("pdf-link").href = src;
+  $("pdf-modal-link").href = src;
+  $("pdf-modal-title").textContent = (STATE && STATE.project_name) || "Your proposal";
 }
 
 // ── chat thread ──────────────────────────────────────────────────────────────
@@ -329,7 +332,6 @@ function applyHashView(scroll) {
   const wantProposal = location.hash.replace("#", "") === "proposal";
   if (wantProposal) {
     hide($("chat-view")); show($("proposal-view"));
-    mountPdf();
     if (scroll) window.scrollTo({ top: 0, behavior: "smooth" });   // only on a user nav, not a poll refetch
   } else {
     show($("chat-view")); hide($("proposal-view"));
@@ -337,8 +339,9 @@ function applyHashView(scroll) {
 }
 window.addEventListener("hashchange", () => applyHashView(true));
 
-// ── PDF iframe: mount lazily on first proposal-view entry (upstream render is a
-// full docx + LibreOffice pass; never trigger it on the chat landing) ──────────
+// ── PDF: opens in a full-screen popup (the native viewer needs room; a card is
+// unusable). Mount the iframe lazily on first open — the upstream render is a
+// full docx + LibreOffice pass, so only customers who open it trigger it. ──────
 let PDF_MOUNTED = false;
 function mountPdf() {
   if (PDF_MOUNTED || !STATE || !STATE.has_pdf) return;
@@ -347,10 +350,19 @@ function mountPdf() {
   const ifr = document.createElement("iframe");
   ifr.className = "pdf-frame";
   ifr.title = "Proposal PDF";
-  ifr.setAttribute("loading", "lazy");
   ifr.addEventListener("load", () => { const l = $("pdf-loading"); if (l) l.remove(); });
   ifr.src = `/api/portal/${TOKEN}/pdf`;
   wrap.appendChild(ifr);
+}
+function openPdfModal() {
+  if (!STATE || !STATE.has_pdf) return;
+  show($("pdf-modal")); show($("pdf-scrim"));
+  document.body.style.overflow = "hidden";   // lock the page behind the popup
+  mountPdf();
+}
+function closePdfModal() {
+  hide($("pdf-modal")); hide($("pdf-scrim"));
+  document.body.style.overflow = "";   // iframe stays mounted → reopening is instant
 }
 
 // ── polling: pull new chat messages + detect status changes ───────────────────
@@ -457,6 +469,12 @@ $("approve-form").addEventListener("submit", async (e) => {
 });
 
 $("back-to-chat").addEventListener("click", () => { location.hash = "chat"; });
+
+// PDF popup: open from the card, close via ×, scrim, or Esc.
+$("pdf-open").addEventListener("click", openPdfModal);
+$("pdf-close").addEventListener("click", closePdfModal);
+$("pdf-scrim").addEventListener("click", closePdfModal);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePdfModal(); });
 
 $("qa-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("qa-alert"));

@@ -86,13 +86,14 @@
 
         <div class="card hidden" id="pdf-card">
           <h2>Official proposal document</h2>
-          <div class="pdf-frame-wrap" id="pdf-frame-wrap">
-            <div class="pdf-loading" id="pdf-loading"><span class="spinner"></span> Loading your proposal document…</div>
+          <p class="muted small" style="margin-top:0">Your full Treadwell proposal, with pricing, scope, and terms.</p>
+          <div class="row" style="gap:10px;flex-wrap:wrap">
+            <button class="btn btn-primary" id="pdf-open" type="button">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+              View proposal document
+            </button>
+            <a class="btn btn-secondary" id="pdf-link" href="#" target="_blank" rel="noopener">Open in a new tab</a>
           </div>
-          <a class="btn btn-secondary" id="pdf-link" href="#" target="_blank" rel="noopener" style="margin-top:12px">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-            Open full PDF
-          </a>
         </div>
 
         <div class="card" id="options-card">
@@ -163,6 +164,21 @@
       </div><!-- /#proposal-view -->
     </section>
   </main>
+
+  <!-- Full-screen proposal-PDF popup (lives at body level so a poll re-render can't close it) -->
+  <div id="pdf-scrim" class="hidden"></div>
+  <div id="pdf-modal" class="hidden" role="dialog" aria-modal="true" aria-label="Proposal document">
+    <div class="pdf-modal-head">
+      <span id="pdf-modal-title">Your proposal</span>
+      <div class="pdf-modal-actions">
+        <a id="pdf-modal-link" href="#" target="_blank" rel="noopener" class="linkbtn">Open in a new tab</a>
+        <button id="pdf-close" class="pdf-close" type="button" aria-label="Close">&times;</button>
+      </div>
+    </div>
+    <div class="pdf-frame-wrap" id="pdf-frame-wrap">
+      <div class="pdf-loading" id="pdf-loading"><span class="spinner"></span> Loading your proposal document…</div>
+    </div>
+  </div>
 
   <script src="/auth.js"></script>
   <script src="/app.js"></script>
