@@ -86,14 +86,17 @@
 
         <div class="card hidden" id="pdf-card">
           <h2>Official proposal document</h2>
-          <p class="muted small" style="margin-top:0">Your full Treadwell proposal, with pricing, scope, and terms.</p>
-          <div class="row" style="gap:10px;flex-wrap:wrap">
-            <button class="btn btn-primary" id="pdf-open" type="button">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-              View proposal document
-            </button>
-            <a class="btn btn-secondary" id="pdf-link" href="#" target="_blank" rel="noopener">Open in a new tab</a>
-          </div>
+          <p class="muted small" style="margin-top:0">Your full Treadwell proposal, with pricing, scope, and terms. Click it to open the full-size view.</p>
+          <button type="button" id="pdf-preview" class="pdf-preview" aria-label="Open the full proposal document">
+            <div class="pdf-preview-frame" id="pdf-inline-wrap">
+              <div class="pdf-loading" id="pdf-inline-loading"><span class="spinner"></span> Loading your proposal document…</div>
+            </div>
+            <span class="pdf-preview-hint" aria-hidden="true">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>
+              Click to enlarge
+            </span>
+          </button>
+          <a class="linkbtn" id="pdf-link" href="#" target="_blank" rel="noopener" style="display:inline-block;margin-top:10px">Open in a new tab</a>
         </div>
 
         <div class="card" id="options-card">

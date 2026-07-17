@@ -282,6 +282,7 @@ function renderPdf(has) {
   $("pdf-link").href = src;
   $("pdf-modal-link").href = src;
   $("pdf-modal-title").textContent = (STATE && STATE.project_name) || "Your proposal";
+  mountInlinePdf();   // website-style preview in the card; clicking it opens the full view
 }
 
 // ── chat thread ──────────────────────────────────────────────────────────────
@@ -351,6 +352,25 @@ function mountPdf() {
   ifr.className = "pdf-frame";
   ifr.title = "Proposal PDF";
   ifr.addEventListener("load", () => { const l = $("pdf-loading"); if (l) l.remove(); });
+  ifr.src = `/api/portal/${TOKEN}/pdf`;
+  wrap.appendChild(ifr);
+}
+
+// Inline website-style preview inside the card. Non-interactive (pointer-events
+// are disabled in CSS) so a click anywhere on it falls through to the #pdf-preview
+// button, which opens the full-size popup. Mounted once, on first render.
+let INLINE_PDF_MOUNTED = false;
+function mountInlinePdf() {
+  if (INLINE_PDF_MOUNTED || !STATE || !STATE.has_pdf) return;
+  const wrap = $("pdf-inline-wrap");
+  if (!wrap) return;
+  INLINE_PDF_MOUNTED = true;
+  const ifr = document.createElement("iframe");
+  ifr.className = "pdf-inline-frame";
+  ifr.title = "Proposal document preview";
+  ifr.setAttribute("tabindex", "-1");
+  ifr.setAttribute("aria-hidden", "true");
+  ifr.addEventListener("load", () => { const l = $("pdf-inline-loading"); if (l) l.remove(); });
   ifr.src = `/api/portal/${TOKEN}/pdf`;
   wrap.appendChild(ifr);
 }
@@ -470,8 +490,8 @@ $("approve-form").addEventListener("submit", async (e) => {
 
 $("back-to-chat").addEventListener("click", () => { location.hash = "chat"; });
 
-// PDF popup: open from the card, close via ×, scrim, or Esc.
-$("pdf-open").addEventListener("click", openPdfModal);
+// PDF: click the inline preview to open the full-size popup; close via ×, scrim, or Esc.
+$("pdf-preview").addEventListener("click", openPdfModal);
 $("pdf-close").addEventListener("click", closePdfModal);
 $("pdf-scrim").addEventListener("click", closePdfModal);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePdfModal(); });
