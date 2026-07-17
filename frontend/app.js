@@ -453,7 +453,8 @@ function setupDeposit() {
   }
 
   $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
-  const sd = $("ach-sent-date"); if (sd && !sd.value) sd.value = new Date().toISOString().slice(0, 10);
+  // "Date sent" starts blank — don't prefill today's date (the customer may have
+  // sent the transfer on a different day and could submit the wrong date).
 
   // If a deposit was already submitted (and not yet marked received), show a
   // recorded state instead of a fresh form — so a reload / second device doesn't
