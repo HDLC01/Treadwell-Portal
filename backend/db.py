@@ -349,12 +349,12 @@ def list_notify_recipients() -> list[dict[str, Any]]:
 
 def add_notify_recipient(email: str, kind: str, added_by: Optional[str] = None,
                          enabled: bool = True) -> None:
-    # on-conflict UPDATES enabled so re-adding an existing-but-disabled email
-    # (e.g. from the roster page) turns it back on instead of silently no-opping.
+    # on-conflict DO NOTHING: a duplicate add must never flip an existing person's
+    # green/gray state (you change that with the toggle, not by re-adding).
     execute(
         "insert into public.portal_notify_recipients (email, kind, enabled, added_by) "
         "values (%s,%s,%s,%s) "
-        "on conflict (kind, lower(email)) do update set enabled = excluded.enabled",
+        "on conflict (kind, lower(email)) do nothing",
         (email.strip().lower(), kind, enabled, added_by),
     )
 

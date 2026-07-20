@@ -1044,7 +1044,9 @@ async def admin_notify_add(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "invalid_email"}, 400)
     if len(db.list_notify_recipients()) >= _MAX_NOTIFY_RECIPIENTS:
         return _json({"ok": False, "error": "too_many"}, 400)
-    db.add_notify_recipient(email, kind, _cap(body.get("by"), 120) or None)
+    # New recipients start OFF (gray) — added to the roster but not emailed until an
+    # admin toggles them green. Adding someone must never silently start sending.
+    db.add_notify_recipient(email, kind, _cap(body.get("by"), 120) or None, enabled=False)
     return _json({"ok": True})
 
 
