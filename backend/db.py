@@ -376,6 +376,15 @@ def list_notify_overrides(proposal_id: str) -> list[dict[str, Any]]:
     )
 
 
+def list_all_notify_overrides() -> list[dict[str, Any]]:
+    """Every per-project override, for the Notification Sending page's per-project
+    view (one fetch instead of one-per-project)."""
+    return qall(
+        "select proposal_id, email, mode from public.portal_notify_overrides "
+        "order by proposal_id, lower(email)"
+    )
+
+
 def set_notify_override(proposal_id: str, email: str, mode: str) -> None:
     execute(
         "insert into public.portal_notify_overrides (proposal_id, email, mode) values (%s,%s,%s) "

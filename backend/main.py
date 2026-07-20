@@ -1066,6 +1066,15 @@ def admin_notify_delete(rid: int, request: Request) -> JSONResponse:
 
 
 # ── admin: per-project notification overrides (add extra / mute someone) ──────
+@app.get("/api/admin/notify-overrides")
+def admin_notify_overrides_all(request: Request) -> JSONResponse:
+    """Every per-project override at once — for the Notification Sending page's
+    per-project view (avoids one request per project)."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    return _json({"ok": True, "overrides": db.list_all_notify_overrides()})
+
+
 @app.get("/api/admin/proposal/{proposal_id}/notify-overrides")
 def admin_notify_overrides_get(proposal_id: str, request: Request) -> JSONResponse:
     if not _admin_ok(request):
