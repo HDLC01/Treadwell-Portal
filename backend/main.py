@@ -404,7 +404,7 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<p><strong>{html.escape(who or '')}</strong> asked a question on "
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
         f"<blockquote>{html.escape(text)}</blockquote>",
-        reply_link=_staff_link(p["proposal_id"]),
+        reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
     return _json({"ok": True, "question": _q(row), "message": _msg(row)})
 
@@ -482,7 +482,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
         f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>"
         f"<p>Project: {html.escape(project_name)}.</p>",
-        reply_link=_staff_link(p["proposal_id"]),
+        reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
     try:
         automations.run_on_approval(p, project_name)
@@ -557,7 +557,7 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         f"on the statement.</p>"
         + detail
         + f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
-        kind="deposit", reply_link=_staff_link(p["proposal_id"]),
+        kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
     return _json({"ok": True})
 
@@ -619,7 +619,7 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
     email_sender.notify_team(
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
-        reply_link=_staff_link(p["proposal_id"]),
+        reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
     return _json({"ok": True})
 
@@ -774,16 +774,23 @@ async def api_inbound_resend(request: Request):
         f"<blockquote>{esc_body}</blockquote>"
     )
     link = _staff_link(pid)
+    # ONE send, governed by the notification roster + this project's overrides — the
+    # same switch as every other portal notification (no separate hardcoded list).
+    # Sent via _send (not notify_team) so Reply-To stays the customer: a staff reply
+    # from their own inbox reaches the customer. Empty/muted roster → nobody emailed.
+    to = email_sender._resolve_notify("general", proposal_id=pid)
     try:
-        if config.INBOUND_FORWARD_EMAILS:
-            email_sender._send(config.INBOUND_FORWARD_EMAILS,
-                               f"Customer email reply — {project}",
-                               email_sender._wrap("Customer replied by email",
-                                                  fwd_html + f'<p><a href="{link}">Open in the proposal tool</a></p>'),
-                               reply_to=from_email or None)   # reply from your inbox goes to the customer
-        email_sender.notify_team(f"Customer email reply — {project}", fwd_html, reply_link=link)
+        if to:
+            email_sender._send(
+                to,
+                f"Customer email reply — {project}",
+                email_sender._wrap("Customer replied by email",
+                                   fwd_html + f'<p><a href="{link}">Open in the proposal tool</a></p>'),
+                reply_to=from_email or None)
+        else:
+            log.info("inbound: no notify recipients after roster/overrides for %s", pid)
     except Exception as exc:  # noqa: BLE001 — the CRM insert already happened
-        log.error("inbound: forward/notify failed: %s", exc)
+        log.error("inbound: forward failed: %s", exc)
     return _json({"ok": True, "verified": verified})
 
 
@@ -1010,8 +1017,8 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
-# ── admin: configurable team-notification recipients ──────────────────────────
-_MAX_NOTIFY_RECIPIENTS = 20
+# ── admin: configurable team-notification recipients (roster) ─────────────────
+_MAX_NOTIFY_RECIPIENTS = 40
 
 
 @app.get("/api/admin/notify-recipients")
@@ -1019,7 +1026,8 @@ def admin_notify_list(request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     return _json({"ok": True, "recipients": [
-        {"id": r["id"], "email": r["email"], "kind": r["kind"], "added_by": r.get("added_by")}
+        {"id": r["id"], "email": r["email"], "kind": r["kind"],
+         "enabled": bool(r.get("enabled", True)), "added_by": r.get("added_by")}
         for r in db.list_notify_recipients()]})
 
 
@@ -1040,11 +1048,55 @@ async def admin_notify_add(request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
+@app.patch("/api/admin/notify-recipients/{rid}")
+async def admin_notify_toggle(rid: int, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    db.set_notify_recipient_enabled(rid, bool(body.get("enabled")))
+    return _json({"ok": True})
+
+
 @app.delete("/api/admin/notify-recipients/{rid}")
 def admin_notify_delete(rid: int, request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     db.delete_notify_recipient(rid)
+    return _json({"ok": True})
+
+
+# ── admin: per-project notification overrides (add extra / mute someone) ──────
+@app.get("/api/admin/proposal/{proposal_id}/notify-overrides")
+def admin_notify_overrides_get(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    # Return the roster (enabled state) + this project's overrides so the drawer can
+    # show each person's EFFECTIVE state without a second roster fetch.
+    return _json({"ok": True,
+                  "roster": [{"email": r["email"], "enabled": bool(r.get("enabled", True))}
+                             for r in db.list_notify_recipients() if r["kind"] == "general"],
+                  "overrides": db.list_notify_overrides(proposal_id)})
+
+
+@app.put("/api/admin/proposal/{proposal_id}/notify-overrides")
+async def admin_notify_overrides_set(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    email = (body.get("email") or "").strip().lower()
+    mode = (body.get("mode") or "").strip().lower()
+    if len(email) > 254 or not _EMAIL_RE.match(email):
+        return _json({"ok": False, "error": "invalid_email"}, 400)
+    if mode == "clear":
+        db.clear_notify_override(proposal_id, email)
+    elif mode in ("add", "mute"):
+        db.set_notify_override(proposal_id, email, mode)
+    else:
+        return _json({"ok": False, "error": "invalid_mode"}, 400)
     return _json({"ok": True})
 
 

@@ -141,15 +141,33 @@ create table if not exists public.portal_notify_recipients (
   id         bigint generated always as identity primary key,
   email      text not null,
   kind       text not null default 'general' check (kind in ('general','deposit')),
+  enabled    boolean not null default true,   -- green (receives portal notifs) / gray (off)
   added_by   text,
   created_at timestamptz not null default now()
 );
+-- Existing installs: add the on/off toggle column (the create-table above is a
+-- no-op there). Governs whether a roster member actually receives notifications.
+alter table public.portal_notify_recipients add column if not exists enabled boolean not null default true;
 create unique index if not exists portal_notify_recipients_unique_idx
   on public.portal_notify_recipients (kind, lower(email));
 insert into public.portal_notify_recipients (email, kind)
 select v.email, 'general'
-from (values ('kyle@wetreadwell.com'), ('kylene@wetreadwell.com'), ('rj@wetreadwell.com')) as v(email)
+from (values ('hanz@wetreadwell.com'), ('will@wetreadwell.com')) as v(email)
 where not exists (select 1 from public.portal_notify_recipients);
+
+-- Per-project notification overrides: assign an extra person to ONE project's
+-- notifications ('add'), or let someone opt OUT of one project ('mute'). Applied
+-- on top of the enabled roster at send time (mute wins over add). Mirrors
+-- portal_proposal_recipients (the customer-side per-project scoping table).
+create table if not exists public.portal_notify_overrides (
+  id           bigint generated always as identity primary key,
+  proposal_id  text not null references public.portal_proposals(proposal_id) on delete cascade,
+  email        text not null,
+  mode         text not null check (mode in ('add','mute')),
+  created_at   timestamptz not null default now()
+);
+create unique index if not exists portal_notify_overrides_unique_idx
+  on public.portal_notify_overrides (proposal_id, lower(email));
 
 -- ── V1 revamp: multi-select pricing → summed approval + 25% deposit ───────────
 -- A customer may now approve MULTIPLE published options. approved_options holds
@@ -224,4 +242,5 @@ alter table public.portal_sessions    enable row level security;
 alter table public.portal_deposits    enable row level security;
 alter table public.portal_proposal_recipients enable row level security;
 alter table public.portal_notify_recipients enable row level security;
+alter table public.portal_notify_overrides enable row level security;
 alter table public.portal_contacts enable row level security;

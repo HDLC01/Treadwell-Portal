@@ -68,6 +68,12 @@ grant select, insert, update, delete on public.portal_notify_recipients to porta
 drop policy if exists portal_app_rw on public.portal_notify_recipients;
 create policy portal_app_rw on public.portal_notify_recipients for all to portal_app using (true) with check (true);
 
+-- Notification Sending: per-project notify overrides (portal-owned). The POLICY is
+-- required — RLS is enabled in schema.sql, so grants without a policy = default-deny.
+grant select, insert, update, delete on public.portal_notify_overrides to portal_app;
+drop policy if exists portal_app_rw on public.portal_notify_overrides;
+create policy portal_app_rw on public.portal_notify_overrides for all to portal_app using (true) with check (true);
+
 -- V1 revamp: project contacts collected after the deposit (portal-owned).
 grant select, insert, update, delete on public.portal_contacts to portal_app;
 drop policy if exists portal_app_rw on public.portal_contacts;

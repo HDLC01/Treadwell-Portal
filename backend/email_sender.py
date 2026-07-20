@@ -129,35 +129,80 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
                  _thread_headers(email), reply_to=reply_to)
 
 
-def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit) -> list[str]:
-    """Pure recipient resolution for team notifications. Configured DB rows win;
-    a 'deposit' alert prefers deposit-kind rows, then general rows, then the
-    deposit env list; a 'general' alert uses general rows then the general env
-    list. Empty DB → env fallback, so the feature is safe before anyone
-    configures recipients."""
+def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit,
+                              adds=(), mutes=(), configured=None) -> list[str]:
+    """Pure recipient resolution for team notifications, fully driven by the
+    UI-managed roster (not hardcoded env). Base list: when the roster is CONFIGURED
+    (any rows exist), a 'deposit' alert prefers deposit-kind rows then general rows,
+    a 'general' alert uses general rows. Then per-project overrides apply: union
+    `adds`, subtract `mutes` (mute wins over add) — case-insensitive, order-preserving,
+    deduped.
+
+    `configured` tells apart two empty states: an UNCONFIGURED roster (no rows at all,
+    e.g. fresh install) falls back to the env list, but a CONFIGURED roster whose
+    enabled bucket is empty (everyone toggled off) sends to NOBODY — it must NOT
+    resurrect the env default inbox. `configured=None` infers from the rows passed
+    (back-compat for callers that pass only the 5 base args)."""
+    if configured is None:
+        configured = bool(general_rows or deposit_rows)
     if kind == "deposit":
-        return list(deposit_rows or general_rows or env_deposit)
-    return list(general_rows or env_general)
+        base = list(deposit_rows or general_rows) if configured else list(env_deposit)
+    else:
+        base = list(general_rows) if configured else list(env_general)
+    mute_set = {m.strip().lower() for m in (mutes or []) if m}
+    out, seen = [], set()
+    for e in list(base) + list(adds or []):
+        if not e:
+            continue
+        key = e.strip().lower()
+        if key in seen or key in mute_set:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
 
 
-def _resolve_notify(kind: str) -> list[str]:
-    general, deposit = [], []
+def _resolve_notify(kind: str, proposal_id: str | None = None) -> list[str]:
+    """Resolve recipients from the roster (enabled rows only) plus this proposal's
+    per-project overrides. On DB failure, fall back to env (don't go silent just
+    because the table was momentarily unreachable)."""
+    general, deposit, adds, mutes = [], [], [], []
+    configured = False
     try:
         import db  # local import: avoid a hard DB dependency at module import time
-        for r in db.list_notify_recipients():
+        rows = db.list_notify_recipients()
+        configured = bool(rows)
+        for r in rows:
+            if not r.get("enabled", True):   # gray toggle → excluded
+                continue
             (deposit if r.get("kind") == "deposit" else general).append(r["email"])
     except Exception as exc:  # noqa: BLE001 — DB down / table missing → env fallback
         log.warning("notify-recipient lookup failed (%s); using env fallback", exc)
-    return resolve_notify_recipients(general, deposit, kind, config.NOTIFY_EMAILS, config.DEPOSIT_NOTIFY_EMAILS)
+        configured = False
+    if proposal_id:
+        # Separate try: an overrides-fetch failure must NOT discard the roster we
+        # just loaded (or it would silently fall back to the env list).
+        try:
+            import db
+            for o in db.list_notify_overrides(proposal_id):
+                (adds if o.get("mode") == "add" else mutes).append(o["email"])
+        except Exception as exc:  # noqa: BLE001 — ignore overrides, keep the roster
+            log.warning("notify-override lookup failed (%s); ignoring per-project overrides", exc)
+    return resolve_notify_recipients(general, deposit, kind, config.NOTIFY_EMAILS,
+                                     config.DEPOSIT_NOTIFY_EMAILS, adds=adds, mutes=mutes,
+                                     configured=configured)
 
 
 def notify_team(subject: str, body_html: str, kind: str = "general",
-                recipients: list[str] | None = None, reply_link: str | None = None) -> bool:
+                recipients: list[str] | None = None, reply_link: str | None = None,
+                proposal_id: str | None = None) -> bool:
     """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
-    `kind` from the configurable table with env fallback. `reply_link` appends a
-    "Reply in Portal" button that deep-links staff to the proposal in the staff
-    tool (so they answer in-portal, not by replying to the email)."""
-    to = recipients if recipients is not None else _resolve_notify(kind)
+    `kind` from the UI-managed roster, applying this proposal's per-project overrides
+    (`proposal_id`). `reply_link` appends a "Reply in Portal" button that deep-links
+    staff to the proposal in the staff tool (so they answer in-portal, not by email)."""
+    to = recipients if recipients is not None else _resolve_notify(kind, proposal_id)
+    if not to:
+        log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
     if reply_link:
         body_html += (
             f'<p style="margin-top:16px"><a href="{reply_link}" style="background:#0ea5e9;color:#fff;'

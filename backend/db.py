@@ -339,24 +339,56 @@ def has_email_message(proposal_id: str, email_id: str) -> bool:
     ) is not None
 
 
-# ── Team notification recipients (configurable; falls back to env when empty) ───
+# ── Team notification recipients (configurable roster; falls back to env when empty) ─
 def list_notify_recipients() -> list[dict[str, Any]]:
     return qall(
-        "select id, email, kind, added_by, created_at from public.portal_notify_recipients "
+        "select id, email, kind, enabled, added_by, created_at from public.portal_notify_recipients "
         "order by kind, lower(email)"
     )
 
 
-def add_notify_recipient(email: str, kind: str, added_by: Optional[str] = None) -> None:
+def add_notify_recipient(email: str, kind: str, added_by: Optional[str] = None,
+                         enabled: bool = True) -> None:
+    # on-conflict UPDATES enabled so re-adding an existing-but-disabled email
+    # (e.g. from the roster page) turns it back on instead of silently no-opping.
     execute(
-        "insert into public.portal_notify_recipients (email, kind, added_by) values (%s,%s,%s) "
-        "on conflict (kind, lower(email)) do nothing",
-        (email.strip().lower(), kind, added_by),
+        "insert into public.portal_notify_recipients (email, kind, enabled, added_by) "
+        "values (%s,%s,%s,%s) "
+        "on conflict (kind, lower(email)) do update set enabled = excluded.enabled",
+        (email.strip().lower(), kind, enabled, added_by),
     )
+
+
+def set_notify_recipient_enabled(rid: int, enabled: bool) -> None:
+    execute("update public.portal_notify_recipients set enabled=%s where id=%s", (enabled, rid))
 
 
 def delete_notify_recipient(rid: int) -> None:
     execute("delete from public.portal_notify_recipients where id=%s", (rid,))
+
+
+# ── Per-project notify overrides ('add' extra person / 'mute' someone for ONE project) ─
+def list_notify_overrides(proposal_id: str) -> list[dict[str, Any]]:
+    return qall(
+        "select email, mode from public.portal_notify_overrides where proposal_id=%s "
+        "order by lower(email)",
+        (proposal_id,),
+    )
+
+
+def set_notify_override(proposal_id: str, email: str, mode: str) -> None:
+    execute(
+        "insert into public.portal_notify_overrides (proposal_id, email, mode) values (%s,%s,%s) "
+        "on conflict (proposal_id, lower(email)) do update set mode = excluded.mode",
+        (proposal_id, email.strip().lower(), mode),
+    )
+
+
+def clear_notify_override(proposal_id: str, email: str) -> None:
+    execute(
+        "delete from public.portal_notify_overrides where proposal_id=%s and lower(email)=lower(%s)",
+        (proposal_id, email),
+    )
 
 
 # ── Approvals ───────────────────────────────────────────────────────────────────

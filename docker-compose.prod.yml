@@ -33,7 +33,7 @@ services:
       # <token>@piaxenoizh.resend.app → prod webhook → CRM thread. RESEND_WEBHOOK_SECRET
       # lives in .env on the VPS. Captured replies are forwarded to the team below.
       RESEND_INBOUND_DOMAIN: "piaxenoizh.resend.app"
-      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com,will@wetreadwell.com,kyle@wetreadwell.com"
+      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com,will@wetreadwell.com"
     networks:
       - shared
 
