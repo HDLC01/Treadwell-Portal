@@ -34,17 +34,12 @@ RATE_WINDOW_SEC = int(_env("PORTAL_RATE_WINDOW_SEC", "900"))            # 15 min
 RATE_REQUESTS_PER_IP = int(_env("PORTAL_RATE_PER_IP", "40"))            # auth POSTs per IP per window
 
 # ── Deposit (shown to the customer; exact instructions provided by Treadwell) ──
+# Cheque mailing address + who the cheque is payable to. Set the real address in
+# the VPS .env (never committed) — the defaults are placeholders until then.
+# ACH needs no bank details here: the customer self-records where they sent the
+# transfer, so we never store Treadwell's receiving account in the app.
 CHECK_ADDRESS = _env("PORTAL_CHECK_ADDRESS", "Treadwell — Attn: Accounts Receivable (mailing address provided by your representative)")
-
-# Bank-transfer (ACH/wire) beneficiary details shown on the deposit card. The
-# customer PUSHES the transfer from their own bank, so these are TREADWELL's
-# receiving-account details — we never collect the customer's account number.
-# Set ONLY in the VPS .env (never committed); all four unset → the card shows a
-# "your rep will provide instructions" fallback.
-DEPOSIT_BENEFICIARY = _env("PORTAL_DEPOSIT_BENEFICIARY", "")
-DEPOSIT_BANK = _env("PORTAL_DEPOSIT_BANK", "")
-DEPOSIT_ROUTING = _env("PORTAL_DEPOSIT_ROUTING", "")
-DEPOSIT_ACCOUNT = _env("PORTAL_DEPOSIT_ACCOUNT", "")
+PAYABLE_TO = _env("PORTAL_DEPOSIT_PAYABLE_TO", "Treadwell")
 
 # ── Service token (admin proposal tool -> this portal /api/notify) ────────────
 SERVICE_TOKEN = _env("SERVICE_TOKEN")

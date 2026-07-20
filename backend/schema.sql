@@ -184,6 +184,11 @@ alter table public.portal_deposits add column if not exists sent_to_bank text;
 alter table public.portal_deposits add column if not exists sent_to_routing text;
 alter table public.portal_deposits add column if not exists sent_to_account text;
 
+-- Pay-by-check: the customer records the check number off the cheque they mailed
+-- (we never ask for the MICR routing/account — staff read those off the physical
+-- cheque on arrival). `account_name` reuse = the name printed on the check.
+alter table public.portal_deposits add column if not exists check_number text;
+
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,
 -- plus optional accounts-payable / billing). contacts_status gates the new

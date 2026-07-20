@@ -429,30 +429,37 @@ function setupDeposit() {
     ? `Deposit due: ${due} (25% of your total). Reference: ${ref}`
     : (ref ? `Reference: ${ref}` : "");
   if ($("check-ref")) $("check-ref").textContent = ref;
-
-  // No pre-configured Treadwell bank details are displayed — the customer records
-  // where they sent the transfer in the ACH form ("Where you sent it").
-
+  if ($("check-payable")) $("check-payable").textContent = (STATE && STATE.payable_to) || "Treadwell";
   $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
-  // "Date sent" starts blank — don't prefill today's date (the customer may have
-  // sent the transfer on a different day and could submit the wrong date).
+  // No pre-configured Treadwell bank details are displayed — for ACH the customer
+  // records where they sent the transfer; for a check they record the check number.
+  // Neither "date" field is prefilled with today (the customer may have sent it on
+  // a different day and could submit the wrong date).
 
-  // If a deposit was already submitted (and not yet marked received), show a
-  // recorded state instead of a fresh form — so a reload / second device doesn't
-  // invite an accidental duplicate submission. "Update or resend" reveals the form.
-  const recorded = $("deposit-recorded"), form = $("ach-form"), intro = $("deposit-intro");
-  if (dep.submitted) {
-    const when = dep.submitted_sent_date ? ` sent ${dep.submitted_sent_date}` : "";
-    const meth = dep.submitted_method === "check" ? "check" : "bank transfer";
-    $("deposit-recorded-msg").textContent = `Thanks — we've recorded your ${meth}${when}. We'll mark your deposit Received once it lands in our account.`;
-    show(recorded); hide(form); hide(intro);   // hide the "send + record below" intro once recorded
-  } else { hide(recorded); show(form); show(intro); }
-  $("deposit-resend").onclick = () => { hide(recorded); show(form); show(intro); };
-
+  const tabs = $("deposit-tabs"), achPane = $("ach-pane"), checkPane = $("check-instructions");
   const tabAch = $("tab-ach"), tabCheck = $("tab-check");
-  const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show($("ach-pane")); hide($("check-instructions")); };
-  const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide($("ach-pane")); show($("check-instructions")); };
+  const showAch = () => { tabAch.setAttribute("aria-pressed", "true"); tabCheck.setAttribute("aria-pressed", "false"); show(achPane); hide(checkPane); };
+  const showCheck = () => { tabAch.setAttribute("aria-pressed", "false"); tabCheck.setAttribute("aria-pressed", "true"); hide(achPane); show(checkPane); };
   tabAch.onclick = showAch; tabCheck.onclick = showCheck;
+
+  // If a deposit was already submitted (and not yet marked received), show a shared
+  // recorded banner and hide the tabs + BOTH panes — so a reload / second device
+  // can't invite a duplicate submission (either method). "Update or resend" reopens
+  // the form on whichever method was used (deposit_status only flips when staff confirm).
+  const recorded = $("deposit-recorded");
+  const reopen = () => { hide(recorded); show(tabs); (dep.submitted_method === "check" ? showCheck : showAch)(); };
+  if (dep.submitted) {
+    const isCheck = dep.submitted_method === "check";
+    const extra = isCheck
+      ? (dep.submitted_check_number ? ` (check #${dep.submitted_check_number})` : "")
+      : (dep.submitted_sent_date ? ` sent ${dep.submitted_sent_date}` : "");
+    $("deposit-recorded-msg").textContent =
+      `Thanks — we've recorded your ${isCheck ? "check" : "bank transfer"}${extra}. We'll mark your deposit Received once it lands in our account.`;
+    show(recorded); hide(tabs); hide(achPane); hide(checkPane);
+  } else {
+    hide(recorded); show(tabs); showAch();
+  }
+  $("deposit-resend").onclick = reopen;
 }
 
 // ── actions (handlers attach once; elements exist in the hidden #portal) ──────────
@@ -559,13 +566,22 @@ $("ach-form").addEventListener("submit", async (e) => {
   alertBox($("deposit-alert"), "success", "Thank you — we've noted your transfer. We'll mark your deposit Received once it lands in our account.");
 });
 
-$("check-ack").addEventListener("click", async () => {
-  clearAlert($("deposit-alert"));
-  const res = await api("POST", "/deposit", { method: "check" });
+$("check-form").addEventListener("submit", async (e) => {
+  e.preventDefault(); clearAlert($("deposit-alert"));
+  const check_number = $("check-number").value.trim();
+  const account_name = $("check-name").value.trim();
+  if (!check_number) { alertBox($("deposit-alert"), "error", "Please enter the check number."); $("check-number").focus(); return; }
+  if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name printed on the check."); $("check-name").focus(); return; }
+  const btn = $("check-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const res = await api("POST", "/deposit", {
+    method: "check", check_number, account_name,
+    bank_name: $("check-bank").value.trim(), sent_date: $("check-sent-date").value || "", note: $("check-note").value.trim(),
+  });
+  btn.disabled = false; btn.textContent = "I've mailed the check";
   if (handleExpired(res, $("deposit-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
-  const fresh = await api("GET", "");
+  const fresh = await api("GET", "");   // refetch → recorded state (prevents accidental re-submit)
   if (fresh.ok && fresh.data.view) renderPortal(fresh.data.view);
   alertBox($("deposit-alert"), "success", "Thanks for letting us know — we'll mark your deposit Received once the check arrives.");
 });

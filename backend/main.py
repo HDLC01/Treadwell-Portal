@@ -190,16 +190,6 @@ def _staff_link(proposal_id: str) -> str:
     return f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={proposal_id}"
 
 
-def _deposit_instructions() -> Optional[dict]:
-    """Treadwell's bank-transfer beneficiary details for the deposit card, or None
-    when not fully configured (the card then shows a rep-will-follow-up fallback).
-    The customer pushes the transfer to these — we never collect their account."""
-    if all((config.DEPOSIT_BENEFICIARY, config.DEPOSIT_BANK, config.DEPOSIT_ROUTING, config.DEPOSIT_ACCOUNT)):
-        return {"beneficiary": config.DEPOSIT_BENEFICIARY, "bank": config.DEPOSIT_BANK,
-                "routing": config.DEPOSIT_ROUTING, "account": config.DEPOSIT_ACCOUNT}
-    return None
-
-
 def _proposal_card(row: dict) -> dict:
     return {
         "token": row["token"],
@@ -356,6 +346,7 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm["messages"] = [_msg(m) for m in db.list_messages(p["proposal_id"])]   # full chat thread (chat UI)
     vm["contacts"] = [_contact(c) for c in db.list_contacts(p["proposal_id"])]
     vm["check_address"] = config.CHECK_ADDRESS
+    vm["payable_to"] = config.PAYABLE_TO
     _deps = db.list_deposits(p["proposal_id"])   # newest first
     _latest = _deps[0] if _deps else None
     vm["deposit"] = {
@@ -369,6 +360,7 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         "submitted_method": _latest["method"] if _latest else None,
         "submitted_sent_date": (_latest["sent_date"].isoformat()
                                 if _latest and _latest.get("sent_date") else None),
+        "submitted_check_number": _latest.get("check_number") if _latest else None,
     }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
@@ -526,29 +518,44 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         sent_date = date.fromisoformat(body["sent_date"]) if body.get("sent_date") else None
     except (ValueError, TypeError):
         sent_date = None
+    # Pay-by-check: the check number off the mailed cheque. Collapse inner
+    # whitespace (_cap only trims the ends) so it stays clean in the email + chat.
+    check_number = _cap(" ".join(str(body.get("check_number") or "").split()), 40) or None
 
     db.add_deposit(p["proposal_id"], method, account_name, bank_name, masked_ref, note,
                    sent_date=sent_date, trace_ref=trace_ref,
                    sent_to_beneficiary=sent_to_beneficiary, sent_to_bank=sent_to_bank,
-                   sent_to_routing=sent_to_routing, sent_to_account=sent_to_account)
+                   sent_to_routing=sent_to_routing, sent_to_account=sent_to_account,
+                   check_number=check_number)
     project_name = p.get("project_name") or "proposal"
     ref = proposals.deposit_ref(p["proposal_id"])
     # A system line records it in the chat so both sides see the deposit is in flight.
     who = account_name or "The customer"
-    action = f"sent a bank transfer{f' on {sent_date}' if sent_date else ''}" if method == "ach" else "is mailing a check"
+    action = (f"sent a bank transfer{f' on {sent_date}' if sent_date else ''}" if method == "ach"
+              else f"is mailing a check{f' (#{check_number})' if check_number else ''}")
     db.add_message(p["proposal_id"], "staff", None,
                    f"Deposit initiated — {who} {action} (ref {ref}). We'll confirm once it clears.",
                    msg_type="system")
+    if method == "ach":
+        detail = (
+            f"<p>From: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
+            f"Sent: {sent_date or '—'} · Trace: {html.escape(trace_ref or '—')}"
+            f"{f' · Acct {masked_ref}' if masked_ref else ''}</p>"
+            f"<p>Sent to (customer-recorded): {html.escape(sent_to_beneficiary or '—')} · "
+            f"Bank: {html.escape(sent_to_bank or '—')} · Routing: {html.escape(sent_to_routing or '—')} · "
+            f"Acct: {html.escape(sent_to_account or '—')}</p>"
+        )
+    else:   # check
+        detail = (
+            f"<p>Check #: {html.escape(check_number or '—')} · Name on check: {html.escape(account_name or '—')} · "
+            f"Bank: {html.escape(bank_name or '—')} · Sent: {sent_date or '—'}</p>"
+        )
     email_sender.notify_team(
         f"Deposit {'sent' if method == 'ach' else 'method'} — {project_name} ({ref})",
         f"<p>{'Bank transfer sent' if method == 'ach' else 'Paying by check'} for "
         f"<strong>{html.escape(project_name)}</strong> — match reference <strong>{html.escape(ref)}</strong> "
         f"on the statement.</p>"
-        f"<p>From: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
-        f"Sent: {sent_date or '—'} · Trace: {html.escape(trace_ref or '—')}{f' · Acct {masked_ref}' if masked_ref else ''}</p>"
-        + (f"<p>Sent to (customer-recorded): {html.escape(sent_to_beneficiary or '—')} · "
-           f"Bank: {html.escape(sent_to_bank or '—')} · Routing: {html.escape(sent_to_routing or '—')} · "
-           f"Acct: {html.escape(sent_to_account or '—')}</p>" if method == "ach" else "")
+        + detail
         + f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]),
     )
@@ -914,6 +921,7 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "trace_ref": d.get("trace_ref"),
             "sent_to_beneficiary": d.get("sent_to_beneficiary"), "sent_to_bank": d.get("sent_to_bank"),
             "sent_to_routing": d.get("sent_to_routing"), "sent_to_account": d.get("sent_to_account"),
+            "check_number": d.get("check_number"),
             "submitted_at": d["submitted_at"].isoformat() if d.get("submitted_at") else None,
         } for d in db.list_deposits(proposal_id)],
     })
