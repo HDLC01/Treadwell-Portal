@@ -100,14 +100,25 @@ def test_ach_bad_routing_rejected(client):
     assert client.calls["status_calls"] == 0
 
 
-def test_ach_bad_account_rejected(client):
-    for bad in ("123", "012345678901234567"):           # 3 digits, 18 digits
+def test_ach_short_account_rejected(client):
+    for bad in ("123", ""):                               # under 4 digits still rejected
         client.calls["deposits"].clear()
         r = client.post("/api/portal/tok/deposit",
                         json={"method": "ach", "account_name": "Payer LLC",
                               "routing_number": "021000021", "account_number": bad})
         assert r.status_code == 400, bad
         assert client.calls["deposits"] == []
+
+
+def test_ach_long_account_accepted(client):
+    # Upper cap removed per Will ("don't limit the account number") — an 18-digit
+    # account (previously rejected) is now accepted. Routing still must be 9 digits.
+    client.calls["deposits"].clear()
+    r = client.post("/api/portal/tok/deposit",
+                    json={"method": "ach", "account_name": "Payer LLC",
+                          "routing_number": "021000021", "account_number": "012345678901234567"})
+    assert r.status_code == 200
+    assert len(client.calls["deposits"]) == 1
 
 
 def test_ach_email_masks_account_number(client):

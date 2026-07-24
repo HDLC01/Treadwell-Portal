@@ -509,8 +509,8 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
             return _json({"ok": False, "error": "Please enter the account name."}, 400)
         if len(routing_number) != 9:
             return _json({"ok": False, "error": "Routing number must be exactly 9 digits."}, 400)
-        if not (4 <= len(account_number) <= 17):
-            return _json({"ok": False, "error": "Account number must be 4–17 digits."}, 400)
+        if len(account_number) < 4:
+            return _json({"ok": False, "error": "Account number must be at least 4 digits."}, 400)
         masked_ref = f"••••{account_number[-4:]}"
 
     db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
