@@ -501,20 +501,24 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     # ACH: the customer's OWN routing + account numbers (double-entry verified on the
     # client). We store the full numbers so Treadwell can initiate the debit; the team
     # email + chat only ever show the last-4 mask. Normalize to digits before storing.
-    routing_number = account_number = masked_ref = None
+    routing_number = account_number = masked_ref = account_type = None
     if method == "ach":
         routing_number = "".join(ch for ch in str(body.get("routing_number") or "") if ch.isdigit())
         account_number = "".join(ch for ch in str(body.get("account_number") or "") if ch.isdigit())
+        account_type = (str(body.get("account_type") or "").strip().lower() or None)
         if not account_name:
             return _json({"ok": False, "error": "Please enter the account name."}, 400)
         if len(routing_number) != 9:
             return _json({"ok": False, "error": "Routing number must be exactly 9 digits."}, 400)
         if len(account_number) < 4:
             return _json({"ok": False, "error": "Account number must be at least 4 digits."}, 400)
+        if account_type not in ("checking", "savings"):
+            return _json({"ok": False, "error": "Please choose an account type (checking or savings)."}, 400)
         masked_ref = f"••••{account_number[-4:]}"
 
     db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
-                   routing_number=routing_number, account_number=account_number)
+                   routing_number=routing_number, account_number=account_number,
+                   account_type=account_type)
     project_name = p.get("project_name") or "proposal"
     ref = proposals.deposit_ref(p["proposal_id"])
     # A system line records it in the chat so both sides see the deposit is in flight.
@@ -529,6 +533,7 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     if method == "ach":
         detail = (
             f"<p>Name on account: {html.escape(account_name or '—')} · "
+            f"Type: {html.escape((account_type or '—').title())} · "
             f"Routing: {html.escape(routing_number or '—')} · "
             f"Account: {masked_ref or '—'} · Note: {html.escape(note or '—')}</p>"
             f"<p>Full account number is in the proposal's admin view.</p>"
@@ -917,6 +922,7 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
             "masked_ref": d.get("masked_ref"), "note": d.get("note"),
             "routing_number": d.get("routing_number"), "account_number": d.get("account_number"),
+            "account_type": d.get("account_type"),
             "sent_date": d["sent_date"].isoformat() if d.get("sent_date") else None,
             "trace_ref": d.get("trace_ref"),
             "sent_to_beneficiary": d.get("sent_to_beneficiary"), "sent_to_bank": d.get("sent_to_bank"),

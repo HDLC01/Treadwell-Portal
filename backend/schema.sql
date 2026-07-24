@@ -215,6 +215,8 @@ alter table public.portal_deposits add column if not exists check_number text;
 -- surfaced only through the SERVICE_TOKEN-gated admin endpoint (masked in email/chat).
 alter table public.portal_deposits add column if not exists routing_number text;
 alter table public.portal_deposits add column if not exists account_number text;
+-- Account type the customer selected on the ACH form: 'checking' or 'savings'.
+alter table public.portal_deposits add column if not exists account_type text;
 
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,

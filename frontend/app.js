@@ -558,9 +558,12 @@ $("ach-form").addEventListener("submit", async (e) => {
   if (routing !== routingConfirm) return fail("Routing numbers don't match — please re-enter.", "ach-routing-confirm");
   if (!/^\d{4,}$/.test(account)) return fail("Account number must be at least 4 digits.", "ach-account");
   if (account !== accountConfirm) return fail("Account numbers don't match — please re-enter.", "ach-account-confirm");
+  const account_type = $("ach-account-type").value;
+  if (!account_type) return fail("Please choose an account type (checking or savings).", "ach-account-type");
   const btn = $("ach-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
   const res = await api("POST", "/deposit", {
-    method: "ach", account_name, routing_number: routing, account_number: account, note: $("ach-note").value.trim(),
+    method: "ach", account_name, routing_number: routing, account_number: account,
+    account_type, note: $("ach-note").value.trim(),
   });
   btn.disabled = false; btn.textContent = "Pay The Deposit";
   if (handleExpired(res, $("deposit-alert"))) return;
@@ -593,11 +596,14 @@ $("ach-form").addEventListener("submit", async (e) => {
     setInd("ind-account", aOk, !a ? "" : (aOk ? "✓ Looks good" : "✗ Enter at least 4 digits"));
     setInd("ind-account-confirm", acOk, !ac ? "" : (acOk ? "✓ Matches" : "✗ Doesn't match"));
     const name = (F("ach-acct-name").value || "").trim();
+    const type = F("ach-account-type") ? F("ach-account-type").value : "";
     const btn = F("ach-btn");
-    if (btn) btn.disabled = !(name && rOk && rcOk && aOk && acOk);
+    if (btn) btn.disabled = !(name && rOk && rcOk && aOk && acOk && type);
   }
   ["ach-acct-name", "ach-routing", "ach-routing-confirm", "ach-account", "ach-account-confirm"]
     .forEach((id) => { const el = F(id); if (el) el.addEventListener("input", refresh); });
+  const typeSel = F("ach-account-type");
+  if (typeSel) typeSel.addEventListener("change", refresh);
   refresh();
 })();
 

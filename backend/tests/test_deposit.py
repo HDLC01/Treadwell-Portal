@@ -69,7 +69,8 @@ def test_check_deposit_minimal_records_note_and_leaves_status(client):
 def test_ach_stores_full_numbers_and_derives_mask(client):
     r = client.post("/api/portal/tok/deposit",
                     json={"method": "ach", "account_name": "Payer LLC",
-                          "routing_number": "021000021", "account_number": "000123456789"})
+                          "routing_number": "021000021", "account_number": "000123456789",
+                          "account_type": "checking"})
     assert r.status_code == 200 and r.json()["ok"] is True
     rec = client.calls["deposits"][0]
     assert rec["args"][2] == "Payer LLC"                # account_name (positional)
@@ -82,7 +83,8 @@ def test_ach_stores_full_numbers_and_derives_mask(client):
 def test_ach_normalizes_separators(client):
     r = client.post("/api/portal/tok/deposit",
                     json={"method": "ach", "account_name": "Payer LLC",
-                          "routing_number": "021-000-021", "account_number": "0001 2345 6789"})
+                          "routing_number": "021-000-021", "account_number": "0001 2345 6789",
+                          "account_type": "savings"})
     assert r.status_code == 200
     kw = client.calls["deposits"][0]["kwargs"]
     assert kw["routing_number"] == "021000021"
@@ -116,15 +118,35 @@ def test_ach_long_account_accepted(client):
     client.calls["deposits"].clear()
     r = client.post("/api/portal/tok/deposit",
                     json={"method": "ach", "account_name": "Payer LLC",
-                          "routing_number": "021000021", "account_number": "012345678901234567"})
+                          "routing_number": "021000021", "account_number": "012345678901234567",
+                          "account_type": "checking"})
     assert r.status_code == 200
     assert len(client.calls["deposits"]) == 1
+
+
+def test_ach_account_type_required_and_stored(client):
+    base = {"method": "ach", "account_name": "Payer LLC",
+            "routing_number": "021000021", "account_number": "000123456789"}
+    # Missing / invalid account type is rejected.
+    for at in (None, "", "bogus"):
+        client.calls["deposits"].clear()
+        body = dict(base) if at is None else {**base, "account_type": at}
+        r = client.post("/api/portal/tok/deposit", json=body)
+        assert r.status_code == 400, at
+        assert client.calls["deposits"] == []
+    # Valid choice is stored (checking/savings).
+    for at in ("checking", "savings"):
+        client.calls["deposits"].clear()
+        r = client.post("/api/portal/tok/deposit", json={**base, "account_type": at})
+        assert r.status_code == 200, at
+        assert client.calls["deposits"][0]["kwargs"]["account_type"] == at
 
 
 def test_ach_email_masks_account_number(client):
     r = client.post("/api/portal/tok/deposit",
                     json={"method": "ach", "account_name": "Payer LLC",
-                          "routing_number": "021000021", "account_number": "000123456789"})
+                          "routing_number": "021000021", "account_number": "000123456789",
+                          "account_type": "checking"})
     assert r.status_code == 200
     assert len(client.calls["emails"]) == 1
     body = client.calls["emails"][0]["body"]
