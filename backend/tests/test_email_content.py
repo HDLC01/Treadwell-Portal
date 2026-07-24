@@ -51,6 +51,20 @@ def test_reply_email_includes_reply_text_escaped(monkeypatch):
     assert "&amp; done" in box["html"]
 
 
+def test_signature_footer_address_then_tagline(monkeypatch):
+    box = _capture(monkeypatch)
+    es.send_portal_link("c@x.com", "Jane", "http://u", "Westport")
+    html = box["html"]
+    assert "1707 E. 123rd Ter, Olathe, KS 66061" in html
+    assert "commercial epoxy" in html
+    # address line comes BEFORE the tagline (Will's order)
+    assert html.index("1707 E. 123rd Ter") < html.index("commercial epoxy")
+    # footer is on the reply + deposit emails too (single _wrap choke-point)
+    box2 = _capture(monkeypatch)
+    es.send_deposit_request("c@x.com", "http://u", "Westport", amount=100.0)
+    assert "1707 E. 123rd Ter, Olathe, KS 66061" in box2["html"]
+
+
 def test_note_and_message_are_html_escaped(monkeypatch):
     box = _capture(monkeypatch)
     es.send_portal_link("c@x.com", "Jane", "http://u", "Westport",
