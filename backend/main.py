@@ -885,6 +885,39 @@ def admin_pipeline(request: Request) -> JSONResponse:
     return _json({"ok": True, "proposals": out})
 
 
+# Preview length for the bell/toast — enough to read at a glance, short enough
+# that the notification payload stays small.
+_RECENT_MSG_PREVIEW = 240
+
+
+def _recent_msg(row: dict) -> dict:
+    """One recent customer message shaped for the staff notification feed. Body is
+    truncated server-side; `created_at` is ISO (matches _msg)."""
+    body = (row.get("body") or "").strip()
+    if len(body) > _RECENT_MSG_PREVIEW:
+        body = body[:_RECENT_MSG_PREVIEW - 1].rstrip() + "…"
+    return {
+        "id": row.get("id"),
+        "proposal_id": row.get("proposal_id"),
+        "project_name": row.get("project_name"),
+        "customer_name": row.get("customer_name"),
+        "author_email": row.get("author_email"),
+        "body": body,
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
+
+
+@app.get("/api/admin/recent-messages")
+def admin_recent_messages(request: Request) -> JSONResponse:
+    """Newest customer messages across all proposals — drives the staff tool's
+    notification bell + bottom-right toast. Customer text only (staff/system rows
+    excluded by the query)."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    rows = db.list_recent_customer_messages(limit=25)
+    return _json({"ok": True, "messages": [_recent_msg(r) for r in rows]})
+
+
 @app.get("/api/admin/proposal/{proposal_id}")
 def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
     if not _admin_ok(request):

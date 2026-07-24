@@ -202,6 +202,23 @@ def unread_counts() -> dict[str, int]:
     return {r["pid"]: int(r["n"]) for r in rows}
 
 
+def list_recent_customer_messages(limit: int = 25) -> list[dict[str, Any]]:
+    """Newest customer chat messages across ALL proposals, for the staff tool's
+    notification bell + toast feed. Only real customer text (chat + inbound-email
+    replies) — staff replies and system/card/deposit rows are excluded. Joined to
+    the proposal for a display title. `id` is the monotonic cursor the staff side
+    uses to dedupe toasts."""
+    return qall(
+        "select q.id, q.proposal_id, q.author_email, q.body, q.created_at, "
+        "p.project_name, p.customer_name "
+        "from public.portal_questions q "
+        "join public.portal_proposals p on p.proposal_id = q.proposal_id "
+        "where q.author_kind='customer' and q.msg_type='text' "
+        "order by q.id desc limit %s",
+        (int(limit),),
+    )
+
+
 def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     return qall(
         "select method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "
