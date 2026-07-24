@@ -586,15 +586,25 @@ $("ach-form").addEventListener("submit", async (e) => {
     el.textContent = msg || "";
     el.className = "ach-ind" + (msg ? (ok ? " ok" : " bad") : "");
   };
+  // Green/red border on the input itself (only once there's something typed).
+  const setField = (id, ok, active) => {
+    const el = F(id); if (!el) return;
+    el.classList.toggle("ach-ok", !!active && ok);
+    el.classList.toggle("ach-bad", !!active && !ok);
+  };
   function refresh() {
     const r = digitsOf("ach-routing"), rc = digitsOf("ach-routing-confirm");
     const a = digitsOf("ach-account"), ac = digitsOf("ach-account-confirm");
     const rOk = /^\d{9}$/.test(r), aOk = /^\d{4,}$/.test(a);
     const rcOk = rc.length > 0 && rc === r, acOk = ac.length > 0 && ac === a;
-    setInd("ind-routing", rOk, !r ? "" : (rOk ? "✓ Valid 9-digit routing number" : "✗ Routing number should be 9 digits"));
+    setInd("ind-routing", rOk, !r ? "" : (rOk ? "✓ Looks good" : "✗ Must be 9 digits"));
     setInd("ind-routing-confirm", rcOk, !rc ? "" : (rcOk ? "✓ Matches" : "✗ Doesn't match"));
-    setInd("ind-account", aOk, !a ? "" : (aOk ? "✓ Looks good" : "✗ Enter at least 4 digits"));
+    setInd("ind-account", aOk, !a ? "" : (aOk ? "✓ Looks good" : "✗ At least 4 digits"));
     setInd("ind-account-confirm", acOk, !ac ? "" : (acOk ? "✓ Matches" : "✗ Doesn't match"));
+    setField("ach-routing", rOk, !!r);
+    setField("ach-routing-confirm", rcOk, !!rc);
+    setField("ach-account", aOk, !!a);
+    setField("ach-account-confirm", acOk, !!ac);
     const name = (F("ach-acct-name").value || "").trim();
     const type = F("ach-account-type") ? F("ach-account-type").value : "";
     const btn = F("ach-btn");

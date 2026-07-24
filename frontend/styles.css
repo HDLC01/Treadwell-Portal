@@ -224,10 +224,13 @@ textarea { min-height: 96px; resize: vertical; }
 /* deposit bank-transfer instructions */
 .deposit-section-label { margin: 4px 0 -2px; font-size: .78rem; font-weight: 700; color: var(--secondary); text-transform: uppercase; letter-spacing: .04em; }
 .deposit-section-label + .field { margin-top: 2px; }
-/* Live ✓/✗ verifier under the ACH routing/account + confirm fields. */
-.ach-ind { margin-top: 4px; font-size: .8rem; font-weight: 600; min-height: 1.05em; }
-.ach-ind.ok { color: #14532D; }
-.ach-ind.bad { color: #93000A; }
+/* Live ✓/✗ verifier — shown INLINE beside the field's label; the input border
+   also turns green (valid) / red (invalid) as you type. */
+.ach-ind { margin-left: 8px; font-size: .78rem; font-weight: 600; text-transform: none; letter-spacing: 0; }
+.ach-ind.ok { color: #1f7a34; }
+.ach-ind.bad { color: var(--error); }
+input.ach-ok { border-color: #1f7a34 !important; box-shadow: 0 0 0 1px #1f7a34; }
+input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var(--error); }
 .deposit-instructions { border: 1px solid var(--surface-highest); border-radius: var(--radius); overflow: hidden; }
 .di-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--surface-highest); }
 .di-row:first-child { border-top: none; }
