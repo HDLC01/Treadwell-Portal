@@ -833,6 +833,9 @@ async def admin_publish(request: Request) -> JSONResponse:
     project = _cap(data.get("project_name"), 200) or "Your Proposal"
     pdf_path = (body.get("pdf_path") or "").strip() or None
     by = _cap(body.get("by"), 120) or None
+    # Optional personal note the estimator typed on the Done page — shown in the
+    # customer's proposal-ready email above the button.
+    note = _cap(body.get("message"), 2000) or None
 
     existing = db.get_proposal(draft_id)
     if existing:
@@ -863,7 +866,8 @@ async def admin_publish(request: Request) -> JSONResponse:
     # never see each other's addresses). Only the primary gets the name greeting.
     rt = email_sender.proposal_reply_to(token)
     emailed = [e for e in send_list
-               if email_sender.send_portal_link(e, name if e == primary else "", link, project, reply_to=rt)]
+               if email_sender.send_portal_link(e, name if e == primary else "", link, project,
+                                                 reply_to=rt, note=note)]
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
                   "recipients": send_list, "emailed": emailed})
 
@@ -950,7 +954,7 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
     project = p.get("project_name") or "your proposal"
     rt = email_sender.proposal_reply_to(p["token"])
     for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_reply_notification(e, link, project, reply_to=rt)
+        email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text)
     return _json({"ok": True})
 
 

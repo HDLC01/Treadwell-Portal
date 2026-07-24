@@ -4,6 +4,7 @@ message to stdout instead of sending, so the full flow is testable offline.
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 
 import httpx
@@ -13,6 +14,18 @@ import config
 log = logging.getLogger("portal.email")
 
 _RESEND_URL = "https://api.resend.com/emails"
+
+
+def _esc(s) -> str:
+    """HTML-escape any value dropped into an email body (customer free-text notes,
+    replies, names) so it can't break the markup or inject."""
+    return html.escape(str(s if s is not None else ""))
+
+
+def _first_name(name) -> str:
+    """Customer greeting uses the FIRST name only (per Hanz). Empty → '' so the
+    caller can fall back to a generic greeting."""
+    return (str(name or "").strip().split() or [""])[0]
 
 
 def _thread_headers(email: str) -> dict[str, str]:
@@ -86,10 +99,19 @@ def proposal_reply_to(token: str) -> str | None:
 
 
 def send_portal_link(email: str, name: str, url: str, project_name: str,
-                     reply_to: str | None = None) -> bool:
+                     reply_to: str | None = None, note: str | None = None) -> bool:
+    # Greet by FIRST name only; `note` is the estimator's optional personal message
+    # (entered on the Done page before sending) shown above the button.
+    note_html = ""
+    if note and str(note).strip():
+        note_html = (
+            f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
+            f'border-left:3px solid #0ea5e9;white-space:pre-wrap">{_esc(note)}</p>'
+        )
     body = (
-        f'<p>Hi {name or "there"},</p>'
-        f'<p>Your proposal for <strong>{project_name}</strong> is ready to review.</p>'
+        f'<p>Hi {_esc(_first_name(name) or "there")},</p>'
+        f'<p>Your proposal for <strong>{_esc(project_name)}</strong> is ready to review.</p>'
+        f'{note_html}'
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
@@ -99,14 +121,22 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
 
 
 def send_reply_notification(email: str, url: str, project_name: str,
-                            reply_to: str | None = None) -> bool:
+                            reply_to: str | None = None, message: str | None = None) -> bool:
     # Only advertise reply-by-email when inbound capture is armed (reply_to set);
     # otherwise steer to the portal so nothing dead-ends.
     nudge = ("You can reply right on your proposal page, or simply reply to this email."
              if reply_to else
              "Reply right on your proposal page (button above) so our team sees it fastest.")
+    # Show the actual reply TEXT in the email (Will's ask) — not just a button.
+    msg_html = ""
+    if message and str(message).strip():
+        msg_html = (
+            f'<blockquote style="margin:12px 0;padding:8px 14px;border-left:3px solid #cbd5e1;'
+            f'color:#334155;white-space:pre-wrap">{_esc(message)}</blockquote>'
+        )
     body = (
-        f'<p>Treadwell replied to your question on the proposal for <strong>{project_name}</strong>.</p>'
+        f'<p>Treadwell replied to your question on the proposal for <strong>{_esc(project_name)}</strong>:</p>'
+        f'{msg_html}'
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
         f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
