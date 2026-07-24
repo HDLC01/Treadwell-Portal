@@ -158,10 +158,14 @@ textarea { min-height: 96px; resize: vertical; }
 .option.opt-check input[type="checkbox"]:disabled { cursor: default; }
 .option.opt-check .opt-main { flex: 1; min-width: 0; }
 .selected-total {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  display: flex; flex-direction: column; gap: 6px;
   margin-top: 14px; padding-top: 14px; border-top: 2px solid var(--surface-highest);
   font-weight: 700;
 }
+.selected-total .st-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.selected-total .st-dep { font-weight: 600; }
+.selected-total .st-dep span { color: var(--secondary); font-size: .9rem; }
+.selected-total .st-dep strong { font-size: 1.05rem !important; color: var(--secondary) !important; }
 .selected-total strong { font-size: 1.35rem; color: var(--primary); font-variant-numeric: tabular-nums; }
 
 /* Q&A thread */

@@ -352,15 +352,10 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm["deposit"] = {
         "due": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
         "ref": proposals.deposit_ref(p["proposal_id"]),
-        # No pre-configured Treadwell bank details are shown; the customer records
-        # where they sent the transfer themselves (see the ACH form).
-        # so the customer sees a "recorded" state on reload instead of a blank
-        # form they might resubmit (deposit_status only flips when staff confirm).
+        # `submitted` lets the customer see a "recorded" state on reload instead of a
+        # blank form they might resubmit (deposit_status only flips when staff confirm).
         "submitted": bool(_latest),
         "submitted_method": _latest["method"] if _latest else None,
-        "submitted_sent_date": (_latest["sent_date"].isoformat()
-                                if _latest and _latest.get("sent_date") else None),
-        "submitted_check_number": _latest.get("check_number") if _latest else None,
     }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
@@ -501,62 +496,55 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     if method not in ("ach", "check"):
         return _json({"ok": False, "error": "Choose ACH or check."}, 400)
     account_name = _cap(body.get("account_name"), 120) or None
-    bank_name = _cap(body.get("bank_name"), 120) or None
     note = _cap(body.get("note"), 1000) or None
-    trace_ref = _cap(body.get("trace_ref"), 60) or None
-    # Customer-recorded destination ("where you sent it"). This is Treadwell's own
-    # receiving account (self-reported by the customer for reconciliation), not the
-    # customer's account — the source account number is still never collected.
-    sent_to_beneficiary = _cap(body.get("sent_to_beneficiary"), 120) or None
-    sent_to_bank = _cap(body.get("sent_to_bank"), 120) or None
-    sent_to_routing = _cap(body.get("sent_to_routing"), 40) or None
-    sent_to_account = _cap(body.get("sent_to_account"), 40) or None
-    # account_last4 is optional and only ever stored masked (never the full number).
-    last4 = "".join(ch for ch in (body.get("account_last4") or "") if ch.isdigit())[-4:]
-    masked_ref = f"••••{last4}" if last4 else None
-    try:
-        sent_date = date.fromisoformat(body["sent_date"]) if body.get("sent_date") else None
-    except (ValueError, TypeError):
-        sent_date = None
-    # Pay-by-check: the check number off the mailed cheque. Collapse inner
-    # whitespace (_cap only trims the ends) so it stays clean in the email + chat.
-    check_number = _cap(" ".join(str(body.get("check_number") or "").split()), 40) or None
 
-    db.add_deposit(p["proposal_id"], method, account_name, bank_name, masked_ref, note,
-                   sent_date=sent_date, trace_ref=trace_ref,
-                   sent_to_beneficiary=sent_to_beneficiary, sent_to_bank=sent_to_bank,
-                   sent_to_routing=sent_to_routing, sent_to_account=sent_to_account,
-                   check_number=check_number)
+    # ACH: the customer's OWN routing + account numbers (double-entry verified on the
+    # client). We store the full numbers so Treadwell can initiate the debit; the team
+    # email + chat only ever show the last-4 mask. Normalize to digits before storing.
+    routing_number = account_number = masked_ref = None
+    if method == "ach":
+        routing_number = "".join(ch for ch in str(body.get("routing_number") or "") if ch.isdigit())
+        account_number = "".join(ch for ch in str(body.get("account_number") or "") if ch.isdigit())
+        if not account_name:
+            return _json({"ok": False, "error": "Please enter the account name."}, 400)
+        if len(routing_number) != 9:
+            return _json({"ok": False, "error": "Routing number must be exactly 9 digits."}, 400)
+        if not (4 <= len(account_number) <= 17):
+            return _json({"ok": False, "error": "Account number must be 4–17 digits."}, 400)
+        masked_ref = f"••••{account_number[-4:]}"
+
+    db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
+                   routing_number=routing_number, account_number=account_number)
     project_name = p.get("project_name") or "proposal"
     ref = proposals.deposit_ref(p["proposal_id"])
     # A system line records it in the chat so both sides see the deposit is in flight.
+    # (No account details or internal ref in the customer-visible message.)
     who = account_name or "The customer"
-    action = (f"sent a bank transfer{f' on {sent_date}' if sent_date else ''}" if method == "ach"
-              else f"is mailing a check{f' (#{check_number})' if check_number else ''}")
-    db.add_message(p["proposal_id"], "staff", None,
-                   f"Deposit initiated — {who} {action} (ref {ref}). We'll confirm once it clears.",
-                   msg_type="system")
+    chat = (f"Deposit initiated — {who} provided ACH payment details for {project_name}. "
+            "We'll confirm once the transfer clears." if method == "ach"
+            else f"Deposit initiated — a check is on its way for {project_name}. "
+                 "We'll confirm once it arrives.")
+    db.add_message(p["proposal_id"], "staff", None, chat, msg_type="system")
+
     if method == "ach":
         detail = (
-            f"<p>From: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
-            f"Sent: {sent_date or '—'} · Trace: {html.escape(trace_ref or '—')}"
-            f"{f' · Acct {masked_ref}' if masked_ref else ''}</p>"
-            f"<p>Sent to (customer-recorded): {html.escape(sent_to_beneficiary or '—')} · "
-            f"Bank: {html.escape(sent_to_bank or '—')} · Routing: {html.escape(sent_to_routing or '—')} · "
-            f"Acct: {html.escape(sent_to_account or '—')}</p>"
+            f"<p>Name on account: {html.escape(account_name or '—')} · "
+            f"Routing: {html.escape(routing_number or '—')} · "
+            f"Account: {masked_ref or '—'} · Note: {html.escape(note or '—')}</p>"
+            f"<p>Full account number is in the proposal's admin view.</p>"
         )
+        lead = (f"Customer provided ACH details to pay the deposit for "
+                f"<strong>{html.escape(project_name)}</strong> ({html.escape(ref)}).")
+        closing = "Initiate the debit, then mark the deposit Received in the proposal tool."
+        subject = f"Deposit details — {project_name} ({ref})"
     else:   # check
-        detail = (
-            f"<p>Check #: {html.escape(check_number or '—')} · Name on check: {html.escape(account_name or '—')} · "
-            f"Bank: {html.escape(bank_name or '—')} · Sent: {sent_date or '—'}</p>"
-        )
+        detail = f"<p>Note: {html.escape(note or '—')}</p>"
+        lead = (f"Paying by check for <strong>{html.escape(project_name)}</strong> "
+                f"({html.escape(ref)}) — the memo line will show the project name.")
+        closing = "Confirm it arrived, then mark the deposit Received in the proposal tool."
+        subject = f"Deposit by check — {project_name} ({ref})"
     email_sender.notify_team(
-        f"Deposit {'sent' if method == 'ach' else 'method'} — {project_name} ({ref})",
-        f"<p>{'Bank transfer sent' if method == 'ach' else 'Paying by check'} for "
-        f"<strong>{html.escape(project_name)}</strong> — match reference <strong>{html.escape(ref)}</strong> "
-        f"on the statement.</p>"
-        + detail
-        + f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
+        subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
     return _json({"ok": True})
@@ -924,6 +912,7 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
         "deposits": [{
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
             "masked_ref": d.get("masked_ref"), "note": d.get("note"),
+            "routing_number": d.get("routing_number"), "account_number": d.get("account_number"),
             "sent_date": d["sent_date"].isoformat() if d.get("sent_date") else None,
             "trace_ref": d.get("trace_ref"),
             "sent_to_beneficiary": d.get("sent_to_beneficiary"), "sent_to_bank": d.get("sent_to_bank"),

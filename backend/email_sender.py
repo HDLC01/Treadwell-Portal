@@ -62,7 +62,8 @@ def _wrap(title: str, body_html: str) -> str:
         f'max-width:520px;margin:0 auto;color:#0f172a">'
         f'<h2 style="color:#0f172a;margin:0 0 12px">{title}</h2>{body_html}'
         f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">'
-        f'<p style="color:#64748b;font-size:12px">Treadwell — commercial epoxy &amp; polished concrete.</p></div>'
+        f'<p style="color:#64748b;font-size:12px;line-height:1.5">Treadwell — commercial epoxy &amp; polished concrete.<br>'
+        f'1707 E. 123rd Ter, Olathe, KS 66061</p></div>'
     )
 
 

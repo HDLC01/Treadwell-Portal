@@ -74,7 +74,10 @@ create table if not exists public.portal_sessions (
 create index if not exists portal_sessions_email_idx on public.portal_sessions(email);
 create index if not exists portal_proposals_email_idx on public.portal_proposals(lower(customer_email));
 
--- Deposit intake. NEVER store raw bank numbers — only a masked reference.
+-- Deposit intake. masked_ref = last-4 display value (derived server-side). Full
+-- customer ACH routing/account numbers live in routing_number/account_number (added
+-- in the V1 alter block below) so Treadwell can initiate the debit; those are exposed
+-- ONLY via the SERVICE_TOKEN-gated admin endpoint (masked in email + chat).
 create table if not exists public.portal_deposits (
   id            bigint generated always as identity primary key,
   proposal_id   text not null references public.portal_proposals(proposal_id) on delete cascade,
@@ -206,6 +209,12 @@ alter table public.portal_deposits add column if not exists sent_to_account text
 -- (we never ask for the MICR routing/account — staff read those off the physical
 -- cheque on arrival). `account_name` reuse = the name printed on the check.
 alter table public.portal_deposits add column if not exists check_number text;
+
+-- ACH debit intake (V1): the customer's OWN routing + account numbers, collected so
+-- Treadwell can initiate the deposit debit. Full values are stored deliberately and
+-- surfaced only through the SERVICE_TOKEN-gated admin endpoint (masked in email/chat).
+alter table public.portal_deposits add column if not exists routing_number text;
+alter table public.portal_deposits add column if not exists account_number text;
 
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,

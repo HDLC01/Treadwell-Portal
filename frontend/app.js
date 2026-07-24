@@ -167,6 +167,7 @@ function renderTracker(st) {
 // Selected pricing option labels (multi-select). Persists across re-renders.
 let SELECTED = new Set();
 let CUR_OPTIONS = [];
+const DEPOSIT_PCT = 0.25;   // mirrors backend proposals.DEPOSIT_PCT — live deposit preview
 
 function renderOptions(options, addons, approved) {
   CUR_OPTIONS = options || [];
@@ -212,7 +213,14 @@ function renderOptions(options, addons, approved) {
 function updateSelectedTotal() {
   const total = CUR_OPTIONS.filter((o) => SELECTED.has(o.label)).reduce((s, o) => s + o.total, 0);
   const el = $("selected-total");
-  if (el) el.innerHTML = `<span>Selected total</span><strong>${money(total)}</strong>`;
+  const approved = !!(STATE && STATE.status && STATE.status.proposal === "approved");
+  if (el) {
+    let html = `<div class="st-row"><span>Selected total</span><strong>${money(total)}</strong></div>`;
+    if (!approved && total > 0) {   // live deposit preview while the customer is choosing
+      html += `<div class="st-row st-dep"><span>25% deposit due on approval</span><strong>${money(total * DEPOSIT_PCT)}</strong></div>`;
+    }
+    el.innerHTML = html;
+  }
   const btn = $("approve-btn");
   if (btn && !btn.dataset.locked) btn.disabled = SELECTED.size === 0;
 }
@@ -424,17 +432,14 @@ function startPolling() {
 function setupDeposit() {
   const dep = (STATE && STATE.deposit) || {};
   const due = dep.due != null ? money(dep.due) : null;
-  const ref = dep.ref || "";
+  // Customer-facing reference = the project name (the internal TW-… ref is staff-only).
+  const ref = (STATE && STATE.project_name) || "";
   $("deposit-due-line").textContent = due
     ? `Deposit due: ${due} (25% of your total). Reference: ${ref}`
     : (ref ? `Reference: ${ref}` : "");
   if ($("check-ref")) $("check-ref").textContent = ref;
   if ($("check-payable")) $("check-payable").textContent = (STATE && STATE.payable_to) || "Treadwell";
   $("check-address").textContent = (STATE && STATE.check_address) || "Your Treadwell representative will provide the mailing address.";
-  // No pre-configured Treadwell bank details are displayed — for ACH the customer
-  // records where they sent the transfer; for a check they record the check number.
-  // Neither "date" field is prefilled with today (the customer may have sent it on
-  // a different day and could submit the wrong date).
 
   const tabs = $("deposit-tabs"), achPane = $("ach-pane"), checkPane = $("check-instructions");
   const tabAch = $("tab-ach"), tabCheck = $("tab-check");
@@ -450,11 +455,8 @@ function setupDeposit() {
   const reopen = () => { hide(recorded); show(tabs); (dep.submitted_method === "check" ? showCheck : showAch)(); };
   if (dep.submitted) {
     const isCheck = dep.submitted_method === "check";
-    const extra = isCheck
-      ? (dep.submitted_check_number ? ` (check #${dep.submitted_check_number})` : "")
-      : (dep.submitted_sent_date ? ` sent ${dep.submitted_sent_date}` : "");
     $("deposit-recorded-msg").textContent =
-      `Thanks — we've recorded your ${isCheck ? "check" : "bank transfer"}${extra}. We'll mark your deposit Received once it lands in our account.`;
+      `Thanks — we've recorded your ${isCheck ? "check" : "ACH transfer"}. We'll mark your deposit Received once it ${isCheck ? "arrives" : "clears"}.`;
     show(recorded); hide(tabs); hide(achPane); hide(checkPane);
   } else {
     hide(recorded); show(tabs); showAch();
@@ -547,36 +549,32 @@ $("qa-body").addEventListener("input", (e) => {
 $("ach-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("deposit-alert"));
   const account_name = $("ach-acct-name").value.trim();
-  if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name on the account you sent from."); return; }
+  const digits = (id) => $(id).value.replace(/\D/g, "");
+  const routing = digits("ach-routing"), routingConfirm = digits("ach-routing-confirm");
+  const account = digits("ach-account"), accountConfirm = digits("ach-account-confirm");
+  const fail = (msg, id) => { alertBox($("deposit-alert"), "error", msg); $(id).focus(); };
+  if (!account_name) return fail("Please enter the account name.", "ach-acct-name");
+  if (!/^\d{9}$/.test(routing)) return fail("Routing number must be exactly 9 digits.", "ach-routing");
+  if (routing !== routingConfirm) return fail("Routing numbers don't match — please re-enter.", "ach-routing-confirm");
+  if (!/^\d{4,17}$/.test(account)) return fail("Account number must be 4–17 digits.", "ach-account");
+  if (account !== accountConfirm) return fail("Account numbers don't match — please re-enter.", "ach-account-confirm");
   const btn = $("ach-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
   const res = await api("POST", "/deposit", {
-    method: "ach", account_name, bank_name: $("ach-bank").value.trim(),
-    sent_date: $("ach-sent-date").value || "", trace_ref: $("ach-trace").value.trim(), note: $("ach-note").value.trim(),
-    sent_to_beneficiary: $("ach-sent-to-beneficiary").value.trim(),
-    sent_to_bank: $("ach-sent-to-bank").value.trim(),
-    sent_to_routing: $("ach-sent-to-routing").value.trim(),
-    sent_to_account: $("ach-sent-to-account").value.trim(),
+    method: "ach", account_name, routing_number: routing, account_number: account, note: $("ach-note").value.trim(),
   });
-  btn.disabled = false; btn.textContent = "I've sent the transfer";
+  btn.disabled = false; btn.textContent = "Pay The Deposit";
   if (handleExpired(res, $("deposit-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("deposit-alert"), "error", data.error || "Could not submit."); return; }
   const fresh = await api("GET", "");   // refetch → recorded state (prevents accidental re-submit)
   if (fresh.ok && fresh.data.view) renderPortal(fresh.data.view);
-  alertBox($("deposit-alert"), "success", "Thank you — we've noted your transfer. We'll mark your deposit Received once it lands in our account.");
+  alertBox($("deposit-alert"), "success", "Thank you — we've received your payment details. We'll initiate the transfer and mark your deposit Received once it clears.");
 });
 
 $("check-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("deposit-alert"));
-  const check_number = $("check-number").value.trim();
-  const account_name = $("check-name").value.trim();
-  if (!check_number) { alertBox($("deposit-alert"), "error", "Please enter the check number."); $("check-number").focus(); return; }
-  if (!account_name) { alertBox($("deposit-alert"), "error", "Please enter the name printed on the check."); $("check-name").focus(); return; }
   const btn = $("check-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
-  const res = await api("POST", "/deposit", {
-    method: "check", check_number, account_name,
-    bank_name: $("check-bank").value.trim(), sent_date: $("check-sent-date").value || "", note: $("check-note").value.trim(),
-  });
+  const res = await api("POST", "/deposit", { method: "check", note: $("check-note").value.trim() });
   btn.disabled = false; btn.textContent = "I've mailed the check";
   if (handleExpired(res, $("deposit-alert"))) return;
   const { ok, data } = res;

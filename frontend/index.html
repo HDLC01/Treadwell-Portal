@@ -84,6 +84,44 @@
           <p class="muted small" style="margin-top:10px">Your project can be scheduled once your deposit is received.</p>
         </div>
 
+        <div class="card hidden" id="deposit-card">
+          <h2>Send your deposit</h2>
+          <p class="muted small" id="deposit-due-line"></p>
+          <p class="muted small" id="deposit-pref">ACH Transfer is preferred — it processes faster. You can also pay by check.</p>
+          <div id="deposit-alert" role="alert" aria-live="polite"></div>
+          <!-- Shared recorded banner (both methods): shown once a deposit is on file, -->
+          <!-- with the tabs + both panes hidden so a reload can't double-submit. -->
+          <div class="alert success hidden" id="deposit-recorded">
+            <span id="deposit-recorded-msg"></span>
+            <button class="linkbtn" id="deposit-resend" type="button" style="margin-left:6px">Update or resend</button>
+          </div>
+          <div class="row" id="deposit-tabs" role="tablist" aria-label="Deposit method">
+            <button class="btn btn-secondary" id="tab-ach" type="button" aria-pressed="true">ACH Transfer</button>
+            <button class="btn btn-secondary" id="tab-check" type="button" aria-pressed="false">Pay by check</button>
+          </div>
+
+          <div id="ach-pane" style="margin-top:16px">
+            <form id="ach-form" class="stack" novalidate>
+              <div class="field"><label for="ach-acct-name">Account name <span class="req">*</span></label><input id="ach-acct-name" type="text" autocomplete="name" required></div>
+              <div class="field"><label for="ach-routing">Routing number <span class="req">*</span></label><input id="ach-routing" type="text" inputmode="numeric" autocomplete="off" maxlength="9" required></div>
+              <div class="field"><label for="ach-routing-confirm">Routing number (confirm) <span class="req">*</span></label><input id="ach-routing-confirm" type="text" inputmode="numeric" autocomplete="off" maxlength="9" required></div>
+              <div class="field"><label for="ach-account">Account number <span class="req">*</span></label><input id="ach-account" type="text" inputmode="numeric" autocomplete="off" maxlength="17" required></div>
+              <div class="field"><label for="ach-account-confirm">Account number (confirm) <span class="req">*</span></label><input id="ach-account-confirm" type="text" inputmode="numeric" autocomplete="off" maxlength="17" required></div>
+              <div class="field"><label for="ach-note">Note (optional)</label><textarea id="ach-note"></textarea></div>
+              <button class="btn btn-primary btn-block" type="submit" id="ach-btn">Pay The Deposit</button>
+            </form>
+          </div>
+
+          <div id="check-instructions" class="hidden" style="margin-top:16px">
+            <div class="alert info">Make the check payable to <strong id="check-payable">Treadwell</strong>, write <strong id="check-ref"></strong> on the memo line, and mail it to the address below. Your deposit shows as Received once we confirm it.</div>
+            <p id="check-address" class="num"></p>
+            <form id="check-form" class="stack" style="margin-top:16px" novalidate>
+              <div class="field"><label for="check-note">Note (optional)</label><textarea id="check-note"></textarea></div>
+              <button class="btn btn-primary btn-block" type="submit" id="check-btn">I've mailed the check</button>
+            </form>
+          </div>
+        </div>
+
         <div class="card hidden" id="pdf-card">
           <h2>Official proposal document</h2>
           <p class="muted small" style="margin-top:0">Your full Treadwell proposal, with pricing, scope, and terms. Click it to open the full-size view.</p>
@@ -131,55 +169,6 @@
           <button class="btn btn-secondary" id="contacts-add" type="button" style="margin-top:8px">+ Add another contact</button>
           <button class="btn btn-primary btn-block" id="contacts-submit" type="button" style="margin-top:12px">Submit contacts</button>
         </div>
-
-      <div class="card hidden" id="deposit-card">
-        <h2>Send your deposit</h2>
-        <p class="muted small" id="deposit-due-line"></p>
-        <p class="muted small" id="deposit-pref">Bank transfer (ACH) is preferred — it processes faster. You can also pay by check.</p>
-        <div id="deposit-alert" role="alert" aria-live="polite"></div>
-        <!-- Shared recorded banner (both methods): shown once a deposit is on file, -->
-        <!-- with the tabs + both panes hidden so a reload can't double-submit. -->
-        <div class="alert success hidden" id="deposit-recorded">
-          <span id="deposit-recorded-msg"></span>
-          <button class="linkbtn" id="deposit-resend" type="button" style="margin-left:6px">Update or resend</button>
-        </div>
-        <div class="row" id="deposit-tabs" role="tablist" aria-label="Deposit method">
-          <button class="btn btn-secondary" id="tab-ach" type="button" aria-pressed="true">Bank transfer</button>
-          <button class="btn btn-secondary" id="tab-check" type="button" aria-pressed="false">Pay by check</button>
-        </div>
-
-        <div id="ach-pane" style="margin-top:16px">
-          <div class="alert info" id="deposit-intro">Your Treadwell representative will send you the bank details to transfer the deposit to. Send it for the amount shown above and put the reference in the transfer memo. Once you've sent it, record the details below so we can match it.</div>
-          <form id="ach-form" class="stack" style="margin-top:16px" novalidate>
-            <p class="deposit-section-label">Where you sent it</p>
-            <div class="field"><label for="ach-sent-to-beneficiary">Beneficiary / account name</label><input id="ach-sent-to-beneficiary" type="text"></div>
-            <div class="field"><label for="ach-sent-to-bank">Bank</label><input id="ach-sent-to-bank" type="text"></div>
-            <div class="field"><label for="ach-sent-to-routing">Routing number</label><input id="ach-sent-to-routing" type="text" inputmode="numeric" autocomplete="off"></div>
-            <div class="field"><label for="ach-sent-to-account">Account number</label><input id="ach-sent-to-account" type="text" inputmode="numeric" autocomplete="off"></div>
-            <p class="deposit-section-label">Your details</p>
-            <div class="field"><label for="ach-acct-name">Name on the account you sent from <span class="req">*</span></label><input id="ach-acct-name" type="text" autocomplete="name" required></div>
-            <div class="field"><label for="ach-bank">Your bank</label><input id="ach-bank" type="text"></div>
-            <div class="field"><label for="ach-sent-date">Date sent</label><input id="ach-sent-date" type="date"></div>
-            <div class="field"><label for="ach-trace">Confirmation / trace number (optional)</label><input id="ach-trace" type="text"></div>
-            <div class="field"><label for="ach-note">Note (optional)</label><textarea id="ach-note"></textarea></div>
-            <button class="btn btn-primary btn-block" type="submit" id="ach-btn">I've sent the transfer</button>
-          </form>
-        </div>
-
-        <div id="check-instructions" class="hidden" style="margin-top:16px">
-          <div class="alert info">Make the check payable to <strong id="check-payable">Treadwell</strong>, include reference <strong id="check-ref"></strong> on the memo line, and mail it to the address below. Your deposit shows as Received once we confirm it.</div>
-          <p id="check-address" class="num"></p>
-          <form id="check-form" class="stack" style="margin-top:16px" novalidate>
-            <p class="deposit-section-label">The check you mailed</p>
-            <div class="field"><label for="check-number">Check number <span class="req">*</span></label><input id="check-number" type="text" inputmode="numeric" autocomplete="off" required></div>
-            <div class="field"><label for="check-name">Name printed on the check <span class="req">*</span></label><input id="check-name" type="text" autocomplete="name" required></div>
-            <div class="field"><label for="check-bank">Bank (optional)</label><input id="check-bank" type="text"></div>
-            <div class="field"><label for="check-sent-date">Date mailed (optional)</label><input id="check-sent-date" type="date"></div>
-            <div class="field"><label for="check-note">Note (optional)</label><textarea id="check-note"></textarea></div>
-            <button class="btn btn-primary btn-block" type="submit" id="check-btn">I've mailed the check</button>
-          </form>
-        </div>
-      </div>
       </div><!-- /#proposal-view -->
     </section>
   </main>
