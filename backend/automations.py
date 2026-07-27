@@ -60,9 +60,18 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     invoice_no = db.assign_invoice_no(pid)
     # Re-read so the document shows the issued-at stamp just written.
     fresh = db.get_proposal(pid) or fresh
-    pdf = invoice_mod.build_deposit_invoice_pdf(fresh, amount, invoice_no)
     filename = invoice_mod.invoice_filename(invoice_no)
     reference = proposals.deposit_ref(pid)
+    # The document is rendered by the proposal tool (it owns the template +
+    # LibreOffice). If that's down the deposit request still goes out — just
+    # without the attachment — rather than blocking the customer on our plumbing.
+    try:
+        payload = invoice_mod.invoice_payload(fresh, amount, invoice_no,
+                                              draft=db.get_draft_data(pid) or {})
+        pdf = invoice_mod.render_invoice_pdf(payload)
+    except invoice_mod.InvoiceUnavailable as exc:
+        log.error("[deposit] invoice render unavailable for %s: %s", pid, exc)
+        pdf = None
 
     db.add_message(
         pid, "staff", None,

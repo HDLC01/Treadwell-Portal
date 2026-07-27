@@ -79,6 +79,10 @@ def test_deposit_email_escapes_project_name(captured):
 @pytest.fixture
 def client(monkeypatch):
     from fastapi.testclient import TestClient
+    # The document is rendered by the proposal tool over HTTP; stub that seam so
+    # the suite never makes a real call (it would hang on the 90s timeout).
+    monkeypatch.setattr(main.invoice, "render_invoice_pdf", lambda payload, **k: b"%PDF-1.4 stub")
+    monkeypatch.setattr(main.db, "get_draft_data", lambda pid: {})
     return TestClient(main.app)
 
 

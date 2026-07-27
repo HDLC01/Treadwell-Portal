@@ -7,6 +7,7 @@ amount sends nothing.
 import automations
 import db
 import email_sender
+import invoice as invoice_mod
 
 
 def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
@@ -27,6 +28,10 @@ def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
 
     monkeypatch.setattr(db, "get_proposal", _proposal)
     monkeypatch.setattr(db, "assign_invoice_no", _assign)
+    # The invoice PDF is rendered by the proposal tool over HTTP — stub that seam
+    # so the suite never reaches the network.
+    monkeypatch.setattr(db, "get_draft_data", lambda pid: {})
+    monkeypatch.setattr(invoice_mod, "render_invoice_pdf", lambda payload, **k: b"%PDF-1.4 stub")
     monkeypatch.setattr(db, "set_deposit_amount",
                         lambda pid, amt: flags.setdefault("amounts", []).append(amt))
     monkeypatch.setattr(db, "add_message",

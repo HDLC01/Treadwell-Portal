@@ -676,7 +676,12 @@ def api_deposit_invoice_pdf(token: str, request: Request):
     if not invoice_no or amount is None:
         return _json({"ok": False, "error": "no_invoice"}, 404)
     try:
-        pdf = invoice.build_deposit_invoice_pdf(p, float(amount), invoice_no)
+        payload = invoice.invoice_payload(p, float(amount), invoice_no,
+                                          draft=db.get_draft_data(p["proposal_id"]) or {})
+        pdf = invoice.render_invoice_pdf(payload)
+    except invoice.InvoiceUnavailable as exc:
+        log.error("deposit invoice unavailable for %s: %s", p["proposal_id"], exc)
+        return _json({"ok": False, "error": "render_failed"}, 502)
     except Exception as exc:  # noqa: BLE001
         log.error("deposit invoice render failed for %s: %s", p["proposal_id"], exc)
         return _json({"ok": False, "error": "render_failed"}, 500)
