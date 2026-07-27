@@ -101,16 +101,19 @@ function renderPortal(vm) {
   const approved = vm.status.proposal === "approved";
 
   setHeader(vm, approved);
+  ACTIVE_STEP = defaultStep(vm.status);
   renderTracker(vm.status);
 
+  setEligible("approved-banner", false);
+  setEligible("thankyou-card", false);
   if (approved && vm.approved && vm.approved.name) {
     const a = vm.approved;
     // Lock the selection to what was actually approved (jsonb list; fall back to
     // the denormalized single summary for pre-revamp approvals).
     SELECTED = new Set(a.options && a.options.length ? a.options : (a.option ? [a.option] : []));
     $("approved-banner").innerHTML = `Approved by <strong>${esc(a.name)}</strong>${a.title ? ", " + esc(a.title) : ""} on ${esc(a.date || "")} — <strong>${esc(a.option || "")}</strong> at <strong>${money(a.total)}</strong>.`;
-    show($("approved-banner"));
-    hide($("approve-card"));
+    setEligible("approved-banner", true);
+    setEligible("approve-card", false);
     renderThankYou(a);
   }
 
@@ -120,11 +123,12 @@ function renderPortal(vm) {
   renderChat(STATE.messages);
   setupDeposit();
 
-  // Deposit stays reachable at every stage so a customer can open the step from
-  // the tracker and skip around. setupDeposit's "recorded" banner already covers
-  // the post-submission state, and the server has no approval precondition on
-  // POST /deposit — only a valid session.
-  show($("deposit-card"));
+  // Deposit and contacts stay reachable at every stage so the customer can open
+  // any step and skip around; setupDeposit's "recorded" banner covers the
+  // post-submission state, and POST /deposit has no approval precondition.
+  setEligible("deposit-card", true);
+  setEligible("contacts-card", true);
+  setEligible("schedule-card", true);
   renderSchedule(vm.status);
 
   // Pre-fill the approver name from the contact we already have — editable, so a
@@ -138,6 +142,7 @@ function renderPortal(vm) {
 
   LAST_STATUS = statusKey(vm.status);
   applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
+  applyStepPanel();       // keep the active tab showing only its own cards
   mountSwitcher();        // once per session; no-op on poll re-renders
   startPolling();
 }
@@ -205,33 +210,61 @@ function renderTracker(st) {
 // renderTracker) re-runs on every status poll, which would otherwise wipe it.
 let ACTIVE_STEP = null;
 
+/** First open lands on the step that actually needs attention, rather than
+ *  always starting at Proposal. Only ever set once — after that the customer's
+ *  own tab choice wins. */
+function defaultStep(st) {
+  if (ACTIVE_STEP) return ACTIVE_STEP;
+  if (st.proposal !== "approved") return "proposal";
+  if (st.deposit !== "received") return "deposit";
+  if (st.contacts !== "received") return "contacts";
+  return "schedule";
+}
+
 // Exposed so the sidebar (shell.js) drives the SAME navigation as the tiles.
 window.focusStep = (k) => focusStep(k);
 
-const STEP_TARGETS = {
-  proposal: ["pdf-card", "options-card", "approve-card"],
-  deposit: ["deposit-card"],
+// The tracker is a TAB SWITCHER: picking a step shows only that step's cards.
+// The customer sees one thing at a time instead of one long scroll.
+const STEP_CARDS = {
+  proposal: ["approved-banner", "pdf-card", "options-card", "approve-card"],
+  deposit: ["thankyou-card", "deposit-card"],
   contacts: ["contacts-card"],
   schedule: ["schedule-card"],
 };
+const ALL_STEP_CARDS = Object.values(STEP_CARDS).flat();
 
-/** Open a step: switch to the proposal view, then scroll its card into sight.
- *  The rAF matters — hashchange is async, so #proposal-view is still display:none
- *  at call time and scrollIntoView would silently do nothing. */
+/** Cards whose CONTENT applies right now (e.g. the thank-you only after
+ *  approval). Kept apart from the step filter so the two can't fight: state
+ *  decides what's eligible, the active tab decides what's on screen. */
+const ELIGIBLE = new Set();
+const setEligible = (id, on) => { on ? ELIGIBLE.add(id) : ELIGIBLE.delete(id); };
+
+/** Show only the active step's eligible cards. Runs after every render, since
+ *  renderPortal re-runs on each status poll and would otherwise reset things. */
+function applyStepPanel() {
+  const step = ACTIVE_STEP || "proposal";
+  for (const id of ALL_STEP_CARDS) {
+    const el = $(id);
+    if (!el) continue;
+    const belongs = (STEP_CARDS[step] || []).includes(id);
+    el.classList.toggle("hidden", !(belongs && ELIGIBLE.has(id)));
+  }
+  const t = $("tracker");
+  if (t) t.querySelectorAll(".step").forEach((b) =>
+    b.classList.toggle("is-active", b.dataset.step === step));
+}
+
+/** Open a step from a tracker tile or the sidebar. */
 function focusStep(step) {
   ACTIVE_STEP = step;
   if (location.hash !== "#proposal") location.hash = "proposal"; else applyHashView(false);
   requestAnimationFrame(() => {
-    const el = (STEP_TARGETS[step] || []).map((id) => $(id))
-      .find((n) => n && !n.classList.contains("hidden"));
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-      el.classList.add("step-flash");
-      setTimeout(() => el.classList.remove("step-flash"), 1400);
-    }
-    const t = $("tracker");
-    if (t) t.querySelectorAll(".step").forEach((b) =>
-      b.classList.toggle("is-active", b.dataset.step === step));
+    applyStepPanel();
+    // Land at the top of the panel rather than wherever the previous step was
+    // scrolled to.
+    const anchor = $("tracker");
+    if (anchor) anchor.scrollIntoView({ behavior: "smooth", block: "start" });
   });
 }
 
@@ -253,13 +286,13 @@ function renderOptions(options, addons, approved) {
     $("options-help").textContent = "";
     wrap.innerHTML = '<p class="muted">Your pricing is being finalized — your Treadwell rep will follow up. You can still message us below.</p>';
     $("addons").innerHTML = "";
-    if (!approved) hide($("approve-card"));
+    if (!approved) setEligible("approve-card", false);
     return;
   }
   // Pricing exists, so the approve card belongs on screen. It had no show()
   // anywhere: once hidden (empty pricing, or an approval) it stayed hidden for
   // the rest of the session even after pricing landed on a later poll.
-  if (!approved) show($("approve-card"));
+  if (!approved) setEligible("approve-card", true);
   // Default selection (pre-approval only): the base option, else the first.
   if (!approved && !SELECTED.size) {
     const base = options.find((o) => o.is_base) || options[0];
@@ -345,7 +378,7 @@ function renderThankYou(a) {
     lead.textContent = "Your deposit invoice is on its way — expect it within about 24 hours.";
     actions.classList.add("hidden");
   }
-  show($("thankyou-card"));
+  setEligible("thankyou-card", true);
 }
 
 // ── project contacts (visible after approval; emphasized once deposit received) ─
@@ -353,9 +386,8 @@ let CONTACT_ROWS = [];
 
 function renderContacts(vm) {
   const card = $("contacts-card");
-  // Always open, per Hanz — the customer can add contacts whenever they like
-  // instead of waiting for approval.
-  show(card);
+  // Always available (per Hanz); whether it's ON SCREEN is the tab's call.
+  setEligible("contacts-card", true);
   card.classList.toggle("emphasized", vm.status.deposit === "received" && vm.status.contacts !== "received");
   const submitted = vm.status.contacts === "received";
   $("contacts-help").textContent = submitted
@@ -448,8 +480,8 @@ function contactRow(c, i) {
 }
 
 function renderPdf(has) {
-  if (!has) { hide($("pdf-card")); return; }
-  show($("pdf-card"));
+  setEligible("pdf-card", !!has);
+  if (!has) return;
   const src = `/api/portal/${TOKEN}/pdf`;
   $("pdf-link").href = src;
   $("pdf-modal-link").href = src;

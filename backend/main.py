@@ -1173,6 +1173,14 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
     if not db.get_proposal(proposal_id):
         return _json({"ok": False, "error": "not_found"}, 404)
     db.set_schedule_status(proposal_id, "scheduled")
+    # Every other status change leaves a trace in the thread; this one didn't, so
+    # the customer's bell and chat stayed silent while the tracker quietly moved.
+    try:
+        db.add_message(proposal_id, "staff", None,
+                       "Project scheduled — we'll confirm the dates with you shortly.",
+                       msg_type="system")
+    except Exception as exc:  # noqa: BLE001 — the status change is what matters
+        log.warning("could not post the scheduled system message for %s: %s", proposal_id, exc)
     return _json({"ok": True})
 
 
