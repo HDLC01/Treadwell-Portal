@@ -283,6 +283,10 @@ const veLabel = (o) => (o.delta < 0 ? `Deduct (${money(Math.abs(o.delta))})` : `
 
 function renderOptions(options, addons, approved) {
   CUR_OPTIONS = options || [];
+  // Pricing always belongs to the Proposal tab — it shows either the options or
+  // the "being finalized" note. Before the tab switch this card was never hidden
+  // by JS at all, so it had no eligibility flag and went permanently missing.
+  setEligible("options-card", true);
   const wrap = $("options");
   if (!options || !options.length) {
     $("options-help").textContent = "";
