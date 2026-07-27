@@ -79,6 +79,13 @@ grant select, insert, update, delete on public.portal_contacts to portal_app;
 drop policy if exists portal_app_rw on public.portal_contacts;
 create policy portal_app_rw on public.portal_contacts for all to portal_app using (true) with check (true);
 
+-- Customer notification bell: per-(reader, proposal) last-seen markers.
+-- RLS is enabled in schema.sql, so the POLICY is required — grants alone are
+-- default-deny.
+grant select, insert, update, delete on public.portal_read_state to portal_app;
+drop policy if exists portal_app_rw on public.portal_read_state;
+create policy portal_app_rw on public.portal_read_state for all to portal_app using (true) with check (true);
+
 -- Deposit invoice numbering: portal_app must be able to call nextval() when it
 -- issues an invoice number. A sequence needs its OWN grant — the table grants
 -- above do not cover it, and without this the first invoice fails with

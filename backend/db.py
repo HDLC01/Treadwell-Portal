@@ -219,6 +219,52 @@ def list_recent_customer_messages(limit: int = 25) -> list[dict[str, Any]]:
     )
 
 
+def list_customer_events(email: str, limit: int = 30) -> list[dict[str, Any]]:
+    """Everything worth telling a customer about, across EVERY proposal they can
+    reach — staff replies, deposit invoices, and the system lines that record
+    approvals, deposits received and scheduling.
+
+    Scoped by the same primary-OR-recipient union as list_proposals_by_email, so
+    one customer can never see another's activity."""
+    return qall(
+        "select q.id, q.proposal_id, q.msg_type, q.body, q.created_at, "
+        "       p.project_name, p.token "
+        "from public.portal_questions q "
+        "join public.portal_proposals p on p.proposal_id = q.proposal_id "
+        "where q.author_kind = 'staff' "
+        "  and q.msg_type in ('text','deposit_request','system') "
+        "  and q.proposal_id in ("
+        "    select proposal_id from public.portal_proposals where lower(customer_email) = lower(%s)"
+        "    union"
+        "    select proposal_id from public.portal_proposal_recipients where lower(email) = lower(%s)"
+        "  ) "
+        "order by q.id desc limit %s",
+        (email, email, int(limit)),
+    )
+
+
+def get_read_state(email: str) -> dict[str, Any]:
+    """proposal_id -> last_seen_at for this reader."""
+    rows = qall(
+        "select proposal_id, last_seen_at from public.portal_read_state where lower(email) = lower(%s)",
+        (email,),
+    )
+    return {r["proposal_id"]: r["last_seen_at"] for r in rows}
+
+
+def mark_read(email: str, proposal_ids: list[str]) -> None:
+    """Stamp 'seen now' for this reader on the given proposals. Per (reader,
+    proposal) so two recipients on one proposal keep separate unread counts."""
+    for pid in proposal_ids:
+        execute(
+            "insert into public.portal_read_state (email, proposal_id, last_seen_at, updated_at) "
+            "values (%s, %s, now(), now()) "
+            "on conflict (lower(email), proposal_id) "
+            "do update set last_seen_at = now(), updated_at = now()",
+            (email.strip().lower(), pid),
+        )
+
+
 def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     return qall(
         "select method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "

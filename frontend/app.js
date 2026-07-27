@@ -205,6 +205,9 @@ function renderTracker(st) {
 // renderTracker) re-runs on every status poll, which would otherwise wipe it.
 let ACTIVE_STEP = null;
 
+// Exposed so the sidebar (shell.js) drives the SAME navigation as the tiles.
+window.focusStep = (k) => focusStep(k);
+
 const STEP_TARGETS = {
   proposal: ["pdf-card", "options-card", "approve-card"],
   deposit: ["deposit-card"],

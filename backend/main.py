@@ -327,6 +327,68 @@ def auth_logout(request: Request) -> JSONResponse:
     return resp
 
 
+_EVENT_ICONS = {"text": "💬", "deposit_request": "🧾", "system": "🔔"}
+
+
+def _event(row: dict, seen) -> dict:
+    """One bell item. `title` carries the project name because the feed spans
+    every project this customer can reach."""
+    kind = row.get("msg_type") or "text"
+    body = (row.get("body") or "").strip()
+    if kind == "text":
+        head = "Treadwell replied"
+    elif kind == "deposit_request":
+        head = "Deposit invoice"
+    else:
+        head = (body.split(" — ", 1)[0] if " — " in body[:60] else "Update")
+        body = body.split(" — ", 1)[1] if " — " in body[:60] else body
+    ts = row.get("created_at")
+    link = f"/p/{row['token']}" + ("#proposal" if kind == "deposit_request" else "")
+    return {
+        "id": f"ev:{row.get('id')}",
+        "kind": kind,
+        "icon": _EVENT_ICONS.get(kind, "•"),
+        "title": f"{head} · {row.get('project_name') or 'your project'}",
+        "body": body[:240],
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else ts,
+        "link": link,
+        "unread": bool(ts and (seen.get(row["proposal_id"]) is None or ts > seen[row["proposal_id"]])),
+    }
+
+
+@app.get("/api/me/notifications")
+def me_notifications(request: Request) -> JSONResponse:
+    """The customer's bell: staff replies, deposit invoices and status changes
+    across ALL their projects, newest first, with a per-reader unread count."""
+    se = _session_email(request)
+    if not se:
+        return _json({"ok": True, "authed": False, "items": [], "unread": 0})
+    try:
+        seen = db.get_read_state(se)
+        items = [_event(r, seen) for r in db.list_customer_events(se)]
+    except Exception as exc:  # noqa: BLE001 — the bell must never break the page
+        log.warning("customer notifications failed for %s: %s", se, exc)
+        return _json({"ok": True, "authed": True, "items": [], "unread": 0})
+    return _json({"ok": True, "authed": True, "items": items,
+                  "unread": sum(1 for i in items if i["unread"])})
+
+
+@app.post("/api/me/notifications/seen")
+async def me_notifications_seen(request: Request) -> JSONResponse:
+    """Clear this reader's badge. Per-customer, unlike the staff bell's single
+    shared marker — a shared one would leak read state between customers."""
+    se = _session_email(request)
+    if not se:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    try:
+        pids = [r["proposal_id"] for r in db.list_proposals_by_email(se)]
+        db.mark_read(se, pids)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mark_read failed for %s: %s", se, exc)
+        return _json({"ok": False}, 500)
+    return _json({"ok": True})
+
+
 @app.get("/api/me/proposals")
 def me_proposals(request: Request) -> JSONResponse:
     se = _session_email(request)
@@ -1225,6 +1287,6 @@ def asset(asset: str):
     saving a few hundred bytes on a handful of tiny files."""
     f = FRONTEND_DIR / asset
     if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js",
-                                 "projects.js", "favicon.ico"}:
+                                 "projects.js", "shell.js", "favicon.ico"}:
         return FileResponse(f, headers=_NO_CACHE)
     return _json({"ok": False, "error": "not_found"}, 404)

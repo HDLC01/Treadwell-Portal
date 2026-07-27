@@ -246,6 +246,22 @@ create sequence if not exists public.portal_invoice_seq start 1001;
 alter table public.portal_proposals add column if not exists deposit_invoice_no text;
 alter table public.portal_proposals add column if not exists deposit_invoice_issued_at timestamptz;
 
+-- ── Customer read state (notification bell) ───────────────────────────────────
+-- Per (reader, proposal), NOT per session: sessions expire and are replaced, so a
+-- re-login would reset the marker. Keyed on email like portal_proposal_recipients,
+-- so two people on one proposal each keep their own unread count. Deliberately
+-- per-customer — a shared marker would leak one customer's read state to another.
+create table if not exists public.portal_read_state (
+  email        text not null,
+  proposal_id  text not null references public.portal_proposals(proposal_id) on delete cascade,
+  last_seen_at timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+create unique index if not exists portal_read_state_unique_idx
+  on public.portal_read_state (lower(email), proposal_id);
+create index if not exists portal_read_state_email_idx
+  on public.portal_read_state (lower(email));
+
 -- ── Row Level Security ────────────────────────────────────────────────────────
 -- Enable RLS on every portal_* table so they are NOT exposed through the public
 -- (anon) REST API of the shared database. Idempotent: ENABLE on an already-
@@ -264,3 +280,4 @@ alter table public.portal_proposal_recipients enable row level security;
 alter table public.portal_notify_recipients enable row level security;
 alter table public.portal_notify_overrides enable row level security;
 alter table public.portal_contacts enable row level security;
+alter table public.portal_read_state enable row level security;
