@@ -185,6 +185,23 @@ def _contact(row: dict) -> dict:
             "phone": row.get("phone"), "label": row.get("label")}
 
 
+def _notify_customer(p: dict, heading: str, body_html: str) -> None:
+    """Email the milestone to EVERY recipient on the proposal.
+
+    The third channel alongside the chat line and the team email. Best-effort:
+    a mail failure must never fail the action the customer just completed."""
+    try:
+        pid = p["proposal_id"]
+        link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+        rt = email_sender.proposal_reply_to(p["token"])
+        project = p.get("project_name") or "your project"
+        for e in (db.get_recipients(pid) or [p.get("customer_email")]):
+            if e:
+                email_sender.send_customer_update(e, link, project, heading, body_html, reply_to=rt)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("customer update email failed for %s: %s", p.get("proposal_id"), exc)
+
+
 def _staff_link(proposal_id: str) -> str:
     """Deep-link a staff notification email into the proposal in the staff tool
     (so staff answer in-portal rather than replying to the email)."""
@@ -558,6 +575,17 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         f"<p>Project: {html.escape(project_name)}.</p>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
+    # Confirm the approval to the customer in writing. They'd just committed to a
+    # price and heard nothing back except (later) an invoice.
+    _notify_customer(
+        p, "Thank you — your proposal is approved",
+        f"<p>We've recorded your approval of <strong>{html.escape(project_name)}</strong>"
+        f"{(' by ' + html.escape(name)) if name else ''} on {approved_date}.</p>"
+        f"<p>Approved: <strong>{html.escape(option_summary)}</strong> — "
+        f"<strong>${total:,.2f}</strong>.</p>"
+        f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves your place on our "
+        f"schedule; the invoice follows separately.</p>",
+    )
     try:
         automations.run_on_approval(p, project_name)
     except Exception as exc:  # noqa: BLE001
@@ -631,6 +659,15 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
     )
+    _notify_customer(
+        p, "We've received your deposit details",
+        f"<p>Thanks — we've recorded your "
+        f"{'bank transfer' if method == 'ach' else 'check'} for "
+        f"<strong>{html.escape(project_name)}</strong>.</p>"
+        f"<p>We'll confirm here as soon as it "
+        f"{'clears' if method == 'ach' else 'arrives'}. Nothing else is needed from you "
+        f"right now.</p>",
+    )
     return _json({"ok": True})
 
 
@@ -692,6 +729,12 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+    )
+    _notify_customer(
+        p, "Thanks — we have your project contacts",
+        f"<p>We've saved the contacts for <strong>{html.escape(project)}</strong>:</p>"
+        f"<ul>{rows}</ul>"
+        f"<p>You can update them any time before we schedule the work.</p>",
     )
     return _json({"ok": True})
 
@@ -1110,6 +1153,19 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
     db.add_message(proposal_id, "staff", None,
                    "Deposit received — thank you! Please add your project contacts so we can schedule the work.",
                    msg_type="system")
+    p = db.get_proposal(proposal_id) or {}
+    project = p.get("project_name") or "your project"
+    email_sender.notify_team(
+        f"Deposit RECEIVED — {project}",
+        f"<p>The deposit for <strong>{html.escape(project)}</strong> is marked received. "
+        f"The customer has been asked for their project contacts.</p>",
+        kind="deposit", reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+    )
+    _notify_customer(
+        p, "Deposit received — thank you",
+        f"<p>We've received your deposit for <strong>{html.escape(project)}</strong>.</p>"
+        f"<p>Next: add your project contacts so we can schedule the work.</p>",
+    )
     return _json({"ok": True})
 
 
@@ -1181,6 +1237,18 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
                        msg_type="system")
     except Exception as exc:  # noqa: BLE001 — the status change is what matters
         log.warning("could not post the scheduled system message for %s: %s", proposal_id, exc)
+    p = db.get_proposal(proposal_id) or {}
+    project = p.get("project_name") or "your project"
+    email_sender.notify_team(
+        f"Project SCHEDULED — {project}",
+        f"<p><strong>{html.escape(project)}</strong> is marked scheduled.</p>",
+        reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+    )
+    _notify_customer(
+        p, "Your project is scheduled",
+        f"<p><strong>{html.escape(project)}</strong> is on our schedule.</p>"
+        f"<p>Your Treadwell contact will confirm the dates with you shortly.</p>",
+    )
     return _json({"ok": True})
 
 

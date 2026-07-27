@@ -177,6 +177,24 @@ def send_reply_notification(email: str, url: str, project_name: str,
                  _thread_headers(email), reply_to=reply_to)
 
 
+def send_customer_update(email: str, url: str, project_name: str, heading: str,
+                         body_html: str, reply_to: str | None = None) -> bool:
+    """Confirm a milestone to the CUSTOMER — approval, deposit, contacts, dates.
+
+    Every one of these already posted a chat line and (mostly) emailed the team,
+    but the customer got nothing, so from their side the project went quiet at
+    exactly the moments they'd want acknowledgement. `body_html` is trusted
+    markup built by the caller; anything user-supplied must be escaped first."""
+    body = (
+        f'{body_html}'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
+        f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">'
+        f'View your project</a></p>'
+    )
+    return _send([email], f"{heading} — {project_name}", _wrap(heading, body),
+                 _thread_headers(email), reply_to=reply_to)
+
+
 def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None,
                          reply_to: str | None = None, invoice_no: str | None = None,
                          invoice_pdf: bytes | None = None, invoice_filename: str | None = None,

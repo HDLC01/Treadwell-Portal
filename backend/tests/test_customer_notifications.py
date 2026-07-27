@@ -111,6 +111,8 @@ def test_scheduling_leaves_a_trace_in_the_thread(monkeypatch):
     monkeypatch.setattr(main, "_admin_ok", lambda request: True)
     monkeypatch.setattr(main.db, "get_proposal", lambda pid: {"proposal_id": pid})
     monkeypatch.setattr(main.db, "set_schedule_status", lambda pid, s: None)
+    monkeypatch.setattr(main.email_sender, "notify_team", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_notify_customer", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "add_message",
                         lambda pid, kind, who, body, **k: posted.append((body, k.get("msg_type"))))
     r = TestClient(main.app).post("/api/admin/proposal/p1/scheduled")
@@ -124,6 +126,8 @@ def test_scheduling_still_succeeds_if_the_message_fails(monkeypatch):
     monkeypatch.setattr(main, "_admin_ok", lambda request: True)
     monkeypatch.setattr(main.db, "get_proposal", lambda pid: {"proposal_id": pid})
     monkeypatch.setattr(main.db, "set_schedule_status", lambda pid, s: None)
+    monkeypatch.setattr(main.email_sender, "notify_team", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_notify_customer", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "add_message",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
     assert TestClient(main.app).post("/api/admin/proposal/p1/scheduled").json()["ok"] is True
