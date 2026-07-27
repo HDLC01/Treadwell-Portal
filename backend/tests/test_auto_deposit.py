@@ -27,6 +27,8 @@ def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
 
     monkeypatch.setattr(db, "get_proposal", _proposal)
     monkeypatch.setattr(db, "assign_invoice_no", _assign)
+    monkeypatch.setattr(db, "set_deposit_amount",
+                        lambda pid, amt: flags.setdefault("amounts", []).append(amt))
     monkeypatch.setattr(db, "add_message",
                         lambda pid, kind, who, body, **k: flags["msgs"].append((body, k)))
     monkeypatch.setattr(db, "set_deposit_requested", lambda pid: flags["requested"].append(pid))
@@ -59,6 +61,24 @@ def test_auto_deposit_posts_invoice_chat_card(monkeypatch):
     assert kw["meta"]["amount"] == 3316.25
     assert kw["meta"]["reference"] == "TW-P1"          # deposit_ref('p1')
     assert "TW-INV-01001" in body and "3,316.25" in body
+
+
+def test_auto_deposit_does_not_rewrite_matching_amount(monkeypatch):
+    """The auto path uses the stored 25% — no pointless write."""
+    _sent, flags = _wire(monkeypatch)
+    automations.request_deposit({"proposal_id": "p1", "token": "tok"}, "Westport")
+    assert flags.get("amounts") is None
+
+
+def test_staff_override_amount_is_persisted_before_render(monkeypatch):
+    """A staff-adjusted amount must be written to deposit_amount, otherwise the
+    downloadable invoice (rebuilt from that column) would disagree with the PDF
+    that was emailed."""
+    sent, flags = _wire(monkeypatch)
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 999.0)
+    assert flags["amounts"] == [999.0]
+    assert sent[0][1] == 999.0
+    assert "999.00" in flags["msgs"][0][0]
 
 
 def test_auto_deposit_skips_when_already_invoiced(monkeypatch):

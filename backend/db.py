@@ -272,6 +272,17 @@ def set_deposit_requested(proposal_id: str) -> None:
     )
 
 
+def set_deposit_amount(proposal_id: str, amount) -> None:
+    """Persist a staff-adjusted deposit amount. Must be written before the invoice
+    is rendered: the customer-facing /deposit-invoice.pdf rebuilds the document
+    from this column, so leaving it stale would make the downloaded invoice
+    disagree with the one that was emailed."""
+    execute(
+        "update public.portal_proposals set deposit_amount=%s, updated_at=now() where proposal_id=%s",
+        (amount, proposal_id),
+    )
+
+
 def assign_invoice_no(proposal_id: str) -> Optional[str]:
     """Issue the deposit invoice number, ONCE. Returns the number (existing or
     newly minted). Idempotent by construction: the `where deposit_invoice_no is

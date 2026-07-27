@@ -47,9 +47,15 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
 
     pid = proposal_row["proposal_id"]
     fresh = db.get_proposal(pid) or proposal_row
+    stored = fresh.get("deposit_amount")
     if amount is None:
-        amount = fresh.get("deposit_amount")
+        amount = stored
     amount = float(amount)
+    # A staff override has to be persisted BEFORE rendering: the customer-facing
+    # /deposit-invoice.pdf rebuilds from the stored column, so skipping this would
+    # make the downloadable invoice disagree with the emailed one.
+    if stored is None or float(stored) != amount:
+        db.set_deposit_amount(pid, amount)
 
     invoice_no = db.assign_invoice_no(pid)
     # Re-read so the document shows the issued-at stamp just written.
