@@ -83,6 +83,12 @@ a { color: var(--primary); }
   padding: 6px 10px; line-height: 1;
 }
 .switcher-btn:hover { background: var(--surface-low); }
+/* The label is the current project's name, which can be long — truncate it
+   rather than let the header grow or wrap. */
+.switcher-btn #proj-switch-label {
+  max-width: min(46vw, 320px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.switcher-btn svg { flex: none; }
 .switcher-menu {
   position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
   width: min(420px, calc(100vw - 32px));

@@ -165,6 +165,11 @@ async function mountSwitcher() {
   const proposals = await TWProjects.load();
   if (proposals.length < 2) return;   // nothing to switch between
   menu.innerHTML = TWProjects.rowsHtml(proposals, TOKEN);
+  // Label the button with the project you're actually looking at, so it matches
+  // the title below it instead of reading a generic "My projects".
+  const here = proposals.find((p) => p.token === TOKEN);
+  const label = $("proj-switch-label");
+  if (label && here && here.project_name) label.textContent = here.project_name;
   wrap.classList.remove("hidden");
 
   const close = () => { menu.classList.add("hidden"); btn.setAttribute("aria-expanded", "false"); };

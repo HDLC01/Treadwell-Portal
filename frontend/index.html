@@ -14,7 +14,9 @@
     <!-- Project switcher: revealed by app.js only when this customer has 2+ projects. -->
     <div class="switcher hidden" id="proj-switcher">
       <button class="switcher-btn" id="proj-switch-btn" type="button" aria-haspopup="true" aria-expanded="false">
-        My projects
+        <!-- Replaced by app.js with THIS project's name, so the button and the
+             page title agree; falls back to the generic label. -->
+        <span id="proj-switch-label">My projects</span>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
       </button>
       <div class="switcher-menu hidden" id="proj-switch-menu" role="menu"></div>
