@@ -154,7 +154,20 @@ textarea { min-height: 96px; resize: vertical; }
 
 /* Status tracker */
 .tracker { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-.tracker .step { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 14px; background: var(--surface-low); }
+/* Tiles are <button>s that navigate to their step, so the browser defaults
+   (centred text, its own font) have to be reset. */
+.tracker .step { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 14px;
+  background: var(--surface-low); font: inherit; text-align: left; width: 100%; cursor: pointer;
+  display: block; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+.tracker .step:hover { border-color: var(--outline); background: var(--surface); }
+.tracker .step:focus-visible { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-tint); }
+.tracker .step.is-active { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-tint); }
+/* Brief highlight so it's obvious which card a tile jumped you to. */
+.step-flash { animation: step-flash 1.4s ease; }
+@keyframes step-flash {
+  0%, 30% { box-shadow: 0 0 0 3px var(--primary-tint); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
 .tracker .step .lbl { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary); font-weight: 700; }
 .tracker .step .val { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; font-weight: 700; font-size: .95rem; }
 .tracker .step.is-done { border-color: var(--success); background: var(--success-bg); }

@@ -120,9 +120,12 @@ function renderPortal(vm) {
   renderChat(STATE.messages);
   setupDeposit();
 
-  // Deposit card: shown once approved, until the deposit is marked received.
-  if (approved && vm.status.deposit !== "received") show($("deposit-card"));
-  else hide($("deposit-card"));
+  // Deposit stays reachable at every stage so a customer can open the step from
+  // the tracker and skip around. setupDeposit's "recorded" banner already covers
+  // the post-submission state, and the server has no approval precondition on
+  // POST /deposit — only a valid session.
+  show($("deposit-card"));
+  renderSchedule(vm.status);
 
   // Pre-fill the approver name from the contact we already have — editable, so a
   // different signer can overwrite. Only when empty, so a poll refetch (or the
@@ -183,16 +186,50 @@ function setHeader(vm, approved) {
 
 function renderTracker(st) {
   const steps = [
-    { label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
-    { label: "Deposit", done: st.deposit === "received", val: st.deposit === "received" ? "Received" : "Pending" },
-    { label: "Contact info", done: st.contacts === "received", val: st.contacts === "received" ? "Received" : "Pending" },
-    { label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
+    { key: "proposal", label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
+    { key: "deposit", label: "Deposit", done: st.deposit === "received", val: st.deposit === "received" ? "Received" : "Pending" },
+    { key: "contacts", label: "Contact info", done: st.contacts === "received", val: st.contacts === "received" ? "Received" : "Pending" },
+    { key: "schedule", label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
   ];
+  // Buttons, not divs: each tile navigates to that step. Customers can move back
+  // and forth and skip ahead — nothing here gates on the previous step.
   $("tracker").innerHTML = steps.map((s) => `
-    <div class="step ${s.done ? "is-done" : ""}">
-      <div class="lbl">${s.label}</div>
-      <div class="val" style="color:${s.done ? "var(--success)" : "var(--secondary)"}">${s.done ? ICON_CHECK : ICON_DOT}${s.val}</div>
-    </div>`).join("");
+    <button type="button" class="step ${s.done ? "is-done" : ""}${ACTIVE_STEP === s.key ? " is-active" : ""}"
+            data-step="${s.key}"${ACTIVE_STEP === s.key ? ' aria-current="step"' : ""}>
+      <span class="lbl">${s.label}</span>
+      <span class="val" style="color:${s.done ? "var(--success)" : "var(--secondary)"}">${s.done ? ICON_CHECK : ICON_DOT}${s.val}</span>
+    </button>`).join("");
+}
+
+// Which step the customer last opened. Module-level because renderPortal (and so
+// renderTracker) re-runs on every status poll, which would otherwise wipe it.
+let ACTIVE_STEP = null;
+
+const STEP_TARGETS = {
+  proposal: ["pdf-card", "options-card", "approve-card"],
+  deposit: ["deposit-card"],
+  contacts: ["contacts-card"],
+  schedule: ["schedule-card"],
+};
+
+/** Open a step: switch to the proposal view, then scroll its card into sight.
+ *  The rAF matters — hashchange is async, so #proposal-view is still display:none
+ *  at call time and scrollIntoView would silently do nothing. */
+function focusStep(step) {
+  ACTIVE_STEP = step;
+  if (location.hash !== "#proposal") location.hash = "proposal"; else applyHashView(false);
+  requestAnimationFrame(() => {
+    const el = (STEP_TARGETS[step] || []).map((id) => $(id))
+      .find((n) => n && !n.classList.contains("hidden"));
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      el.classList.add("step-flash");
+      setTimeout(() => el.classList.remove("step-flash"), 1400);
+    }
+    const t = $("tracker");
+    if (t) t.querySelectorAll(".step").forEach((b) =>
+      b.classList.toggle("is-active", b.dataset.step === step));
+  });
 }
 
 // Selected pricing option labels (multi-select). Persists across re-renders.
@@ -216,6 +253,10 @@ function renderOptions(options, addons, approved) {
     if (!approved) hide($("approve-card"));
     return;
   }
+  // Pricing exists, so the approve card belongs on screen. It had no show()
+  // anywhere: once hidden (empty pricing, or an approval) it stayed hidden for
+  // the rest of the session even after pricing landed on a later poll.
+  if (!approved) show($("approve-card"));
   // Default selection (pre-approval only): the base option, else the first.
   if (!approved && !SELECTED.size) {
     const base = options.find((o) => o.is_base) || options[0];
@@ -309,7 +350,8 @@ let CONTACT_ROWS = [];
 
 function renderContacts(vm) {
   const card = $("contacts-card");
-  if (vm.status.proposal !== "approved") { hide(card); return; }
+  // Always open, per Hanz — the customer can add contacts whenever they like
+  // instead of waiting for approval.
   show(card);
   card.classList.toggle("emphasized", vm.status.deposit === "received" && vm.status.contacts !== "received");
   const submitted = vm.status.contacts === "received";
@@ -355,6 +397,18 @@ function drawContacts() {
     };
     el.addEventListener("input", upd); el.addEventListener("change", upd);
   });
+}
+
+/** The Schedule step's destination. Treadwell books the date, so this explains
+ *  where the customer stands rather than offering a self-service picker. */
+function renderSchedule(st) {
+  const el = $("schedule-help");
+  if (!el) return;
+  el.textContent = st.schedule === "scheduled"
+    ? "Your project is scheduled — your Treadwell contact will confirm the details with you."
+    : st.deposit === "received"
+      ? "We've received your deposit. We'll be in touch shortly to book your dates."
+      : "We book your dates once the deposit is received. Your Treadwell contact will confirm them with you.";
 }
 
 /** Copy the primary contact's details onto a mirrored row (role is preserved). */
@@ -642,6 +696,12 @@ $("approve-form").addEventListener("submit", async (e) => {
 
 $("back-to-chat").addEventListener("click", () => { location.hash = "chat"; });
 $("thankyou-pay").addEventListener("click", openDeposit);
+// Delegated on the static container: renderTracker replaces its innerHTML on
+// every poll, so per-tile listeners would not survive.
+$("tracker").addEventListener("click", (e) => {
+  const b = e.target.closest(".step");
+  if (b && b.dataset.step) focusStep(b.dataset.step);
+});
 
 // PDF: click the inline preview to open the full-size popup; close via ×, scrim, or Esc.
 $("pdf-preview").addEventListener("click", openPdfModal);
