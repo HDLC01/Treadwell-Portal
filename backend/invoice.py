@@ -47,6 +47,17 @@ def _money(v) -> str:
         return ""
 
 
+def _num(v):
+    """Postgres hands back numeric columns as Decimal, which json can't encode —
+    coerce to float so the payload survives the hop to the proposal tool."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def invoice_payload(proposal_row: dict[str, Any], amount: float,
                     invoice_no: Optional[str] = None,
                     draft: Optional[dict[str, Any]] = None,
@@ -66,9 +77,9 @@ def invoice_payload(proposal_row: dict[str, Any], amount: float,
         "job_number": (d.get("job_number") or "").strip(),
         "invoice_no": invoice_no or "",
         "invoice_date": date.today().isoformat(),
-        "contract_value": proposal_row.get("approved_total"),
-        "deposit_amount": amount,
-        "total_due": amount,
+        "contract_value": _num(proposal_row.get("approved_total")),
+        "deposit_amount": _num(amount),
+        "total_due": _num(amount),
         "deposit_pct": round(proposals.DEPOSIT_PCT * 100),
         "reference": proposals.deposit_ref(pid),
     }
@@ -86,8 +97,12 @@ def render_invoice_pdf(payload: dict[str, Any], *, timeout: float = 90.0) -> byt
     try:
         r = httpx.post(config.PROPOSAL_TOOL_URL + _ENDPOINT, json=payload,
                        headers={"X-Service-Token": config.SERVICE_TOKEN}, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001
+    except httpx.HTTPError as exc:
         raise InvoiceUnavailable(f"proposal tool unreachable: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - e.g. an unencodable payload value
+        # Don't blame the network for a local failure; that misdirected the first
+        # diagnosis of a Decimal slipping into the payload.
+        raise InvoiceUnavailable(f"could not build the invoice request: {exc}") from exc
     if r.status_code != 200:
         raise InvoiceUnavailable(f"proposal tool returned {r.status_code}")
     if not r.content.startswith(b"%PDF"):

@@ -119,3 +119,30 @@ def test_render_returns_the_pdf_and_sends_the_service_token(monkeypatch):
     assert invoice.render_invoice_pdf({"invoice_no": "26.114-01"}).startswith(b"%PDF")
     assert seen["url"].endswith("/api/admin/deposit-invoice")
     assert seen["headers"]["X-Service-Token"] == "tok"
+
+
+def test_payload_is_json_safe_when_postgres_returns_decimals():
+    """psycopg hands numeric columns back as Decimal, which json can't encode —
+    the first end-to-end run died on exactly that. Coerce to float."""
+    import json
+    from decimal import Decimal
+    row = {**ROW, "approved_total": Decimal("14973.00")}
+    p = invoice.invoice_payload(row, Decimal("3743.25"), "26.114-01", draft=DRAFT)
+    assert isinstance(p["contract_value"], float) and p["contract_value"] == 14973.0
+    assert isinstance(p["deposit_amount"], float) and p["deposit_amount"] == 3743.25
+    assert isinstance(p["total_due"], float)
+    json.dumps(p)          # must not raise
+
+
+def test_local_encoding_failure_is_not_reported_as_a_network_error(monkeypatch):
+    """A misleading 'proposal tool unreachable' sent the first diagnosis down the
+    wrong path; a local failure must say so."""
+    monkeypatch.setattr(config, "PROPOSAL_TOOL_URL", "http://tool")
+    monkeypatch.setattr(config, "SERVICE_TOKEN", "tok")
+
+    def boom(*a, **k):
+        raise TypeError("Object of type Decimal is not JSON serializable")
+
+    monkeypatch.setattr(invoice.httpx, "post", boom)
+    with pytest.raises(invoice.InvoiceUnavailable, match="could not build the invoice request"):
+        invoice.render_invoice_pdf({})
