@@ -29,7 +29,8 @@ def create_dropbox_folder(project_name: str, proposal_id: str) -> None:
 
 def issue_deposit_invoice(proposal_row: dict, project_name: str,
                           amount: float | None = None,
-                          overrides: dict | None = None) -> dict:
+                          overrides: dict | None = None,
+                          new_number: bool = False) -> dict:
     """Issue the deposit invoice: mint the number, generate the PDF, post it to
     the chat thread, and email it to every recipient with the PDF attached.
 
@@ -58,7 +59,10 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     if stored is None or float(stored) != amount:
         db.set_deposit_amount(pid, amount)
 
-    invoice_no = db.assign_invoice_no(pid)
+    # Approval reuses the number (idempotent); a staff RESEND mints a fresh one
+    # that supersedes the last, per Hanz — so one deposit can carry several.
+    prior_no = fresh.get("deposit_invoice_no")
+    invoice_no = db.issue_new_invoice_no(pid) if new_number else db.assign_invoice_no(pid)
     # Re-read so the document shows the issued-at stamp just written.
     fresh = db.get_proposal(pid) or fresh
     filename = invoice_mod.invoice_filename(invoice_no)
@@ -82,6 +86,14 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     except invoice_mod.InvoiceUnavailable as exc:
         log.error("[deposit] invoice render unavailable for %s: %s", pid, exc)
         pdf = None
+
+    # A new number replaces the old one — mark the earlier cards so the customer
+    # can tell at a glance which invoice is current.
+    if new_number and prior_no and prior_no != invoice_no:
+        try:
+            db.supersede_invoice_cards(pid, invoice_no)
+        except Exception as exc:  # noqa: BLE001 — labelling must not block the send
+            log.warning("[deposit] could not supersede prior cards for %s: %s", pid, exc)
 
     db.add_message(
         pid, "staff", None,

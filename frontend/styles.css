@@ -226,6 +226,11 @@ textarea { min-height: 96px; resize: vertical; }
 /* Status lines (approved, deposit initiated, …) — same card shape as the deposit
    card so the thread reads consistently, in a muted tone since they're FYI. */
 .chat-card.system { border-left-color: var(--secondary); }
+/* A replaced invoice: kept for the record, visibly not the one to pay. */
+.chat-card.is-superseded { opacity: .6; border-left-color: var(--surface-highest); }
+.chat-card .cc-tag { font-size: .62rem; font-weight: 800; text-transform: uppercase;
+  letter-spacing: .05em; border: 1px solid currentColor; border-radius: 999px;
+  padding: 1px 7px; margin-left: 6px; vertical-align: middle; color: var(--secondary); }
 .chat-card.system .cc-title { font-size: .95rem; }
 .chat-card.system .cc-body { margin-bottom: 0; }
 .chat-card .cc-title { font-weight: 800; margin-bottom: 4px; }

@@ -436,8 +436,20 @@ function renderMsg(m) {
   if (m.msg_type === "deposit_request") {
     const meta = m.meta || {};
     const amt = meta.amount != null ? money(meta.amount) : "";
+    // Only the CURRENT invoice number is stored, so a superseded card's document
+    // can't be re-rendered — label it and drop the download rather than linking
+    // to a PDF that would show a different number.
+    const dead = !!meta.superseded;
     const no = meta.invoice_no ? `<div class="cc-meta">Invoice ${esc(meta.invoice_no)}${
-      meta.reference ? ` · Reference ${esc(meta.reference)}` : ""}</div>` : "";
+      meta.reference ? ` · Reference ${esc(meta.reference)}` : ""}${
+      dead && meta.superseded_by ? ` · replaced by ${esc(meta.superseded_by)}` : ""}</div>` : "";
+    if (dead) {
+      return `<div class="chat-card deposit is-superseded">
+        <div class="cc-title">Deposit invoice${amt ? ` — ${amt}` : ""} <span class="cc-tag">Superseded</span></div>
+        ${no}
+        <div class="cc-body">${esc(m.body || "")}</div>
+      </div>`;
+    }
     // The invoice PDF is served per-proposal, so the link works for any recipient
     // with a valid session (same gate as the proposal PDF).
     const dl = meta.invoice_no

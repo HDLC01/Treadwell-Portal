@@ -28,6 +28,13 @@ def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
 
     monkeypatch.setattr(db, "get_proposal", _proposal)
     monkeypatch.setattr(db, "assign_invoice_no", _assign)
+    def _new(pid):
+        flags["assigned"] = "TW-INV-01002"
+        flags.setdefault("minted", []).append(pid)
+        return flags["assigned"]
+    monkeypatch.setattr(db, "issue_new_invoice_no", _new)
+    monkeypatch.setattr(db, "supersede_invoice_cards",
+                        lambda pid, by: flags.setdefault("superseded", []).append(by))
     # The invoice PDF is rendered by the proposal tool over HTTP — stub that seam
     # so the suite never reaches the network.
     monkeypatch.setattr(db, "get_draft_data", lambda pid: {})
@@ -147,3 +154,29 @@ def test_unedited_number_is_not_rewritten(monkeypatch):
     _sent, flags = _wire(monkeypatch)
     automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25)
     assert "set_no" not in flags
+
+
+# ── resend mints a NEW invoice number (Hanz's call) ──────────────────────────
+def test_resend_mints_a_new_number_and_supersedes_the_old_card(monkeypatch):
+    sent, flags = _wire(monkeypatch, deposit_invoice_no="TW-INV-01001")
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25,
+                                      new_number=True)
+    assert flags["minted"] == ["p1"]                  # fresh number, not reused
+    assert flags["superseded"] == ["TW-INV-01002"]    # prior cards point at it
+    assert sent[0][2] == "TW-INV-01002"
+
+
+def test_approval_path_reuses_its_number(monkeypatch):
+    """Only the staff resend mints; a re-approval must not renumber."""
+    _sent, flags = _wire(monkeypatch)
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25)
+    assert "minted" not in flags
+    assert flags["invoice_calls"] == ["p1"]           # went through assign_invoice_no
+
+
+def test_first_send_does_not_supersede_anything(monkeypatch):
+    """Nothing to replace when there was no prior invoice."""
+    _sent, flags = _wire(monkeypatch, deposit_invoice_no=None)
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25,
+                                      new_number=True)
+    assert "superseded" not in flags

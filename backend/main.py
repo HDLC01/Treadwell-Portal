@@ -1094,7 +1094,10 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
 
     project = p.get("project_name") or "your proposal"
     try:
-        result = automations.issue_deposit_invoice(p, project, amount, overrides=overrides)
+        # Staff resend = a genuinely new invoice that supersedes the last (Hanz's
+        # call). The auto path on approval keeps reusing its number.
+        result = automations.issue_deposit_invoice(p, project, amount, overrides=overrides,
+                                                   new_number=bool(p.get("deposit_invoice_no")))
     except Exception as exc:  # noqa: BLE001
         log.error("manual deposit invoice failed for %s: %s", proposal_id, exc)
         return _json({"ok": False, "error": "invoice_failed"}, 500)

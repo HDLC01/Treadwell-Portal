@@ -283,6 +283,36 @@ def set_deposit_amount(proposal_id: str, amount) -> None:
     )
 
 
+def issue_new_invoice_no(proposal_id: str) -> Optional[str]:
+    """Mint a FRESH invoice number, always. Used by the staff resend: per Hanz,
+    each resend is a genuinely new invoice that supersedes the last, unlike the
+    auto-on-approval path which reuses the number via assign_invoice_no."""
+    execute(
+        "update public.portal_proposals "
+        "set deposit_invoice_no = 'TW-INV-' || to_char(nextval('public.portal_invoice_seq'), 'FM00000'), "
+        "    deposit_invoice_issued_at = now(), updated_at = now() "
+        "where proposal_id = %s",
+        (proposal_id,),
+    )
+    row = q1("select deposit_invoice_no from public.portal_proposals where proposal_id=%s", (proposal_id,))
+    return (row or {}).get("deposit_invoice_no")
+
+
+def supersede_invoice_cards(proposal_id: str, replaced_by: str) -> None:
+    """Mark earlier deposit_request cards superseded so the customer can tell
+    which invoice is current. Only the latest number is stored, so an old card's
+    document can't be re-rendered — the frontends drop its download link and
+    label it instead."""
+    execute(
+        "update public.portal_questions "
+        "set meta = coalesce(meta, '{}'::jsonb) || jsonb_build_object('superseded', true, "
+        "                                                            'superseded_by', %s::text) "
+        "where proposal_id = %s and msg_type = 'deposit_request' "
+        "  and coalesce((meta->>'superseded')::boolean, false) = false",
+        (replaced_by, proposal_id),
+    )
+
+
 def set_invoice_no(proposal_id: str, invoice_no: str) -> None:
     """Persist a staff-edited invoice number. The customer quotes this back, and
     the portal download rebuilds the document from it, so an edit that only lived
