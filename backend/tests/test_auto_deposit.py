@@ -31,7 +31,10 @@ def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
     # The invoice PDF is rendered by the proposal tool over HTTP — stub that seam
     # so the suite never reaches the network.
     monkeypatch.setattr(db, "get_draft_data", lambda pid: {})
-    monkeypatch.setattr(invoice_mod, "render_invoice_pdf", lambda payload, **k: b"%PDF-1.4 stub")
+    monkeypatch.setattr(invoice_mod, "render_invoice_pdf",
+                        lambda payload, **k: flags.setdefault("payloads", []).append(payload) or b"%PDF-1.4 stub")
+    monkeypatch.setattr(db, "set_invoice_no",
+                        lambda pid, no: flags.setdefault("set_no", []).append(no))
     monkeypatch.setattr(db, "set_deposit_amount",
                         lambda pid, amt: flags.setdefault("amounts", []).append(amt))
     monkeypatch.setattr(db, "add_message",
@@ -115,3 +118,32 @@ def test_auto_deposit_never_raises(monkeypatch):
     monkeypatch.setattr(db, "set_deposit_requested",
                         lambda pid: (_ for _ in ()).throw(RuntimeError("db down")))
     automations.request_deposit({"proposal_id": "p1", "token": "tok"}, "Westport")   # no exception
+
+
+# ── staff edits from the review form ─────────────────────────────────────────
+def test_staff_overrides_reach_the_document(monkeypatch):
+    """Edit-before-send: whatever staff corrected must be what gets rendered."""
+    _sent, flags = _wire(monkeypatch)
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25,
+                                      overrides={"customer_name": "Acme Holdings LLC",
+                                                 "customer_address": "1 Main St"})
+    payload = flags["payloads"][0]
+    assert payload["customer_name"] == "Acme Holdings LLC"
+    assert payload["customer_address"] == "1 Main St"
+
+
+def test_an_edited_invoice_number_is_persisted(monkeypatch):
+    """The customer quotes this number back and the portal download rebuilds from
+    it, so an edit that only lived in the emailed PDF would leave them disagreeing."""
+    sent, flags = _wire(monkeypatch)
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25,
+                                      overrides={"invoice_no": "26.114-01"})
+    assert flags["set_no"] == ["26.114-01"]
+    assert sent[0][2] == "26.114-01"          # the email cites the edited number
+    assert "26.114-01" in flags["msgs"][0][0] # so does the chat card
+
+
+def test_unedited_number_is_not_rewritten(monkeypatch):
+    _sent, flags = _wire(monkeypatch)
+    automations.issue_deposit_invoice({"proposal_id": "p1", "token": "tok"}, "Westport", 3316.25)
+    assert "set_no" not in flags

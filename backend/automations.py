@@ -28,7 +28,8 @@ def create_dropbox_folder(project_name: str, proposal_id: str) -> None:
 
 
 def issue_deposit_invoice(proposal_row: dict, project_name: str,
-                          amount: float | None = None) -> dict:
+                          amount: float | None = None,
+                          overrides: dict | None = None) -> dict:
     """Issue the deposit invoice: mint the number, generate the PDF, post it to
     the chat thread, and email it to every recipient with the PDF attached.
 
@@ -67,8 +68,17 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     # without the attachment — rather than blocking the customer on our plumbing.
     try:
         payload = invoice_mod.invoice_payload(fresh, amount, invoice_no,
-                                              draft=db.get_draft_data(pid) or {})
+                                              draft=db.get_draft_data(pid) or {},
+                                              overrides=overrides)
         pdf = invoice_mod.render_invoice_pdf(payload)
+        # A staff-edited invoice number is what the customer will quote back, so
+        # persist it — otherwise the portal download would rebuild the document
+        # under the auto-generated number instead.
+        edited_no = (overrides or {}).get("invoice_no")
+        if edited_no and str(edited_no).strip() and str(edited_no).strip() != invoice_no:
+            invoice_no = str(edited_no).strip()
+            db.set_invoice_no(pid, invoice_no)
+            filename = invoice_mod.invoice_filename(invoice_no)
     except invoice_mod.InvoiceUnavailable as exc:
         log.error("[deposit] invoice render unavailable for %s: %s", pid, exc)
         pdf = None

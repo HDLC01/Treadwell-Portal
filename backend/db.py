@@ -283,6 +283,17 @@ def set_deposit_amount(proposal_id: str, amount) -> None:
     )
 
 
+def set_invoice_no(proposal_id: str, invoice_no: str) -> None:
+    """Persist a staff-edited invoice number. The customer quotes this back, and
+    the portal download rebuilds the document from it, so an edit that only lived
+    in the emailed PDF would leave the two disagreeing."""
+    execute(
+        "update public.portal_proposals set deposit_invoice_no=%s, updated_at=now() "
+        "where proposal_id=%s",
+        (invoice_no, proposal_id),
+    )
+
+
 def assign_invoice_no(proposal_id: str) -> Optional[str]:
     """Issue the deposit invoice number, ONCE. Returns the number (existing or
     newly minted). Idempotent by construction: the `where deposit_invoice_no is

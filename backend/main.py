@@ -1085,9 +1085,16 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
     if amount is None or amount <= 0:
         return _json({"ok": False, "error": "invalid_amount"}, 400)   # nothing to invoice
 
+    # Whatever staff corrected on the review form. Capped and string-coerced here
+    # so nothing odd reaches the document renderer.
+    overrides = body.get("invoice")
+    overrides = ({str(k): _cap(v, 300) for k, v in overrides.items()
+                  if isinstance(k, str) and v is not None}
+                 if isinstance(overrides, dict) else None)
+
     project = p.get("project_name") or "your proposal"
     try:
-        result = automations.issue_deposit_invoice(p, project, amount)
+        result = automations.issue_deposit_invoice(p, project, amount, overrides=overrides)
     except Exception as exc:  # noqa: BLE001
         log.error("manual deposit invoice failed for %s: %s", proposal_id, exc)
         return _json({"ok": False, "error": "invoice_failed"}, 500)
