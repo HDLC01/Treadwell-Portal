@@ -221,8 +221,10 @@ function defaultStep(st) {
   return "schedule";
 }
 
-// Exposed so the sidebar (shell.js) drives the SAME navigation as the tiles.
-window.focusStep = (k) => focusStep(k);
+// NOTE: no `window.focusStep = ...` alias here. app.js is a classic script, so
+// the function declaration below is ALREADY window.focusStep — assigning an
+// arrow that calls focusStep(k) just overwrote it with a call to itself and blew
+// the stack on the first tile click. shell.js can use it directly.
 
 // The tracker is a TAB SWITCHER: picking a step shows only that step's cards.
 // The customer sees one thing at a time instead of one long scroll.
