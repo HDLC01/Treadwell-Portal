@@ -11,6 +11,9 @@
   function status(p) {
     if (p.schedule_status === "scheduled") return { label: "Scheduled", cls: "done" };
     if (p.deposit_status === "received") return { label: "Deposit received", cls: "done" };
+    // Between paying and staff confirming it landed — telling them "Deposit due"
+    // here reads as though their payment never arrived.
+    if (p.deposit_status === "submitted") return { label: "Deposit sent", cls: "warn" };
     if (p.proposal_status === "approved") return { label: "Deposit due", cls: "warn" };
     if (p.proposal_status === "viewed") return { label: "Awaiting approval", cls: "warn" };
     return { label: "New proposal", cls: "pending" };

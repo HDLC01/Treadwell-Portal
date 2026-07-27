@@ -35,6 +35,45 @@ def test_recent_msg_handles_missing_fields():
     assert m["id"] is None and m["proposal_id"] is None
     assert m["body"] == ""
     assert m["created_at"] is None
+    assert m["msg_type"] == "text"                       # default for pre-msg_type rows
+
+
+def test_recent_msg_carries_msg_type():
+    """The staff side styles a deposit differently from a question, so the kind has
+    to survive the serializer — it used to drop off here."""
+    m = main._recent_msg({"id": 9, "body": "Deposit initiated — …",
+                          "msg_type": "deposit_submitted", "created_at": None})
+    assert m["msg_type"] == "deposit_submitted"
+
+
+# ── the feed query itself ────────────────────────────────────────────────────
+def test_feed_query_selects_deposit_submissions(monkeypatch):
+    """A deposit submission is the one non-chat thing that must reach the bell: it
+    used to arrive as author_kind='staff'/'system' and was filtered straight out,
+    leaving one email as the only signal a customer had paid. Asserted against the
+    SQL because there is no DB in unit tests (the live query is covered by the
+    staging smoke) — the point is that the predicate can't silently narrow again."""
+    seen = {}
+    monkeypatch.setattr(main.db, "qall",
+                        lambda sql, params=(): seen.update(sql=sql, params=params) or [])
+    main.db.list_recent_customer_messages(limit=5)
+    sql = " ".join(seen["sql"].split())
+    assert "q.author_kind='customer'" in sql             # staff rows still excluded
+    assert "q.msg_type in ('text','deposit_submitted')" in sql
+    assert "q.msg_type" in sql.split("select")[1]        # kind is returned, not just filtered on
+    assert seen["params"] == (5,)
+
+
+def test_unread_counts_ignores_deposit_submissions(monkeypatch):
+    """Nothing clears a deposit the way a staff reply clears a question, so counting
+    it here would pin the board badge on forever. It reaches staff via the bell feed
+    and deposit_status instead."""
+    seen = {}
+    monkeypatch.setattr(main.db, "qall",
+                        lambda sql, params=(): seen.update(sql=sql) or [])
+    main.db.unread_counts()
+    assert "deposit_submitted" not in seen["sql"]
+    assert "q.msg_type='text'" in " ".join(seen["sql"].split())
 
 
 # ── endpoint auth gate ───────────────────────────────────────────────────────
@@ -47,6 +86,11 @@ def client(monkeypatch):
     monkeypatch.setattr(main.config, "SERVICE_TOKEN", "secret-tok")
     monkeypatch.setattr(main.db, "list_recent_customer_messages",
                         lambda limit=25: [
+                            {"id": 8, "proposal_id": "p8", "project_name": "P8",
+                             "customer_name": "D", "author_email": "d@x.com",
+                             "msg_type": "deposit_submitted",
+                             "body": "Deposit initiated — a check is on its way for P8.",
+                             "created_at": dt.datetime(2026, 7, 24, 9, 5, 0)},
                             {"id": 7, "proposal_id": "p7", "project_name": "P7",
                              "customer_name": "C", "author_email": "c@x.com",
                              "body": "hello", "created_at": dt.datetime(2026, 7, 24, 9, 0, 0)},
@@ -66,7 +110,18 @@ def test_recent_messages_returns_feed(client):
     assert r.status_code == 200
     j = r.json()
     assert j["ok"] is True
-    assert len(j["messages"]) == 1
-    assert j["messages"][0]["id"] == 7
-    assert j["messages"][0]["body"] == "hello"
-    assert j["messages"][0]["project_name"] == "P7"
+    assert len(j["messages"]) == 2
+    assert j["messages"][1]["id"] == 7
+    assert j["messages"][1]["body"] == "hello"
+    assert j["messages"][1]["project_name"] == "P7"
+    assert j["messages"][1]["msg_type"] == "text"
+
+
+def test_recent_messages_include_deposit_submissions(client):
+    """End of the chain the deposit travels: endpoint → staff bell. Newest-first,
+    so the deposit leads."""
+    j = client.get("/api/admin/recent-messages", headers={"X-Service-Token": "secret-tok"}).json()
+    dep = j["messages"][0]
+    assert dep["id"] == 8 and dep["msg_type"] == "deposit_submitted"
+    assert dep["project_name"] == "P8"
+    assert "Deposit initiated" in dep["body"]

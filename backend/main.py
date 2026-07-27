@@ -442,7 +442,8 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         "due": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
         "ref": proposals.deposit_ref(p["proposal_id"]),
         # `submitted` lets the customer see a "recorded" state on reload instead of a
-        # blank form they might resubmit (deposit_status only flips when staff confirm).
+        # blank form they might resubmit. Derived from the deposit rows, not from
+        # deposit_status, so the banner survives staff moving the status either way.
         "submitted": bool(_latest),
         "submitted_method": _latest["method"] if _latest else None,
         # Present once the invoice has been issued — drives the download button on
@@ -615,8 +616,11 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         account_type = (str(body.get("account_type") or "").strip().lower() or None)
         if not account_name:
             return _json({"ok": False, "error": "Please enter the account name."}, 400)
-        if len(routing_number) != 9:
-            return _json({"ok": False, "error": "Routing number must be exactly 9 digits."}, 400)
+        # Length floor only, no exact-length rule: routing formats vary by bank and
+        # country and may change, so pinning 9 digits would reject a valid payer.
+        # 4 is just enough to reject an empty/garbage field (same floor as account).
+        if len(routing_number) < 4:
+            return _json({"ok": False, "error": "Routing number must be at least 4 digits."}, 400)
         if len(account_number) < 4:
             return _json({"ok": False, "error": "Account number must be at least 4 digits."}, 400)
         if account_type not in ("checking", "savings"):
@@ -626,16 +630,25 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
                    routing_number=routing_number, account_number=account_number,
                    account_type=account_type)
+    # Move the board card off 'pending' so staff can see money is in flight — until
+    # now the only signal a customer had paid was one email, leaving a paid project
+    # indistinguishable from an approved-but-unpaid one. Guarded in SQL so a
+    # resubmission can't un-receive a deposit staff already verified.
+    db.mark_deposit_submitted(p["proposal_id"])
     project_name = p.get("project_name") or "proposal"
     ref = proposals.deposit_ref(p["proposal_id"])
-    # A system line records it in the chat so both sides see the deposit is in flight.
+    # A chat line records it so both sides see the deposit is in flight. Filed as a
+    # CUSTOMER-authored 'deposit_submitted' row (it is the customer's action, not
+    # ours) — that is what puts it in the staff notification bell feed, which only
+    # carries customer-originated rows.
     # (No account details or internal ref in the customer-visible message.)
     who = account_name or "The customer"
     chat = (f"Deposit initiated — {who} provided ACH payment details for {project_name}. "
             "We'll confirm once the transfer clears." if method == "ach"
             else f"Deposit initiated — a check is on its way for {project_name}. "
                  "We'll confirm once it arrives.")
-    db.add_message(p["proposal_id"], "staff", None, chat, msg_type="system")
+    db.add_message(p["proposal_id"], "customer", _session_email(request), chat,
+                   msg_type="deposit_submitted")
 
     if method == "ach":
         detail = (
@@ -1048,7 +1061,9 @@ _RECENT_MSG_PREVIEW = 240
 
 def _recent_msg(row: dict) -> dict:
     """One recent customer message shaped for the staff notification feed. Body is
-    truncated server-side; `created_at` is ISO (matches _msg)."""
+    truncated server-side; `created_at` is ISO (matches _msg). `msg_type` lets the
+    staff side tell a question apart from a deposit submission (defaults to 'text'
+    so an older row without one still renders)."""
     body = (row.get("body") or "").strip()
     if len(body) > _RECENT_MSG_PREVIEW:
         body = body[:_RECENT_MSG_PREVIEW - 1].rstrip() + "…"
@@ -1058,6 +1073,7 @@ def _recent_msg(row: dict) -> dict:
         "project_name": row.get("project_name"),
         "customer_name": row.get("customer_name"),
         "author_email": row.get("author_email"),
+        "msg_type": row.get("msg_type") or "text",
         "body": body,
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
     }
@@ -1066,7 +1082,8 @@ def _recent_msg(row: dict) -> dict:
 @app.get("/api/admin/recent-messages")
 def admin_recent_messages(request: Request) -> JSONResponse:
     """Newest customer messages across all proposals — drives the staff tool's
-    notification bell + bottom-right toast. Customer text only (staff/system rows
+    notification bell + bottom-right toast. Customer-originated rows only: chat
+    text plus deposit submissions (staff replies and staff system/card rows are
     excluded by the query)."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
@@ -1082,8 +1099,15 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     appr = db.latest_approval(proposal_id)
+    # So the staff review form can prefill the invoice number instead of leaving
+    # it blank; peeking never consumes a sequence value.
+    try:
+        next_no = p.get("deposit_invoice_no") or db.peek_next_invoice_no()
+    except Exception:  # noqa: BLE001 — a missing sequence must not break the drawer
+        next_no = p.get("deposit_invoice_no")
     return _json({
         "ok": True,
+        "next_invoice_no": next_no,
         "proposal": {
             "proposal_id": p["proposal_id"], "token": p["token"],
             "url": f"{config.PUBLIC_BASE_URL}/p/{p['token']}",

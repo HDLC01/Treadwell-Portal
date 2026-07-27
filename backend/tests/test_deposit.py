@@ -31,18 +31,22 @@ import pytest
 @pytest.fixture
 def client(monkeypatch):
     """TestClient over the real app with the DB/auth/email seams stubbed.
-    `add_deposit` calls are captured; `set_deposit_status` is tripwired so a test
-    can assert a customer submission never flips deposit status (staff-only)."""
+    `add_deposit`, `add_message` and `mark_deposit_submitted` calls are captured;
+    `set_deposit_status` (the unguarded staff-only setter) stays tripwired so a
+    test can assert the customer path never reaches for it."""
     from fastapi.testclient import TestClient
     import main
 
-    calls = {"deposits": [], "status_calls": 0, "emails": []}
+    calls = {"deposits": [], "status_calls": 0, "submitted": [], "messages": [], "emails": []}
     # Any token → one fake proposal (bypasses session/DB auth).
     monkeypatch.setattr(main, "_require",
                         lambda request, token: {"proposal_id": "test-pid-0001", "project_name": "Test Project"})
     monkeypatch.setattr(main.db, "add_deposit",
                         lambda *a, **k: calls["deposits"].append({"args": a, "kwargs": k}))
-    monkeypatch.setattr(main.db, "add_message", lambda *a, **k: None)
+    monkeypatch.setattr(main.db, "add_message",
+                        lambda *a, **k: calls["messages"].append({"args": a, "kwargs": k}))
+    monkeypatch.setattr(main.db, "mark_deposit_submitted",
+                        lambda pid: calls["submitted"].append(pid))
     monkeypatch.setattr(main.db, "set_deposit_status",
                         lambda *a, **k: calls.__setitem__("status_calls", calls["status_calls"] + 1))
     monkeypatch.setattr(main.email_sender, "notify_team",
@@ -53,7 +57,7 @@ def client(monkeypatch):
     return tc
 
 
-def test_check_deposit_minimal_records_note_and_leaves_status(client):
+def test_check_deposit_minimal_records_note_and_marks_submitted(client):
     r = client.post("/api/portal/tok/deposit", json={"method": "check", "note": "mailed Friday"})
     assert r.status_code == 200 and r.json()["ok"] is True
     assert len(client.calls["deposits"]) == 1
@@ -62,7 +66,9 @@ def test_check_deposit_minimal_records_note_and_leaves_status(client):
     assert rec["args"][5] == "mailed Friday"            # note (positional)
     assert rec["kwargs"].get("routing_number") is None
     assert rec["kwargs"].get("account_number") is None
-    # A customer submission must NEVER flip deposit status — staff verify manually.
+    # Visible to staff: the board card leaves 'pending'. Only via the guarded
+    # helper — never the raw setter, which could overwrite a verified 'received'.
+    assert client.calls["submitted"] == ["test-pid-0001"]
     assert client.calls["status_calls"] == 0
 
 
@@ -77,6 +83,32 @@ def test_ach_stores_full_numbers_and_derives_mask(client):
     assert rec["args"][4] == "••••6789"                 # masked_ref derived server-side (positional)
     assert rec["kwargs"]["routing_number"] == "021000021"
     assert rec["kwargs"]["account_number"] == "000123456789"
+    assert client.calls["submitted"] == ["test-pid-0001"]
+    assert client.calls["status_calls"] == 0
+
+
+def test_deposit_chat_row_is_customer_authored_deposit_submitted(client):
+    """The chat line is what carries the deposit into the staff bell feed, which
+    only selects customer-authored rows — so author_kind/msg_type are load-bearing,
+    not cosmetic."""
+    r = client.post("/api/portal/tok/deposit", json={"method": "check"})
+    assert r.status_code == 200
+    assert len(client.calls["messages"]) == 1
+    args, kwargs = client.calls["messages"][0]["args"], client.calls["messages"][0]["kwargs"]
+    assert args[0] == "test-pid-0001"
+    assert args[1] == "customer"                        # author_kind (positional)
+    assert kwargs["msg_type"] == "deposit_submitted"
+    assert "Deposit initiated" in args[3]               # body (positional)
+
+
+def test_resubmission_cannot_downgrade_a_received_deposit(client):
+    """A customer who resends details after staff verified the money must not
+    un-receive it. The guard lives in SQL (mark_deposit_submitted's where-clause),
+    so the endpoint's contract is simply that it never calls the raw setter."""
+    for _ in range(2):
+        r = client.post("/api/portal/tok/deposit", json={"method": "check"})
+        assert r.status_code == 200
+    assert client.calls["submitted"] == ["test-pid-0001", "test-pid-0001"]
     assert client.calls["status_calls"] == 0
 
 
@@ -92,7 +124,7 @@ def test_ach_normalizes_separators(client):
 
 
 def test_ach_bad_routing_rejected(client):
-    for bad in ("12345678", "0210000210", ""):          # 8 digits, 10 digits, empty
+    for bad in ("123", "ab-", ""):                      # under 4 digits, no digits, empty
         client.calls["deposits"].clear()
         r = client.post("/api/portal/tok/deposit",
                         json={"method": "ach", "account_name": "Payer LLC",
@@ -100,6 +132,20 @@ def test_ach_bad_routing_rejected(client):
         assert r.status_code == 400, bad
         assert client.calls["deposits"] == []
     assert client.calls["status_calls"] == 0
+
+
+def test_ach_off_length_routing_accepted(client):
+    # Exact-length cap lifted per Hanz ("don't limit the number to 9 digits ...
+    # because it might change") — routing formats vary by bank/country, so only the
+    # 4-digit floor survives. 8/10/12 digits were all rejected before.
+    for ok_routing in ("12345678", "0210000210", "021000021000"):
+        client.calls["deposits"].clear()
+        r = client.post("/api/portal/tok/deposit",
+                        json={"method": "ach", "account_name": "Payer LLC",
+                              "routing_number": ok_routing, "account_number": "000123456789",
+                              "account_type": "checking"})
+        assert r.status_code == 200, ok_routing
+        assert client.calls["deposits"][0]["kwargs"]["routing_number"] == ok_routing
 
 
 def test_ach_short_account_rejected(client):
@@ -114,7 +160,9 @@ def test_ach_short_account_rejected(client):
 
 def test_ach_long_account_accepted(client):
     # Upper cap removed per Will ("don't limit the account number") — an 18-digit
-    # account (previously rejected) is now accepted. Routing still must be 9 digits.
+    # account (previously rejected) is now accepted. The routing number lost its
+    # exact-9 rule the same way and for the same reason (the format might change);
+    # both now keep only a 4-digit floor to reject an empty/garbage field.
     client.calls["deposits"].clear()
     r = client.post("/api/portal/tok/deposit",
                     json={"method": "ach", "account_name": "Payer LLC",
@@ -159,3 +207,18 @@ def test_invalid_method_rejected(client):
     r = client.post("/api/portal/tok/deposit", json={"method": "wire"})
     assert r.status_code == 400
     assert client.calls["deposits"] == []
+
+
+def test_mark_deposit_submitted_guards_received_in_sql(monkeypatch):
+    """The no-downgrade rule is a where-clause, not a read-then-write, so two
+    concurrent requests can't race past it. Asserted on the SQL because there is no
+    DB in unit tests (the live behaviour is covered by the staging smoke)."""
+    import db as dbmod
+
+    seen = {}
+    monkeypatch.setattr(dbmod, "execute", lambda sql, params=(): seen.update(sql=sql, params=params))
+    dbmod.mark_deposit_submitted("p1")
+    sql = " ".join(seen["sql"].split())
+    assert "deposit_status='submitted'" in sql
+    assert "deposit_status <> 'received'" in sql        # a verified deposit is never downgraded
+    assert seen["params"] == ("p1",)

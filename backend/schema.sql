@@ -13,7 +13,7 @@ create table if not exists public.portal_proposals (
   project_name    text,
   pdf_path        text,                             -- Supabase Storage path / URL of the official PDF
   proposal_status text not null default 'sent'      check (proposal_status in ('sent','viewed','approved')),
-  deposit_status  text not null default 'pending'   check (deposit_status  in ('pending','received')),
+  deposit_status  text not null default 'pending'   check (deposit_status  in ('pending','submitted','received')),
   schedule_status text not null default 'pending'   check (schedule_status in ('pending','scheduled')),
   approved_total  numeric,
   approved_option text,
@@ -122,7 +122,7 @@ on conflict do nothing;
 -- current thread is unchanged. System/card rows use author_kind='staff' (the
 -- author_kind check has no 'system' value — msg_type is the real discriminator).
 alter table public.portal_questions add column if not exists msg_type text not null default 'text'
-  check (msg_type in ('text','proposal_card','deposit_request','system'));
+  check (msg_type in ('text','proposal_card','deposit_request','system','deposit_submitted'));
 alter table public.portal_questions add column if not exists meta jsonb;
 
 -- Backfill one proposal_card per published proposal so existing threads open with
@@ -217,6 +217,24 @@ alter table public.portal_deposits add column if not exists routing_number text;
 alter table public.portal_deposits add column if not exists account_number text;
 -- Account type the customer selected on the ACH form: 'checking' or 'savings'.
 alter table public.portal_deposits add column if not exists account_type text;
+
+-- ── Deposit 'submitted' state (customer has paid; staff have not verified yet) ─
+-- Without this the board could not tell "approved, nothing paid" from "customer
+-- sent us their money and is waiting" — both read 'pending'.
+--
+-- The create-table / add-column statements above already carry the widened checks,
+-- but they are no-ops on an existing table, so re-add the constraints explicitly.
+-- The names are Postgres' auto-generated ones for a column-level check
+-- (<table>_<column>_check), which is how both were originally created. Written as
+-- plain statements, NOT a `do $$ … $$` block: run_script() splits this file on ';'
+-- and a dollar-quoted body would be torn in half. Idempotent (drop-if-exists first);
+-- every existing value is still legal, so the re-validation passes.
+alter table public.portal_proposals drop constraint if exists portal_proposals_deposit_status_check;
+alter table public.portal_proposals add constraint portal_proposals_deposit_status_check
+  check (deposit_status in ('pending','submitted','received'));
+alter table public.portal_questions drop constraint if exists portal_questions_msg_type_check;
+alter table public.portal_questions add constraint portal_questions_msg_type_check
+  check (msg_type in ('text','proposal_card','deposit_request','system','deposit_submitted'));
 
 -- ── V1 revamp: contact collection (tracker step between Deposit and Schedule) ──
 -- After the deposit, the customer supplies project contacts (primary required,

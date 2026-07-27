@@ -190,7 +190,12 @@ def unread_counts() -> dict[str, int]:
     """Per-proposal count of customer messages awaiting a staff reply — customer
     text messages newer than the last staff TEXT reply. System/card rows, though
     author_kind='staff', are msg_type!='text' so they never count as a reply.
-    One aggregate query for the whole board (no N+1)."""
+    One aggregate query for the whole board (no N+1).
+
+    Deliberately excludes 'deposit_submitted': nothing clears it (staff answer a
+    deposit by marking it Received, not by typing a chat reply), so counting it
+    would pin a badge on the card forever. It reaches staff via the bell feed
+    below and via deposit_status instead."""
     rows = qall(
         "select q.proposal_id as pid, count(*) as n "
         "from public.portal_questions q "
@@ -203,17 +208,22 @@ def unread_counts() -> dict[str, int]:
 
 
 def list_recent_customer_messages(limit: int = 25) -> list[dict[str, Any]]:
-    """Newest customer chat messages across ALL proposals, for the staff tool's
-    notification bell + toast feed. Only real customer text (chat + inbound-email
-    replies) — staff replies and system/card/deposit rows are excluded. Joined to
-    the proposal for a display title. `id` is the monotonic cursor the staff side
-    uses to dedupe toasts."""
+    """Newest customer-originated chat rows across ALL proposals, for the staff
+    tool's notification bell + toast feed: real customer text (chat + inbound-email
+    replies) plus deposit submissions. Staff replies and staff-authored system/card
+    rows are excluded. Joined to the proposal for a display title. `id` is the
+    monotonic cursor the staff side uses to dedupe toasts.
+
+    'deposit_submitted' is here because a deposit used to reach staff through one
+    email and nothing else — the board card sat in 'Approved' looking identical to
+    a customer who had paid nothing. msg_type ships to the client so the staff side
+    can style it differently from a question."""
     return qall(
-        "select q.id, q.proposal_id, q.author_email, q.body, q.created_at, "
+        "select q.id, q.proposal_id, q.author_email, q.body, q.msg_type, q.created_at, "
         "p.project_name, p.customer_name "
         "from public.portal_questions q "
         "join public.portal_proposals p on p.proposal_id = q.proposal_id "
-        "where q.author_kind='customer' and q.msg_type='text' "
+        "where q.author_kind='customer' and q.msg_type in ('text','deposit_submitted') "
         "order by q.id desc limit %s",
         (int(limit),),
     )
@@ -311,6 +321,19 @@ def set_deposit_status(proposal_id: str, status: str) -> None:
     )
 
 
+def mark_deposit_submitted(proposal_id: str) -> None:
+    """Customer-side flip to 'submitted' — they've sent us their payment details.
+
+    Guarded in SQL rather than read-then-write so a customer who resubmits (or a
+    concurrent request) can never downgrade a deposit staff already verified as
+    'received'. Staff still move the status freely via set_deposit_status."""
+    execute(
+        "update public.portal_proposals set deposit_status='submitted', updated_at=now() "
+        "where proposal_id=%s and deposit_status <> 'received'",
+        (proposal_id,),
+    )
+
+
 def set_deposit_requested(proposal_id: str) -> None:
     execute(
         "update public.portal_proposals set deposit_requested_at=now(), updated_at=now() where proposal_id=%s",
@@ -327,6 +350,19 @@ def set_deposit_amount(proposal_id: str, amount) -> None:
         "update public.portal_proposals set deposit_amount=%s, updated_at=now() where proposal_id=%s",
         (amount, proposal_id),
     )
+
+
+def peek_next_invoice_no() -> Optional[str]:
+    """What the NEXT invoice number will be, without consuming it.
+
+    The staff review form prefills with this so nobody has to guess, and reading
+    last_value (rather than calling nextval) means opening the dialog can't burn
+    numbers or create gaps."""
+    row = q1("select last_value, is_called from public.portal_invoice_seq")
+    if not row:
+        return None
+    nxt = int(row["last_value"]) + (1 if row.get("is_called") else 0)
+    return f"TW-INV-{nxt:05d}"
 
 
 def issue_new_invoice_no(proposal_id: str) -> Optional[str]:

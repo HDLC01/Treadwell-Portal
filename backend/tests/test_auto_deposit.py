@@ -98,8 +98,9 @@ def test_staff_override_amount_is_persisted_before_render(monkeypatch):
 
 def test_auto_deposit_skips_when_already_invoiced(monkeypatch):
     """Re-approval must not issue a second invoice. Guarded on
-    deposit_requested_at — NOT deposit_status, whose check constraint only
-    permits 'pending'/'received' (the old 'requested' guard was unreachable)."""
+    deposit_requested_at — NOT deposit_status, whose check constraint permits only
+    'pending'/'submitted'/'received' (the old 'requested' guard was unreachable;
+    'submitted' means the CUSTOMER paid, which is not the same as us asking)."""
     sent, flags = _wire(monkeypatch, deposit_requested_at="2026-07-27T13:36:44+00:00")
     automations.request_deposit({"proposal_id": "p1", "token": "tok"}, "Westport")
     assert sent == [] and flags["requested"] == [] and flags["invoice_calls"] == []

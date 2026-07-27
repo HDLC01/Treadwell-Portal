@@ -197,7 +197,10 @@ function setHeader(vm, approved) {
 function renderTracker(st) {
   const steps = [
     { key: "proposal", label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
-    { key: "deposit", label: "Deposit", done: st.deposit === "received", val: st.deposit === "received" ? "Received" : "Pending" },
+    // "Submitted" is not "Pending": a customer who has just sent their payment
+    // details must not be told they still owe us a deposit.
+    { key: "deposit", label: "Deposit", done: st.deposit === "received",
+      val: st.deposit === "received" ? "Received" : st.deposit === "submitted" ? "Sent" : "Pending" },
     { key: "contacts", label: "Contact info", done: st.contacts === "received", val: st.contacts === "received" ? "Received" : "Pending" },
     { key: "schedule", label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
   ];
@@ -564,7 +567,10 @@ function renderMsg(m) {
       </div>
     </div>`;
   }
-  if (m.msg_type === "system") {
+  // 'deposit_submitted' is authored by the customer (that's what routes it to the
+  // staff bell), but its wording is a third-person record of the event — so render
+  // it as a system card, not as one of the customer's own chat bubbles.
+  if (m.msg_type === "system" || m.msg_type === "deposit_submitted") {
     const s = splitSystem(m.body);
     return `<div class="chat-card system">
       <div class="cc-title">${esc(s.title)}</div>
@@ -708,7 +714,8 @@ function setupDeposit() {
   // If a deposit was already submitted (and not yet marked received), show a shared
   // recorded banner and hide the tabs + BOTH panes — so a reload / second device
   // can't invite a duplicate submission (either method). "Update or resend" reopens
-  // the form on whichever method was used (deposit_status only flips when staff confirm).
+  // the form on whichever method was used; `dep.submitted` tracks the deposit rows,
+  // not deposit_status, so a resend is still possible after staff mark it Received.
   const recorded = $("deposit-recorded");
   const reopen = () => { hide(recorded); show(tabs); (dep.submitted_method === "check" ? showCheck : showAch)(); };
   if (dep.submitted) {
@@ -820,7 +827,7 @@ $("ach-form").addEventListener("submit", async (e) => {
   const account = digits("ach-account"), accountConfirm = digits("ach-account-confirm");
   const fail = (msg, id) => { alertBox($("deposit-alert"), "error", msg); $(id).focus(); };
   if (!account_name) return fail("Please enter the account name.", "ach-acct-name");
-  if (!/^\d{9}$/.test(routing)) return fail("Routing number must be exactly 9 digits.", "ach-routing");
+  if (!/^\d{4,}$/.test(routing)) return fail("Routing number must be at least 4 digits.", "ach-routing");
   if (routing !== routingConfirm) return fail("Routing numbers don't match — please re-enter.", "ach-routing-confirm");
   if (!/^\d{4,}$/.test(account)) return fail("Account number must be at least 4 digits.", "ach-account");
   if (account !== accountConfirm) return fail("Account numbers don't match — please re-enter.", "ach-account-confirm");
@@ -861,9 +868,9 @@ $("ach-form").addEventListener("submit", async (e) => {
   function refresh() {
     const r = digitsOf("ach-routing"), rc = digitsOf("ach-routing-confirm");
     const a = digitsOf("ach-account"), ac = digitsOf("ach-account-confirm");
-    const rOk = /^\d{9}$/.test(r), aOk = /^\d{4,}$/.test(a);
+    const rOk = /^\d{4,}$/.test(r), aOk = /^\d{4,}$/.test(a);
     const rcOk = rc.length > 0 && rc === r, acOk = ac.length > 0 && ac === a;
-    setInd("ind-routing", rOk, !r ? "" : (rOk ? "✓ Looks good" : "✗ Must be 9 digits"));
+    setInd("ind-routing", rOk, !r ? "" : (rOk ? "✓ Looks good" : "✗ At least 4 digits"));
     setInd("ind-routing-confirm", rcOk, !rc ? "" : (rcOk ? "✓ Matches" : "✗ Doesn't match"));
     setInd("ind-account", aOk, !a ? "" : (aOk ? "✓ Looks good" : "✗ At least 4 digits"));
     setInd("ind-account-confirm", acOk, !ac ? "" : (acOk ? "✓ Matches" : "✗ Doesn't match"));
