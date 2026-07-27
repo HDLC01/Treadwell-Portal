@@ -85,12 +85,16 @@ a { color: var(--primary); }
 .switcher-btn:hover { background: var(--surface-low); }
 .switcher-menu {
   position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
-  min-width: min(320px, calc(100vw - 32px));
+  width: min(420px, calc(100vw - 32px));
   background: var(--bg); border: 1px solid var(--outline); border-radius: 12px;
-  box-shadow: var(--shadow-lg, 0 16px 44px rgba(0,0,0,.28)); padding: 6px 12px;
+  box-shadow: var(--shadow-lg, 0 16px 44px rgba(0,0,0,.28)); padding: 4px 14px;
   max-height: 60vh; overflow-y: auto;
 }
 .switcher-menu .proj-row:first-child { border-top: 0; }
+.switcher-menu .proj-row { padding: 12px 0; }
+/* One line per project: the name truncates, the badge never wraps. */
+.switcher-menu .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.switcher-menu .badge { white-space: nowrap; flex: none; }
 .proj-row.current { opacity: .65; pointer-events: none; }
 .wrap { max-width: var(--maxw); margin: 0 auto; padding: 24px 16px 72px; }
 
@@ -312,7 +316,11 @@ input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var
 /* overflow:hidden backs up the #scrollbar=0 viewer flag for engines that ignore it —
    the preview must never show a scrollbar it can't honour (pointer-events are off). */
 .pdf-preview-frame { position: relative; width: 100%; height: 520px; background: var(--surface-low); overflow: hidden; }
-.pdf-inline-frame { width: 100%; height: 100%; border: 0; display: block; pointer-events: none; }
+/* Chromium's PDF viewer ignores #scrollbar=0, and the frame is pointer-events:none
+   (clicks belong to the enlarge button), so its scrollbar would render but never
+   work. Overhang the iframe by roughly one scrollbar width and let the wrapper's
+   overflow:hidden clip it — with view=FitH the page still fills the visible area. */
+.pdf-inline-frame { width: calc(100% + 16px); height: 100%; border: 0; display: block; pointer-events: none; }
 .pdf-preview-hint {
   position: absolute; right: 12px; bottom: 12px; z-index: 2;
   display: inline-flex; align-items: center; gap: 6px;
