@@ -223,6 +223,11 @@ textarea { min-height: 96px; resize: vertical; }
   border-radius: var(--radius-lg); padding: 14px 16px; box-shadow: var(--shadow-sm);
 }
 .chat-card.deposit { border-left-color: var(--success); }
+/* Status lines (approved, deposit initiated, …) — same card shape as the deposit
+   card so the thread reads consistently, in a muted tone since they're FYI. */
+.chat-card.system { border-left-color: var(--secondary); }
+.chat-card.system .cc-title { font-size: .95rem; }
+.chat-card.system .cc-body { margin-bottom: 0; }
 .chat-card .cc-title { font-weight: 800; margin-bottom: 4px; }
 .chat-card .cc-body { color: var(--secondary); font-size: .9rem; margin-bottom: 12px; }
 .chat-card .cc-amt { color: var(--success); font-variant-numeric: tabular-nums; }
@@ -271,6 +276,12 @@ input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var
 .contact-row-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .contact-role { font-weight: 700; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--primary); }
 .contact-role-sel { width: auto; margin: 0; padding: 4px 8px; min-height: 34px; }
+/* "Same as primary" — the mirrored row's fields are filled from the primary and
+   locked, so it's obvious they're not independently editable. */
+.contact-same { display: inline-flex; align-items: center; gap: 6px; margin-right: auto;
+  font-size: .8rem; color: var(--secondary); white-space: nowrap; cursor: pointer; }
+.contact-same input { width: auto; min-height: 0; margin: 0; }
+.contact-row.is-mirrored .contact-grid input { background: var(--surface-low); color: var(--secondary); }
 .contact-remove { color: var(--secondary); }
 .contact-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .contact-grid input { margin: 0; }

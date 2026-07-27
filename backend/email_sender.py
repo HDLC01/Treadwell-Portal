@@ -91,11 +91,23 @@ def _wrap(title: str, body_html: str) -> str:
 
 
 # Footer / signatory on EVERY outgoing email (single choke-point — _wrap wraps
-# them all). Address first, then the tagline, per Will.
+# them all). Copied from Kyle's real signature: Arial 8pt, the TREADWELL word and
+# the "l" separators in navy (#000087/#000090), everything else grey. Colours are
+# set inline and explicitly so dark-mode clients tint them as little as possible —
+# the navy is what reads as "violet" in Gmail's dark theme.
+_SIG_NAVY = "#000087"
+_SIG_BAR = "#000090"
+_SIG_GREY = "#595959"
+_SIG_ADDR = "#666666"
 _SIGNATURE_HTML = (
-    '<p style="color:#64748b;font-size:12px;line-height:1.6;margin:0">'
-    '1707 E. 123rd Ter, Olathe, KS 66061<br>'
-    'Treadwell — commercial epoxy &amp; polished concrete.</p>'
+    f'<p style="font-family:Arial,sans-serif;font-size:8pt;line-height:1.6;margin:0">'
+    f'<b><span style="color:{_SIG_NAVY}">TREADWELL</span></b> '
+    f'<b><span style="color:{_SIG_BAR}">l</span></b> '
+    f'<span style="color:{_SIG_GREY}">913.396.6216</span> '
+    f'<b><span style="color:{_SIG_BAR}">l</span></b> '
+    f'<span style="color:{_SIG_ADDR}">1707 E. 123rd Ter, Olathe, KS 66061</span><br>'
+    f'<span style="color:{_SIG_GREY}">Epoxy Flooring + Polished Concrete + Gypsum Underlayments</span>'
+    f'</p>'
 )
 
 
@@ -126,13 +138,13 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
     if note and str(note).strip():
         note_html = (
             f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
-            f'border-left:3px solid #0ea5e9;white-space:pre-wrap">{_esc(note)}</p>'
+            f'border-left:3px solid #C8102E;white-space:pre-wrap">{_esc(note)}</p>'
         )
     body = (
         f'<p>Hi {_esc(_first_name(name) or "there")},</p>'
         f'<p>Your proposal for <strong>{_esc(project_name)}</strong> is ready to review.</p>'
         f'{note_html}'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
@@ -157,7 +169,7 @@ def send_reply_notification(email: str, url: str, project_name: str,
     body = (
         f'<p>Treadwell replied to your question on the proposal for <strong>{_esc(project_name)}</strong>:</p>'
         f'{msg_html}'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
         f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
     )
@@ -183,7 +195,7 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
         f'<p>A deposit{amt}{inv} reserves your place on our schedule.</p>'
         f'{attached}'
         f'<p>You can pay by ACH straight from the portal (fastest), or mail a check.</p>'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">Pay your deposit</a></p>'
         f'{ref}'
     )
@@ -270,7 +282,7 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
         log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
     if reply_link:
         body_html += (
-            f'<p style="margin-top:16px"><a href="{reply_link}" style="background:#0ea5e9;color:#fff;'
+            f'<p style="margin-top:16px"><a href="{reply_link}" style="background:#C8102E;color:#fff;'
             f'padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">Reply in Portal</a></p>'
         )
     return _send(to, subject, _wrap(subject, body_html))

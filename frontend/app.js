@@ -200,6 +200,12 @@ let SELECTED = new Set();
 let CUR_OPTIONS = [];
 const DEPOSIT_PCT = 0.25;   // mirrors backend proposals.DEPOSIT_PCT — live deposit preview
 
+/** A value-engineering row: an alternative priced AGAINST the base bid, not an
+ *  extra job. Its `total` is what the job costs if you take it, so it must never
+ *  be summed as a lump sum. `delta` is the signed difference vs base. */
+const isVE = (o) => o && o.price_mode === "deduct" && !o.is_base && o.delta != null;
+const veLabel = (o) => (o.delta < 0 ? `Deduct (${money(Math.abs(o.delta))})` : `Add ${money(o.delta)}`);
+
 function renderOptions(options, addons, approved) {
   CUR_OPTIONS = options || [];
   const wrap = $("options");
@@ -219,12 +225,20 @@ function renderOptions(options, addons, approved) {
     ? "" : (options.length > 1 ? "Select every option you'd like to approve — your total updates below." : "");
   wrap.innerHTML = options.map((o) => {
     const on = SELECTED.has(o.label);
+    const ve = isVE(o);
+    // A value-engineering row prices the job differently rather than adding a
+    // second job — show it the way the document does ("Add $X" / "Deduct ($X)"),
+    // never as a standalone lump sum.
+    const price = ve ? veLabel(o) : money(o.total);
+    const sub = ve
+      ? `instead of the base bid — ${money(o.total)} total`
+      : (o.diff != null && o.diff !== 0 ? `${o.diff > 0 ? "+" : ""}${money(o.diff)} vs base bid` : "");
     return `<label class="option opt-check ${on ? "selected" : ""}">
       <input type="checkbox" ${on ? "checked" : ""} ${approved ? "disabled" : ""} data-label="${esc(o.label)}">
       <span class="opt-main">
-        <span class="top"><span class="name">${esc(o.label)}</span><span class="price">${money(o.total)}</span></span>
+        <span class="top"><span class="name">${esc(o.label)}</span><span class="price">${esc(price)}</span></span>
         ${o.system_desc ? `<span class="meta">${esc(o.system_desc)}</span>` : ""}
-        ${o.diff != null && o.diff !== 0 ? `<span class="meta">${o.diff > 0 ? "+" : ""}${money(o.diff)} vs base bid</span>` : ""}
+        ${sub ? `<span class="meta">${esc(sub)}</span>` : ""}
       </span>
     </label>`;
   }).join("") + '<div class="selected-total" id="selected-total"></div>';
@@ -242,7 +256,20 @@ function renderOptions(options, addons, approved) {
 }
 
 function updateSelectedTotal() {
-  const total = CUR_OPTIONS.filter((o) => SELECTED.has(o.label)).reduce((s, o) => s + o.total, 0);
+  // Must mirror proposals.resolve_selection on the server exactly: lump-sum rows
+  // contribute their total, VE rows contribute their delta against the base, and
+  // a VE row selected alone still implies the base bid.
+  const picked = CUR_OPTIONS.filter((o) => SELECTED.has(o.label));
+  const ve = picked.filter(isVE);
+  let total = picked.filter((o) => !isVE(o)).reduce((s, o) => s + o.total, 0);
+  if (ve.length) {
+    if (!picked.some((o) => o.is_base)) {
+      const base = CUR_OPTIONS.find((o) => o.is_base);
+      if (base) total += base.total;
+    }
+    total += ve.reduce((s, o) => s + (o.delta || 0), 0);
+  }
+  total = Math.round(total * 100) / 100;
   const el = $("selected-total");
   const approved = !!(STATE && STATE.status && STATE.status.proposal === "approved");
   if (el) {
@@ -302,27 +329,63 @@ function drawContacts() {
   list.innerHTML = CONTACT_ROWS.map(contactRow).join("");
   list.querySelectorAll("[data-remove]").forEach((b) =>
     b.addEventListener("click", () => { CONTACT_ROWS.splice(+b.dataset.remove, 1); drawContacts(); }));
+  // "Same as primary" — copy the primary's details in and lock the row. A full
+  // redraw is fine here (explicit click, no typing in flight).
+  list.querySelectorAll("[data-same]").forEach((cb) =>
+    cb.addEventListener("change", () => {
+      const row = CONTACT_ROWS[+cb.dataset.same];
+      row.same_as_primary = cb.checked;
+      if (cb.checked) mirrorPrimary(row);
+      drawContacts();
+    }));
   list.querySelectorAll("[data-field]").forEach((el) => {
-    const upd = () => { CONTACT_ROWS[+el.dataset.i][el.dataset.field] = el.value; };
+    const upd = () => {
+      const i = +el.dataset.i;
+      CONTACT_ROWS[i][el.dataset.field] = el.value;
+      // Editing the primary keeps every mirrored row in step — patch their inputs
+      // directly rather than redrawing, so the field being typed in keeps focus.
+      if (i === 0) {
+        CONTACT_ROWS.forEach((r, j) => {
+          if (!j || !r.same_as_primary) return;
+          mirrorPrimary(r);
+          const inp = list.querySelector(`[data-field="${el.dataset.field}"][data-i="${j}"]`);
+          if (inp) inp.value = el.value;
+        });
+      }
+    };
     el.addEventListener("input", upd); el.addEventListener("change", upd);
   });
 }
 
+/** Copy the primary contact's details onto a mirrored row (role is preserved). */
+function mirrorPrimary(row) {
+  const p = CONTACT_ROWS[0] || {};
+  row.name = p.name || "";
+  row.email = p.email || "";
+  row.phone = p.phone || "";
+}
+
 function contactRow(c, i) {
   const isPrimary = i === 0;
+  // "accounts_payable" is the billing contact — the role vocabulary is fixed by a
+  // CHECK constraint on portal_contacts, so this is a label, not a new role.
+  const same = !isPrimary && !!c.same_as_primary;
   const head = isPrimary
     ? '<span class="contact-role">Primary contact</span>'
     : `<select data-field="role" data-i="${i}" class="contact-role-sel">
-         <option value="accounts_payable" ${c.role === "accounts_payable" ? "selected" : ""}>Accounts payable</option>
-         <option value="other" ${c.role !== "accounts_payable" ? "selected" : ""}>Other</option>
+         <option value="accounts_payable" ${c.role !== "other" ? "selected" : ""}>Billing contact</option>
+         <option value="other" ${c.role === "other" ? "selected" : ""}>Other</option>
        </select>
+       <label class="contact-same"><input type="checkbox" data-same="${i}" ${same ? "checked" : ""}>
+         Same as primary contact</label>
        <button class="linkbtn contact-remove" type="button" data-remove="${i}">Remove</button>`;
-  return `<div class="contact-row">
+  const ro = same ? "disabled" : "";
+  return `<div class="contact-row${same ? " is-mirrored" : ""}">
     <div class="contact-row-head">${head}</div>
     <div class="contact-grid">
-      <input data-field="name" data-i="${i}" type="text" placeholder="Name *" value="${esc(c.name || "")}">
-      <input data-field="email" data-i="${i}" type="email" placeholder="Email" value="${esc(c.email || "")}">
-      <input data-field="phone" data-i="${i}" type="tel" placeholder="Phone" value="${esc(c.phone || "")}">
+      <input data-field="name" data-i="${i}" type="text" placeholder="Name *" value="${esc(c.name || "")}" ${ro}>
+      <input data-field="email" data-i="${i}" type="email" placeholder="Email" value="${esc(c.email || "")}" ${ro}>
+      <input data-field="phone" data-i="${i}" type="tel" placeholder="Phone" value="${esc(c.phone || "")}" ${ro}>
     </div>
   </div>`;
 }
@@ -349,6 +412,16 @@ function renderChat(msgs) {
   t.querySelectorAll("[data-open-proposal]").forEach((el) => el.addEventListener("click", openProposal));
   t.querySelectorAll("[data-pay-deposit]").forEach((el) => el.addEventListener("click", openDeposit));
   if (atBottom) t.scrollTop = t.scrollHeight;   // keep pinned to newest unless the user scrolled up
+}
+
+/** System lines read "Heading — detail". Split them so they render as a card
+ *  (matching the deposit card) instead of a cramped grey pill. The length guard
+ *  stops a long sentence that happens to contain a dash becoming a giant title. */
+function splitSystem(body) {
+  const s = String(body == null ? "" : body);
+  const i = s.indexOf(" — ");
+  if (i > 0 && i <= 60) return { title: s.slice(0, i), body: s.slice(i + 3) };
+  return { title: "Update", body: s };
 }
 
 function renderMsg(m) {
@@ -380,7 +453,11 @@ function renderMsg(m) {
     </div>`;
   }
   if (m.msg_type === "system") {
-    return `<div class="chat-system">${esc(m.body || "")}</div>`;
+    const s = splitSystem(m.body);
+    return `<div class="chat-card system">
+      <div class="cc-title">${esc(s.title)}</div>
+      <div class="cc-body">${esc(s.body)}</div>
+    </div>`;
   }
   const mine = m.author_kind === "customer";
   const viaEmail = m.meta && m.meta.source === "email";
@@ -582,7 +659,8 @@ $("qa-form").addEventListener("submit", async (e) => {
 });
 
 $("contacts-add").addEventListener("click", () => {
-  CONTACT_ROWS.push({ role: "other", name: "", email: "", phone: "" });
+  // Billing is the common second contact, so it's the default (switchable to Other).
+  CONTACT_ROWS.push({ role: "accounts_payable", name: "", email: "", phone: "" });
   drawContacts();
 });
 

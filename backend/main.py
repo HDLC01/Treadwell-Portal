@@ -709,8 +709,12 @@ async def api_notify(request: Request) -> JSONResponse:
             email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project,
                                           reply_to=rt)
     elif kind == "reply":
+        # Carry the reply TEXT through. Without it this path emailed a bare
+        # "Treadwell replied to your question" + button — the same email the
+        # staff-drawer path (admin_reply) already sends WITH the snippet.
+        msg = _cap(body.get("message") or body.get("body"), 4000) or None
         for e in recipients:
-            email_sender.send_reply_notification(e, link, project, reply_to=rt)
+            email_sender.send_reply_notification(e, link, project, reply_to=rt, message=msg)
     else:
         return _json({"ok": False, "error": "unknown_type"}, 400)
     return _json({"ok": True})

@@ -52,14 +52,22 @@ def test_reply_email_includes_reply_text_escaped(monkeypatch):
     assert "&amp; done" in box["html"]
 
 
-def test_signature_footer_address_then_tagline(monkeypatch):
+def test_signature_footer_matches_kyles_block(monkeypatch):
+    """Kyle's real signature: one line of TREADWELL l phone l address, then the
+    services line. Colours are set inline (navy brand word, grey details) so
+    dark-mode clients recolour it as little as possible."""
     box = _capture(monkeypatch)
     es.send_portal_link("c@x.com", "Jane", "http://u", "Westport")
     html = box["html"]
+    assert "TREADWELL" in html
+    assert "913.396.6216" in html
     assert "1707 E. 123rd Ter, Olathe, KS 66061" in html
-    assert "commercial epoxy" in html
-    # address line comes BEFORE the tagline (Will's order)
-    assert html.index("1707 E. 123rd Ter") < html.index("commercial epoxy")
+    assert "Epoxy Flooring + Polished Concrete + Gypsum Underlayments" in html
+    # order: brand → phone → address → services line
+    assert html.index("TREADWELL") < html.index("913.396.6216") < html.index("1707 E. 123rd Ter")
+    assert html.index("1707 E. 123rd Ter") < html.index("Epoxy Flooring +")
+    assert "#000087" in html and "#595959" in html      # navy brand, grey detail
+    assert "commercial epoxy &amp; polished concrete" not in html   # old footer retired
     # footer is on the reply + deposit emails too (single _wrap choke-point)
     box2 = _capture(monkeypatch)
     es.send_deposit_request("c@x.com", "http://u", "Westport", amount=100.0)
