@@ -247,14 +247,19 @@ def healthz() -> dict:
     return {"ok": True}
 
 
+# Always revalidate the app shell + its assets. See the asset() docstring: without
+# this, browsers heuristically cached them and customers ran stale JS after a deploy.
+_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
 @app.get("/")
 def root() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "login.html")
+    return FileResponse(FRONTEND_DIR / "login.html", headers=_NO_CACHE)
 
 
 @app.get("/p/{token}")
 def portal_page(token: str) -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "index.html")
+    return FileResponse(FRONTEND_DIR / "index.html", headers=_NO_CACHE)
 
 
 @app.get("/api/public-config")
@@ -1191,9 +1196,16 @@ if FRONTEND_DIR.exists():
 
 @app.get("/{asset}")
 def asset(asset: str):
-    """Serve top-level static assets."""
+    """Serve top-level static assets.
+
+    `no-cache` means "revalidate every time", NOT "don't cache" — the browser
+    still stores the file and the ETag turns each check into a cheap 304. Without
+    it these responses carried only an ETag/Last-Modified, so browsers applied
+    HEURISTIC freshness and kept running yesterday's app.js after a deploy (a
+    customer saw the old deposit card with no invoice buttons). Correctness beats
+    saving a few hundred bytes on a handful of tiny files."""
     f = FRONTEND_DIR / asset
     if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js",
                                  "projects.js", "favicon.ico"}:
-        return FileResponse(f)
+        return FileResponse(f, headers=_NO_CACHE)
     return _json({"ok": False, "error": "not_found"}, 404)

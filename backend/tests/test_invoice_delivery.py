@@ -108,3 +108,19 @@ def test_invoice_pdf_served_with_filename(client, monkeypatch):
     assert r.headers["content-type"] == "application/pdf"
     assert "Treadwell-Invoice-TW-INV-01001.pdf" in r.headers["content-disposition"]
     assert r.content.startswith(b"%PDF-")
+
+
+# ── static asset caching ─────────────────────────────────────────────────────
+def test_assets_and_shell_always_revalidate(client):
+    """Regression: these carried only an ETag, so browsers heuristically cached
+    them and customers kept running the previous deploy's app.js (the old deposit
+    card, with no invoice buttons). Every shell/asset response must tell the
+    browser to revalidate."""
+    for path in ("/app.js", "/styles.css", "/projects.js", "/login.js", "/auth.js"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert "no-cache" in r.headers.get("cache-control", ""), path
+    for path in ("/", "/p/sometoken"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert "no-cache" in r.headers.get("cache-control", ""), path
