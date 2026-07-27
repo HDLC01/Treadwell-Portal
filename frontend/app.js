@@ -135,7 +135,38 @@ function renderPortal(vm) {
 
   LAST_STATUS = statusKey(vm.status);
   applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
+  mountSwitcher();        // once per session; no-op on poll re-renders
   startPolling();
+}
+
+// ── "My projects" switcher ────────────────────────────────────────────────────
+// A customer can hold several proposals. Sessions are email-scoped, so every
+// project on this email is already authorized — switching needs no new login.
+// Fetched once and only revealed when there are 2+ projects, so a single-project
+// customer sees no clutter.
+let SWITCHER_MOUNTED = false;
+
+async function mountSwitcher() {
+  if (SWITCHER_MOUNTED || !window.TWProjects) return;
+  SWITCHER_MOUNTED = true;
+  const wrap = $("proj-switcher");
+  const btn = $("proj-switch-btn");
+  const menu = $("proj-switch-menu");
+  if (!wrap || !btn || !menu) return;
+
+  const proposals = await TWProjects.load();
+  if (proposals.length < 2) return;   // nothing to switch between
+  menu.innerHTML = TWProjects.rowsHtml(proposals, TOKEN);
+  wrap.classList.remove("hidden");
+
+  const close = () => { menu.classList.add("hidden"); btn.setAttribute("aria-expanded", "false"); };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = menu.classList.toggle("hidden") === false;
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) close(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
 }
 
 function setHeader(vm, approved) {
@@ -230,6 +261,19 @@ function renderThankYou(a) {
   $("thankyou-deposit").textContent = dep != null
     ? `Deposit due: ${money(dep)} (25% of ${money(a.total)}).`
     : "";
+  // Once the invoice has been issued, offer it right here — the customer lands on
+  // this view after approving, so they shouldn't have to find the chat card.
+  const inv = STATE && STATE.deposit && STATE.deposit.invoice_no;
+  const lead = $("thankyou-lead");
+  const actions = $("thankyou-actions");
+  if (inv) {
+    lead.textContent = `Invoice ${inv} has been emailed to you and is attached below.`;
+    $("thankyou-invoice").href = `/api/portal/${TOKEN}/deposit-invoice.pdf`;
+    actions.classList.remove("hidden");
+  } else {
+    lead.textContent = "Your deposit invoice is on its way — expect it within about 24 hours.";
+    actions.classList.add("hidden");
+  }
   show($("thankyou-card"));
 }
 
@@ -303,6 +347,7 @@ function renderChat(msgs) {
   const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 60;
   t.innerHTML = msgs.map(renderMsg).join("");
   t.querySelectorAll("[data-open-proposal]").forEach((el) => el.addEventListener("click", openProposal));
+  t.querySelectorAll("[data-pay-deposit]").forEach((el) => el.addEventListener("click", openDeposit));
   if (atBottom) t.scrollTop = t.scrollHeight;   // keep pinned to newest unless the user scrolled up
 }
 
@@ -316,10 +361,22 @@ function renderMsg(m) {
     </div>`;
   }
   if (m.msg_type === "deposit_request") {
-    const amt = m.meta && m.meta.amount != null ? money(m.meta.amount) : "";
+    const meta = m.meta || {};
+    const amt = meta.amount != null ? money(meta.amount) : "";
+    const no = meta.invoice_no ? `<div class="cc-meta">Invoice ${esc(meta.invoice_no)}${
+      meta.reference ? ` · Reference ${esc(meta.reference)}` : ""}</div>` : "";
+    // The invoice PDF is served per-proposal, so the link works for any recipient
+    // with a valid session (same gate as the proposal PDF).
+    const dl = meta.invoice_no
+      ? `<a class="btn btn-secondary" href="/api/portal/${TOKEN}/deposit-invoice.pdf">Download invoice (PDF)</a>`
+      : "";
     return `<div class="chat-card deposit">
-      <div class="cc-title">Deposit requested${amt ? ` — <span class="cc-amt">${amt}</span>` : ""}</div>
+      <div class="cc-title">Deposit invoice${amt ? ` — <span class="cc-amt">${amt}</span>` : ""}</div>
+      ${no}
       <div class="cc-body">${esc(m.body || "")}</div>
+      <div class="cc-actions">${dl}
+        <button class="btn btn-primary" type="button" data-pay-deposit>Pay deposit</button>
+      </div>
     </div>`;
   }
   if (m.msg_type === "system") {
@@ -336,6 +393,15 @@ function renderMsg(m) {
 
 // ── chat ⇄ proposal view toggle (hash-driven) ─────────────────────────────────
 function openProposal() { location.hash = "proposal"; }
+
+/** Jump from the chat's invoice card straight to the deposit form. */
+function openDeposit() {
+  location.hash = "proposal";
+  requestAnimationFrame(() => {
+    const card = $("deposit-card");
+    if (card && !card.classList.contains("hidden")) card.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+}
 
 function applyHashView(scroll) {
   const wantProposal = location.hash.replace("#", "") === "proposal";
@@ -381,8 +447,11 @@ function mountInlinePdf() {
   ifr.setAttribute("tabindex", "-1");
   ifr.setAttribute("aria-hidden", "true");
   ifr.addEventListener("load", () => { const l = $("pdf-inline-loading"); if (l) l.remove(); });
-  // Clean, full-width page teaser: hide the viewer toolbar, fit to width.
-  ifr.src = `/api/portal/${TOKEN}/pdf#toolbar=0&view=FitH`;
+  // Clean, full-width page teaser: hide the viewer toolbar, side panes AND the
+  // scrollbars — the frame is pointer-events:none so clicks reach the enlarge
+  // button, which meant the viewer's own scrollbars rendered but could never be
+  // used. Reading happens in the full-size popup.
+  ifr.src = `/api/portal/${TOKEN}/pdf#toolbar=0&navpanes=0&scrollbar=0&view=FitH`;
   wrap.appendChild(ifr);
 }
 function openPdfModal() {
@@ -483,6 +552,7 @@ $("approve-form").addEventListener("submit", async (e) => {
 });
 
 $("back-to-chat").addEventListener("click", () => { location.hash = "chat"; });
+$("thankyou-pay").addEventListener("click", openDeposit);
 
 // PDF: click the inline preview to open the full-size popup; close via ×, scrim, or Esc.
 $("pdf-preview").addEventListener("click", openPdfModal);

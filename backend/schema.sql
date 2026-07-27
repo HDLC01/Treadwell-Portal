@@ -237,6 +237,15 @@ create table if not exists public.portal_contacts (
 );
 create index if not exists portal_contacts_proposal_idx on public.portal_contacts(proposal_id);
 
+-- ── Deposit invoice ───────────────────────────────────────────────────────────
+-- The deposit request is a real invoice document (generated on demand from these
+-- columns — no blob is stored). The NUMBER is issued once from a sequence and then
+-- frozen, so re-sending or re-approving can never show the customer a second
+-- invoice number for the same deposit.
+create sequence if not exists public.portal_invoice_seq start 1001;
+alter table public.portal_proposals add column if not exists deposit_invoice_no text;
+alter table public.portal_proposals add column if not exists deposit_invoice_issued_at timestamptz;
+
 -- ── Row Level Security ────────────────────────────────────────────────────────
 -- Enable RLS on every portal_* table so they are NOT exposed through the public
 -- (anon) REST API of the shared database. Idempotent: ENABLE on an already-

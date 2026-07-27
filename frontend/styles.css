@@ -73,6 +73,25 @@ a { color: var(--primary); }
   margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
   font-size: .8rem; color: var(--secondary);
 }
+
+/* "My projects" switcher — only rendered when the customer has 2+ projects. */
+.switcher { position: relative; margin-left: 18px; }
+.switcher-btn {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  background: none; border: 1px solid var(--outline); border-radius: 8px;
+  color: var(--fg); font: inherit; font-size: .82rem; font-weight: 600;
+  padding: 6px 10px; line-height: 1;
+}
+.switcher-btn:hover { background: var(--surface-low); }
+.switcher-menu {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
+  min-width: min(320px, calc(100vw - 32px));
+  background: var(--bg); border: 1px solid var(--outline); border-radius: 12px;
+  box-shadow: var(--shadow-lg, 0 16px 44px rgba(0,0,0,.28)); padding: 6px 12px;
+  max-height: 60vh; overflow-y: auto;
+}
+.switcher-menu .proj-row:first-child { border-top: 0; }
+.proj-row.current { opacity: .65; pointer-events: none; }
 .wrap { max-width: var(--maxw); margin: 0 auto; padding: 24px 16px 72px; }
 
 /* Labels — uppercase label-caps */
@@ -203,6 +222,8 @@ textarea { min-height: 96px; resize: vertical; }
 .chat-card .cc-title { font-weight: 800; margin-bottom: 4px; }
 .chat-card .cc-body { color: var(--secondary); font-size: .9rem; margin-bottom: 12px; }
 .chat-card .cc-amt { color: var(--success); font-variant-numeric: tabular-nums; }
+.chat-card .cc-meta { color: var(--secondary); font-size: .78rem; margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.chat-card .cc-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .chat-card .btn { min-height: 40px; padding: 0 18px; }
 
 /* sticky composer */
@@ -288,7 +309,9 @@ input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var
 .pdf-preview:hover, .pdf-preview:focus-visible {
   border-color: var(--primary); box-shadow: 0 6px 20px rgba(0,0,0,.18); outline: none;
 }
-.pdf-preview-frame { position: relative; width: 100%; height: 520px; background: var(--surface-low); }
+/* overflow:hidden backs up the #scrollbar=0 viewer flag for engines that ignore it —
+   the preview must never show a scrollbar it can't honour (pointer-events are off). */
+.pdf-preview-frame { position: relative; width: 100%; height: 520px; background: var(--surface-low); overflow: hidden; }
 .pdf-inline-frame { width: 100%; height: 100%; border: 0; display: block; pointer-events: none; }
 .pdf-preview-hint {
   position: absolute; right: 12px; bottom: 12px; z-index: 2;

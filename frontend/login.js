@@ -2,8 +2,6 @@
 // Login page (/) controller. Uses TWLogin (auth.js). Kept external (not inline)
 // so the Content-Security-Policy can forbid inline scripts.
 (function () {
-  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const $ = (id) => document.getElementById(id);
 
   function handleProposals(proposals) {
@@ -14,12 +12,7 @@
     list.classList.remove("hidden");
     list.innerHTML = '<div class="card"><h1>Your projects</h1>' +
       '<p class="muted">Choose a project to view.</p>' +
-      proposals.map((p) => {
-        const done = p.proposal_status === "approved";
-        return `<a class="proj-row" href="/p/${encodeURIComponent(p.token)}">` +
-          `<span class="pname">${esc(p.project_name)}</span>` +
-          `<span class="badge ${done ? "done" : "warn"}">${done ? "Approved" : "Awaiting approval"}</span></a>`;
-      }).join("") + "</div>";
+      TWProjects.rowsHtml(proposals) + "</div>";   // shared with the in-portal switcher
   }
 
   function showLogin() {

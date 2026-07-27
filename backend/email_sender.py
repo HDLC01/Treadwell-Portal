@@ -3,6 +3,7 @@ message to stdout instead of sending, so the full flow is testable offline.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import logging
@@ -40,15 +41,25 @@ def _thread_headers(email: str) -> dict[str, str]:
 
 
 def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None = None,
-          reply_to: str | None = None) -> bool:
+          reply_to: str | None = None,
+          attachments: list[tuple[str, bytes]] | None = None) -> bool:
+    """`attachments` is a list of (filename, raw bytes) — base64-encoded here into
+    Resend's attachment format. Kept as raw bytes at the call site so callers
+    never deal with encoding."""
     to = [t for t in to if t]
     if not to:
         return False
     if not config.RESEND_API_KEY:
-        log.warning("[email:dev] would send to=%s subject=%r\n%s", to, subject, html)
+        log.warning("[email:dev] would send to=%s subject=%r attachments=%s\n%s",
+                    to, subject, [n for n, _ in (attachments or [])], html)
         return True
     try:
         payload: dict = {"from": config.EMAIL_FROM, "to": to, "subject": subject, "html": html}
+        if attachments:
+            payload["attachments"] = [
+                {"filename": name, "content": base64.b64encode(blob).decode("ascii")}
+                for name, blob in attachments if blob
+            ]
         # Explicit per-message reply_to (e.g. the per-proposal inbound-capture
         # address) wins over the global EMAIL_REPLY_TO fallback.
         effective_reply_to = reply_to or config.EMAIL_REPLY_TO
@@ -155,17 +166,32 @@ def send_reply_notification(email: str, url: str, project_name: str,
 
 
 def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None,
-                         reply_to: str | None = None) -> bool:
+                         reply_to: str | None = None, invoice_no: str | None = None,
+                         invoice_pdf: bytes | None = None, invoice_filename: str | None = None,
+                         reference: str | None = None) -> bool:
+    """The deposit invoice email. When `invoice_pdf` is supplied the actual
+    invoice rides along as an attachment, and the body names its number — so the
+    customer receives a document, not just a promise of one."""
     amt = f" of <strong>${amount:,.2f}</strong>" if amount is not None else ""
+    inv = f" (invoice <strong>{_esc(invoice_no)}</strong>)" if invoice_no else ""
+    attached = ("<p>Your invoice is attached as a PDF.</p>" if invoice_pdf else
+                "<p>Your deposit invoice will follow shortly.</p>")
+    ref = (f'<p style="color:#475569;font-size:13px">Include reference '
+           f'<strong>{_esc(reference)}</strong> with your payment.</p>') if reference else ""
     body = (
-        f'<p>Thank you for approving your proposal for <strong>{project_name}</strong>.</p>'
-        f'<p>A deposit{amt} reserves your place on our schedule. Open your proposal for the '
-        f'bank-transfer instructions and the reference to include with your payment.</p>'
+        f'<p>Thank you for approving your proposal for <strong>{_esc(project_name)}</strong>.</p>'
+        f'<p>A deposit{amt}{inv} reserves your place on our schedule.</p>'
+        f'{attached}'
+        f'<p>You can pay by ACH straight from the portal (fastest), or mail a check.</p>'
         f'<p style="margin:20px 0"><a href="{url}" style="background:#0ea5e9;color:#fff;'
-        f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
+        f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">Pay your deposit</a></p>'
+        f'{ref}'
     )
-    return _send([email], f"Deposit requested — {project_name}", _wrap("Deposit requested", body),
-                 _thread_headers(email), reply_to=reply_to)
+    subject = (f"Invoice {invoice_no} — deposit for {project_name}" if invoice_no
+               else f"Deposit requested — {project_name}")
+    atts = [(invoice_filename or "Treadwell-Invoice.pdf", invoice_pdf)] if invoice_pdf else None
+    return _send([email], subject, _wrap("Deposit invoice", body),
+                 _thread_headers(email), reply_to=reply_to, attachments=atts)
 
 
 def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit,

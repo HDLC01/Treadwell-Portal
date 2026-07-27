@@ -9,8 +9,9 @@ import email_sender as es
 def _capture(monkeypatch):
     box = {}
 
-    def fake_send(to, subject, html, headers=None, reply_to=None):
-        box.update(to=to, subject=subject, html=html, reply_to=reply_to)
+    def fake_send(to, subject, html, headers=None, reply_to=None, attachments=None):
+        box.update(to=to, subject=subject, html=html, reply_to=reply_to,
+                   attachments=attachments)
         return True
 
     monkeypatch.setattr(es, "_send", fake_send)

@@ -30,6 +30,7 @@ import customer_auth as ca
 import db
 import email_sender
 import inbound
+import invoice
 import proposals
 import ratelimit
 
@@ -191,12 +192,16 @@ def _staff_link(proposal_id: str) -> str:
 
 
 def _proposal_card(row: dict) -> dict:
+    """One row in the customer's project list (login page + in-portal switcher)."""
+    created = row.get("created_at")
     return {
         "token": row["token"],
         "project_name": row.get("project_name") or "Your Proposal",
         "proposal_status": row.get("proposal_status"),
         "deposit_status": row.get("deposit_status"),
         "schedule_status": row.get("schedule_status"),
+        "contacts_status": row.get("contacts_status") or "pending",
+        "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
     }
 
 
@@ -356,6 +361,9 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         # blank form they might resubmit (deposit_status only flips when staff confirm).
         "submitted": bool(_latest),
         "submitted_method": _latest["method"] if _latest else None,
+        # Present once the invoice has been issued — drives the download button on
+        # the chat card and the thank-you card.
+        "invoice_no": p.get("deposit_invoice_no"),
     }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
@@ -426,6 +434,10 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    if p.get("proposal_status") == "approved":
+        # Idempotent: a double-submit (or a re-opened tab) must not re-run the
+        # approval email + automations, which would issue a second invoice.
+        return _json({"ok": True, "already_approved": True})
     body = await _body(request)
     name = _cap(body.get("name"), 120)
     title = _cap(body.get("title"), 120)
@@ -644,6 +656,31 @@ def api_pdf(token: str, request: Request):
     if p.get("pdf_path"):  # fallback: a stored Storage URL (prod option)
         return RedirectResponse(p["pdf_path"])
     return _json({"ok": False, "error": "no_pdf"}, 404)
+
+
+@app.get("/api/portal/{token}/deposit-invoice.pdf")
+def api_deposit_invoice_pdf(token: str, request: Request):
+    """The deposit invoice document. Rendered on demand from the stored columns
+    (no blob storage) — the invoice NUMBER is what's persisted, so the document is
+    always reproducible and always matches what was emailed."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    invoice_no = p.get("deposit_invoice_no")
+    amount = p.get("deposit_amount")
+    if not invoice_no or amount is None:
+        return _json({"ok": False, "error": "no_invoice"}, 404)
+    try:
+        pdf = invoice.build_deposit_invoice_pdf(p, float(amount), invoice_no)
+    except Exception as exc:  # noqa: BLE001
+        log.error("deposit invoice render failed for %s: %s", p["proposal_id"], exc)
+        return _json({"ok": False, "error": "render_failed"}, 500)
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{invoice.invoice_filename(invoice_no)}"',
+                 "Cache-Control": "private, max-age=0, no-store"},
+    )
 
 
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
@@ -1002,8 +1039,14 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
 
 @app.post("/api/admin/proposal/{proposal_id}/deposit-request")
 async def admin_deposit_request(proposal_id: str, request: Request) -> JSONResponse:
-    """Staff-triggered (NEVER auto-sent): after internal review, push a deposit
-    request into the customer chat + email them. Requires an approved proposal."""
+    """Staff-triggered deposit invoice: mint/reuse the invoice number, post the
+    invoice to the customer chat and email it with the PDF attached. Requires an
+    approved proposal.
+
+    Note: approval ALSO issues this automatically (automations.run_on_approval,
+    Will's item 15). This endpoint stays for re-sends and for a staff-adjusted
+    amount; both paths share automations.issue_deposit_invoice so they can't
+    drift. The invoice NUMBER is issued once and reused on a re-send."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     p = db.get_proposal(proposal_id)
@@ -1025,18 +1068,16 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
         amount = (float(p["deposit_amount"]) if p.get("deposit_amount") is not None
                   else proposals.deposit_amount(p.get("approved_total")))
 
-    msg = (f"Deposit requested: ${amount:,.2f}. Your deposit invoice will follow shortly."
-           if amount is not None else "Deposit requested. Your deposit invoice will follow shortly.")
-    db.add_message(proposal_id, "staff", None, msg, msg_type="deposit_request",
-                   meta={"amount": amount} if amount is not None else None)
-    db.set_deposit_requested(proposal_id)
+    if amount is None or amount <= 0:
+        return _json({"ok": False, "error": "invalid_amount"}, 400)   # nothing to invoice
 
-    link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     project = p.get("project_name") or "your proposal"
-    rt = email_sender.proposal_reply_to(p["token"])
-    for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_deposit_request(e, link, project, amount, reply_to=rt)
-    return _json({"ok": True, "amount": amount})
+    try:
+        result = automations.issue_deposit_invoice(p, project, amount)
+    except Exception as exc:  # noqa: BLE001
+        log.error("manual deposit invoice failed for %s: %s", proposal_id, exc)
+        return _json({"ok": False, "error": "invoice_failed"}, 500)
+    return _json({"ok": True, **result})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/scheduled")
@@ -1152,6 +1193,7 @@ if FRONTEND_DIR.exists():
 def asset(asset: str):
     """Serve top-level static assets."""
     f = FRONTEND_DIR / asset
-    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js", "favicon.ico"}:
+    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js",
+                                 "projects.js", "favicon.ico"}:
         return FileResponse(f)
     return _json({"ok": False, "error": "not_found"}, 404)

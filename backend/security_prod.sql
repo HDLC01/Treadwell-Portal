@@ -79,5 +79,11 @@ grant select, insert, update, delete on public.portal_contacts to portal_app;
 drop policy if exists portal_app_rw on public.portal_contacts;
 create policy portal_app_rw on public.portal_contacts for all to portal_app using (true) with check (true);
 
+-- Deposit invoice numbering: portal_app must be able to call nextval() when it
+-- issues an invoice number. A sequence needs its OWN grant — the table grants
+-- above do not cover it, and without this the first invoice fails with
+-- "permission denied for sequence portal_invoice_seq".
+grant usage, select on sequence public.portal_invoice_seq to portal_app;
+
 -- NOTE: portal_app is deliberately granted NOTHING on public.events or
 -- public.profiles, and only SELECT (no write) on public.drafts. Do not widen.

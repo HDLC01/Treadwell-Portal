@@ -272,6 +272,26 @@ def set_deposit_requested(proposal_id: str) -> None:
     )
 
 
+def assign_invoice_no(proposal_id: str) -> Optional[str]:
+    """Issue the deposit invoice number, ONCE. Returns the number (existing or
+    newly minted). Idempotent by construction: the `where deposit_invoice_no is
+    null` clause means a concurrent/repeat call updates nothing, and the second
+    statement reads back whatever is stored — so a re-send or a re-approval can
+    never show the customer a second number for the same deposit.
+
+    nextval() is only evaluated for the row being updated, so repeat calls don't
+    burn sequence values."""
+    execute(
+        "update public.portal_proposals "
+        "set deposit_invoice_no = 'TW-INV-' || to_char(nextval('public.portal_invoice_seq'), 'FM00000'), "
+        "    deposit_invoice_issued_at = now(), updated_at = now() "
+        "where proposal_id = %s and deposit_invoice_no is null",
+        (proposal_id,),
+    )
+    row = q1("select deposit_invoice_no from public.portal_proposals where proposal_id=%s", (proposal_id,))
+    return (row or {}).get("deposit_invoice_no")
+
+
 def set_schedule_status(proposal_id: str, status: str) -> None:
     execute(
         "update public.portal_proposals set schedule_status=%s, updated_at=now() where proposal_id=%s",
