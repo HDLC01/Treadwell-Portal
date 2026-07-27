@@ -268,7 +268,10 @@ function applyStepPanel() {
 /** Open a step from a tracker tile or the sidebar. */
 function focusStep(step) {
   ACTIVE_STEP = step;
-  if (location.hash !== "#proposal") location.hash = "proposal"; else applyHashView(false);
+  // The step rides in the hash so Back/Forward walks the steps and a copied URL
+  // reopens the same one.
+  const want = "#proposal/" + step;
+  if (location.hash !== want) location.hash = want; else applyHashView(false);
   requestAnimationFrame(() => {
     applyStepPanel();
     // Land at the top of the panel rather than wherever the previous step was
@@ -598,10 +601,16 @@ function openDeposit() {
   });
 }
 
+/** The hash is `view[/step]` — `#proposal`, `#proposal/deposit`, `#chat`.
+ *  It used to be an equality test against "proposal", so every step-bearing
+ *  link (the notification bell and toasts both emit `#proposal/deposit`) fell
+ *  through to the else branch and dumped the customer back into chat. */
 function applyHashView(scroll) {
-  const wantProposal = location.hash.replace("#", "") === "proposal";
-  if (wantProposal) {
+  const [view, step] = location.hash.replace("#", "").split("/");
+  if (view === "proposal") {
+    if (step && STEP_CARDS[step]) ACTIVE_STEP = step;
     hide($("chat-view")); show($("proposal-view"));
+    applyStepPanel();
     if (scroll) window.scrollTo({ top: 0, behavior: "smooth" });   // only on a user nav, not a poll refetch
   } else {
     show($("chat-view")); hide($("proposal-view"));
