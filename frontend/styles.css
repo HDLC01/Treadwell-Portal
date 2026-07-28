@@ -69,6 +69,15 @@ a { color: var(--primary); }
   color: var(--primary); font-weight: 900; font-size: 1.2rem;
   letter-spacing: -0.01em; text-transform: uppercase;
 }
+/* Bison mark, left of the wordmark. Height is pinned under the 60px bar so the
+   bar can't grow, and flex:none keeps the art from being squashed — the
+   switcher label truncates instead. */
+.site-header .brand-bison { flex: none; display: block; }
+/* The bar is exactly full at 375px, so something has to give to fit the mark.
+   Drop the words "Secure proposal portal" rather than the logo: the padlock
+   beside them carries the same reassurance, and most customers read this on a
+   phone — hiding the brand there hides it from nearly everyone. */
+@media (max-width: 480px) { .site-header .tag .tag-text { display: none; } }
 .site-header .tag {
   margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
   font-size: .8rem; color: var(--secondary);

@@ -34,6 +34,8 @@ html.shell-open #shell-back{display:block}
 }
 .shell-brand{display:flex;align-items:center;gap:10px;margin-bottom:20px;font-weight:900;
  color:var(--primary);letter-spacing:-.01em}
+/* flex:none so the mark holds its size and the close button keeps its margin-left:auto slot */
+.shell-bison{flex:none;display:block}
 .shell-x{margin-left:auto;border:none;background:none;font-size:20px;line-height:1;cursor:pointer;
  color:var(--secondary);padding:2px 6px;border-radius:6px}
 .shell-x:hover{background:var(--surface-low)}
@@ -51,13 +53,13 @@ html.shell-open #shell-back{display:block}
 .shell-foot button{margin-left:auto;border:none;background:none;cursor:pointer;color:var(--secondary);
  font-size:15px;padding:4px;border-radius:6px}
 .shell-foot button:hover{background:var(--surface-low);color:var(--primary)}
-#shell-burger{border:1px solid var(--outline);background:var(--bg);color:var(--fg);width:34px;height:34px;
+#shell-burger{border:1px solid var(--outline);background:var(--bg);color:var(--fg);width:54px;height:34px;
  border-radius:8px;cursor:pointer;font-size:16px;line-height:1;flex:none}
 #shell-burger:hover{background:var(--surface-low)}
 .bell{position:relative;border:none;background:none;color:var(--secondary);font-size:17px;cursor:pointer;
  padding:5px 6px;border-radius:8px;line-height:1;margin-left:8px}
 .bell:hover{background:var(--surface-low);color:var(--primary)}
-.bell-badge{position:absolute;top:-1px;right:-1px;min-width:16px;height:16px;padding:0 3px;border-radius:8px;
+.bell-badge{position:absolute;top:-1px;right:-1px;min-width:25px;height:16px;padding:0 3px;border-radius:8px;
  background:var(--primary);color:#fff;font:700 9px/16px system-ui;text-align:center;box-sizing:border-box}
 #bell-back{position:fixed;inset:0;z-index:949;background:transparent}
 #bell-panel{position:fixed;top:58px;right:16px;width:min(360px,calc(100vw - 28px));max-height:70vh;
@@ -98,7 +100,7 @@ html.shell-open #shell-back{display:block}
     side.id = "shell-side";
     const onChat = !!TOKEN;
     side.innerHTML =
-      `<div class="shell-brand">TREADWELL<button class="shell-x" id="shell-close" title="Hide menu">‹</button></div>
+      `<div class="shell-brand"><img class="shell-bison" src="/static/img/treadwell-bison.svg" alt="" width="28" height="18">TREADWELL<button class="shell-x" id="shell-close" title="Hide menu">‹</button></div>
        <div class="shell-sec">Your account</div>
        <a class="shell-item${onChat ? " active" : ""}" href="${onChat ? `/p/${encodeURIComponent(TOKEN)}` : "/"}">
          <span class="shell-ico">💬</span><span>Chat</span></a>

@@ -80,10 +80,34 @@ def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None
         return False
 
 
+def _logo_html() -> str:
+    """Letterhead mark at the top of every email.
+
+    PNG, not the SVG the apps use: Gmail, Outlook desktop and Outlook.com all
+    refuse inline SVG. The src is built from PUBLIC_BASE_URL at CALL time (not
+    import time) so a re-pointed base URL is honoured — a relative or localhost
+    src renders as a broken image in the recipient's inbox. width/height are
+    real ATTRIBUTES because Outlook ignores CSS sizing on images, and border:0
+    kills the border Outlook draws on linked images. alt matters more than usual
+    here: most clients block images by default, so "Treadwell" is what the
+    majority of recipients actually see. No srcset — Outlook drops it anyway,
+    and the 320px asset is already >2x the 150px display box, so it stays crisp
+    on retina without a second source.
+    """
+    return (
+        f'<div style="text-align:center;margin:0 0 20px">'
+        f'<img src="{config.PUBLIC_BASE_URL}/static/img/treadwell-mark.png" alt="Treadwell" '
+        f'width="150" height="90" '
+        f'style="display:block;border:0;margin:0 auto;width:150px;height:auto">'
+        f'</div>'
+    )
+
+
 def _wrap(title: str, body_html: str) -> str:
     return (
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
         f'max-width:520px;margin:0 auto;color:#0f172a">'
+        f'{_logo_html()}'
         f'<h2 style="color:#0f172a;margin:0 0 12px">{title}</h2>{body_html}'
         f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0">'
         f'{_SIGNATURE_HTML}</div>'
@@ -99,6 +123,11 @@ _SIG_NAVY = "#000087"
 _SIG_BAR = "#000090"
 _SIG_GREY = "#595959"
 _SIG_ADDR = "#666666"
+# The red on every CTA button and the estimator-note rule. This is the UI red the
+# apps already use everywhere, deliberately NOT the brand PDF's #E52B2E — the logo
+# artwork carries the brand red, the interface does not. Named so the five buttons
+# below can't drift apart.
+_BRAND_RED = "#C8102E"
 _SIGNATURE_HTML = (
     f'<p style="font-family:Arial,sans-serif;font-size:8pt;line-height:1.6;margin:0">'
     f'<b><span style="color:{_SIG_NAVY}">TREADWELL</span></b> '
@@ -138,13 +167,13 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
     if note and str(note).strip():
         note_html = (
             f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
-            f'border-left:3px solid #C8102E;white-space:pre-wrap">{_esc(note)}</p>'
+            f'border-left:3px solid {_BRAND_RED};white-space:pre-wrap">{_esc(note)}</p>'
         )
     body = (
         f'<p>Hi {_esc(_first_name(name) or "there")},</p>'
         f'<p>Your proposal for <strong>{_esc(project_name)}</strong> is ready to review.</p>'
         f'{note_html}'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:{_BRAND_RED};color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
@@ -169,7 +198,7 @@ def send_reply_notification(email: str, url: str, project_name: str,
     body = (
         f'<p>Treadwell replied to your question on the proposal for <strong>{_esc(project_name)}</strong>:</p>'
         f'{msg_html}'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:{_BRAND_RED};color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
         f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
     )
@@ -187,7 +216,7 @@ def send_customer_update(email: str, url: str, project_name: str, heading: str,
     markup built by the caller; anything user-supplied must be escaped first."""
     body = (
         f'{body_html}'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:{_BRAND_RED};color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">'
         f'View your project</a></p>'
     )
@@ -213,7 +242,7 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
         f'<p>A deposit{amt}{inv} reserves your place on our schedule.</p>'
         f'{attached}'
         f'<p>You can pay by ACH straight from the portal (fastest), or mail a check.</p>'
-        f'<p style="margin:20px 0"><a href="{url}" style="background:#C8102E;color:#fff;'
+        f'<p style="margin:20px 0"><a href="{url}" style="background:{_BRAND_RED};color:#fff;'
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">Pay your deposit</a></p>'
         f'{ref}'
     )
@@ -300,7 +329,7 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
         log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
     if reply_link:
         body_html += (
-            f'<p style="margin-top:16px"><a href="{reply_link}" style="background:#C8102E;color:#fff;'
+            f'<p style="margin-top:16px"><a href="{reply_link}" style="background:{_BRAND_RED};color:#fff;'
             f'padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">Reply in Portal</a></p>'
         )
     return _send(to, subject, _wrap(subject, body_html))
