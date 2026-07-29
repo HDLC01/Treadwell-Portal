@@ -95,6 +95,12 @@ def _cap(v, n: int) -> str:
     return (v or "").strip()[:n]
 
 
+def _iso(v):
+    """A timestamp as an ISO string, or None. Tolerates an already-string value
+    so a caller never has to know whether psycopg parsed the column."""
+    return v.isoformat() if hasattr(v, "isoformat") else (v or None)
+
+
 def _set_session_cookie(resp: Response, token: str) -> None:
     resp.set_cookie(
         config.SESSION_COOKIE, token, max_age=config.SESSION_TTL_HOURS * 3600,
@@ -1050,6 +1056,14 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
             "deposit_amount": float(r["deposit_amount"]) if r.get("deposit_amount") is not None else None,
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
+            # Who owns it, and the milestones the board dates a card by. The
+            # staff side picks the latest of these — it also owns turning the
+            # email into a name, because portal_app is denied `profiles`.
+            "estimator_email": r.get("estimator_email"),
+            "sent_at": _iso(r.get("created_at")),        # a row can't exist unsent
+            "viewed_at": _iso(r.get("viewed_at")),       # FIRST view only
+            "approved_at": _iso(r.get("approved_at")),
+            "deposit_requested_at": _iso(r.get("deposit_requested_at")),
         })
     return _json({"ok": True, "proposals": out})
 

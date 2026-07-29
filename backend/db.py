@@ -179,10 +179,29 @@ def update_portal_proposal(proposal_id, customer_email, customer_name, project_n
 
 
 def list_all_portal_proposals() -> list[dict[str, Any]]:
+    """Every proposal for the staff CRM board, with its estimator and milestones.
+
+    The estimator comes from the DRAFT, not from us: `drafts.owner_email` is
+    written once when the project is first saved and never overwritten, so it
+    exists for every proposal. `published_by` (who clicked Send) is the fallback
+    for rows created before that plumbing landed — it is never backfilled.
+
+    The join deliberately does NOT filter `deleted_at`: trashing the draft does
+    not retract the proposal the customer already has, and the board would
+    otherwise lose the estimator on exactly those rows. Reading `drafts` is
+    already granted to portal_app in prod (security_prod.sql, portal_app_read_drafts).
+
+    `created_at` IS the sent-at: a row cannot exist before the email goes out.
+    Note `viewed_at` is FIRST view only (mark_viewed coalesces it)."""
     return qall(
-        "select proposal_id, token, customer_email, customer_name, project_name, proposal_status, "
-        "deposit_status, contacts_status, schedule_status, approved_total, deposit_amount, created_at "
-        "from public.portal_proposals order by created_at desc"
+        "select p.proposal_id, p.token, p.customer_email, p.customer_name, p.project_name, "
+        "p.proposal_status, p.deposit_status, p.contacts_status, p.schedule_status, "
+        "p.approved_total, p.deposit_amount, p.created_at, p.viewed_at, p.approved_at, "
+        "p.deposit_requested_at, "
+        "coalesce(d.owner_email, p.published_by) as estimator_email "
+        "from public.portal_proposals p "
+        "left join public.drafts d on d.id = p.proposal_id "
+        "order by p.created_at desc"
     )
 
 
