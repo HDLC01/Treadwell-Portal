@@ -359,11 +359,16 @@ def _digest_row(it: dict, staff_url: str) -> str:
     tail = (f'<p style="margin:6px 0 0;color:#64748b;font-size:13px">'
             f'…and {int(more)} more over the bar that didn\'t fit in this email.</p>'
             if isinstance(more, int) and more > 0 else "")
+    # Built out here, not inline: an f-string expression can't contain a backslash on
+    # Python 3.11, which is what the container runs. It parses fine on a newer local
+    # interpreter, so the tests pass and the deploy crashes on import.
+    meta_html = (f'<p style="margin:0 0 6px;color:#64748b;font-size:13px">{meta}</p>'
+                 if meta else "")
     return (
         f'<div style="padding:14px 0;border-top:1px solid #e2e8f0">'
         f'<p style="margin:0 0 3px;font-size:15px;font-weight:700">'
         f'<a href="{staff_url}" style="color:#0f172a;text-decoration:none">{name}</a>{again}</p>'
-        f'{f"<p style=\"margin:0 0 6px;color:#64748b;font-size:13px\">{meta}</p>" if meta else ""}'
+        f'{meta_html}'
         f'<p style="margin:0;color:#334155;font-size:14px">{reason}</p>'
         f'{tail}</div>'
     )
