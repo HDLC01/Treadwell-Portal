@@ -29,15 +29,34 @@ def _first_name(name) -> str:
     return (str(name or "").strip().split() or [""])[0]
 
 
-def _thread_headers(email: str) -> dict[str, str]:
-    """Group every portal email to one customer into a single inbox thread, so the
-    login code always lands in the same conversation as the proposal link (and is
-    never shown on a web page). A stable per-recipient anchor in References/In-Reply-To
-    makes Gmail and most clients thread the proposal, the code, and reply notices
-    together."""
-    anchor = hashlib.sha1((email or "").strip().lower().encode()).hexdigest()[:24]
-    mid = f"<treadwell-portal.{anchor}@wetreadwell.com>"
-    return {"References": mid, "In-Reply-To": mid}
+def proposal_anchor(token: str) -> str:
+    """The Message-ID that identifies a PROPOSAL inside the mail headers.
+
+    This is how a reply finds its project without putting a routing token in the
+    visible address — customers reply to one clean address, and the identity rides
+    in References/In-Reply-To, which every mail client echoes back untouched
+    (verified against a real Gmail reply: our anchor came back in `references`)."""
+    return f"<tw-proposal.{token}@wetreadwell.com>"
+
+
+def _thread_headers(email: str, token: str | None = None) -> dict[str, str]:
+    """Group portal email into inbox threads AND carry the proposal identity.
+
+    Two anchors, both echoed back on reply:
+    - a per-recipient anchor, so the login code lands in the same conversation as
+      the proposal link (and is never shown on a web page);
+    - a per-proposal anchor (when `token` is given), which is what the inbound
+      webhook reads to route a reply to the right project.
+
+    In-Reply-To gets the proposal anchor when we have one, so a customer with
+    several projects gets a thread per project rather than one merged pile."""
+    recipient = hashlib.sha1((email or "").strip().lower().encode()).hexdigest()[:24]
+    mid = f"<treadwell-portal.{recipient}@wetreadwell.com>"
+    if not token:
+        return {"References": mid, "In-Reply-To": mid}
+    anchor = proposal_anchor(token)
+    # RFC 5322: References is a space-separated list, oldest first.
+    return {"References": f"{mid} {anchor}", "In-Reply-To": anchor}
 
 
 def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None = None,
@@ -151,16 +170,26 @@ def send_otp(email: str, code: str, project_name: str) -> bool:
 
 
 def proposal_reply_to(token: str) -> str | None:
-    """The per-proposal inbound-capture Reply-To (token@receiving-domain), or
-    None when inbound receiving isn't configured. An email reply to this address
-    routes through Resend's webhook back into the proposal's CRM thread."""
+    """The Reply-To we put on customer email, or None when receiving isn't set up.
+
+    Prefers INBOUND_REPLY_ADDRESS — ONE clean, human-readable address for every
+    proposal (e.g. proposals@notify.wetreadwell.com). Routing does not depend on
+    this address: the proposal travels in the Message-ID headers (see
+    `proposal_anchor`), so nothing legible has to be sacrificed to make a reply
+    land in the right thread.
+
+    Without INBOUND_REPLY_ADDRESS it falls back to the older token@domain form,
+    which routes fine but shows the customer a wall of random characters."""
+    if config.INBOUND_REPLY_ADDRESS:
+        return config.INBOUND_REPLY_ADDRESS
     if not (config.RESEND_INBOUND_DOMAIN and token):
         return None
     return f"{token}@{config.RESEND_INBOUND_DOMAIN}"
 
 
 def send_portal_link(email: str, name: str, url: str, project_name: str,
-                     reply_to: str | None = None, note: str | None = None) -> bool:
+                     reply_to: str | None = None, note: str | None = None,
+                     token: str | None = None) -> bool:
     # Greet by FIRST name only; `note` is the estimator's optional personal message
     # (entered on the Done page before sending) shown above the button.
     note_html = ""
@@ -178,11 +207,12 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
     return _send([email], f"Your Treadwell proposal — {project_name}", _wrap("Your proposal is ready", body),
-                 _thread_headers(email), reply_to=reply_to)
+                 _thread_headers(email, token), reply_to=reply_to)
 
 
 def send_reply_notification(email: str, url: str, project_name: str,
-                            reply_to: str | None = None, message: str | None = None) -> bool:
+                            reply_to: str | None = None, message: str | None = None,
+                            token: str | None = None) -> bool:
     # Only advertise reply-by-email when inbound capture is armed (reply_to set);
     # otherwise steer to the portal so nothing dead-ends.
     nudge = ("You can reply right on your proposal page, or simply reply to this email."
@@ -203,11 +233,12 @@ def send_reply_notification(email: str, url: str, project_name: str,
         f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
     )
     return _send([email], f"New reply on your proposal — {project_name}", _wrap("You have a new reply", body),
-                 _thread_headers(email), reply_to=reply_to)
+                 _thread_headers(email, token), reply_to=reply_to)
 
 
 def send_customer_update(email: str, url: str, project_name: str, heading: str,
-                         body_html: str, reply_to: str | None = None) -> bool:
+                         body_html: str, reply_to: str | None = None,
+                         token: str | None = None) -> bool:
     """Confirm a milestone to the CUSTOMER — approval, deposit, contacts, dates.
 
     Every one of these already posted a chat line and (mostly) emailed the team,
@@ -221,13 +252,13 @@ def send_customer_update(email: str, url: str, project_name: str, heading: str,
         f'View your project</a></p>'
     )
     return _send([email], f"{heading} — {project_name}", _wrap(heading, body),
-                 _thread_headers(email), reply_to=reply_to)
+                 _thread_headers(email, token), reply_to=reply_to)
 
 
 def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None,
                          reply_to: str | None = None, invoice_no: str | None = None,
                          invoice_pdf: bytes | None = None, invoice_filename: str | None = None,
-                         reference: str | None = None) -> bool:
+                         reference: str | None = None, token: str | None = None) -> bool:
     """The deposit invoice email. When `invoice_pdf` is supplied the actual
     invoice rides along as an attachment, and the body names its number — so the
     customer receives a document, not just a promise of one."""
@@ -250,7 +281,7 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
                else f"Deposit requested — {project_name}")
     atts = [(invoice_filename or "Treadwell-Invoice.pdf", invoice_pdf)] if invoice_pdf else None
     return _send([email], subject, _wrap("Deposit invoice", body),
-                 _thread_headers(email), reply_to=reply_to, attachments=atts)
+                 _thread_headers(email, token), reply_to=reply_to, attachments=atts)
 
 
 def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit,

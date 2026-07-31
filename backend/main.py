@@ -203,7 +203,8 @@ def _notify_customer(p: dict, heading: str, body_html: str) -> None:
         project = p.get("project_name") or "your project"
         for e in (db.get_recipients(pid) or [p.get("customer_email")]):
             if e:
-                email_sender.send_customer_update(e, link, project, heading, body_html, reply_to=rt)
+                email_sender.send_customer_update(e, link, project, heading, body_html,
+                                                  reply_to=rt, token=p["token"])
     except Exception as exc:  # noqa: BLE001
         log.warning("customer update email failed for %s: %s", p.get("proposal_id"), exc)
 
@@ -840,14 +841,15 @@ async def api_notify(request: Request) -> JSONResponse:
     if kind == "published":
         for e in recipients:
             email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project,
-                                          reply_to=rt)
+                                          reply_to=rt, token=p["token"])
     elif kind == "reply":
         # Carry the reply TEXT through. Without it this path emailed a bare
         # "Treadwell replied to your question" + button — the same email the
         # staff-drawer path (admin_reply) already sends WITH the snippet.
         msg = _cap(body.get("message") or body.get("body"), 4000) or None
         for e in recipients:
-            email_sender.send_reply_notification(e, link, project, reply_to=rt, message=msg)
+            email_sender.send_reply_notification(e, link, project, reply_to=rt, message=msg,
+                                                 token=p["token"])
     else:
         return _json({"ok": False, "error": "unknown_type"}, 400)
     return _json({"ok": True})
@@ -946,62 +948,91 @@ async def api_inbound_resend(request: Request):
         log.info("inbound: ignoring mail from ourselves (%r)", from_email)
         return _json({"ok": True, "ignored": "own_address"})
 
-    # Accept EVERY receiving domain we have minted (primary + legacy), so a reply
-    # to a Reply-To address sitting in an old email still finds its thread.
-    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAINS)
-    p = (db.get_proposal_by_token(token) or db.get_proposal_by_token_ci(token)) if token else None
-    matched_by = "token" if p else None
-    is_staff = bool(from_email) and from_email in email_sender.staff_emails()
+    def _resolve(tok):
+        if not tok:
+            return None
+        return db.get_proposal_by_token(tok) or db.get_proposal_by_token_ci(tok)
 
-    if not p and config.INBOUND_SENDER_FALLBACK and not is_staff \
-            and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN):
-        # Mail to the branded address itself, or a reply that lost its token. Match
-        # on the SENDER instead — primary domain only (legacy addresses were only
-        # ever minted as exact tokens), and only when it is unambiguous.
-        try:
-            matches = db.list_proposals_by_email(from_email)
-        except Exception as exc:  # noqa: BLE001 — treat a lookup failure as ambiguous
-            log.warning("inbound: sender lookup failed for %r: %s", from_email, exc)
-            matches = []
-        if len(matches) == 1:
-            p, matched_by = matches[0], "sender"
+    # 1. Token in the recipient address. Every receiving domain we have ever minted
+    #    is accepted (primary + legacy), so a Reply-To sitting in an old email still
+    #    finds its thread. Tried first because it needs no message fetch.
+    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAINS)
+    p = _resolve(token)
+    matched_by = "address" if p else None
+    is_staff = bool(from_email) and from_email in email_sender.staff_emails()
+    fetched = None
 
     if not p:
-        # Nothing to file it against. Rather than drop it silently, hand anything
-        # actually addressed to us to a human — that is the whole point of putting
-        # a real address on our emails. Unaddressed noise is still dropped.
-        if not (config.INBOUND_SENDER_FALLBACK
-                and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN)):
-            log.info("inbound: no proposal match (token=%r, from=%r)", token, from_email)
-            return _json({"ok": True, "ignored": "no_match"})
+        # Everything below needs the message itself — the threading headers live in
+        # the fetched payload, not the webhook metadata. The fetch is a plain GET,
+        # so a Svix retry repeating it is harmless.
         fetched = _inbound_body(email_id, data)
         if fetched is None:
             return _json({"ok": False, "error": "fetch_failed"}, 500)
         body_txt, full = fetched
-        if inbound.is_auto_reply(subject, full.get("headers")):
-            log.info("inbound: unmatched auto-reply dropped (%r)", from_email)
-            return _json({"ok": True, "ignored": "auto_reply"})
-        why = "sent by staff, with no proposal in the address" if is_staff else \
-              "no single proposal matches this sender"
-        log.info("inbound: unmatched email from %r — forwarding (%s)", from_email, why)
-        # No pid here, so no dedup anchor: a Resend dashboard re-delivery could
-        # forward twice. Svix retries only fire on non-2xx, so normal traffic is once.
-        _inbound_forward(
-            email_sender._resolve_notify("general"),
-            f"Unmatched email — {from_email or 'unknown sender'}",
-            "An email we could not place",
-            f"<p><strong>⚠ UNMATCHED — {html.escape(why)}. Not added to any portal "
-            f"thread.</strong></p>",
-            from_email, "", subject, body_txt, reply_to=from_email or None)
-        return _json({"ok": True, "unmatched": True})
+        headers = full.get("headers")
+
+        # 2. Proposal anchor in In-Reply-To / References. This is what makes a single
+        #    clean Reply-To possible: the project rides in a header the customer
+        #    never sees, and their mail client quotes it back for us.
+        header_token = inbound.find_thread_token(headers)
+        p = _resolve(header_token)
+        if p:
+            matched_by = "header"
+            log.info("inbound: matched by thread header (token=%r)", header_token)
+
+        # 3. Nothing identifying in the mail at all — a freshly composed email to our
+        #    address. Match the SENDER, primary domain only, and only when it is
+        #    unambiguous. Staff are never sender-matched: their address appears on
+        #    proposals as a notify recipient, not as the customer.
+        if not p and config.INBOUND_SENDER_FALLBACK and not is_staff \
+                and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN):
+            try:
+                matches = db.list_proposals_by_email(from_email)
+            except Exception as exc:  # noqa: BLE001 — a lookup failure is ambiguous
+                log.warning("inbound: sender lookup failed for %r: %s", from_email, exc)
+                matches = []
+            if len(matches) == 1:
+                p, matched_by = matches[0], "sender"
+
+        if not p:
+            # 4. Unplaceable. Hand it to a human rather than dropping it — that is
+            #    the point of publishing a real address. Gated on the SAME conditions
+            #    as sender matching: the environment that owns untokened mail owns
+            #    forwarding it too, and only on the primary domain. Otherwise both
+            #    environments would forward the same stray email to their own roster,
+            #    and staging would forward production customers' mail.
+            if not (config.INBOUND_SENDER_FALLBACK
+                    and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN)):
+                log.info("inbound: no proposal match (token=%r, from=%r)", token, from_email)
+                return _json({"ok": True, "ignored": "no_match"})
+            if inbound.is_auto_reply(subject, headers):
+                log.info("inbound: unmatched auto-reply dropped (%r)", from_email)
+                return _json({"ok": True, "ignored": "auto_reply"})
+            why = ("sent by staff, with no proposal in the message" if is_staff else
+                   "nothing in the message identifies a proposal, and no single "
+                   "proposal matches this sender")
+            log.info("inbound: unmatched email from %r — forwarding (%s)", from_email, why)
+            # No pid, so no dedup anchor: a Resend dashboard re-delivery could
+            # forward twice. Svix retries only fire on non-2xx, so normal traffic
+            # forwards once.
+            _inbound_forward(
+                email_sender._resolve_notify("general"),
+                f"Unmatched email — {from_email or 'unknown sender'}",
+                "An email we could not place",
+                f"<p><strong>⚠ UNMATCHED — {html.escape(why)}. Not added to any portal "
+                f"thread.</strong></p>",
+                from_email, "", subject, body_txt, reply_to=from_email or None)
+            return _json({"ok": True, "unmatched": True})
 
     pid = p["proposal_id"]
     if db.has_email_message(pid, email_id):
         return _json({"ok": True, "ignored": "duplicate"})
 
-    fetched = _inbound_body(email_id, data)
     if fetched is None:
-        return _json({"ok": False, "error": "fetch_failed"}, 500)
+        fetched = _inbound_body(email_id, data)
+        if fetched is None:
+            return _json({"ok": False, "error": "fetch_failed"}, 500)
     body_txt, full = fetched
     auto = inbound.is_auto_reply(subject, full.get("headers"))
     project = p.get("project_name") or "proposal"
@@ -1009,6 +1040,15 @@ async def api_inbound_resend(request: Request):
 
     # Staff is tested BEFORE the customer: if one address were somehow on both
     # lists, filing staff as the customer would put our words in their mouth.
+    #
+    # A staff inbound email can speak AS Treadwell to a customer, so it is the one
+    # privileged path here and roster membership alone isn't enough — a From header
+    # is forgeable. Require the receiving MTA's SPF+DKIM verdict too. Failing closed
+    # just sends the message through the roster forward instead.
+    if is_staff and not inbound.sender_authenticated(full.get("headers")):
+        log.warning("inbound: %r is on the roster but SPF/DKIM did not both pass — "
+                    "refusing the staff path for proposal %s", from_email, pid)
+        is_staff = False
     if is_staff:
         if auto:
             log.info("inbound: staff auto-reply ignored (%r)", from_email)
@@ -1024,7 +1064,7 @@ async def api_inbound_resend(request: Request):
                 if e:
                     email_sender.send_reply_notification(
                         e, f"{config.PUBLIC_BASE_URL}/p/{p['token']}", project,
-                        reply_to=rt, message=body_txt)
+                        reply_to=rt, message=body_txt, token=p["token"])
         except Exception as exc:  # noqa: BLE001 — the thread insert already happened
             log.error("inbound: staff relay to the customer failed: %s", exc)
         return _json({"ok": True, "staff": True})
@@ -1138,7 +1178,7 @@ async def admin_publish(request: Request) -> JSONResponse:
     rt = email_sender.proposal_reply_to(token)
     emailed = [e for e in send_list
                if email_sender.send_portal_link(e, name if e == primary else "", link, project,
-                                                 reply_to=rt, note=note)]
+                                                 reply_to=rt, note=note, token=token)]
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
                   "recipients": send_list, "emailed": emailed})
 
@@ -1279,7 +1319,8 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
     project = p.get("project_name") or "your proposal"
     rt = email_sender.proposal_reply_to(p["token"])
     for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text)
+        email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text,
+                                             token=p["token"])
     return _json({"ok": True})
 
 

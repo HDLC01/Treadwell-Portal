@@ -58,9 +58,15 @@ def env(monkeypatch):
                                                "reply_to": k.get("reply_to")}) or True)
     monkeypatch.setattr(
         email_sender, "send_reply_notification",
-        lambda email, url, project, reply_to=None, message=None:
+        lambda email, url, project, reply_to=None, message=None, token=None:
         calls["reply_notifications"].append({"to": email, "reply_to": reply_to,
-                                             "message": message}) or True)
+                                            "message": message, "token": token}) or True)
+
+    # A real inbound payload carries an SPF/DKIM verdict from the receiving MTA;
+    # the staff path is gated on it, so the default fixture supplies a passing one.
+    # Tests that care about spoofing override calls["headers"].
+    calls["headers"] = {"authentication-results":
+                        "amazonses.com; spf=pass; dkim=pass header.i=@wetreadwell.com"}
 
     def fake_get(url, headers=None, timeout=None):
         class R:
@@ -68,7 +74,8 @@ def env(monkeypatch):
                 return None
 
             def json(self):
-                return {"text": calls.get("body", "Sounds good, go ahead."), "headers": calls.get("headers")}
+                return {"text": calls.get("body", "Sounds good, go ahead."),
+                        "headers": calls.get("headers")}
         return R()
 
     monkeypatch.setattr(main.httpx, "get", fake_get)
@@ -132,6 +139,70 @@ def test_staff_membership_is_case_insensitive_via_roster(env):
     r = post(env, [f"{TOKEN}@{PRIMARY}"], "KYLE@WeTreadwell.com")
     assert r.json()["staff"] is True
     assert env["messages"][0]["args"][1] == "staff"
+
+
+def test_forged_staff_from_cannot_speak_as_treadwell(env):
+    """Roster membership alone must not grant the privileged path — a From header is
+    forgeable and svix only proves the webhook came from Resend. Without a passing
+    SPF/DKIM verdict the message is demoted, never posted as Treadwell."""
+    env["headers"] = {"authentication-results": "amazonses.com; spf=fail; dkim=fail"}
+    r = post(env, [f"{TOKEN}@{PRIMARY}"], STAFF)
+    assert "staff" not in r.json()
+    # Not posted as Treadwell, and the customer was never emailed on its behalf.
+    assert env["reply_notifications"] == []
+    assert [m for m in env["messages"] if m["args"][1] == "staff"] == []
+    # Staff still see it — it goes out as an unverified-sender forward.
+    (fwd,) = env["sends"]
+    assert "UNVERIFIED SENDER" in fwd["html"]
+
+
+def test_missing_auth_verdict_also_demotes_staff(env):
+    """Absent header → fail closed. The cost is a roster forward; the alternative
+    is letting a forged From post into a customer's thread."""
+    env["headers"] = None
+    r = post(env, [f"{TOKEN}@{PRIMARY}"], STAFF)
+    assert "staff" not in r.json()
+    assert env["reply_notifications"] == []
+
+
+# ── routing by threading header (the clean-address mechanism) ─────────────────
+def test_reply_to_the_clean_address_routes_by_thread_header(env):
+    """The address carries no token at all — the proposal comes from the Message-ID
+    we stamped on the outbound email and Gmail echoed back in References."""
+    import email_sender
+    env["headers"] = {
+        "authentication-results": "spf=pass; dkim=pass",
+        "references": ["<treadwell-portal.02c9e3ca878badf6ec1121e7@wetreadwell.com>",
+                       email_sender.proposal_anchor(TOKEN)],
+    }
+    r = post(env, [f"proposals@{PRIMARY}"], CUSTOMER)
+    assert r.json()["verified"] is True
+    (msg,) = env["messages"]
+    assert msg["args"][0] == PID and msg["args"][1] == "customer"
+
+
+def test_thread_header_wins_over_sender_matching(env, monkeypatch):
+    """Header routing is exact; sender matching is a guess. The exact one must win
+    even when the sender maps cleanly to a different proposal."""
+    import main
+    import email_sender
+    monkeypatch.setattr(main.db, "list_proposals_by_email",
+                        lambda e: [dict(PROPOSAL, proposal_id="WRONG-PID")])
+    env["headers"] = {"authentication-results": "spf=pass; dkim=pass",
+                      "in-reply-to": email_sender.proposal_anchor(TOKEN)}
+    post(env, [f"proposals@{PRIMARY}"], CUSTOMER)
+    assert env["messages"][0]["args"][0] == PID
+
+
+def test_clean_address_with_no_thread_header_falls_back_to_sender(env, monkeypatch):
+    """A freshly composed email to proposals@ has no thread to follow."""
+    import main
+    monkeypatch.setattr(main.db, "list_proposals_by_email",
+                        lambda e: [dict(PROPOSAL)] if e == CUSTOMER else [])
+    env["headers"] = {"authentication-results": "spf=pass; dkim=pass"}
+    r = post(env, [f"proposals@{PRIMARY}"], CUSTOMER)
+    assert r.json()["verified"] is True
+    assert env["messages"][0]["args"][1] == "customer"
 
 
 # ── loop and auto-responder guards ───────────────────────────────────────────

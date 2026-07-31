@@ -110,7 +110,8 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     for e in (db.get_recipients(pid) or [fresh.get("customer_email")]):
         email_sender.send_deposit_request(e, link, project_name, amount, reply_to=rt,
                                           invoice_no=invoice_no, invoice_pdf=pdf,
-                                          invoice_filename=filename, reference=reference)
+                                          invoice_filename=filename, reference=reference,
+                                          token=token)
     log.info("[deposit] issued invoice %s for $%.2f (%s)", invoice_no, amount, pid)
     return {"amount": amount, "invoice_no": invoice_no}
 

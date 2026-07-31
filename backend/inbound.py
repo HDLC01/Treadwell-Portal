@@ -83,6 +83,84 @@ def addressed_to_domain(recipients, domain) -> bool:
     return False
 
 
+def _header_values(headers, *names) -> list[str]:
+    """Pull header values by name from Resend's payload, which returns `headers` as
+    a dict whose values are sometimes a string and sometimes a list (References
+    comes back as a JSON array). Tolerates a list-of-{name,value} shape too, and
+    never raises on anything unexpected."""
+    want = {n.strip().lower() for n in names}
+    out: list[str] = []
+
+    def add(v):
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, (list, tuple)):
+            out.extend(str(x) for x in v if isinstance(x, (str, int, float)))
+        elif v is not None:
+            out.append(str(v))
+
+    try:
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                if str(k).strip().lower() in want:
+                    add(v)
+        elif isinstance(headers, (list, tuple)):
+            for h in headers:
+                if isinstance(h, dict) and str(h.get("name", "")).strip().lower() in want:
+                    add(h.get("value"))
+    except Exception:  # noqa: BLE001 — malformed header payload is never fatal
+        return []
+    return out
+
+
+_ANCHOR_RE = re.compile(r"tw-proposal\.([A-Za-z0-9_\-]{8,80})@", re.IGNORECASE)
+
+
+def find_thread_token(headers) -> str | None:
+    """Recover the proposal token from the threading headers of an inbound reply.
+
+    This is what lets the visible Reply-To be one clean address: we stamp a
+    per-proposal Message-ID on outbound mail (email_sender.proposal_anchor) and the
+    customer's client quotes it back in In-Reply-To / References. In-Reply-To is
+    checked first — it is the message actually being answered — then References,
+    newest last, so the most specific match wins.
+
+    Returns the token verbatim (they are case-sensitive; the caller may retry
+    case-insensitively, as with address tokens)."""
+    for value in _header_values(headers, "in-reply-to"):
+        m = _ANCHOR_RE.search(value)
+        if m:
+            return m.group(1)
+    refs = _header_values(headers, "references")
+    for value in reversed(refs):
+        for m in reversed(list(_ANCHOR_RE.finditer(value))):
+            return m.group(1)
+    return None
+
+
+_SPF_PASS = re.compile(r"\bspf\s*=\s*pass\b", re.IGNORECASE)
+_DKIM_PASS = re.compile(r"\bdkim\s*=\s*pass\b", re.IGNORECASE)
+
+
+def sender_authenticated(headers) -> bool:
+    """True when the receiving MTA verified BOTH SPF and DKIM for this message.
+
+    Resend's inbound payload carries an `authentication-results` header from SES.
+    A From address is trivially forgeable and the svix signature only proves the
+    webhook came from Resend — this is the one signal that says the sending domain
+    actually authorised the message. Used to gate the privileged path where an
+    inbound email may speak AS Treadwell to a customer.
+
+    Absent or unparseable header → False. Failing closed only costs a staff reply
+    a trip through the roster forward; failing open would let a forged From post
+    to a customer's thread."""
+    for value in _header_values(headers, "authentication-results",
+                               "arc-authentication-results"):
+        if _SPF_PASS.search(value) and _DKIM_PASS.search(value):
+            return True
+    return False
+
+
 def is_own_address(from_email: str, own_from: str, domains) -> bool:
     """True when an inbound email appears to come from US — our own From address,
     or any address at a receiving domain. Guards the loop where a message we

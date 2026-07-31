@@ -90,6 +90,14 @@ RESEND_INBOUND_DOMAINS = [
     d for d in [RESEND_INBOUND_DOMAIN.strip().lower(), *RESEND_INBOUND_LEGACY_DOMAINS] if d
 ]
 RESEND_WEBHOOK_SECRET = _env("RESEND_WEBHOOK_SECRET", "")
+# ONE clean, legible Reply-To for every customer email (e.g.
+# proposals@notify.wetreadwell.com) instead of <token>@domain. Customers should
+# never be asked to reply to a wall of random characters — Will's objection, and a
+# fair one. Routing does not depend on this address: the proposal identity rides in
+# the Message-ID / References headers (email_sender.proposal_anchor), which mail
+# clients echo back on reply. Must be an address AT a receiving domain above, or
+# replies to it go nowhere. Empty → fall back to the old <token>@domain form.
+INBOUND_REPLY_ADDRESS = _env("INBOUND_REPLY_ADDRESS", "")
 # Resend receives mail for EVERY address at the receiving domain, so mail can
 # arrive whose local part is not a proposal token (someone emails the From
 # address, or a reply loses the token). With this on, we try to match the SENDER
