@@ -76,6 +76,123 @@ def test_find_token_wrong_domain_or_empty():
     assert inbound.find_token(["tok@piaxenoizh.resend.app"], "") is None
 
 
+# ── multi-domain ingest (branded primary + retired legacy) ────────────────────
+PRIMARY = "notify.wetreadwell.com"
+BOTH = [PRIMARY, DOM]
+
+
+def test_find_token_accepts_primary_and_legacy():
+    """One list, both domains: a reply to a Reply-To we no longer mint still
+    resolves, which is what keeps already-sent emails working after the move."""
+    assert inbound.find_token([f"tokA@{PRIMARY}"], BOTH) == "tokA"
+    assert inbound.find_token([f"tokB@{DOM}"], BOTH) == "tokB"
+    assert inbound.find_token([f"Treadwell <tokC@{PRIMARY.upper()}>"], BOTH) == "tokC"
+    assert inbound.find_token(["nope@gmail.com"], BOTH) is None
+    assert inbound.find_token([f"tok@{PRIMARY}"], []) is None
+
+
+def test_addressed_to_domain_is_primary_only():
+    """The sender-matching fallback keys off this: mail to the branded domain
+    qualifies, mail to the legacy domain never does."""
+    assert inbound.addressed_to_domain([f"proposals@{PRIMARY}"], PRIMARY) is True
+    assert inbound.addressed_to_domain(["a@x.com", f"x@{PRIMARY}"], PRIMARY) is True
+    assert inbound.addressed_to_domain([f"whatever@{DOM}"], PRIMARY) is False
+    assert inbound.addressed_to_domain(["plain-text-not-an-address"], PRIMARY) is False
+    assert inbound.addressed_to_domain([f"x@{PRIMARY}"], "") is False
+
+
+def test_proposal_reply_to_mints_primary_only(monkeypatch):
+    """Legacy domains are accepted on the way IN and never minted on the way out."""
+    monkeypatch.setattr(config, "RESEND_INBOUND_DOMAIN", PRIMARY)
+    monkeypatch.setattr(config, "RESEND_INBOUND_LEGACY_DOMAINS", [DOM])
+    assert email_sender.proposal_reply_to("tok") == f"tok@{PRIMARY}"
+
+
+# ── loop guard: mail that came from us ───────────────────────────────────────
+OWN_FROM = "Treadwell <proposals@notify.wetreadwell.com>"
+
+
+def test_is_own_address_catches_self_and_receiving_domains():
+    assert inbound.is_own_address("proposals@notify.wetreadwell.com", OWN_FROM, BOTH) is True
+    assert inbound.is_own_address("Treadwell <PROPOSALS@Notify.Wetreadwell.com>", OWN_FROM, BOTH) is True
+    assert inbound.is_own_address(f"sometoken@{DOM}", OWN_FROM, BOTH) is True
+    assert inbound.is_own_address("", OWN_FROM, BOTH) is True          # unusable From
+    assert inbound.is_own_address("customer@gmail.com", OWN_FROM, BOTH) is False
+
+
+# ── auto-responder detection ─────────────────────────────────────────────────
+def test_is_auto_reply_subjects():
+    assert inbound.is_auto_reply("Automatic reply: Proposal question") is True
+    assert inbound.is_auto_reply("Out of Office") is True
+    assert inbound.is_auto_reply("auto-response: away") is True
+    assert inbound.is_auto_reply("Re: your proposal") is False
+    assert inbound.is_auto_reply(None) is False
+    # "Auto" as an ordinary word must not trip it — Treadwell bids auto dealerships.
+    assert inbound.is_auto_reply("Auto dealership floor quote") is False
+
+
+def test_is_auto_reply_headers_dict_and_list():
+    assert inbound.is_auto_reply("Re: x", {"Auto-Submitted": "auto-replied"}) is True
+    assert inbound.is_auto_reply("Re: x", {"Auto-Submitted": "no"}) is False
+    assert inbound.is_auto_reply("Re: x", {"Precedence": "bulk"}) is True
+    assert inbound.is_auto_reply("Re: x", [{"name": "X-Autoreply", "value": "yes"}]) is True
+    assert inbound.is_auto_reply("Re: x", [{"name": "Subject", "value": "hi"}]) is False
+    # Malformed payloads are ignored, never raised.
+    assert inbound.is_auto_reply("Re: x", "not-headers") is False
+    assert inbound.is_auto_reply("Re: x", [None, 42]) is False
+
+
+# ── staff allowlist for inbound classification ───────────────────────────────
+def test_staff_emails_enabled_rows_only(monkeypatch):
+    import db
+    monkeypatch.setattr(db, "list_notify_recipients", lambda: [
+        {"email": "Kyle@WeTreadwell.com", "kind": "general", "enabled": True},
+        {"email": "muted@wetreadwell.com", "kind": "general", "enabled": False},
+        {"email": "kyleene@wetreadwell.com", "kind": "deposit", "enabled": True},
+    ])
+    assert email_sender.staff_emails() == {"kyle@wetreadwell.com", "kyleene@wetreadwell.com"}
+
+
+def test_staff_emails_falls_back_to_env_when_db_down(monkeypatch):
+    """A momentarily unreachable table must not silently empty the allowlist —
+    that would demote every staff reply to 'unverified sender'."""
+    import db
+
+    def boom():
+        raise RuntimeError("table gone")
+
+    monkeypatch.setattr(db, "list_notify_recipients", boom)
+    monkeypatch.setattr(config, "NOTIFY_EMAILS", ["Bids@wetreadwell.com"])
+    monkeypatch.setattr(config, "DEPOSIT_NOTIFY_EMAILS", ["kyleene@wetreadwell.com"])
+    assert email_sender.staff_emails() == {"bids@wetreadwell.com", "kyleene@wetreadwell.com"}
+
+
+def test_notify_team_passes_reply_to(monkeypatch):
+    """Team notifications carry the proposal's inbound address, so replying from a
+    staff inbox reaches the thread instead of the send-only From address."""
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
+        captured.update(json)
+        class R:
+            def raise_for_status(self):
+                return None
+        return R()
+
+    monkeypatch.setattr(config, "RESEND_API_KEY", "re_test")
+    monkeypatch.setattr(config, "EMAIL_REPLY_TO", "")
+    monkeypatch.setattr(email_sender.httpx, "post", fake_post)
+
+    email_sender.notify_team("Subj", "<p>x</p>", recipients=["team@x.com"],
+                             reply_to=f"tok@{PRIMARY}")
+    assert captured["reply_to"] == f"tok@{PRIMARY}"
+    assert "posts your message to the customer" in captured["html"]
+
+    captured.clear()
+    email_sender.notify_team("Subj", "<p>x</p>", recipients=["team@x.com"])
+    assert "reply_to" not in captured
+
+
 # ── quoted-reply stripping ────────────────────────────────────────────────────
 def test_strip_gmail_quote():
     txt = "Sounds good, let's proceed.\n\nOn Thu, Jul 16, 2026 at 11:25 PM Treadwell <x@y> wrote:\n> old stuff"

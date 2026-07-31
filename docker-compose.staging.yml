@@ -31,12 +31,24 @@ services:
       PROPOSAL_TOOL_PUBLIC_URL: "https://staging.proposals.wetreadwell.com"
       # Inbound email capture (Resend receiving): per-proposal Reply-To =
       # <token>@<domain>; replies webhook back into the CRM thread. The svix
-      # signing secret (RESEND_WEBHOOK_SECRET) lives in .env on the VPS. Every
-      # captured reply is also forwarded to INBOUND_FORWARD_EMAIL (per Hanz).
+      # signing secret (RESEND_WEBHOOK_SECRET) lives in .env on the VPS.
+      #
+      # Staging deliberately stays on Resend's SHARED receiving domain while prod
+      # uses notify.wetreadwell.com. Both environments' webhooks receive the same
+      # account-wide Resend events, and an exact token only resolves in its own
+      # database — that is the only thing keeping them apart. Because prod's
+      # sender-matching fallback is restricted to its own primary domain, a staging
+      # tester's reply (to a resend.app address) is dropped by prod instead of being
+      # matched into a production proposal or spamming the prod roster.
+      #
+      # Cost of that choice: staging does not exercise the branded receiving domain
+      # end to end; the prod cutover is verified by a manual prod smoke test. Full
+      # parity would need a SECOND receiving domain (staging-notify.wetreadwell.com),
+      # not a shared one.
       RESEND_INBOUND_DOMAIN: "piaxenoizh.resend.app"
-      # Staging forwards to Hanz only (per Hanz — don't email Will on staging).
-      # will@wetreadwell.com gets added to this list on PROD, not here.
-      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com"
+      # Off on staging, on in prod — see the note above. Forwards go to the
+      # notification roster (staging's roster is Hanz only, per Hanz).
+      INBOUND_SENDER_FALLBACK: "false"
     networks:
       - shared
 

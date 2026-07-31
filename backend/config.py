@@ -71,15 +71,37 @@ DEPOSIT_NOTIFY_EMAILS = [
 EMAIL_REPLY_TO = _env("EMAIL_REPLY_TO", "")
 
 # ── Inbound email (Resend receiving) → CRM chat thread ────────────────────────
-# When RESEND_INBOUND_DOMAIN is set, per-proposal customer emails get
+# When RESEND_INBOUND_DOMAIN is set, per-proposal emails get
 # Reply-To: <proposal-token>@<domain> so an email reply routes back to Resend,
 # which webhooks POST /api/inbound/resend (armed only when the signing secret is
-# set). INBOUND_FORWARD_EMAIL gets a copy of every captured reply.
+# set). Ideally this is the SAME branded domain we send From, so one address both
+# sends and receives.
 RESEND_INBOUND_DOMAIN = _env("RESEND_INBOUND_DOMAIN", "")
+# Domains we still ACCEPT on ingest but no longer MINT. When the receiving domain
+# moves (e.g. Resend's shared piaxenoizh.resend.app → notify.wetreadwell.com),
+# every Reply-To already sitting in a customer's inbox points at the old one —
+# list it here so those replies keep landing in the thread. Drop entries once the
+# old addresses have aged out.
+RESEND_INBOUND_LEGACY_DOMAINS = [
+    d.strip().lower() for d in _env("RESEND_INBOUND_LEGACY_DOMAINS", "").split(",") if d.strip()
+]
+# Accepted on ingest = primary + legacy. Only RESEND_INBOUND_DOMAIN mints Reply-To.
+RESEND_INBOUND_DOMAINS = [
+    d for d in [RESEND_INBOUND_DOMAIN.strip().lower(), *RESEND_INBOUND_LEGACY_DOMAINS] if d
+]
 RESEND_WEBHOOK_SECRET = _env("RESEND_WEBHOOK_SECRET", "")
-# Comma-separated list — every address here gets a copy of each captured
-# customer email reply (with Reply-To set to the customer).
-INBOUND_FORWARD_EMAILS = [e.strip() for e in _env("INBOUND_FORWARD_EMAIL", "").split(",") if e.strip()]
+# Resend receives mail for EVERY address at the receiving domain, so mail can
+# arrive whose local part is not a proposal token (someone emails the From
+# address, or a reply loses the token). With this on, we try to match the SENDER
+# to exactly one proposal and file it there; ambiguous or unknown senders get
+# forwarded to the notification roster instead of being dropped.
+#
+# PROD ONLY — deliberately off on staging. Both environments' webhooks receive
+# the same account-wide Resend events, and exact-token matching is what keeps
+# them apart (a token only resolves in its own database). Sender matching is
+# fuzzier, so leaving it off on staging is what stops staging from filing or
+# forwarding a production customer's email.
+INBOUND_SENDER_FALLBACK = _env("INBOUND_SENDER_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
 
 # ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
 # A Google OAuth *Web Client ID* (public). The button only renders when set; the

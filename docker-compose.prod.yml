@@ -30,10 +30,21 @@ services:
       # tool reaches back at http://treadwell-portal:8898 (this container_name).
       PROPOSAL_TOOL_URL: "http://treadwell-proposal-tool:8888"
       # Inbound email capture (Resend receiving). Per-proposal Reply-To =
-      # <token>@piaxenoizh.resend.app → prod webhook → CRM thread. RESEND_WEBHOOK_SECRET
-      # lives in .env on the VPS. Captured replies are forwarded to the team below.
-      RESEND_INBOUND_DOMAIN: "piaxenoizh.resend.app"
-      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com,will@wetreadwell.com"
+      # <token>@notify.wetreadwell.com → prod webhook → CRM thread. Same branded
+      # domain we send From, so one address both sends and receives (requires the
+      # Resend receiving domain + its MX record on notify.wetreadwell.com).
+      # RESEND_WEBHOOK_SECRET lives in .env on the VPS.
+      RESEND_INBOUND_DOMAIN: "notify.wetreadwell.com"
+      # Still ACCEPTED, no longer minted: every Reply-To already in a customer's
+      # inbox points at Resend's shared receiving domain. Remove once those have
+      # aged out (a reply to a months-old email is the case this covers).
+      RESEND_INBOUND_LEGACY_DOMAINS: "piaxenoizh.resend.app"
+      # Mail whose local part is NOT a proposal token (someone emails the From
+      # address, or a reply loses the token): match the sender to exactly one
+      # proposal and file it, else forward to the roster. PROD ONLY — staging shares
+      # this Resend account and receives the same events, so keeping it off there is
+      # what stops staging acting on a production customer's email.
+      INBOUND_SENDER_FALLBACK: "true"
     networks:
       - shared
 

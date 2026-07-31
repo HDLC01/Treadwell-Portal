@@ -499,6 +499,7 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
         f"<blockquote>{html.escape(text)}</blockquote>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     return _json({"ok": True, "question": _q(row), "message": _msg(row)})
 
@@ -581,6 +582,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>"
         f"<p>Project: {html.escape(project_name)}.</p>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     # Confirm the approval to the customer in writing. They'd just committed to a
     # price and heard nothing back except (later) an invoice.
@@ -677,6 +679,7 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     email_sender.notify_team(
         subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     _notify_customer(
         p, "We've received your deposit details",
@@ -748,6 +751,7 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     _notify_customer(
         p, "Thanks — we have your project contacts",
@@ -850,13 +854,62 @@ async def api_notify(request: Request) -> JSONResponse:
 
 
 # ── inbound email (Resend receiving webhook) → CRM chat thread ─────────────────
+def _inbound_body(email_id: str, data: dict) -> tuple[str, dict] | None:
+    """Fetch the message from Resend (the webhook carries metadata only) and
+    reduce it to the text we store or forward. None on fetch failure — the caller
+    answers non-2xx so Svix retries, which is safe before anything is inserted."""
+    try:
+        r = httpx.get(f"https://api.resend.com/emails/receiving/{email_id}",
+                      headers={"Authorization": f"Bearer {config.RESEND_API_KEY}"}, timeout=10)
+        r.raise_for_status()
+        full = r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("inbound: body fetch failed for %s: %s", email_id, exc)
+        return None
+    text = (full.get("text") or "")[:100_000]
+    if not text.strip():
+        html_body = (full.get("html") or "")[:300_000]
+        text = html.unescape(re.sub(r"<[^>]{0,300}>", " ", html_body))
+    body_txt = _cap(inbound.strip_quoted(text), 4000)
+    names = [(_cap(a.get("filename"), 120) or "attachment")
+             for a in (data.get("attachments") or [])[:10] if isinstance(a, dict)]
+    if names:
+        body_txt = (body_txt + "\n" + "\n".join(f"[Attachment: {n}]" for n in names)).strip()
+    return (body_txt or "(empty email)"), (full if isinstance(full, dict) else {})
+
+
+def _inbound_forward(to: list[str], subject_line: str, heading: str, banner: str,
+                     from_email: str, project: str, subject: str, body_txt: str,
+                     link: str | None = None, reply_to: str | None = None,
+                     verb: str = "emailed") -> None:
+    """Forward an inbound email to staff. Best-effort — a mail failure must never
+    turn into a webhook error, because by here the CRM insert may already be done
+    and a Svix retry would only duplicate work."""
+    if not to:
+        log.info("inbound: no notify recipients after roster/overrides — forward skipped")
+        return
+    where = f" on <strong>{html.escape(project)}</strong>" if project else ""
+    esc_body = html.escape(body_txt).replace("\n", "<br>")
+    body = (
+        f"{banner}<p><strong>{html.escape(from_email or 'unknown')}</strong> {verb}{where}"
+        f"{(' — ' + html.escape(subject)) if subject else ''}:</p>"
+        f"<blockquote>{esc_body}</blockquote>"
+    )
+    if link:
+        body += f'<p><a href="{link}">Open in the proposal tool</a></p>'
+    try:
+        email_sender._send(to, subject_line, email_sender._wrap(heading, body), reply_to=reply_to)
+    except Exception as exc:  # noqa: BLE001
+        log.error("inbound: forward failed: %s", exc)
+
+
 @app.post("/api/inbound/resend")
 async def api_inbound_resend(request: Request):
     """Resend `email.received` webhook. Auth = svix signature (no session/token).
-    Flow: verify → match the proposal by the token in the recipient address →
-    dedup → fetch the body from Resend → insert as a customer chat message →
-    forward a copy + notify the team (best-effort). Non-2xx makes Svix retry, so
-    only pre-insert failures return errors."""
+    Flow: verify → match a proposal (by the token in the recipient address, or —
+    production only — by the sender's own address) → dedup → fetch the body from
+    Resend → file it in the chat thread as the customer or as staff → notify.
+    Non-2xx makes Svix retry, so only pre-insert failures return errors."""
     if not config.RESEND_WEBHOOK_SECRET:
         return _json({"ok": False, "error": "not_configured"}, 503)
     raw = await request.body()
@@ -885,80 +938,130 @@ async def api_inbound_resend(request: Request):
         rcpts += v if isinstance(v, list) else ([v] if v else [])
     if data.get("received_for"):
         rcpts.append(data["received_for"])
-    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAIN)
+    from_email = (parseaddr(str(data.get("from") or ""))[1] or "").strip().lower()
+    subject = _cap(data.get("subject"), 200)
+    # Mail that appears to come from us is a loop — a forward or a customer relay
+    # delivered straight back into this webhook. An empty From is equally unusable.
+    if inbound.is_own_address(from_email, config.EMAIL_FROM, config.RESEND_INBOUND_DOMAINS):
+        log.info("inbound: ignoring mail from ourselves (%r)", from_email)
+        return _json({"ok": True, "ignored": "own_address"})
+
+    # Accept EVERY receiving domain we have minted (primary + legacy), so a reply
+    # to a Reply-To address sitting in an old email still finds its thread.
+    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAINS)
     p = (db.get_proposal_by_token(token) or db.get_proposal_by_token_ci(token)) if token else None
+    matched_by = "token" if p else None
+    is_staff = bool(from_email) and from_email in email_sender.staff_emails()
+
+    if not p and config.INBOUND_SENDER_FALLBACK and not is_staff \
+            and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN):
+        # Mail to the branded address itself, or a reply that lost its token. Match
+        # on the SENDER instead — primary domain only (legacy addresses were only
+        # ever minted as exact tokens), and only when it is unambiguous.
+        try:
+            matches = db.list_proposals_by_email(from_email)
+        except Exception as exc:  # noqa: BLE001 — treat a lookup failure as ambiguous
+            log.warning("inbound: sender lookup failed for %r: %s", from_email, exc)
+            matches = []
+        if len(matches) == 1:
+            p, matched_by = matches[0], "sender"
+
     if not p:
-        log.info("inbound: no proposal match (token=%r)", token)
-        return _json({"ok": True, "ignored": "no_match"})
+        # Nothing to file it against. Rather than drop it silently, hand anything
+        # actually addressed to us to a human — that is the whole point of putting
+        # a real address on our emails. Unaddressed noise is still dropped.
+        if not (config.INBOUND_SENDER_FALLBACK
+                and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN)):
+            log.info("inbound: no proposal match (token=%r, from=%r)", token, from_email)
+            return _json({"ok": True, "ignored": "no_match"})
+        fetched = _inbound_body(email_id, data)
+        if fetched is None:
+            return _json({"ok": False, "error": "fetch_failed"}, 500)
+        body_txt, full = fetched
+        if inbound.is_auto_reply(subject, full.get("headers")):
+            log.info("inbound: unmatched auto-reply dropped (%r)", from_email)
+            return _json({"ok": True, "ignored": "auto_reply"})
+        why = "sent by staff, with no proposal in the address" if is_staff else \
+              "no single proposal matches this sender"
+        log.info("inbound: unmatched email from %r — forwarding (%s)", from_email, why)
+        # No pid here, so no dedup anchor: a Resend dashboard re-delivery could
+        # forward twice. Svix retries only fire on non-2xx, so normal traffic is once.
+        _inbound_forward(
+            email_sender._resolve_notify("general"),
+            f"Unmatched email — {from_email or 'unknown sender'}",
+            "An email we could not place",
+            f"<p><strong>⚠ UNMATCHED — {html.escape(why)}. Not added to any portal "
+            f"thread.</strong></p>",
+            from_email, "", subject, body_txt, reply_to=from_email or None)
+        return _json({"ok": True, "unmatched": True})
+
     pid = p["proposal_id"]
     if db.has_email_message(pid, email_id):
         return _json({"ok": True, "ignored": "duplicate"})
 
-    # Fetch the body (webhook is metadata-only). Failure → 500 so Svix retries;
-    # nothing has been inserted yet, so the retry is safe.
-    try:
-        r = httpx.get(f"https://api.resend.com/emails/receiving/{email_id}",
-                      headers={"Authorization": f"Bearer {config.RESEND_API_KEY}"}, timeout=10)
-        r.raise_for_status()
-        full = r.json()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("inbound: body fetch failed for %s: %s", email_id, exc)
+    fetched = _inbound_body(email_id, data)
+    if fetched is None:
         return _json({"ok": False, "error": "fetch_failed"}, 500)
+    body_txt, full = fetched
+    auto = inbound.is_auto_reply(subject, full.get("headers"))
+    project = p.get("project_name") or "proposal"
+    meta = {"source": "email", "email_id": email_id, "from": from_email}
 
-    text = (full.get("text") or "")[:100_000]
-    if not text.strip():
-        html_body = (full.get("html") or "")[:300_000]
-        text = html.unescape(re.sub(r"<[^>]{0,300}>", " ", html_body))
-    body_txt = _cap(inbound.strip_quoted(text), 4000)
-    names = [(_cap(a.get("filename"), 120) or "attachment")
-             for a in (data.get("attachments") or [])[:10] if isinstance(a, dict)]
-    if names:
-        body_txt = (body_txt + "\n" + "\n".join(f"[Attachment: {n}]" for n in names)).strip()
-    if not body_txt:
-        body_txt = "(empty email)"
+    # Staff is tested BEFORE the customer: if one address were somehow on both
+    # lists, filing staff as the customer would put our words in their mouth.
+    if is_staff:
+        if auto:
+            log.info("inbound: staff auto-reply ignored (%r)", from_email)
+            return _json({"ok": True, "ignored": "auto_reply"})
+        # The insert is the idempotency anchor: after this line, retries dedup.
+        db.add_message(pid, "staff", from_email, body_txt, msg_type="text", meta=meta)
+        # Same outcome as a staff reply typed in the portal: the customer sees it
+        # and gets the usual notification. No roster forward — the roster is where
+        # this came from. (Attachments arrive as [Attachment: name] markers only.)
+        try:
+            rt = email_sender.proposal_reply_to(p["token"])
+            for e in (db.get_recipients(pid) or [p.get("customer_email")]):
+                if e:
+                    email_sender.send_reply_notification(
+                        e, f"{config.PUBLIC_BASE_URL}/p/{p['token']}", project,
+                        reply_to=rt, message=body_txt)
+        except Exception as exc:  # noqa: BLE001 — the thread insert already happened
+            log.error("inbound: staff relay to the customer failed: %s", exc)
+        return _json({"ok": True, "staff": True})
 
-    from_email = (parseaddr(str(data.get("from") or ""))[1] or "").strip().lower()
     authorized = set(e.lower() for e in (db.get_recipients(pid) or []))
     authorized.add((p.get("customer_email") or "").strip().lower())
-    verified = bool(from_email) and from_email in authorized
-    project = p.get("project_name") or "proposal"
-    subject = _cap(data.get("subject"), 200)
+    # A sender-matched proposal is verified by construction — that match WAS the
+    # sender's address appearing on exactly one proposal.
+    verified = bool(from_email) and (from_email in authorized or matched_by == "sender")
 
     if verified:
-        # The insert is the idempotency anchor: after this line, retries dedup.
-        db.add_message(pid, "customer", from_email, body_txt, msg_type="text",
-                       meta={"source": "email", "email_id": email_id, "from": from_email})
+        db.add_message(pid, "customer", from_email, body_txt, msg_type="text", meta=meta)
     else:
         # Never let an unverified From speak as the customer in the thread —
-        # staff still see it via the forward + team notification below.
+        # staff still see it via the forward below.
         log.warning("inbound: unverified sender %r for proposal %s", from_email, pid)
 
-    flag = "" if verified else "<p><strong>⚠ UNVERIFIED SENDER — not added to the portal thread.</strong></p>"
-    esc_body = html.escape(body_txt).replace("\n", "<br>")
-    fwd_html = (
-        f"{flag}<p><strong>{html.escape(from_email or 'unknown')}</strong> replied by email on "
-        f"<strong>{html.escape(project)}</strong>"
-        f"{(' — ' + html.escape(subject)) if subject else ''}:</p>"
-        f"<blockquote>{esc_body}</blockquote>"
-    )
-    link = _staff_link(pid)
+    if auto:
+        # Keep the record when it's really the customer, but don't page staff for
+        # an out-of-office, and never bounce one back at another autoresponder.
+        log.info("inbound: auto-reply for %s — no forward (verified=%s)", pid, verified)
+        return _json({"ok": True, "verified": verified, "ignored": "auto_reply"})
+
     # ONE send, governed by the notification roster + this project's overrides — the
     # same switch as every other portal notification (no separate hardcoded list).
-    # Sent via _send (not notify_team) so Reply-To stays the customer: a staff reply
-    # from their own inbox reaches the customer. Empty/muted roster → nobody emailed.
-    to = email_sender._resolve_notify("general", proposal_id=pid)
-    try:
-        if to:
-            email_sender._send(
-                to,
-                f"Customer email reply — {project}",
-                email_sender._wrap("Customer replied by email",
-                                   fwd_html + f'<p><a href="{link}">Open in the proposal tool</a></p>'),
-                reply_to=from_email or None)
-        else:
-            log.info("inbound: no notify recipients after roster/overrides for %s", pid)
-    except Exception as exc:  # noqa: BLE001 — the CRM insert already happened
-        log.error("inbound: forward failed: %s", exc)
+    _inbound_forward(
+        email_sender._resolve_notify("general", proposal_id=pid),
+        f"Customer email reply — {project}", "Customer replied by email",
+        "" if verified else "<p><strong>⚠ UNVERIFIED SENDER — not added to the "
+                            "portal thread.</strong></p>",
+        from_email, project, subject, body_txt, link=_staff_link(pid),
+        # Verified: Reply-To is the proposal, so a staff reply from their own inbox
+        # comes back here and reaches the customer through the thread. Unverified:
+        # reply to the sender — we don't know who they are, so nothing of theirs
+        # should be posted on the customer's behalf.
+        reply_to=(email_sender.proposal_reply_to(p["token"]) if verified else (from_email or None)),
+        verb="replied by email")
     return _json({"ok": True, "verified": verified})
 
 
@@ -1198,6 +1301,7 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
         f"<p>The deposit for <strong>{html.escape(project)}</strong> is marked received. "
         f"The customer has been asked for their project contacts.</p>",
         kind="deposit", reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     _notify_customer(
         p, "Deposit received — thank you",
@@ -1281,6 +1385,7 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
         f"Project SCHEDULED — {project}",
         f"<p><strong>{html.escape(project)}</strong> is marked scheduled.</p>",
         reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     _notify_customer(
         p, "Your project is scheduled",

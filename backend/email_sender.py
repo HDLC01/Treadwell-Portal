@@ -317,13 +317,41 @@ def _resolve_notify(kind: str, proposal_id: str | None = None) -> list[str]:
                                      configured=configured)
 
 
+def staff_emails() -> set[str]:
+    """Lowercase addresses of everyone on the notification roster (enabled rows,
+    both kinds) — the allowlist for "this inbound email came from staff".
+
+    Deliberately narrower than "any @wetreadwell.com address": a From header is
+    forgeable, and the inbound webhook's signature proves the message came from
+    Resend, NOT that the sender is who they claim. The roster is the UI-managed
+    set of people who receive the notifications we now put a proposal Reply-To
+    on, so it is exactly closed under the intended workflow. Residual risk: an
+    attacker who knows both a roster address and a live token address could still
+    forge From and speak as Treadwell — DMARC (p=reject) on the sending domain is
+    the mitigation, and it lives in DNS, not here.
+
+    On DB failure, fall back to the env lists (same posture as _resolve_notify:
+    don't lose the allowlist because the table blinked)."""
+    try:
+        import db  # local import: avoid a hard DB dependency at module import time
+        rows = db.list_notify_recipients()
+        if rows:
+            return {r["email"].strip().lower() for r in rows
+                    if r.get("enabled", True) and r.get("email")}
+    except Exception as exc:  # noqa: BLE001 — DB down / table missing → env fallback
+        log.warning("staff-roster lookup failed (%s); using env fallback", exc)
+    return {e.strip().lower() for e in [*config.NOTIFY_EMAILS, *config.DEPOSIT_NOTIFY_EMAILS] if e}
+
+
 def notify_team(subject: str, body_html: str, kind: str = "general",
                 recipients: list[str] | None = None, reply_link: str | None = None,
-                proposal_id: str | None = None) -> bool:
+                proposal_id: str | None = None, reply_to: str | None = None) -> bool:
     """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
     `kind` from the UI-managed roster, applying this proposal's per-project overrides
     (`proposal_id`). `reply_link` appends a "Reply in Portal" button that deep-links
-    staff to the proposal in the staff tool (so they answer in-portal, not by email)."""
+    staff to the proposal in the staff tool. `reply_to` (the proposal's inbound
+    address) makes a plain reply from a staff inbox land in the thread too, so the
+    button is the convenient path rather than the only one."""
     to = recipients if recipients is not None else _resolve_notify(kind, proposal_id)
     if not to:
         log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
@@ -332,4 +360,7 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
             f'<p style="margin-top:16px"><a href="{reply_link}" style="background:{_BRAND_RED};color:#fff;'
             f'padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">Reply in Portal</a></p>'
         )
-    return _send(to, subject, _wrap(subject, body_html))
+    if reply_to:
+        body_html += ('<p style="color:#64748b;font-size:13px;margin-top:12px">Replying to this email '
+                      'posts your message to the customer\'s portal thread and notifies them.</p>')
+    return _send(to, subject, _wrap(subject, body_html), reply_to=reply_to)
