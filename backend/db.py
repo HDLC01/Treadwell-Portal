@@ -255,9 +255,17 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # customer last did anything, and when THIS estimator last chased them.
         "(select max(q.created_at) from public.portal_questions q "
         "   where q.proposal_id = p.proposal_id) as last_message_at, "
+        # OUTREACH only. `staff_note` carries two different things: a note an
+        # estimator typed, and the system's own bookkeeping (reassigned, automation
+        # on/off, paused, closed). Bookkeeping rows are the ones with an `action`
+        # key, and counting them would mean reassigning a proposal — or merely
+        # switching its automation on — reads as "somebody chased this", which
+        # silently drops it out of the digest for two days and backdates the board's
+        # last-activity to an admin click.
         "(select max(f.created_at) from public.portal_followups f "
         "   where f.proposal_id = p.proposal_id "
-        "     and f.kind in ('staff_call','staff_email','staff_text','staff_note')) "
+        "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
+        "     and f.detail->>'action' is null) "
         "  as last_staff_followup_at "
         "from public.portal_proposals p "
         "left join public.drafts d on d.id = p.proposal_id "

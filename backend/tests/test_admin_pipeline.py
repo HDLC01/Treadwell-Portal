@@ -55,6 +55,25 @@ def test_pipeline_query_selects_every_milestone_the_board_dates_by(monkeypatch):
         assert col in select, col
 
 
+def test_bookkeeping_does_not_count_as_having_chased_the_customer(monkeypatch):
+    """`staff_note` carries two different things: a note an estimator typed, and the
+    system's own record of a reassignment or an automation toggle. Only the first is
+    outreach.
+
+    Counting both meant merely switching a proposal's automation ON logged it as
+    "somebody chased this" — dropping it out of the next two mornings' digests and
+    backdating the board's last-activity to an admin click. Found on staging, where
+    assigning an estimator made the proposal vanish from the digest it had just
+    become eligible for."""
+    seen = {}
+    monkeypatch.setattr(main.db, "qall",
+                        lambda sql, params=(): seen.update(sql=sql) or [])
+    main.db.list_all_portal_proposals()
+    sql = " ".join(seen["sql"].split())
+    assert "last_staff_followup_at" in sql
+    assert "f.detail->>'action' is null" in sql
+
+
 # ── _iso (pure) ──────────────────────────────────────────────────────────────
 def test_iso_serializes_datetimes_and_passes_strings_through():
     assert main._iso(dt.datetime(2026, 7, 29, 9, 5, 0)).startswith("2026-07-29T09:05:00")
