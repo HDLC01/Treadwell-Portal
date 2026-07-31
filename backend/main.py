@@ -1511,6 +1511,10 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "scheduled_at": _iso(r.get("scheduled_at")),
             "last_activity_at": _iso(_last_activity(r)),
             "last_followup_at": _iso(r.get("last_staff_followup_at")),
+            # Named separately so the board can say WHAT last happened, not just
+            # when: dating a card "Viewed 7/12" when the real event was a customer
+            # message on 7/30 reads as a stale deal that nobody has touched.
+            "last_message_at": _iso(r.get("last_message_at")),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
             # staff side picks the latest of these — it also owns turning the
@@ -1750,6 +1754,47 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
     fresh = db.get_proposal(proposal_id) or p
     return _json({"ok": True, "proposal_status": fresh.get("proposal_status"),
                   "followup_state": _followup_state(fresh)})
+
+
+@app.post("/api/admin/send-digest")
+async def admin_send_digest(request: Request) -> JSONResponse:
+    """Render and send one estimator's morning follow-up list.
+
+    The proposal tool decides WHO and WHAT — it owns the pipeline scoring and the
+    Claude call. This end owns the email: the branded template, the staff deep links
+    (only this side knows both base URLs) and Resend. Nothing is looked up here, so a
+    digest can be sent for a proposal this request never reads.
+
+    Items are treated as untrusted input all the way to the template, which escapes
+    every field — the tool is ours, but a rendered-to-HTML payload is exactly where a
+    stray customer-supplied project name would matter."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    email = (parseaddr(str(body.get("estimator_email") or ""))[1] or "").strip().lower()
+    if not email or "@" not in email:
+        return _json({"ok": False, "error": "invalid_email"}, 400)
+    raw = body.get("items")
+    if not isinstance(raw, list):
+        return _json({"ok": False, "error": "invalid_items"}, 400)
+    # Capped here as well as at the source: this endpoint must not be a way to send
+    # a hundred-row email, whatever the caller believes it is sending.
+    items = [i for i in raw if isinstance(i, dict)][:25]
+    if not items:
+        return _json({"ok": True, "sent": False, "reason": "empty"})
+    ok = email_sender.send_digest(email, items, name=_estimator_name(email),
+                                  staff_link=_staff_link)
+    return _json({"ok": True, "sent": bool(ok), "items": len(items)})
+
+
+def _estimator_name(email: str) -> str:
+    """A first name for the greeting, read off the address.
+
+    `portal_app` is denied the `profiles` table by design, so the real name isn't
+    reachable from here — and "Morning Kyle," off kyle@ is worth more than no
+    greeting at all."""
+    local = str(email or "").split("@")[0]
+    return " ".join(w.capitalize() for w in re.split(r"[._-]+", local) if w)
 
 
 @app.post("/api/admin/proposal/{proposal_id}/reply")

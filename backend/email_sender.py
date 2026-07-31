@@ -330,6 +330,80 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
                  _thread_headers(email, token), reply_to=reply_to)
 
 
+# ── the morning digest ────────────────────────────────────────────────────────
+# One email per estimator, at most five proposals, ranked and reasoned by the
+# proposal tool's digest_worker. This module only renders and sends: the scoring is
+# arithmetic over there so "why is this first?" has a stable answer, and the sentence
+# on each row was written from those same facts.
+
+def _digest_row(it: dict, staff_url: str) -> str:
+    """One proposal. The project name is the link — an estimator reading this on a
+    phone at 6 AM taps the name, not a button at the end of five rows."""
+    name = _esc(str(it.get("project_name") or "Proposal"))
+    customer = _esc(str(it.get("customer") or ""))
+    reason = _esc(str(it.get("reason") or ""))
+    stage = _esc(str(it.get("stage") or ""))
+    total = it.get("total")
+    money = "${:,.0f}".format(float(total)) if isinstance(total, (int, float)) and total else ""
+    streak = int(it.get("streak") or 1)
+    meta = " · ".join(x for x in (customer, stage, money) if x)
+    # Said in words, because "3rd morning" is the difference between a reminder and
+    # a duplicate email nobody trusts.
+    again = (f'<span style="display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;'
+             f'background:#fef3c7;color:#78350f;font-size:11px;font-weight:700">'
+             f'{streak}rd morning running</span>' if streak >= 3
+             else '<span style="display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;'
+                  'background:#f1f5f9;color:#475569;font-size:11px;font-weight:700">again today</span>'
+             if streak == 2 else "")
+    more = it.get("and_more")
+    tail = (f'<p style="margin:6px 0 0;color:#64748b;font-size:13px">'
+            f'…and {int(more)} more over the bar that didn\'t fit in this email.</p>'
+            if isinstance(more, int) and more > 0 else "")
+    return (
+        f'<div style="padding:14px 0;border-top:1px solid #e2e8f0">'
+        f'<p style="margin:0 0 3px;font-size:15px;font-weight:700">'
+        f'<a href="{staff_url}" style="color:#0f172a;text-decoration:none">{name}</a>{again}</p>'
+        f'{f"<p style=\"margin:0 0 6px;color:#64748b;font-size:13px\">{meta}</p>" if meta else ""}'
+        f'<p style="margin:0;color:#334155;font-size:14px">{reason}</p>'
+        f'{tail}</div>'
+    )
+
+
+def send_digest(email: str, items: list[dict], *, name: str = "",
+                staff_link=None) -> bool:
+    """The 6 AM list. `staff_link(proposal_id)` builds the CRM deep link.
+
+    Returns False without sending when there is nothing to chase — an empty digest
+    every morning is how a daily email becomes one people filter away, and then the
+    one that matters goes unread too."""
+    if not items:
+        log.info("digest: nothing to chase for %s — not sending", email)
+        return False
+    n = len(items)
+    greeting = f'<p>Morning {_esc(_first_name(name) or "")},</p>' if name else "<p>Morning,</p>"
+    rows = "".join(_digest_row(it, staff_link(it.get("proposal_id")) if staff_link else "#")
+                   for it in items)
+    body = (
+        f'{greeting}'
+        f'<p>{n} proposal{"" if n == 1 else "s"} worth a follow-up today.</p>'
+        f'{rows}'
+        f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 14px">'
+        f'<p style="color:#64748b;font-size:13px">Logging a call or a text in the CRM takes it '
+        f'off tomorrow\'s list. Automatic customer follow-ups keep running either way.</p>'
+    )
+    subject = f"{n} proposal{'' if n == 1 else 's'} to follow up today"
+    return _send([email], subject, _wrap("Your follow-ups for today", body),
+                 _digest_headers(email))
+
+
+def _digest_headers(email: str) -> dict:
+    """Its own thread, like the OTP. Threading the digest onto a proposal's
+    conversation would bury the customer's actual messages under a daily email —
+    and there is no single proposal it belongs to anyway."""
+    anchor = hashlib.sha1(f"tw-digest:{email.lower()}".encode()).hexdigest()[:16]
+    return {"References": f"<treadwell-digest.{anchor}@wetreadwell.com>"}
+
+
 def send_reply_notification(email: str, url: str, project_name: str,
                             reply_to: str | None = None, message: str | None = None,
                             token: str | None = None) -> bool:
