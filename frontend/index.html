@@ -57,6 +57,50 @@
 
         <div class="chat-thread" id="chat-thread" aria-live="polite" aria-label="Conversation with Treadwell"></div>
 
+        <!-- Where the project actually stands. Reached from the follow-up emails
+             (/p/<token>#status) or shown inline once we've been chasing a while, so a
+             customer waiting on a budget can say so instead of ignoring reminders.
+             Rendered by app.js renderStatusCard; no inline handlers (CSP). -->
+        <div class="status-card hidden" id="status-card">
+          <p class="sc-title" id="sc-title">Has your timeline changed?</p>
+          <p class="sc-lead muted small" id="sc-lead">Tell us where things stand and we'll stop the reminders.</p>
+
+          <div class="sc-choices" id="sc-choices">
+            <button class="btn btn-secondary" type="button" data-sc="delayed">Project delayed</button>
+            <button class="btn btn-secondary" type="button" data-sc="lost">Not moving forward</button>
+          </div>
+
+          <div class="sc-panel hidden" id="sc-delayed">
+            <p class="small">Roughly how long?</p>
+            <div class="sc-months">
+              <button class="btn btn-secondary" type="button" data-months="1">1 month</button>
+              <button class="btn btn-secondary" type="button" data-months="2">2 months</button>
+              <button class="btn btn-secondary" type="button" data-months="3">3 months</button>
+              <button class="btn btn-secondary" type="button" data-months="4">4+ months</button>
+            </div>
+            <button class="btn btn-link" type="button" data-sc="cancel">Never mind</button>
+          </div>
+
+          <div class="sc-panel hidden" id="sc-lost">
+            <p class="small">If you don't mind saying — what decided it?</p>
+            <div class="sc-reasons" id="sc-reasons">
+              <label><input type="radio" name="sc-reason" value="price"> Price</label>
+              <label><input type="radio" name="sc-reason" value="another_contractor"> Selected another contractor</label>
+              <label><input type="radio" name="sc-reason" value="canceled"> Project canceled</label>
+              <label><input type="radio" name="sc-reason" value="scope_changed"> Scope changed</label>
+              <label><input type="radio" name="sc-reason" value="timing"> Timing</label>
+              <label><input type="radio" name="sc-reason" value="other"> Other</label>
+            </div>
+            <textarea id="sc-note" rows="2" maxlength="1000" placeholder="Anything else you'd like us to know (optional)"></textarea>
+            <div class="sc-actions">
+              <button class="btn btn-primary" type="button" data-sc="confirm-lost">Confirm</button>
+              <button class="btn btn-link" type="button" data-sc="cancel">Never mind</button>
+            </div>
+          </div>
+
+          <div id="sc-alert" role="alert" aria-live="polite"></div>
+        </div>
+
         <form id="qa-form" class="composer" novalidate>
           <div id="qa-alert" role="alert" aria-live="polite"></div>
           <div class="composer-row">

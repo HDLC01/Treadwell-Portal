@@ -408,3 +408,38 @@ input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* ── Project status card ──────────────────────────────────────────────────────
+   The customer's way out of the follow-up cadence: "we're delayed" or "we're not
+   moving forward". Deliberately quiet — a bordered panel rather than an alert, so
+   it reads as an offer rather than a warning. */
+.status-card {
+  border: 1px solid var(--outline);
+  border-radius: var(--radius);
+  background: var(--surface-low);
+  padding: 14px 16px;
+  margin: 0 0 12px;
+}
+.status-card .sc-title { font-weight: 700; margin: 0 0 4px; }
+.status-card .sc-lead { margin: 0 0 12px; }
+.status-card .sc-choices,
+.status-card .sc-months,
+.status-card .sc-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.status-card .sc-panel { margin-top: 12px; }
+.status-card .sc-panel > p { margin: 0 0 8px; }
+.status-card .sc-reasons { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.status-card .sc-reasons label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.status-card textarea {
+  width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px;
+  border: 1px solid var(--outline); border-radius: 8px; resize: vertical; margin-bottom: 10px;
+}
+/* A text-weight button for "never mind" — cancelling should not compete visually
+   with the actual choices. */
+.btn-link {
+  background: none; border: none; color: var(--secondary);
+  text-decoration: underline; padding: 8px 4px; box-shadow: none;
+}
+.btn-link:hover { color: var(--fg); background: none; }
+/* Resting state once they have told us something. */
+.status-card.is-settled { background: var(--surface); }
+.status-card #sc-alert:not(:empty) { margin-top: 10px; font-size: .85rem; color: var(--danger, #b3261e); }

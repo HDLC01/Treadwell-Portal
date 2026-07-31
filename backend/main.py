@@ -512,6 +512,14 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     # Which version of the document this is. Lets the client notice a revision
     # landing mid-session and re-fetch the PDF instead of showing the old one.
     vm["revision_no"] = p.get("current_revision_no")
+    # Where the customer has told us the project stands, and how long it has been
+    # sitting — the status card uses both to decide whether offering a way out is
+    # helpful or presumptuous.
+    vm["project_status"] = {
+        "paused_until": _iso(p.get("followup_paused_until")),
+        "closed": (p.get("proposal_status") or "") == "closed_lost",
+    }
+    vm["sent_at"] = _iso(p.get("created_at"))
     base["view"] = vm
     return _json(base)
 
@@ -583,7 +591,11 @@ def api_messages(token: str, request: Request) -> JSONResponse:
         "deposit_required": p.get("deposit_required") is not False,
         # A revision landing while the customer has the page open changes the whole
         # document — the client re-renders and re-fetches the PDF off this.
-        "revision_no": p.get("current_revision_no")}})
+        "revision_no": p.get("current_revision_no"),
+        # So the status card updates in the tab the customer left open — including
+        # when STAFF pause or close it from the drawer.
+        "paused_until": _iso(p.get("followup_paused_until")),
+        "closed": (p.get("proposal_status") or "") == "closed_lost"}})
 
 
 @app.post("/api/portal/{token}/approve")

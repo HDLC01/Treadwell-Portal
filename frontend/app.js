@@ -161,6 +161,9 @@ function renderPortal(vm) {
   // Must be keyed the same way the POLL is, or the two disagree forever and every
   // tick refetches the whole view. The full payload carries these three under
   // `deposit`; the poll returns them flat.
+  renderStatusCard(vm);
+  wireStatusCard();
+
   LAST_STATUS = statusKey(pollShapedStatus(vm));
   applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
   applyStepPanel();       // keep the active tab showing only its own cards
@@ -558,6 +561,113 @@ function renderPdf(has) {
   mountInlinePdf();   // website-style preview in the card; clicking it opens the full view
 }
 
+// ── project status: the customer's way out of the follow-up cadence ──────────
+// Shown when they arrive from a follow-up email (#status), or once the proposal has
+// been sitting unapproved long enough that we're chasing them. Hidden entirely once
+// approved — at that point the question is moot.
+
+/** Has this proposal been pending long enough that offering a way out is helpful
+ *  rather than presumptuous? Mirrors the point in the cadence where the emails
+ *  start carrying the same question (the recurring stage). */
+function shouldOfferStatus(vm) {
+  if (!vm || !vm.status) return false;
+  if (vm.status.proposal === "approved") return false;
+  const ps = vm.project_status || {};
+  if (ps.closed) return true;                    // render the settled state
+  if (ps.paused_until) return true;              // render "paused until …"
+  if ((location.hash || "").indexOf("status") >= 0) return true;
+  const sent = vm.sent_at || (vm.status && vm.status.sent_at);
+  if (!sent) return false;
+  const days = (Date.now() - new Date(sent).getTime()) / 86400000;
+  return days >= 4;                              // by now they've had a nudge or two
+}
+
+function renderStatusCard(vm) {
+  const card = $("status-card");
+  if (!card) return;
+  const ps = (vm && vm.project_status) || {};
+  if (!shouldOfferStatus(vm)) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  $("sc-alert").textContent = "";
+
+  const choices = $("sc-choices");
+  const settled = !!(ps.closed || ps.paused_until);
+  card.classList.toggle("is-settled", settled);
+  // Once they've told us something, the card becomes a receipt rather than a form.
+  hide($("sc-delayed")); hide($("sc-lost"));
+
+  if (ps.closed) {
+    $("sc-title").textContent = "Thanks for letting us know";
+    $("sc-lead").textContent = "We've closed this out and stopped the reminders. "
+      + "If anything changes, just reply to any of our emails.";
+    hide(choices);
+    return;
+  }
+  if (ps.paused_until) {
+    $("sc-title").textContent = "We'll check back later";
+    $("sc-lead").textContent = "Reminders are paused until "
+      + new Date(ps.paused_until + "T12:00:00").toLocaleDateString(undefined,
+          { month: "long", year: "numeric" })
+      + ". Ready sooner? Let us know.";
+    choices.innerHTML = '<button class="btn btn-secondary" type="button" data-sc="resume">'
+      + "We're ready to move forward</button>";
+    show(choices);
+    return;
+  }
+  $("sc-title").textContent = "Has your timeline changed?";
+  $("sc-lead").textContent = "Tell us where things stand and we'll stop the reminders.";
+  choices.innerHTML =
+    '<button class="btn btn-secondary" type="button" data-sc="delayed">Project delayed</button>'
+    + '<button class="btn btn-secondary" type="button" data-sc="lost">Not moving forward</button>';
+  show(choices);
+}
+
+async function postStatus(payload, button) {
+  const alert = $("sc-alert");
+  alert.textContent = "";
+  const orig = button ? button.textContent : "";
+  if (button) { button.disabled = true; button.textContent = "Saving…"; }
+  const res = await api("POST", "/project-status", payload);
+  if (button) { button.disabled = false; button.textContent = orig; }
+  if (res.status === 401) { handleExpired(res, alert); return; }
+  if (!res.ok || (res.data && res.data.ok === false)) {
+    alert.textContent = "That didn't save — please try again, or just reply to our email.";
+    return;
+  }
+  // Re-render from the server so the card, the badge and the tracker all agree.
+  const full = await api("GET", "");
+  if (full.ok && full.data.view) renderPortal(full.data.view);
+}
+
+// Delegated once: renderStatusCard replaces the buttons, so per-button listeners
+// would be lost on every re-render (CSP rules out inline handlers).
+function wireStatusCard() {
+  const card = $("status-card");
+  if (!card || card.dataset.wired) return;
+  card.dataset.wired = "1";
+  card.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-sc],[data-months]");
+    if (!b) return;
+    const months = b.dataset.months;
+    if (months) { postStatus({ status: "delayed", months: Number(months) }, b); return; }
+    switch (b.dataset.sc) {
+      case "delayed": show($("sc-delayed")); hide($("sc-lost")); break;
+      case "lost":    show($("sc-lost")); hide($("sc-delayed")); break;
+      case "cancel":  hide($("sc-delayed")); hide($("sc-lost")); $("sc-alert").textContent = ""; break;
+      case "resume":  postStatus({ status: "resume" }, b); break;
+      case "confirm-lost": {
+        const picked = card.querySelector('input[name="sc-reason"]:checked');
+        postStatus({
+          status: "not_moving_forward",
+          reason: picked ? picked.value : null,
+          note: ($("sc-note").value || "").trim() || null,
+        }, b);
+        break;
+      }
+    }
+  });
+}
+
 // ── chat thread ──────────────────────────────────────────────────────────────
 function renderChat(msgs) {
   const t = $("chat-thread");
@@ -674,6 +784,16 @@ function applyHashView(scroll) {
     if (scroll) window.scrollTo({ top: 0, behavior: "smooth" });   // only on a user nav, not a poll refetch
   } else {
     show($("chat-view")); hide($("proposal-view"));
+    // #status is the deep link in every follow-up email. It lands on the chat view
+    // with the status card open and scrolled to, so a customer who clicked "project
+    // delayed" doesn't have to hunt for where to say it. The hash survives the login
+    // gate because boot re-reads location.hash after authenticating.
+    if (view === "status" && STATE) {
+      const card = $("status-card");
+      if (card && !card.classList.contains("hidden") && scroll) {
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }
   }
 }
 window.addEventListener("hashchange", () => applyHashView(true));
@@ -754,7 +874,7 @@ let LAST_STATUS = "";
 // leave the four status columns untouched.
 const statusKey = (st) => [st.proposal, st.deposit, st.contacts, st.schedule,
                            st.invoice_no, st.deposit_amount, st.deposit_required,
-                           st.revision_no].join("|");
+                           st.revision_no, st.paused_until, st.closed].join("|");
 
 /** The full view model in the shape the poll returns, so both sides can be keyed
  *  identically. `GET /api/portal/{token}` nests the deposit fields under
@@ -766,6 +886,8 @@ function pollShapedStatus(vm) {
     deposit_amount: d.due == null ? null : d.due,
     deposit_required: d.required !== false,
     revision_no: (vm && vm.revision_no) == null ? null : vm.revision_no,
+    paused_until: ((vm && vm.project_status) || {}).paused_until || null,
+    closed: !!((vm && vm.project_status) || {}).closed,
   });
 }
 const maxMsgId = () => (STATE && STATE.messages || []).reduce((m, x) => Math.max(m, x.id || 0), 0);
