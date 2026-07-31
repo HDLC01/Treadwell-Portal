@@ -242,7 +242,23 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "p.proposal_status, p.deposit_status, p.contacts_status, p.schedule_status, "
         "p.approved_total, p.deposit_amount, p.created_at, p.viewed_at, p.approved_at, "
         "p.deposit_requested_at, p.deposit_required, "
-        "coalesce(d.owner_email, p.published_by) as estimator_email "
+        # Per-stage timestamps so each board column can sort by its OWN date.
+        "p.last_viewed_at, p.deposit_submitted_at, p.deposit_received_at, "
+        "p.contacts_received_at, p.scheduled_at, "
+        # Follow-up automation state.
+        "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
+        "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "
+        # The assigned estimator OWNS the follow-up; owner_email is only the fallback
+        # for proposals published before assignment was required.
+        "coalesce(p.assigned_estimator, d.owner_email, p.published_by) as estimator_email, "
+        # Two "last touched" facts the digest and the board both need: when the
+        # customer last did anything, and when THIS estimator last chased them.
+        "(select max(q.created_at) from public.portal_questions q "
+        "   where q.proposal_id = p.proposal_id) as last_message_at, "
+        "(select max(f.created_at) from public.portal_followups f "
+        "   where f.proposal_id = p.proposal_id "
+        "     and f.kind in ('staff_call','staff_email','staff_text','staff_note')) "
+        "  as last_staff_followup_at "
         "from public.portal_proposals p "
         "left join public.drafts d on d.id = p.proposal_id "
         "order by p.created_at desc"
@@ -357,8 +373,18 @@ def latest_approval(proposal_id: str) -> Optional[dict[str, Any]]:
 
 
 def mark_viewed(proposal_id: str) -> None:
+    """Three different "viewed" facts, which is why this writes three columns.
+
+    `viewed_at` is the FIRST view ever (coalesced — the board dates a card by it).
+    `last_viewed_at` is every view, so the Viewed column can sort by most recent.
+    `cycle_viewed_at` is the first view of the CURRENT send: a revision re-publish
+    nulls it, so the follow-up cadence restarts instead of inheriting a clock from
+    a version the customer saw weeks ago."""
     execute(
         "update public.portal_proposals set viewed_at = coalesce(viewed_at, now()), "
+        "last_viewed_at = now(), "
+        "cycle_viewed_at = case when proposal_status = 'sent' "
+        "                       then coalesce(cycle_viewed_at, now()) else cycle_viewed_at end, "
         "proposal_status = case when proposal_status = 'sent' then 'viewed' else proposal_status end, "
         "updated_at = now() where proposal_id = %s",
         (proposal_id,),
@@ -378,9 +404,15 @@ def set_approved(proposal_id: str, total, option_label, name, title, approved_da
 
 
 def set_deposit_status(proposal_id: str, status: str) -> None:
+    # Stamp the received-at the first time it lands there, so the board's "Deposit
+    # received" column can sort by deposit date rather than by last-touched.
     execute(
-        "update public.portal_proposals set deposit_status=%s, updated_at=now() where proposal_id=%s",
-        (status, proposal_id),
+        "update public.portal_proposals set deposit_status=%s, "
+        "deposit_received_at = case when %s = 'received' "
+        "                           then coalesce(deposit_received_at, now()) "
+        "                           else deposit_received_at end, "
+        "updated_at=now() where proposal_id=%s",
+        (status, status, proposal_id),
     )
 
 
@@ -391,7 +423,8 @@ def mark_deposit_submitted(proposal_id: str) -> None:
     concurrent request) can never downgrade a deposit staff already verified as
     'received'. Staff still move the status freely via set_deposit_status."""
     execute(
-        "update public.portal_proposals set deposit_status='submitted', updated_at=now() "
+        "update public.portal_proposals set deposit_status='submitted', "
+        "deposit_submitted_at = coalesce(deposit_submitted_at, now()), updated_at=now() "
         "where proposal_id=%s and deposit_status <> 'received'",
         (proposal_id,),
     )
@@ -492,6 +525,119 @@ def supersede_proposal_cards(proposal_id: str, replaced_by_rev: int) -> None:
     )
 
 
+# ── Follow-up automation ──────────────────────────────────────────────────────
+# A sent proposal is chased on a cadence until it is approved, the customer says
+# they are delayed or out, or an estimator takes it off automation. See
+# followup_rules.py for the schedule and followup_worker.py for the tick.
+
+def set_assigned_estimator(proposal_id: str, email: Optional[str]) -> None:
+    execute("update public.portal_proposals set assigned_estimator=%s, updated_at=now() "
+            "where proposal_id=%s", ((email or None), proposal_id))
+
+
+def enroll_followup(proposal_id: str) -> None:
+    """Start (or restart) the cadence for a freshly sent proposal.
+
+    Deliberately does NOT clear `followup_disabled_at`: an estimator taking a
+    proposal off automation is a human decision, and sending a revision should not
+    quietly undo it. The drawer toggle is how you turn it back on."""
+    execute("update public.portal_proposals set followup_enrolled_at=now(), "
+            "cycle_viewed_at=null, followup_paused_until=null, updated_at=now() "
+            "where proposal_id=%s", (proposal_id,))
+
+
+def set_followup_enabled(proposal_id: str, enabled: bool) -> None:
+    """Estimator toggle. Enabling a proposal that was never enrolled (a legacy row
+    published before automation existed) anchors the cadence at opt-in time rather
+    than at its original send, which is weeks stale."""
+    if enabled:
+        execute("update public.portal_proposals set followup_disabled_at=null, "
+                "followup_enrolled_at=coalesce(followup_enrolled_at, now()), updated_at=now() "
+                "where proposal_id=%s", (proposal_id,))
+    else:
+        execute("update public.portal_proposals set followup_disabled_at=now(), updated_at=now() "
+                "where proposal_id=%s", (proposal_id,))
+
+
+def pause_followups(proposal_id: str, until) -> None:
+    execute("update public.portal_proposals set followup_paused_until=%s, updated_at=now() "
+            "where proposal_id=%s", (until, proposal_id))
+
+
+def resume_followups(proposal_id: str) -> None:
+    execute("update public.portal_proposals set followup_paused_until=null, updated_at=now() "
+            "where proposal_id=%s", (proposal_id,))
+
+
+def close_lost(proposal_id: str, reason: Optional[str]) -> bool:
+    """Mark the opportunity lost. Guarded against clobbering an approval: a signed
+    proposal is a win, and a stray "not moving forward" click must not erase it.
+    Returns whether the row actually moved."""
+    row = q1("update public.portal_proposals set proposal_status='closed_lost', "
+             "closed_lost_reason=%s, closed_at=now(), updated_at=now() "
+             "where proposal_id=%s and proposal_status <> 'approved' "
+             "returning proposal_id", ((reason or None), proposal_id))
+    return bool(row)
+
+
+def reopen_if_closed(proposal_id: str) -> bool:
+    """A new version sent to a closed-lost proposal puts it back in play."""
+    row = q1("update public.portal_proposals set proposal_status='sent', "
+             "closed_lost_reason=null, closed_at=null, updated_at=now() "
+             "where proposal_id=%s and proposal_status='closed_lost' "
+             "returning proposal_id", (proposal_id,))
+    return bool(row)
+
+
+def add_followup(proposal_id: str, kind: str, detail: Optional[dict] = None,
+                 created_by: Optional[str] = None) -> dict[str, Any]:
+    return q1("insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+              "values (%s,%s,%s,%s) returning id, kind, detail, created_by, created_at",
+              (proposal_id, kind, Jsonb(detail or {}), created_by))
+
+
+def list_followups(proposal_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    return qall("select id, kind, detail, created_by, created_at from public.portal_followups "
+                "where proposal_id=%s order by created_at desc limit %s",
+                (proposal_id, limit))
+
+
+def reserve_followup(proposal_id: str, rule_key: str, detail: dict) -> Optional[int]:
+    """Claim the right to send one automated email, or return None if it is already
+    claimed.
+
+    This is the whole dedupe: the partial unique index on (proposal_id, rule_key)
+    means a crashed tick, a container restart, or two overlapping containers during
+    a deploy cannot double-nag a customer. Reserve first, send second — a lost
+    reservation costs one missed nudge (the next cadence step covers it), whereas
+    sending first would risk sending twice, which is not recoverable."""
+    payload = dict(detail or {})
+    payload["rule_key"] = rule_key
+    row = q1("insert into public.portal_followups (proposal_id, kind, detail) "
+             "values (%s,'auto_email',%s) on conflict do nothing returning id",
+             (proposal_id, Jsonb(payload)))
+    return int(row["id"]) if row else None
+
+
+def delete_followup(followup_id: int) -> None:
+    """Release a reservation whose send failed outright, so the next tick retries."""
+    execute("delete from public.portal_followups where id=%s", (followup_id,))
+
+
+def list_followup_candidates() -> list[dict[str, Any]]:
+    """Proposals the cadence should consider this tick.
+
+    Paused rows are deliberately INCLUDED: the rule engine needs them to notice a
+    pause that has expired and remind the estimator. Approved and closed-lost are
+    excluded — there is nothing left to chase."""
+    return qall(
+        "select * from public.portal_proposals "
+        "where followup_enrolled_at is not null and followup_disabled_at is null "
+        "  and proposal_status in ('sent','viewed') "
+        "order by followup_enrolled_at"
+    )
+
+
 def supersede_invoice_cards(proposal_id: str, replaced_by: str) -> None:
     """Mark earlier deposit_request cards superseded so the customer can tell
     which invoice is current. Only the latest number is stored, so an old card's
@@ -540,8 +686,11 @@ def assign_invoice_no(proposal_id: str) -> Optional[str]:
 
 def set_schedule_status(proposal_id: str, status: str) -> None:
     execute(
-        "update public.portal_proposals set schedule_status=%s, updated_at=now() where proposal_id=%s",
-        (status, proposal_id),
+        "update public.portal_proposals set schedule_status=%s, "
+        "scheduled_at = case when %s = 'scheduled' "
+        "                    then coalesce(scheduled_at, now()) else scheduled_at end, "
+        "updated_at=now() where proposal_id=%s",
+        (status, status, proposal_id),
     )
 
 
@@ -570,7 +719,9 @@ def replace_contacts(proposal_id: str, contacts: list[dict[str, Any]], submitted
                  c.get("email"), c.get("phone"), c.get("label"), submitted_by),
             )
         conn.execute(
-            "update public.portal_proposals set contacts_status='received', updated_at=now() where proposal_id=%s",
+            "update public.portal_proposals set contacts_status='received', "
+            "contacts_received_at = coalesce(contacts_received_at, now()), "
+            "updated_at=now() where proposal_id=%s",
             (proposal_id,),
         )
 

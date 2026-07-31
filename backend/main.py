@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Optional
@@ -29,6 +29,8 @@ import config
 import customer_auth as ca
 import db
 import email_sender
+import followup_rules
+import followup_worker
 import inbound
 import invoice
 import proposals
@@ -72,6 +74,13 @@ def _startup() -> None:
                  " + dev seed" if config.DEV_SEED else "")
     except Exception as exc:  # noqa: BLE001
         log.error("startup failed: %s", exc)
+    # Started here rather than lazily off a request: the proposals that most need
+    # chasing are the ones nobody is looking at, so waiting for traffic would mean
+    # the quiet ones never get followed up. Guarded internally by the env flag.
+    try:
+        followup_worker.ensure_started()
+    except Exception as exc:  # noqa: BLE001 — never block boot on the worker
+        log.error("follow-up worker failed to start: %s", exc)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -99,6 +108,39 @@ def _iso(v):
     """A timestamp as an ISO string, or None. Tolerates an already-string value
     so a caller never has to know whether psycopg parsed the column."""
     return v.isoformat() if hasattr(v, "isoformat") else (v or None)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _followup_state(p: dict) -> dict:
+    """Where this proposal stands in follow-up automation, for the staff board.
+
+    `enrolled` false means nothing is chasing it — either a legacy proposal published
+    before automation existed, or one an estimator took off. The board renders paused
+    and closed-lost as badges, so both need to travel."""
+    return {
+        "enrolled": bool(p.get("followup_enrolled_at")),
+        "enabled": bool(p.get("followup_enrolled_at")) and not p.get("followup_disabled_at"),
+        "paused_until": _iso(p.get("followup_paused_until")),
+        "closed_lost_reason": p.get("closed_lost_reason"),
+        "closed_at": _iso(p.get("closed_at")),
+    }
+
+
+def _last_activity(p: dict):
+    """The most recent thing that happened on this proposal, from either side.
+
+    The board dates cards by it and the digest scores "customer silence" from it, so
+    it spans the customer's messages, the estimator's logged outreach and the
+    milestones themselves — whichever is latest."""
+    stamps = [p.get(k) for k in (
+        "last_message_at", "last_staff_followup_at", "scheduled_at", "contacts_received_at",
+        "deposit_received_at", "deposit_submitted_at", "approved_at", "last_viewed_at",
+        "viewed_at", "created_at")]
+    real = [s for s in stamps if hasattr(s, "isoformat")]
+    return max(real) if real else None
 
 
 def _set_session_cookie(resp: Response, token: str) -> None:
@@ -645,6 +687,132 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         log.error("approval automations failed: %s", exc)
     return _json({"ok": True})
+
+
+_LOST_REASON_LABELS = {
+    "price": "Price", "another_contractor": "Selected another contractor",
+    "canceled": "Project canceled", "scope_changed": "Scope changed",
+    "timing": "Timing", "other": "Other",
+}
+
+
+@app.post("/api/portal/{token}/project-status")
+async def api_project_status(token: str, request: Request) -> JSONResponse:
+    """The customer tells us where the project actually stands.
+
+    The point of the whole follow-up system: a customer who has gone quiet usually
+    isn't ignoring us, they're waiting on a budget or they've gone elsewhere. Give
+    them one click to say so and the reminders stop being noise — for them and for
+    the estimator.
+
+    Rate-limited by IP: unlike /questions this fans out email to the estimator and
+    the roster and mutates pipeline state, so it is worth the cheap guard."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP,
+                              config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "rate_limited"}, 429)
+    if (p.get("proposal_status") or "") == "approved":
+        return _json({"ok": False, "error": "already_approved"}, 400)
+
+    body = await _body(request)
+    status = str(body.get("status") or "").strip().lower()
+    pid = p["proposal_id"]
+    who = _session_email(request) or p.get("customer_email")
+    name = p.get("customer_name") or who or "the customer"
+    project = p.get("project_name") or "the project"
+
+    if status == "delayed":
+        try:
+            months = int(body.get("months") or 0)
+        except (TypeError, ValueError):
+            months = 0
+        if months not in _PAUSE_MONTHS:
+            return _json({"ok": False, "error": "invalid_months"}, 400)
+        until = followup_rules.add_months(followup_rules.business_today(_now_utc()), months)
+        # Saying "two months" twice — a second click from an older email — must not
+        # fire another notification at the estimator.
+        if followup_rules.as_date(p.get("followup_paused_until")) == until:
+            return _json({"ok": True, "project_status": {"paused_until": until.isoformat(),
+                                                         "closed": False}})
+        db.pause_followups(pid, until)
+        window = "4+ months" if months == 4 else f"{months} month{'s' if months > 1 else ''}"
+        db.add_message(pid, "customer", who,
+                       f"Project delayed — revisiting in about {window}.",
+                       msg_type="status_update",
+                       meta={"status": "delayed", "months": months,
+                             "paused_until": until.isoformat()})
+        db.add_followup(pid, "customer_status",
+                        {"status": "delayed", "months": months, "until": until.isoformat()}, who)
+        _notify_staff_status(
+            p, f"Project delayed — {project}",
+            f"<p><strong>{html.escape(str(name))}</strong> says "
+            f"<strong>{html.escape(project)}</strong> is delayed by about "
+            f"{html.escape(window)}.</p>"
+            f"<p>Automated follow-ups are paused until "
+            f"{html.escape(until.isoformat())}, and you'll get a reminder then.</p>")
+        return _json({"ok": True, "project_status": {"paused_until": until.isoformat(),
+                                                     "closed": False}})
+
+    if status == "not_moving_forward":
+        reason = str(body.get("reason") or "").strip().lower() or None
+        if reason and reason not in _LOST_REASONS:
+            return _json({"ok": False, "error": "invalid_reason"}, 400)
+        note = _cap(body.get("note"), 1000) or None
+        if (p.get("proposal_status") or "") == "closed_lost":
+            return _json({"ok": True, "project_status": {"paused_until": None, "closed": True}})
+        if not db.close_lost(pid, reason):
+            return _json({"ok": False, "error": "already_approved"}, 400)
+        label = _LOST_REASON_LABELS.get(reason or "", "")
+        db.add_message(pid, "customer", who,
+                       "Not moving forward with this project."
+                       + (f" Reason: {label}." if label else ""),
+                       msg_type="status_update",
+                       meta={"status": "not_moving_forward", "reason": reason, "note": note})
+        db.add_followup(pid, "customer_status",
+                        {"status": "not_moving_forward", "reason": reason, "note": note}, who)
+        _notify_staff_status(
+            p, f"Closed–Lost — {project}",
+            f"<p><strong>{html.escape(str(name))}</strong> is not moving forward with "
+            f"<strong>{html.escape(project)}</strong>.</p>"
+            + (f"<p>Reason: <strong>{html.escape(label)}</strong></p>" if label else "")
+            + (f"<blockquote>{html.escape(note)}</blockquote>" if note else "")
+            + "<p>Follow-ups have stopped and the opportunity is marked Closed–Lost.</p>")
+        return _json({"ok": True, "project_status": {"paused_until": None, "closed": True}})
+
+    if status == "resume":
+        db.resume_followups(pid)
+        db.add_message(pid, "customer", who, "Ready to move forward again.",
+                       msg_type="status_update", meta={"status": "resume"})
+        db.add_followup(pid, "customer_status", {"status": "resume"}, who)
+        _notify_staff_status(
+            p, f"Back on — {project}",
+            f"<p><strong>{html.escape(str(name))}</strong> says "
+            f"<strong>{html.escape(project)}</strong> is ready to move forward again.</p>")
+        return _json({"ok": True, "project_status": {"paused_until": None, "closed": False}})
+
+    return _json({"ok": False, "error": "invalid_status"}, 400)
+
+
+def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:
+    """Tell the assigned estimator (and the roster) what the customer just said.
+
+    Best-effort: the customer's answer is already recorded, and an email failure must
+    not make their click look broken."""
+    pid = p["proposal_id"]
+    try:
+        to = email_sender._resolve_notify("general", pid) or []
+        assigned = (p.get("assigned_estimator") or "").strip()
+        if assigned and assigned.lower() not in [t.lower() for t in to]:
+            to = [assigned] + to
+        if not to:
+            return
+        email_sender.notify_team(subject, body_html, recipients=to,
+                                 reply_link=_staff_link(pid), proposal_id=pid,
+                                 reply_to=email_sender.proposal_reply_to(p.get("token")))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("status notify failed for %s: %s", pid, exc)
 
 
 @app.post("/api/portal/{token}/deposit")
@@ -1214,11 +1382,23 @@ async def admin_publish(request: Request) -> JSONResponse:
         rev_no = int(raw_rev) if raw_rev is not None and int(raw_rev) > 0 else None
     except (TypeError, ValueError):
         rev_no = None
+    # Who owns chasing this proposal. The proposal tool requires it at send time;
+    # absent means an older tool, so the stored value is preserved.
+    assigned = (parseaddr(str(body.get("assigned_estimator") or ""))[1] or "").strip().lower()
+    if body.get("assigned_estimator") and not assigned:
+        return _json({"ok": False, "error": "invalid_estimator"}, 400)
 
     existing = db.get_proposal(draft_id)
     revised = False
     if existing:
         token = existing["token"]
+        # Sending a new version to a lost opportunity puts it back in play — staff
+        # would otherwise have to remember to un-close it by hand, and the board
+        # would show a live proposal sitting in Closed-lost.
+        if existing.get("proposal_status") == "closed_lost" and db.reopen_if_closed(draft_id):
+            db.add_message(draft_id, "staff", None,
+                           "Re-opened — a new version of this proposal has been sent.",
+                           msg_type="system")
         db.update_portal_proposal(draft_id, primary, name, project, pdf_path,
                                   deposit_required=require_deposit, revision_no=rev_no)
         _pdf_cache_drop(draft_id)   # a re-publish may have changed the document — don't serve a stale render
@@ -1272,9 +1452,21 @@ async def admin_publish(request: Request) -> JSONResponse:
                if email_sender.send_portal_link(e, name if e == primary else "", link, project,
                                                  reply_to=rt, note=note, token=token,
                                                  revised=revised)]
+
+    # Enrol (or re-enrol) in follow-up automation. Stamped AFTER the emails go out so
+    # the cadence clock starts from the send the customer actually received, and last
+    # so a failure here can never stop a proposal from being delivered.
+    try:
+        if assigned:
+            db.set_assigned_estimator(draft_id, assigned)
+        db.enroll_followup(draft_id)
+    except Exception as exc:  # noqa: BLE001 — the proposal is sent; automation is secondary
+        log.warning("could not enrol %s in follow-ups: %s", draft_id, exc)
+
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
                   "recipients": send_list, "emailed": emailed,
-                  "revision_no": rev_no, "revised": revised})
+                  "revision_no": rev_no, "revised": revised,
+                  "assigned_estimator": assigned or None})
 
 
 @app.get("/api/admin/pipeline")
@@ -1295,6 +1487,18 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # Lets the board stop parking no-deposit jobs in a deposit column they
             # can never leave. Legacy rows read as required.
             "deposit_required": r.get("deposit_required") is not False,
+            # Who owns the follow-up, and where this proposal stands in automation.
+            "assigned_estimator": r.get("assigned_estimator"),
+            "followup_state": _followup_state(r),
+            # Per-stage dates so each board column sorts by its own milestone rather
+            # than by whatever was touched last.
+            "last_viewed_at": _iso(r.get("last_viewed_at")),
+            "deposit_submitted_at": _iso(r.get("deposit_submitted_at")),
+            "deposit_received_at": _iso(r.get("deposit_received_at")),
+            "contacts_received_at": _iso(r.get("contacts_received_at")),
+            "scheduled_at": _iso(r.get("scheduled_at")),
+            "last_activity_at": _iso(_last_activity(r)),
+            "last_followup_at": _iso(r.get("last_staff_followup_at")),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
             # staff side picks the latest of these — it also owns turning the
@@ -1373,9 +1577,19 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "deposit_amount": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
             "deposit_requested_at": p["deposit_requested_at"].isoformat() if p.get("deposit_requested_at") else None,
             "deposit_required": p.get("deposit_required") is not False,
+            "assigned_estimator": p.get("assigned_estimator"),
+            "followup_state": _followup_state(p),
             "recipients": db.get_recipients(proposal_id),
         },
         "contacts": [_contact(c) for c in db.list_contacts(proposal_id)],
+        # Recent follow-up activity for the drawer: what the automation sent, what the
+        # estimator logged, and what the customer said about their timeline.
+        "followups": [{
+            "kind": f["kind"],
+            "detail": f.get("detail") or {},
+            "by": f.get("created_by"),
+            "created_at": _iso(f.get("created_at")),
+        } for f in db.list_followups(proposal_id)],
         "approval": ({
             "name": appr["name"], "title": appr.get("title"),
             "date": appr["approved_date"].isoformat() if appr.get("approved_date") else None,
@@ -1399,6 +1613,131 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "submitted_at": d["submitted_at"].isoformat() if d.get("submitted_at") else None,
         } for d in db.list_deposits(proposal_id)],
     })
+
+
+# ── follow-up automation (staff-facing) ───────────────────────────────────────
+# Kinds an estimator may log. `auto_email` and `customer_status` are minted by the
+# server only — letting staff post them would corrupt both the dedupe and the
+# digest's "has anyone actually chased this?" signal.
+_STAFF_FOLLOWUP_KINDS = ("staff_call", "staff_email", "staff_text", "staff_note")
+_LOST_REASONS = ("price", "another_contractor", "canceled", "scope_changed", "timing", "other")
+_PAUSE_MONTHS = (1, 2, 3, 4)
+
+
+@app.post("/api/admin/proposal/{proposal_id}/assign")
+async def admin_assign(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    email = (parseaddr(str(body.get("estimator_email") or ""))[1] or "").strip().lower()
+    if not email:
+        return _json({"ok": False, "error": "invalid_estimator"}, 400)
+    by = _cap(body.get("by"), 120) or None
+    db.set_assigned_estimator(proposal_id, email)
+    db.add_followup(proposal_id, "staff_note", {"action": "reassigned", "to": email}, by)
+    return _json({"ok": True, "assigned_estimator": email})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/followup-automation")
+async def admin_followup_automation(proposal_id: str, request: Request) -> JSONResponse:
+    """Take a proposal off automation, or put it back on.
+
+    This is the spec's "estimator manually removes the proposal from automation" —
+    the deliberate human override, so it is sticky across re-publishes."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    enabled = bool(body.get("enabled"))
+    by = _cap(body.get("by"), 120) or None
+    db.set_followup_enabled(proposal_id, enabled)
+    db.add_followup(proposal_id, "staff_note",
+                    {"action": "automation_on" if enabled else "automation_off"}, by)
+    return _json({"ok": True, "followup_state": _followup_state(db.get_proposal(proposal_id) or p)})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/followups")
+async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse:
+    """Record that an estimator chased this one personally.
+
+    The digest reads these: a logged follow-up suppresses the recommendation, and its
+    absence is what "no follow-up logged in 9 days" means."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    kind = str(body.get("kind") or "").strip().lower()
+    if kind in ("call", "email", "text", "note"):
+        kind = "staff_" + kind          # accept the short form the drawer sends
+    if kind not in _STAFF_FOLLOWUP_KINDS:
+        return _json({"ok": False, "error": "invalid_kind"}, 400)
+    note = _cap(body.get("note"), 2000) or None
+    row = db.add_followup(proposal_id, kind, {"note": note}, _cap(body.get("by"), 120) or None)
+    return _json({"ok": True, "followup": {
+        "kind": row["kind"], "detail": row.get("detail") or {},
+        "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})
+
+
+@app.get("/api/admin/proposal/{proposal_id}/followups")
+def admin_list_followups(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    return _json({"ok": True, "followups": [{
+        "kind": f["kind"], "detail": f.get("detail") or {},
+        "by": f.get("created_by"), "created_at": _iso(f.get("created_at")),
+    } for f in db.list_followups(proposal_id)]})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/status")
+async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
+    """Staff-side equivalent of the customer's project-status card: pause the chase,
+    close the opportunity, or put it back in play. Same db helpers, so the two paths
+    can never diverge."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    status = str(body.get("status") or "").strip().lower()
+    by = _cap(body.get("by"), 120) or None
+
+    if status == "delayed":
+        try:
+            months = int(body.get("months") or 0)
+        except (TypeError, ValueError):
+            months = 0
+        if months not in _PAUSE_MONTHS:
+            return _json({"ok": False, "error": "invalid_months"}, 400)
+        until = followup_rules.add_months(followup_rules.business_today(_now_utc()), months)
+        db.pause_followups(proposal_id, until)
+        db.add_followup(proposal_id, "staff_note",
+                        {"action": "paused", "months": months, "until": until.isoformat()}, by)
+    elif status == "closed_lost":
+        reason = str(body.get("reason") or "").strip().lower() or None
+        if reason and reason not in _LOST_REASONS:
+            return _json({"ok": False, "error": "invalid_reason"}, 400)
+        if not db.close_lost(proposal_id, reason):
+            # An approved proposal is a win; refuse to record it as lost.
+            return _json({"ok": False, "error": "already_approved"}, 400)
+        db.add_followup(proposal_id, "staff_note",
+                        {"action": "closed_lost", "reason": reason}, by)
+    elif status == "active":
+        db.resume_followups(proposal_id)
+        if p.get("proposal_status") == "closed_lost":
+            db.reopen_if_closed(proposal_id)
+        db.add_followup(proposal_id, "staff_note", {"action": "reactivated"}, by)
+    else:
+        return _json({"ok": False, "error": "invalid_status"}, 400)
+
+    fresh = db.get_proposal(proposal_id) or p
+    return _json({"ok": True, "proposal_status": fresh.get("proposal_status"),
+                  "followup_state": _followup_state(fresh)})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/reply")

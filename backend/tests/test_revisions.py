@@ -74,6 +74,14 @@ def publish(monkeypatch):
     monkeypatch.setattr(main.db, "set_recipients", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "remove_recipient", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: ["c@x.com"])
+    # Publishing also enrols the proposal in follow-up automation. Left unstubbed
+    # these reach for a real connection and each call burns the pool's full timeout,
+    # which turned this suite from seconds into minutes.
+    monkeypatch.setattr(main.db, "enroll_followup",
+                        lambda pid: calls.setdefault("enrolled", []).append(pid))
+    monkeypatch.setattr(main.db, "set_assigned_estimator",
+                        lambda pid, e: calls.setdefault("assigned", []).append(e))
+    monkeypatch.setattr(main.db, "reopen_if_closed", lambda pid: False)
     monkeypatch.setattr(main, "_pdf_cache_drop", lambda pid: None)
     monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda t: None)
     monkeypatch.setattr(main.email_sender, "send_portal_link",

@@ -321,3 +321,76 @@ alter table public.portal_notify_recipients enable row level security;
 alter table public.portal_notify_overrides enable row level security;
 alter table public.portal_contacts enable row level security;
 alter table public.portal_read_state enable row level security;
+
+-- ── Proposal Follow-Up System ─────────────────────────────────────────────────
+-- The CRM as a virtual sales coordinator: chase every sent proposal on a cadence,
+-- let the customer say "delayed" or "not moving forward" instead of going silent,
+-- and point each estimator at the handful worth a personal call.
+--
+-- Assignment lives on the proposal row. The proposal tool requires it at publish,
+-- so it is coalesced ahead of drafts.owner_email everywhere the board reads an
+-- estimator.
+alter table public.portal_proposals add column if not exists assigned_estimator text;
+
+-- NULL = this proposal is not automated. Stamped now() on EVERY publish, so it is
+-- both the enrolment marker AND the "sent" cadence anchor. created_at cannot
+-- anchor it: a re-publish never moves created_at, so a revision would inherit the
+-- original send's clock and fire its reminders immediately.
+alter table public.portal_proposals add column if not exists followup_enrolled_at timestamptz;
+-- An estimator deliberately removed this proposal from automation. Sticky across
+-- re-publishes: a revision send must not silently undo a human's decision.
+alter table public.portal_proposals add column if not exists followup_disabled_at timestamptz;
+-- The customer asked for time. Automation sleeps until this date (Chicago).
+alter table public.portal_proposals add column if not exists followup_paused_until date;
+-- Closed-Lost detail; the stage itself is proposal_status below.
+alter table public.portal_proposals add column if not exists closed_lost_reason text;
+alter table public.portal_proposals add column if not exists closed_at timestamptz;
+-- First view of the CURRENT send cycle. viewed_at coalesces (first view EVER, which
+-- the board wants), so after a revision it cannot anchor the viewed-track
+-- reminders. Set by mark_viewed on the sent->viewed transition; nulled each publish.
+alter table public.portal_proposals add column if not exists cycle_viewed_at timestamptz;
+
+-- Stage timestamps. The board sorts each column by its OWN date, and these
+-- milestones were previously status flips with no time recorded, so "Deposit
+-- received, most recent first" was unanswerable.
+alter table public.portal_proposals add column if not exists last_viewed_at timestamptz;
+alter table public.portal_proposals add column if not exists deposit_submitted_at timestamptz;
+alter table public.portal_proposals add column if not exists deposit_received_at timestamptz;
+alter table public.portal_proposals add column if not exists contacts_received_at timestamptz;
+alter table public.portal_proposals add column if not exists scheduled_at timestamptz;
+
+-- Closed-Lost is a terminal pipeline stage, not a parallel flag: proposal_status is
+-- the single source of stage truth for the board, the drawer and the customer
+-- badge, and a second column would force every consumer to consult both.
+alter table public.portal_proposals drop constraint if exists portal_proposals_proposal_status_check;
+alter table public.portal_proposals add constraint portal_proposals_proposal_status_check
+  check (proposal_status in ('sent','viewed','approved','closed_lost'));
+
+-- The customer's project-status answer posts a customer-authored chat row, so it
+-- reaches the staff bell the same way a submitted deposit does.
+alter table public.portal_questions drop constraint if exists portal_questions_msg_type_check;
+alter table public.portal_questions add constraint portal_questions_msg_type_check
+  check (msg_type in ('text','proposal_card','deposit_request','system','deposit_submitted','status_update'));
+
+-- Follow-up activity: automated sends, the estimator's own logged outreach, and the
+-- customer's status answers. The daily digest reads "time since last estimator
+-- follow-up" from the staff_* kinds, and suppresses anything already actioned.
+create table if not exists public.portal_followups (
+  id           bigint generated always as identity primary key,
+  proposal_id  text not null references public.portal_proposals(proposal_id) on delete cascade,
+  kind         text not null check (kind in
+                 ('auto_email','staff_call','staff_email','staff_text','staff_note','customer_status')),
+  detail       jsonb,
+  created_by   text,
+  created_at   timestamptz not null default now()
+);
+create index if not exists portal_followups_proposal_idx
+  on public.portal_followups (proposal_id, created_at desc);
+-- THE dedupe for automated sends: one email per (proposal, rule occurrence),
+-- enforced by the database rather than by application bookkeeping. The worker
+-- reserves a row before sending, so a crashed tick, a container restart, or two
+-- overlapping containers during a deploy cannot double-nag a customer.
+create unique index if not exists portal_followups_rule_uidx
+  on public.portal_followups (proposal_id, (detail->>'rule_key'))
+  where kind = 'auto_email' and (detail->>'rule_key') is not null;
+alter table public.portal_followups enable row level security;

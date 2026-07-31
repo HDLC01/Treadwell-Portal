@@ -234,6 +234,102 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
                  _thread_headers(email, token), reply_to=reply_to)
 
 
+# ── Automated follow-ups ──────────────────────────────────────────────────────
+# Sent by followup_worker on the cadence in followup_rules. Every one carries the
+# per-proposal Reply-To and thread anchor, so a customer who just replies lands in
+# the right chat thread instead of in a black hole.
+
+def _status_ask_html(token: str) -> str:
+    """"Has your timeline changed?" — the customer's way out.
+
+    From the recurring stage onward, every follow-up offers this. It is also the
+    polite unsubscribe: a customer who is not moving forward can say so in one click
+    instead of ignoring us until we stop, and staff learn why rather than guessing."""
+    base = f"{config.PUBLIC_BASE_URL}/p/{token}#status"
+    return (
+        f'<div style="margin:22px 0 6px;padding:14px 16px;background:#f8fafc;'
+        f'border:1px solid #e2e8f0;border-radius:10px">'
+        f'<p style="margin:0 0 10px;font-weight:600">Has your timeline changed?</p>'
+        f'<p style="margin:0 0 12px;color:#475569;font-size:14px">'
+        f'Let us know and we\'ll stop the reminders.</p>'
+        f'<a href="{base}" style="display:inline-block;margin-right:8px;padding:9px 14px;'
+        f'border:1px solid #cbd5e1;border-radius:8px;text-decoration:none;color:#0f172a;'
+        f'font-weight:600;font-size:14px">Project delayed</a>'
+        f'<a href="{base}" style="display:inline-block;padding:9px 14px;border:1px solid #cbd5e1;'
+        f'border-radius:8px;text-decoration:none;color:#0f172a;font-weight:600;font-size:14px">'
+        f'Not moving forward</a>'
+        f'</div>'
+    )
+
+
+def _cta(url: str, label: str) -> str:
+    return (f'<p style="margin:20px 0"><a href="{url}" style="background:{_BRAND_RED};color:#fff;'
+            f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">'
+            f'{label}</a></p>')
+
+
+def send_followup(email: str, url: str, project_name: str, template: str, *,
+                  name: str = "", deposit_required: bool = True,
+                  reply_to: str | None = None, token: str | None = None,
+                  include_status_ask: bool = False) -> bool:
+    """One automated follow-up. `template` comes from followup_rules.Due.
+
+    The deposit sentence is conditional: promising "signed proposal and deposit" on a
+    job sent without a deposit requirement would be wrong, and GC work usually is."""
+    greeting = f'<p>Hi {_esc(_first_name(name) or "there")},</p>' if name else ""
+    need = ("your signed approval and the deposit" if deposit_required
+            else "your signed approval")
+
+    if template == "not_viewed":
+        subject = f"Your Treadwell proposal for {project_name} is ready when you are"
+        title = "Your proposal is waiting"
+        body = (
+            f'{greeting}'
+            f'<p>We sent over the proposal for <strong>{_esc(project_name)}</strong> and '
+            f'wanted to make sure it reached you.</p>'
+            f'{_cta(url, "View your proposal")}'
+            f'<p style="color:#64748b">Any questions at all, just reply to this email — '
+            f'it comes straight to us.</p>'
+        )
+    elif template == "next_steps":
+        subject = f"Next steps for {project_name}"
+        title = "Getting you on the schedule"
+        body = (
+            f'{greeting}'
+            f'<p>Thanks for taking a look at the proposal for '
+            f'<strong>{_esc(project_name)}</strong>.</p>'
+            f'<p>Whenever you\'re ready, we need {need} before we can book your dates.</p>'
+            f'{_cta(url, "Review and approve")}'
+            f'<p style="color:#64748b">If anything needs changing first, reply and tell us — '
+            f'we\'d rather adjust it than have it sit.</p>'
+        )
+    elif template == "second_nudge":
+        subject = f"Quick reminder — {project_name}"
+        title = "Still holding your spot"
+        body = (
+            f'{greeting}'
+            f'<p>Just a nudge that the proposal for <strong>{_esc(project_name)}</strong> '
+            f'is still pending. We need {need} to schedule the work.</p>'
+            f'{_cta(url, "Review and approve")}'
+            f'<p style="color:#64748b">Happy to walk through it or price an alternative — '
+            f'a reply is enough.</p>'
+        )
+    else:   # "checkin" — the recurring stage
+        subject = f"Checking in on {project_name}"
+        title = "Checking in"
+        body = (
+            f'{greeting}'
+            f'<p>Circling back on <strong>{_esc(project_name)}</strong>. It\'s still open on '
+            f'our side and we need {need} whenever the timing works.</p>'
+            f'{_cta(url, "View your proposal")}'
+        )
+
+    if include_status_ask and token:
+        body += _status_ask_html(token)
+    return _send([email], subject, _wrap(title, body),
+                 _thread_headers(email, token), reply_to=reply_to)
+
+
 def send_reply_notification(email: str, url: str, project_name: str,
                             reply_to: str | None = None, message: str | None = None,
                             token: str | None = None) -> bool:

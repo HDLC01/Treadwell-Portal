@@ -111,6 +111,19 @@ INBOUND_REPLY_ADDRESS = _env("INBOUND_REPLY_ADDRESS", "")
 # forwarding a production customer's email.
 INBOUND_SENDER_FALLBACK = _env("INBOUND_SENDER_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
 
+# ── Proposal follow-up automation ─────────────────────────────────────────────
+# The cadence that chases sent proposals (followup_rules / followup_worker). The
+# worker re-reads BOTH of these from the environment on every tick, so production
+# can be stopped with an env change plus a restart rather than a deploy.
+#
+# Ships FALSE in production and TRUE on staging: staging's database holds only test
+# customers, so the cadence can be exercised for real there, while production stays
+# off until Hanz decides to turn it on.
+FOLLOWUP_AUTOMATION_ENABLED = _env("FOLLOWUP_AUTOMATION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# Seconds between sweeps. Clamped 60..3600 by the worker. Lower it on staging to
+# exercise a multi-day cadence in minutes.
+FOLLOWUP_TICK_SECONDS = _env("FOLLOWUP_TICK_SECONDS", "900")
+
 # ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
 # A Google OAuth *Web Client ID* (public). The button only renders when set; the
 # backend verifies the returned Google ID token and matches email to the proposal.

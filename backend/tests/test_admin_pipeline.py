@@ -15,16 +15,21 @@ import main
 
 # ── the query ────────────────────────────────────────────────────────────────
 def test_pipeline_query_joins_the_estimator_off_the_draft(monkeypatch):
-    """`drafts.owner_email` is the only field that exists for every proposal —
-    it is written once at first save and never overwritten. `published_by` is the
-    fallback for rows predating that plumbing."""
+    """The ASSIGNED estimator owns the proposal — they get the follow-up notes and the
+    daily digest, so they must win. `drafts.owner_email` is the fallback that exists
+    for every proposal (written once at first save, never overwritten), and
+    `published_by` covers rows predating that plumbing.
+
+    Ordering matters: reassigning a proposal has to change who is chased, and reading
+    owner_email first would silently keep pointing at whoever created the project."""
     seen = {}
     monkeypatch.setattr(main.db, "qall",
                         lambda sql, params=(): seen.update(sql=sql) or [])
     main.db.list_all_portal_proposals()
     sql = " ".join(seen["sql"].split())
     assert "left join public.drafts d on d.id = p.proposal_id" in sql
-    assert "coalesce(d.owner_email, p.published_by) as estimator_email" in sql
+    assert ("coalesce(p.assigned_estimator, d.owner_email, p.published_by) "
+            "as estimator_email") in sql
 
 
 def test_pipeline_query_keeps_proposals_whose_draft_was_trashed(monkeypatch):

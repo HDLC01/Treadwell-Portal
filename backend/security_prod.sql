@@ -105,3 +105,12 @@ grant usage, select on sequence public.portal_invoice_seq to portal_app;
 
 -- NOTE: portal_app is deliberately granted NOTHING on public.events or
 -- public.profiles, and only SELECT (no write) on public.drafts. Do not widen.
+
+-- 3c) Proposal Follow-Up System: the activity log (portal-owned). RLS is enabled in
+--     schema.sql, so grants alone are default-deny — the policy is required.
+--     Without this the follow-up worker cannot reserve a send, which means it would
+--     either re-nag customers on every tick or stop entirely.
+grant select, insert, update, delete on public.portal_followups to portal_app;
+drop policy if exists portal_app_rw_followups on public.portal_followups;
+create policy portal_app_rw_followups on public.portal_followups
+  for all to portal_app using (true) with check (true);
