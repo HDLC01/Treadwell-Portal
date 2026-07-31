@@ -193,6 +193,23 @@ def test_outbound_without_a_token_is_unchanged():
     assert "tw-proposal." not in h["References"]
 
 
+def test_otp_threads_separately_from_the_proposal():
+    """Login codes are transient noise — several may be requested while reading one
+    proposal. They thread with each other, never into the proposal conversation."""
+    otp = email_sender._otp_headers("c@x.com")
+    proposal = email_sender._thread_headers("c@x.com", "SOMETOKEN_longenough")
+    assert "treadwell-otp." in otp["References"]
+    assert "treadwell-portal." not in otp["References"]
+    assert "tw-proposal." not in otp["References"]
+    assert otp["References"] != proposal["References"]
+    assert otp["In-Reply-To"] != proposal["In-Reply-To"]
+    # Two codes to the same person share one thread; different people don't.
+    assert email_sender._otp_headers("c@x.com") == otp
+    assert email_sender._otp_headers("other@x.com") != otp
+    # An OTP anchor must never be mistaken for a proposal anchor on the way back in.
+    assert inbound.find_thread_token({"references": [otp["References"]]}) is None
+
+
 def test_find_thread_token_round_trip():
     """The whole point: what we stamp on the way out is recoverable on the way in."""
     tok = "G3Hu5zMKQ6NIu2REaUITyiFmWk_dHr9O"

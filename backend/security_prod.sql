@@ -39,6 +39,17 @@ drop policy if exists portal_app_read_drafts on public.drafts;
 create policy portal_app_read_drafts on public.drafts
   for select to portal_app using (true);
 
+-- 3b) Read-only on draft_revisions — the snapshot of the estimate as it was SENT.
+--     The customer's proposal page, its PDF and the approval check all read the
+--     pinned revision rather than the live draft, so without this grant a pinned
+--     proposal silently falls back to live data and mid-edit changes become visible
+--     to the customer again. Also owned by the proposal tool (its
+--     supabase_schema.sql creates the table); same role-scoped policy as drafts.
+grant select on public.draft_revisions to portal_app;
+drop policy if exists portal_app_read_draft_revisions on public.draft_revisions;
+create policy portal_app_read_draft_revisions on public.draft_revisions
+  for select to portal_app using (true);
+
 -- 4) Full DML on the portal's own tables, plus row policies so the RLS enabled
 --    in schema.sql admits portal_app to its own tables while still denying the
 --    anon/public REST role.

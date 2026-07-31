@@ -108,7 +108,16 @@ def test_existing_card_keys_are_unchanged(pipeline):
     card, = pipeline([_row(approved_total=27653, deposit_amount=6913.25)], unread={"p1": 3})
     for k in ("proposal_id", "token", "customer_email", "customer_name", "project_name",
               "proposal_status", "deposit_status", "schedule_status", "contacts_status",
-              "approved_total", "deposit_amount", "unread"):
+              "approved_total", "deposit_amount", "deposit_required", "unread"):
         assert k in card, k
     assert card["approved_total"] == 27653.0 and card["deposit_amount"] == 6913.25
     assert card["unread"] == 3
+
+
+def test_deposit_required_defaults_true_for_legacy_rows(pipeline):
+    """The board must not treat a pre-column row as "no deposit" — that would slide
+    it past the deposit stages it genuinely still needs."""
+    card, = pipeline([_row()])
+    assert card["deposit_required"] is True
+    off, = pipeline([_row(deposit_required=False)])
+    assert off["deposit_required"] is False

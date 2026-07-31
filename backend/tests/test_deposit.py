@@ -54,7 +54,36 @@ def client(monkeypatch):
 
     tc = TestClient(main.app)
     tc.calls = calls
+    tc.main = main
+    tc.monkeypatch = monkeypatch
     return tc
+
+
+def _proposal(**over):
+    p = {"proposal_id": "test-pid-0001", "project_name": "Test Project"}
+    p.update(over)
+    return p
+
+
+def test_deposit_rejected_when_not_required(client):
+    """Staff sent this job without a deposit, so there is nothing to pay. Accepting
+    bank details here would record money nobody asked for."""
+    client.monkeypatch.setattr(client.main, "_require",
+                               lambda request, token: _proposal(deposit_required=False))
+    r = client.post("/api/portal/tok/deposit", json={"method": "check", "note": "x"})
+    assert r.status_code == 400 and r.json()["error"] == "deposit_not_required"
+    assert client.calls["deposits"] == [] and client.calls["submitted"] == []
+
+
+def test_deposit_accepted_when_not_required_but_invoice_exists(client):
+    """Staff changed their mind and invoiced manually. The customer must be able to
+    pay it — an issued invoice outranks the flag."""
+    client.monkeypatch.setattr(client.main, "_require",
+                               lambda request, token: _proposal(deposit_required=False,
+                                                                deposit_invoice_no="TW-INV-01001"))
+    r = client.post("/api/portal/tok/deposit", json={"method": "check", "note": "x"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert len(client.calls["deposits"]) == 1
 
 
 def test_check_deposit_minimal_records_note_and_marks_submitted(client):

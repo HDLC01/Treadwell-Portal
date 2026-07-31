@@ -94,11 +94,29 @@ function renderWrongAccount() {
 const ICON_CHECK = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
 const ICON_DOT = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>';
 
+let SHOWN_REVISION = null;
 function renderPortal(vm) {
+  // A revision landed: the document, prices and option labels are all different, so
+  // force the cached PDF frames to re-fetch and drop any ticked options that no
+  // longer exist. Otherwise the customer could approve a selection from the version
+  // they were reading a moment ago.
+  const rev = vm.revision_no == null ? null : vm.revision_no;
+  if (SHOWN_REVISION !== null && rev !== SHOWN_REVISION) {
+    resetPdfMounts();
+    SELECTED.clear();
+  }
+  SHOWN_REVISION = rev;
+
   STATE = vm;
   STATE.messages = vm.messages || [];
   show($("portal"));
   const approved = vm.status.proposal === "approved";
+
+  // Tell the sidebar whether this project has a Deposit step. The shell is built
+  // before the first load, so it needs a nudge once we know — and again if staff
+  // invoice a no-deposit job mid-session (renderPortal re-runs on status change).
+  window.TW_DEPOSIT_APPLIES = depositApplies();
+  if (typeof window.TW_refreshShellSteps === "function") window.TW_refreshShellSteps();
 
   setHeader(vm, approved);
   ACTIVE_STEP = defaultStep(vm.status);
@@ -126,7 +144,7 @@ function renderPortal(vm) {
   // Deposit and contacts stay reachable at every stage so the customer can open
   // any step and skip around; setupDeposit's "recorded" banner covers the
   // post-submission state, and POST /deposit has no approval precondition.
-  setEligible("deposit-card", true);
+  setEligible("deposit-card", depositApplies());
   setEligible("contacts-card", true);
   setEligible("schedule-card", true);
   renderSchedule(vm.status);
@@ -140,7 +158,10 @@ function renderPortal(vm) {
     if (nm && !nm.value && vm.customer_name) nm.value = vm.customer_name;
   }
 
-  LAST_STATUS = statusKey(vm.status);
+  // Must be keyed the same way the POLL is, or the two disagree forever and every
+  // tick refetches the whole view. The full payload carries these three under
+  // `deposit`; the poll returns them flat.
+  LAST_STATUS = statusKey(pollShapedStatus(vm));
   applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
   applyStepPanel();       // keep the active tab showing only its own cards
   mountSwitcher();        // once per session; no-op on poll re-renders
@@ -194,6 +215,20 @@ function setHeader(vm, approved) {
   }
 }
 
+/** Does this project involve a deposit at all?
+ *
+ *  Staff tick "Require deposit" before sending; GC work usually doesn't. An
+ *  ISSUED INVOICE overrides the flag — staff can decide to invoice a no-deposit
+ *  job later, and from that moment the customer needs somewhere to pay it. So the
+ *  whole UI gates on `required || invoice_no`, never on the flag alone.
+ *
+ *  Also exposed to shell.js (a separate classic script with no STATE) so the
+ *  sidebar can drop the Deposit item without duplicating this rule. */
+function depositApplies() {
+  const d = (STATE && STATE.deposit) || {};
+  return d.required !== false || !!d.invoice_no;
+}
+
 function renderTracker(st) {
   const steps = [
     { key: "proposal", label: "Proposal", done: st.proposal === "approved", val: st.proposal === "approved" ? "Approved" : "Pending" },
@@ -203,7 +238,7 @@ function renderTracker(st) {
       val: st.deposit === "received" ? "Received" : st.deposit === "submitted" ? "Sent" : "Pending" },
     { key: "contacts", label: "Contact info", done: st.contacts === "received", val: st.contacts === "received" ? "Received" : "Pending" },
     { key: "schedule", label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
-  ];
+  ].filter((s) => s.key !== "deposit" || depositApplies());
   // Buttons, not divs: each tile navigates to that step. Customers can move back
   // and forth and skip ahead — nothing here gates on the previous step.
   $("tracker").innerHTML = steps.map((s) => `
@@ -224,7 +259,7 @@ let ACTIVE_STEP = null;
 function defaultStep(st) {
   if (ACTIVE_STEP) return ACTIVE_STEP;
   if (st.proposal !== "approved") return "proposal";
-  if (st.deposit !== "received") return "deposit";
+  if (depositApplies() && st.deposit !== "received") return "deposit";
   if (st.contacts !== "received") return "contacts";
   return "schedule";
 }
@@ -253,6 +288,9 @@ const setEligible = (id, on) => { on ? ELIGIBLE.add(id) : ELIGIBLE.delete(id); }
 /** Show only the active step's eligible cards. Runs after every render, since
  *  renderPortal re-runs on each status poll and would otherwise reset things. */
 function applyStepPanel() {
+  // A stale link (an old bell toast, a bookmarked #proposal/deposit) can point at
+  // a step this project doesn't have. Land on contacts rather than a blank panel.
+  if (ACTIVE_STEP === "deposit" && !depositApplies()) ACTIVE_STEP = "contacts";
   const step = ACTIVE_STEP || "proposal";
   for (const id of ALL_STEP_CARDS) {
     const el = $(id);
@@ -368,7 +406,9 @@ function updateSelectedTotal() {
   const approved = !!(STATE && STATE.status && STATE.status.proposal === "approved");
   if (el) {
     let html = `<div class="st-row"><span>Selected total</span><strong>${money(total)}</strong></div>`;
-    if (!approved && total > 0) {   // live deposit preview while the customer is choosing
+    // Live deposit preview while the customer is choosing — but only when this job
+    // actually collects one, or we'd promise a deposit that never gets invoiced.
+    if (!approved && total > 0 && depositApplies()) {
       html += `<div class="st-row st-dep"><span>25% deposit due on approval</span><strong>${money(total * DEPOSIT_PCT)}</strong></div>`;
     }
     el.innerHTML = html;
@@ -379,14 +419,23 @@ function updateSelectedTotal() {
 
 function renderThankYou(a) {
   const dep = a.deposit_amount;
+  const lead = $("thankyou-lead");
+  const actions = $("thankyou-actions");
+  // No deposit on this job: say so plainly and point at the next real step, rather
+  // than quoting an amount and promising an invoice that will never arrive.
+  if (!depositApplies()) {
+    $("thankyou-deposit").textContent = "No deposit is required for this project.";
+    lead.textContent = "Next, please add your project contacts so we can schedule the work.";
+    actions.classList.add("hidden");
+    setEligible("thankyou-card", true);
+    return;
+  }
   $("thankyou-deposit").textContent = dep != null
     ? `Deposit due: ${money(dep)} (25% of ${money(a.total)}).`
     : "";
   // Once the invoice has been issued, offer it right here — the customer lands on
   // this view after approving, so they shouldn't have to find the chat card.
   const inv = STATE && STATE.deposit && STATE.deposit.invoice_no;
-  const lead = $("thankyou-lead");
-  const actions = $("thankyou-actions");
   if (inv) {
     lead.textContent = `Invoice ${inv} has been emailed to you and is attached below.`;
     $("thankyou-invoice").href = `/api/portal/${TOKEN}/deposit-invoice.pdf`;
@@ -460,7 +509,10 @@ function renderSchedule(st) {
     ? "Your project is scheduled — your Treadwell contact will confirm the details with you."
     : st.deposit === "received"
       ? "We've received your deposit. We'll be in touch shortly to book your dates."
-      : "We book your dates once the deposit is received. Your Treadwell contact will confirm them with you.";
+      // No deposit gates this job, so don't tell them we're waiting on one.
+      : !depositApplies()
+        ? "We'll be in touch shortly to book your dates."
+        : "We book your dates once the deposit is received. Your Treadwell contact will confirm them with you.";
 }
 
 /** Copy the primary contact's details onto a mirrored row (role is preserved). */
@@ -533,10 +585,18 @@ function splitSystem(body) {
 function renderMsg(m) {
   const when = m.created_at ? new Date(m.created_at).toLocaleString() : "";
   if (m.msg_type === "proposal_card") {
-    return `<div class="chat-card proposal">
-      <div class="cc-title">Your proposal is ready</div>
+    // When a revision is sent, the older card is retired: it is labelled and loses
+    // its button, because "View proposal" would open the CURRENT version and make
+    // the two cards look interchangeable when they are not.
+    const meta = m.meta || {};
+    const dead = !!meta.superseded;
+    const rev = meta.revision_no;
+    const title = (rev && rev > 1) ? `Revision ${esc(rev)} of your proposal` : "Your proposal is ready";
+    return `<div class="chat-card proposal${dead ? " is-superseded" : ""}">
+      <div class="cc-title">${title}${dead ? ' <span class="cc-tag">Superseded</span>' : ""}</div>
+      ${dead && meta.superseded_by ? `<div class="cc-meta">Replaced by revision ${esc(meta.superseded_by)}</div>` : ""}
       <div class="cc-body">${esc(m.body || "")}</div>
-      <button class="btn btn-primary" type="button" data-open-proposal>View proposal</button>
+      ${dead ? "" : '<button class="btn btn-primary" type="button" data-open-proposal>View proposal</button>'}
     </div>`;
   }
   if (m.msg_type === "deposit_request") {
@@ -636,6 +696,22 @@ function mountPdf() {
   wrap.appendChild(ifr);
 }
 
+/** Force both PDF frames to re-fetch on the next render.
+ *
+ *  They are mounted once and cached by the browser, so when the underlying
+ *  document changes (staff sent a revision) the customer would keep seeing the old
+ *  one — the most confusing possible staleness, since the price on screen would
+ *  disagree with the price in the PDF. Called from renderPortal when the document
+ *  identity moves. */
+function resetPdfMounts() {
+  PDF_MOUNTED = false;
+  INLINE_PDF_MOUNTED = false;
+  for (const id of ["pdf-wrap", "pdf-inline-wrap"]) {
+    const w = $(id);
+    if (w) w.querySelectorAll("iframe").forEach((f) => f.remove());
+  }
+}
+
 // Inline website-style preview inside the card. Non-interactive (pointer-events
 // are disabled in CSS) so a click anywhere on it falls through to the #pdf-preview
 // button, which opens the full-size popup. Mounted once, on first render.
@@ -672,7 +748,26 @@ function closePdfModal() {
 // ── polling: pull new chat messages + detect status changes ───────────────────
 let POLL_TIMER = null;
 let LAST_STATUS = "";
-const statusKey = (st) => `${st.proposal}|${st.deposit}|${st.contacts}|${st.schedule}`;
+// Everything a customer would otherwise reload to see. Any change re-renders the
+// page, so leaving a field out of this key is what makes the UI go stale — an
+// issued invoice, a staff-corrected amount and a deposit becoming un-required all
+// leave the four status columns untouched.
+const statusKey = (st) => [st.proposal, st.deposit, st.contacts, st.schedule,
+                           st.invoice_no, st.deposit_amount, st.deposit_required,
+                           st.revision_no].join("|");
+
+/** The full view model in the shape the poll returns, so both sides can be keyed
+ *  identically. `GET /api/portal/{token}` nests the deposit fields under
+ *  `deposit`; `GET .../messages` returns them flat alongside the four statuses. */
+function pollShapedStatus(vm) {
+  const d = (vm && vm.deposit) || {};
+  return Object.assign({}, vm && vm.status, {
+    invoice_no: d.invoice_no == null ? null : d.invoice_no,
+    deposit_amount: d.due == null ? null : d.due,
+    deposit_required: d.required !== false,
+    revision_no: (vm && vm.revision_no) == null ? null : vm.revision_no,
+  });
+}
 const maxMsgId = () => (STATE && STATE.messages || []).reduce((m, x) => Math.max(m, x.id || 0), 0);
 
 async function pollOnce() {
@@ -696,10 +791,17 @@ async function pollOnce() {
   }
 }
 
+let VIS_BOUND = false;
 function startPolling() {
   if (POLL_TIMER) return;
   POLL_TIMER = setInterval(pollOnce, 12000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
+  // Bind the visibility listener ONCE. A 401 clears POLL_TIMER, so a later
+  // renderPortal → startPolling would otherwise stack a second listener and
+  // double-poll on every tab switch.
+  if (!VIS_BOUND) {
+    VIS_BOUND = true;
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) pollOnce(); });
+  }
 }
 
 function setupDeposit() {

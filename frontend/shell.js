@@ -149,18 +149,34 @@ html.shell-open #shell-back{display:block}
     // tiles share one navigation path.
     if (onChat && typeof window.focusStep === "function") {
       $("shell-steps-h").hidden = false;
-      $("shell-steps").innerHTML = [
-        ["proposal", "📄", "Proposal"], ["deposit", "💳", "Deposit"],
-        ["contacts", "👤", "Contact info"], ["schedule", "📅", "Schedule"],
-      ].map(([k, i, l]) =>
-        `<button class="shell-item" data-step="${k}"><span class="shell-ico">${i}</span><span>${l}</span></button>`
-      ).join("");
+      renderSteps();
       $("shell-steps").addEventListener("click", (e) => {
         const b = e.target.closest("[data-step]");
         if (b) { window.focusStep(b.dataset.step); if (innerWidth < 900) setOpen(false); }
       });
     }
   }
+
+  /** Paint the step list. Separate from buildSidebar (which runs once) because the
+   *  sidebar is built before the first portal load, so whether this project has a
+   *  Deposit step isn't known yet — app.js calls back here once it is.
+   *
+   *  app.js owns the deposit rule (required, or an invoice already issued) and
+   *  publishes it on window; shell.js has no STATE of its own. Undefined keeps the
+   *  item, matching the default-true column. The click handler is delegated on the
+   *  container, so repainting the buttons never loses it. */
+  function renderSteps() {
+    const box = $("shell-steps");
+    if (!box) return;
+    const showDeposit = window.TW_DEPOSIT_APPLIES !== false;
+    box.innerHTML = [
+      ["proposal", "📄", "Proposal"], ["deposit", "💳", "Deposit"],
+      ["contacts", "👤", "Contact info"], ["schedule", "📅", "Schedule"],
+    ].filter(([k]) => k !== "deposit" || showDeposit).map(([k, i, l]) =>
+      `<button class="shell-item" data-step="${k}"><span class="shell-ico">${i}</span><span>${l}</span></button>`
+    ).join("");
+  }
+  window.TW_refreshShellSteps = renderSteps;
 
   // ── bell + toasts ──────────────────────────────────────────────────────────
   let ITEMS = [], OPEN = false;

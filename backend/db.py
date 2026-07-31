@@ -6,6 +6,7 @@ tables. psycopg3 parses jsonb columns into Python objects automatically.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from psycopg.rows import dict_row
@@ -14,6 +15,7 @@ from psycopg_pool import ConnectionPool
 
 import config
 
+log = logging.getLogger("portal")
 _pool: Optional[ConnectionPool] = None
 
 
@@ -59,6 +61,35 @@ def run_script(sql: str) -> None:
 def get_draft_data(proposal_id: str) -> Optional[dict[str, Any]]:
     row = q1("select data from public.drafts where id = %s and deleted_at is null", (proposal_id,))
     return (row or {}).get("data") if row else None
+
+
+def get_revision_data(proposal_id: str, revision_no: int) -> Optional[dict[str, Any]]:
+    """One snapshot of the project state, as sent. Also owned by the proposal tool."""
+    row = q1("select data from public.draft_revisions "
+             "where project_id = %s and revision_no = %s", (proposal_id, revision_no))
+    return (row or {}).get("data") if row else None
+
+
+def get_pinned_draft_data(p: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The project state the customer was actually SENT — use this for anything
+    customer-facing, not `get_draft_data`.
+
+    The live draft is whatever an estimator last typed, which is not the same thing
+    as the proposal in the customer's inbox. Rendering the live blob meant a
+    mid-edit save rewrote a proposal that had already gone out, and an approval
+    could be recorded against option labels that no longer existed.
+
+    Falls back to the live blob when there is no pin: proposals published before
+    revisions existed (current_revision_no NULL), and the should-never-happen case
+    of a pin whose snapshot row is gone. Both keep working exactly as before."""
+    no = p.get("current_revision_no")
+    if no:
+        data = get_revision_data(p["proposal_id"], int(no))
+        if data is not None:
+            return data
+        log.warning("proposal %s pins revision %s but no snapshot exists — "
+                    "falling back to live draft data", p.get("proposal_id"), no)
+    return get_draft_data(p["proposal_id"])
 
 
 # ── portal_proposals ──────────────────────────────────────────────────────────
@@ -161,20 +192,33 @@ def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] 
 
 
 # ── admin (publish + pipeline) ──────────────────────────────────────────────────
-def create_portal_proposal(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by) -> None:
+def create_portal_proposal(proposal_id, token, customer_email, customer_name, project_name, pdf_path,
+                           published_by, deposit_required: bool = True,
+                           revision_no: Optional[int] = None) -> None:
     execute(
         "insert into public.portal_proposals "
-        "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by) "
-        "values (%s,%s,%s,%s,%s,%s,%s)",
-        (proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by),
+        "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by, "
+        "deposit_required, current_revision_no) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by,
+         bool(deposit_required), None if revision_no is None else int(revision_no)),
     )
 
 
-def update_portal_proposal(proposal_id, customer_email, customer_name, project_name, pdf_path) -> None:
+def update_portal_proposal(proposal_id, customer_email, customer_name, project_name, pdf_path,
+                           deposit_required: Optional[bool] = None,
+                           revision_no: Optional[int] = None) -> None:
+    """Re-publish. `deposit_required=None` PRESERVES the stored value — an older
+    proposal tool sends no flag, and a re-send must not silently start requiring a
+    deposit on a job that was sent without one. Same for `revision_no`."""
     execute(
         "update public.portal_proposals set customer_email=%s, customer_name=%s, project_name=%s, "
-        "pdf_path=coalesce(%s, pdf_path), updated_at=now() where proposal_id=%s",
-        (customer_email, customer_name, project_name, pdf_path, proposal_id),
+        "pdf_path=coalesce(%s, pdf_path), deposit_required=coalesce(%s, deposit_required), "
+        "current_revision_no=coalesce(%s, current_revision_no), "
+        "updated_at=now() where proposal_id=%s",
+        (customer_email, customer_name, project_name, pdf_path,
+         None if deposit_required is None else bool(deposit_required),
+         None if revision_no is None else int(revision_no), proposal_id),
     )
 
 
@@ -197,7 +241,7 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "select p.proposal_id, p.token, p.customer_email, p.customer_name, p.project_name, "
         "p.proposal_status, p.deposit_status, p.contacts_status, p.schedule_status, "
         "p.approved_total, p.deposit_amount, p.created_at, p.viewed_at, p.approved_at, "
-        "p.deposit_requested_at, "
+        "p.deposit_requested_at, p.deposit_required, "
         "coalesce(d.owner_email, p.published_by) as estimator_email "
         "from public.portal_proposals p "
         "left join public.drafts d on d.id = p.proposal_id "
@@ -397,6 +441,55 @@ def issue_new_invoice_no(proposal_id: str) -> Optional[str]:
     )
     row = q1("select deposit_invoice_no from public.portal_proposals where proposal_id=%s", (proposal_id,))
     return (row or {}).get("deposit_invoice_no")
+
+
+def reset_for_revision(proposal_id: str, revision_no: int) -> bool:
+    """Point the proposal at a newly sent revision and reopen it for approval.
+
+    A revised estimate means the customer has not agreed to THIS one yet, so a
+    'viewed' or 'approved' proposal goes back to 'sent' and the denormalised
+    approved_* columns are cleared — otherwise the board would show an approval of
+    a price nobody was shown. The portal_approvals rows are deliberately left
+    alone: they are the audit record of what was agreed and when.
+
+    Deposit columns are untouched. Money that has already been invoiced or paid is
+    a fact about the project, not about which revision is current.
+
+    Returns True when a prior approval was cleared, so the caller can say so in the
+    thread."""
+    row = q1("select proposal_status from public.portal_proposals where proposal_id = %s",
+             (proposal_id,))
+    was_approved = (row or {}).get("proposal_status") == "approved"
+    execute(
+        "update public.portal_proposals set current_revision_no = %s, "
+        "proposal_status = case when proposal_status in ('viewed','approved') "
+        "                       then 'sent' else proposal_status end, "
+        "approved_total = case when %s then null else approved_total end, "
+        "approved_option = case when %s then null else approved_option end, "
+        "approved_options = case when %s then null else approved_options end, "
+        "approved_name = case when %s then null else approved_name end, "
+        "approved_title = case when %s then null else approved_title end, "
+        "approved_date = case when %s then null else approved_date end, "
+        "approved_at = case when %s then null else approved_at end, "
+        "updated_at = now() where proposal_id = %s",
+        (revision_no, was_approved, was_approved, was_approved, was_approved,
+         was_approved, was_approved, was_approved, proposal_id),
+    )
+    return was_approved
+
+
+def supersede_proposal_cards(proposal_id: str, replaced_by_rev: int) -> None:
+    """Mark earlier proposal cards superseded so the customer can tell at a glance
+    which version is current. Same shape as supersede_invoice_cards — the frontends
+    already know how to render a superseded card."""
+    execute(
+        "update public.portal_questions "
+        "set meta = coalesce(meta, '{}'::jsonb) || jsonb_build_object('superseded', true, "
+        "                                                            'superseded_by', %s::int) "
+        "where proposal_id = %s and msg_type = 'proposal_card' "
+        "  and coalesce((meta->>'superseded')::boolean, false) = false",
+        (int(replaced_by_rev), proposal_id),
+    )
 
 
 def supersede_invoice_cards(proposal_id: str, replaced_by: str) -> None:

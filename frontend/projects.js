@@ -14,6 +14,10 @@
     // Between paying and staff confirming it landed — telling them "Deposit due"
     // here reads as though their payment never arrived.
     if (p.deposit_status === "submitted") return { label: "Deposit sent", cls: "warn" };
+    // "Deposit due" is wrong on a job that doesn't collect one. An issued invoice
+    // still means due, even when the flag says otherwise — staff changed their mind.
+    if (p.proposal_status === "approved" && p.deposit_required === false && !p.deposit_requested)
+      return { label: "Approved", cls: "done" };
     if (p.proposal_status === "approved") return { label: "Deposit due", cls: "warn" };
     if (p.proposal_status === "viewed") return { label: "Awaiting approval", cls: "warn" };
     return { label: "New proposal", cls: "pending" };

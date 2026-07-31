@@ -11,7 +11,7 @@ import invoice as invoice_mod
 
 
 def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
-          deposit_requested_at=None, deposit_invoice_no=None):
+          deposit_requested_at=None, deposit_invoice_no=None, deposit_required=True):
     sent, flags = [], {"requested": [], "msgs": [], "invoice_calls": []}
 
     def _proposal(pid):
@@ -19,6 +19,7 @@ def _wire(monkeypatch, *, deposit_amount=3316.25, deposit_status="pending",
                 "project_name": "Westport", "approved_total": 13265.0,
                 "deposit_amount": deposit_amount, "deposit_status": deposit_status,
                 "deposit_requested_at": deposit_requested_at,
+                "deposit_required": deposit_required,
                 "deposit_invoice_no": deposit_invoice_no or flags.get("assigned")}
 
     def _assign(pid):
@@ -104,6 +105,33 @@ def test_auto_deposit_skips_when_already_invoiced(monkeypatch):
     sent, flags = _wire(monkeypatch, deposit_requested_at="2026-07-27T13:36:44+00:00")
     automations.request_deposit({"proposal_id": "p1", "token": "tok"}, "Westport")
     assert sent == [] and flags["requested"] == [] and flags["invoice_calls"] == []
+
+
+def test_auto_deposit_skips_when_deposit_not_required(monkeypatch):
+    """Staff unticked "Require deposit" before sending (typical for GC work). The
+    approval must produce NO invoice, no number, no email and no chat card — and
+    critically no deposit_requested_at, which is what the staff board dates the
+    "Invoiced" milestone by."""
+    sent, flags = _wire(monkeypatch, deposit_required=False)
+    automations.request_deposit({"proposal_id": "p1", "token": "tok"}, "Westport")
+    assert sent == []
+    assert flags["requested"] == []
+    assert flags["invoice_calls"] == []
+    assert flags["msgs"] == []
+
+
+def test_auto_deposit_still_invoices_when_flag_is_absent(monkeypatch):
+    """A legacy row (column added with default true) and any caller passing a dict
+    without the key must keep today's behaviour. The guard tests `is False`, not
+    falsiness, precisely so a missing key cannot silently disable deposits."""
+    sent, flags = _wire(monkeypatch)
+    monkeypatch.setattr(db, "get_proposal", lambda pid: {
+        "proposal_id": pid, "token": "tok", "customer_email": "c@x.com",
+        "project_name": "Westport", "approved_total": 13265.0,
+        "deposit_amount": 3316.25, "deposit_status": "pending",
+        "deposit_requested_at": None, "deposit_invoice_no": None})
+    automations.request_deposit({"proposal_id": "p1", "token": "tok"}, "Westport")
+    assert flags["requested"] == ["p1"] and len(sent) == 2
 
 
 def test_auto_deposit_skips_when_deposit_already_received(monkeypatch):

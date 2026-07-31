@@ -72,7 +72,9 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     # without the attachment — rather than blocking the customer on our plumbing.
     try:
         payload = invoice_mod.invoice_payload(fresh, amount, invoice_no,
-                                              draft=db.get_draft_data(pid) or {},
+                                              # The invoice must describe the version
+                                              # the customer approved, not a later edit.
+                                              draft=db.get_pinned_draft_data(fresh) or {},
                                               overrides=overrides)
         pdf = invoice_mod.render_invoice_pdf(payload)
         # A staff-edited invoice number is what the customer will quote back, so
@@ -127,6 +129,14 @@ def request_deposit(proposal_row: dict, project_name: str) -> None:
         import db
 
         fresh = db.get_proposal(pid) or proposal_row
+        # Staff decided at send time whether this job collects a deposit at all
+        # (GC work usually doesn't). `is False` deliberately, not falsy: a legacy
+        # row or a test stub without the key must keep today's behaviour, which is
+        # to invoice. Nothing downstream runs — no invoice, no email, no chat card,
+        # no deposit_requested_at — so the customer never sees a Deposit step.
+        if fresh.get("deposit_required") is False:
+            log.info("[deposit:skip] deposit not required for %s", pid)
+            return
         # Guard on deposit_requested_at, NOT deposit_status: the status check
         # constraint only permits 'pending'/'received', so a 'requested' status
         # never exists and the old check let a re-approval issue a 2nd invoice.

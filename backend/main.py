@@ -226,6 +226,9 @@ def _proposal_card(row: dict) -> dict:
         "schedule_status": row.get("schedule_status"),
         "contacts_status": row.get("contacts_status") or "pending",
         "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+        # So the card doesn't say "Deposit due" on a job that never needs one.
+        "deposit_required": row.get("deposit_required") is not False,
+        "deposit_requested": bool(row.get("deposit_requested_at")),
     }
 
 
@@ -434,7 +437,8 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
             "wrong_account": bool(se and not authed)}
     if not authed:
         return _json(base)
-    data = db.get_draft_data(p["proposal_id"]) or {}
+    # The snapshot they were SENT, not whatever an estimator has since typed.
+    data = db.get_pinned_draft_data(p) or {}
     db.mark_viewed(p["proposal_id"])
     p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
@@ -456,9 +460,16 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         # Present once the invoice has been issued — drives the download button on
         # the chat card and the thank-you card.
         "invoice_no": p.get("deposit_invoice_no"),
+        # Does this job collect a deposit at all? False hides the whole Deposit
+        # step. An issued invoice overrides it (staff can invoice a no-deposit job
+        # later), so the UI gates on `required || invoice_no`.
+        "required": p.get("deposit_required") is not False,
     }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
+    # Which version of the document this is. Lets the client notice a revision
+    # landing mid-session and re-fetch the PDF instead of showing the old one.
+    vm["revision_no"] = p.get("current_revision_no")
     base["view"] = vm
     return _json(base)
 
@@ -517,9 +528,20 @@ def api_messages(token: str, request: Request) -> JSONResponse:
     except (ValueError, TypeError):
         after = 0
     msgs = [_msg(m) for m in db.list_messages(p["proposal_id"], after)]
+    # The client re-renders the whole page when ANY of these changes, so anything a
+    # customer would otherwise have to reload to see belongs here. Issuing an
+    # invoice or a staff amount edit never moves deposit_status, so without
+    # invoice_no/amount the page kept saying "your invoice is on its way" while the
+    # invoice sat in the chat below it.
     return _json({"ok": True, "messages": msgs, "status": {
         "proposal": p["proposal_status"], "deposit": p["deposit_status"],
-        "contacts": p.get("contacts_status") or "pending", "schedule": p["schedule_status"]}})
+        "contacts": p.get("contacts_status") or "pending", "schedule": p["schedule_status"],
+        "invoice_no": p.get("deposit_invoice_no"),
+        "deposit_amount": (float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None),
+        "deposit_required": p.get("deposit_required") is not False,
+        # A revision landing while the customer has the page open changes the whole
+        # document — the client re-renders and re-fetches the PDF off this.
+        "revision_no": p.get("current_revision_no")}})
 
 
 @app.post("/api/portal/{token}/approve")
@@ -537,7 +559,11 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     if not name:
         return _json({"ok": False, "error": "Name is required."}, 400)
 
-    data = db.get_draft_data(p["proposal_id"]) or {}
+    # Validate the approval against the SAME snapshot the customer was shown, so the
+    # option labels they ticked always exist and the total they agreed to is the
+    # total we record. Reading live data here meant a mid-edit rename could orphan
+    # their selection between page load and pressing Approve.
+    data = db.get_pinned_draft_data(p) or {}
     options = proposals.pricing_options(data)
 
     # Multi-select (option_labels[]) is the V1 path; option_label (single string)
@@ -575,13 +601,19 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     db.add_message(p["proposal_id"], "staff", None,
                    f"Approved by {name} — {sel_txt}. Total ${total:,.2f}.", msg_type="system")
 
+    # Staff decided at send time whether this job collects a deposit. When it
+    # doesn't, every mention of one has to go — promising an invoice that will
+    # never arrive is worse than saying nothing.
+    deposit_due = p.get("deposit_required") is not False
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
         f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
         f"<strong>{html.escape(option_summary)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
         f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
-        f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>"
-        f"<p>Project: {html.escape(project_name)}.</p>",
+        + (f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>" if deposit_due
+           else "<p>No deposit required for this project — the customer has been asked for "
+                "their project contacts.</p>")
+        + f"<p>Project: {html.escape(project_name)}.</p>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
@@ -593,9 +625,21 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         f"{(' by ' + html.escape(name)) if name else ''} on {approved_date}.</p>"
         f"<p>Approved: <strong>{html.escape(option_summary)}</strong> — "
         f"<strong>${total:,.2f}</strong>.</p>"
-        f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves your place on our "
-        f"schedule; the invoice follows separately.</p>",
+        + (f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves your place on our "
+           f"schedule; the invoice follows separately.</p>" if deposit_due
+           else "<p>No deposit is needed. Next, please add your project contacts so we can "
+                "schedule the work.</p>"),
     )
+    if not deposit_due:
+        # The contacts prompt normally rides on deposit-received (admin_deposit_received).
+        # With no deposit there is no such moment, so ask now — otherwise the thread
+        # goes quiet and the project stalls waiting for contacts nobody requested.
+        try:
+            db.add_message(p["proposal_id"], "staff", None,
+                           "Approved — thank you! Please add your project contacts so we can "
+                           "schedule the work.", msg_type="system")
+        except Exception as exc:  # noqa: BLE001 — the approval itself must still succeed
+            log.warning("could not post the contacts prompt for %s: %s", p["proposal_id"], exc)
     try:
         automations.run_on_approval(p, project_name)
     except Exception as exc:  # noqa: BLE001
@@ -608,6 +652,11 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    # Don't accept money nobody asked for. An invoice existing overrides the flag:
+    # staff can always choose to invoice a no-deposit job later, and once they have,
+    # the customer must be able to pay it.
+    if p.get("deposit_required") is False and not p.get("deposit_invoice_no"):
+        return _json({"ok": False, "error": "deposit_not_required"}, 400)
     body = await _body(request)
     method = (body.get("method") or "").strip().lower()
     if method not in ("ach", "check"):
@@ -775,9 +824,14 @@ def api_pdf(token: str, request: Request):
     # Preferred: render the real Treadwell PDF on demand from the proposal tool.
     if config.PROPOSAL_TOOL_URL and config.SERVICE_TOKEN:
         try:
+            # Render the pinned revision, so the downloaded document and the prices
+            # on the page can never disagree. Omitted for legacy rows → live draft.
+            params = {"draft_id": pid}
+            if p.get("current_revision_no"):
+                params["revision_no"] = int(p["current_revision_no"])
             r = httpx.get(
                 config.PROPOSAL_TOOL_URL + "/api/admin/proposal-pdf",
-                params={"draft_id": pid},
+                params=params,
                 headers={"X-Service-Token": config.SERVICE_TOKEN},
                 timeout=90,
             )
@@ -806,7 +860,7 @@ def api_deposit_invoice_pdf(token: str, request: Request):
         return _json({"ok": False, "error": "no_invoice"}, 404)
     try:
         payload = invoice.invoice_payload(p, float(amount), invoice_no,
-                                          draft=db.get_draft_data(p["proposal_id"]) or {})
+                                          draft=db.get_pinned_draft_data(p) or {})
         pdf = invoice.render_invoice_pdf(payload)
     except invoice.InvoiceUnavailable as exc:
         log.error("deposit invoice unavailable for %s: %s", p["proposal_id"], exc)
@@ -1147,18 +1201,56 @@ async def admin_publish(request: Request) -> JSONResponse:
     # Optional personal note the estimator typed on the Done page — shown in the
     # customer's proposal-ready email above the button.
     note = _cap(body.get("message"), 2000) or None
+    # Whether this job collects a 25% deposit, decided by staff at send time. None
+    # (field absent — an older proposal tool) means "don't change it": on create
+    # that lands on the column default TRUE, on update it preserves what was sent.
+    rd = body.get("require_deposit")
+    require_deposit = None if rd is None else bool(rd)
+    # Which snapshot of the project this send represents. Absent → an older proposal
+    # tool that doesn't snapshot; the customer view falls back to the live draft,
+    # exactly as before.
+    raw_rev = body.get("revision_no")
+    try:
+        rev_no = int(raw_rev) if raw_rev is not None and int(raw_rev) > 0 else None
+    except (TypeError, ValueError):
+        rev_no = None
 
     existing = db.get_proposal(draft_id)
+    revised = False
     if existing:
         token = existing["token"]
-        db.update_portal_proposal(draft_id, primary, name, project, pdf_path)
+        db.update_portal_proposal(draft_id, primary, name, project, pdf_path,
+                                  deposit_required=require_deposit, revision_no=rev_no)
         _pdf_cache_drop(draft_id)   # a re-publish may have changed the document — don't serve a stale render
+        # A second (or later) revision is a genuinely new document, not a re-send of
+        # the same one: reopen it for approval, retire the old card, post a new one.
+        if rev_no and rev_no > 1:
+            revised = True
+            was_approved = db.reset_for_revision(draft_id, rev_no)
+            db.supersede_proposal_cards(draft_id, rev_no)
+            db.add_message(draft_id, "staff", None,
+                           f"Revision {rev_no} of your proposal is ready to review.",
+                           msg_type="proposal_card", meta={"revision_no": rev_no})
+            if was_approved:
+                # Say plainly that the earlier agreement no longer stands, so nobody
+                # is left thinking a signed number still applies.
+                db.add_message(
+                    draft_id, "staff", None,
+                    f"Revision {rev_no} replaces the previous version. Your earlier approval "
+                    f"has been recorded for reference, and this revision needs a new approval.",
+                    msg_type="system")
+        elif rev_no:
+            # Re-send of the FIRST revision (e.g. adding a recipient). Just re-point.
+            db.reset_for_revision(draft_id, rev_no)
     else:
         token = ca.new_proposal_token()
-        db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by)
+        db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by,
+                                  deposit_required=True if require_deposit is None else require_deposit,
+                                  revision_no=rev_no)
         # Seed the chat thread with the proposal card (first publish only).
         db.add_message(draft_id, "staff", None, "Your proposal is ready to review.",
-                       msg_type="proposal_card")
+                       msg_type="proposal_card",
+                       meta={"revision_no": rev_no} if rev_no else None)
 
     # Reconcile the recipient set.
     if recipients is None:                      # legacy call — preserve exact old semantics
@@ -1178,9 +1270,11 @@ async def admin_publish(request: Request) -> JSONResponse:
     rt = email_sender.proposal_reply_to(token)
     emailed = [e for e in send_list
                if email_sender.send_portal_link(e, name if e == primary else "", link, project,
-                                                 reply_to=rt, note=note, token=token)]
+                                                 reply_to=rt, note=note, token=token,
+                                                 revised=revised)]
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
-                  "recipients": send_list, "emailed": emailed})
+                  "recipients": send_list, "emailed": emailed,
+                  "revision_no": rev_no, "revised": revised})
 
 
 @app.get("/api/admin/pipeline")
@@ -1198,6 +1292,9 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "contacts_status": r.get("contacts_status") or "pending",
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
             "deposit_amount": float(r["deposit_amount"]) if r.get("deposit_amount") is not None else None,
+            # Lets the board stop parking no-deposit jobs in a deposit column they
+            # can never leave. Legacy rows read as required.
+            "deposit_required": r.get("deposit_required") is not False,
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
             # staff side picks the latest of these — it also owns turning the
@@ -1275,6 +1372,7 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "approved_total": float(p["approved_total"]) if p.get("approved_total") is not None else None,
             "deposit_amount": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
             "deposit_requested_at": p["deposit_requested_at"].isoformat() if p.get("deposit_requested_at") else None,
+            "deposit_required": p.get("deposit_required") is not False,
             "recipients": db.get_recipients(proposal_id),
         },
         "contacts": [_contact(c) for c in db.list_contacts(proposal_id)],

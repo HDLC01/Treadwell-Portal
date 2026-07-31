@@ -264,6 +264,28 @@ create sequence if not exists public.portal_invoice_seq start 1001;
 alter table public.portal_proposals add column if not exists deposit_invoice_no text;
 alter table public.portal_proposals add column if not exists deposit_invoice_issued_at timestamptz;
 
+-- ── Deposit required? ─────────────────────────────────────────────────────────
+-- Staff tick "Require deposit" on the Files page before sending. Direct-customer
+-- work defaults to requiring one; GC work usually does not, but the box is free to
+-- toggle either way for edge cases. FALSE means the approval automation issues no
+-- invoice and the customer never sees a Deposit step.
+--
+-- Default TRUE, so every row that existed before this column keeps today's
+-- behaviour, and a publish from an older proposal tool (which sends no flag) is
+-- indistinguishable from today.
+alter table public.portal_proposals add column if not exists deposit_required boolean not null default true;
+
+-- ── Which revision the customer was actually SENT ─────────────────────────────
+-- Points at a public.draft_revisions row (owned by the proposal tool). The
+-- proposal page and its PDF used to render LIVE from drafts.data, which meant any
+-- mid-edit save silently rewrote a proposal somebody had already received — and
+-- after approval, the numbers they had agreed to. Pinning to the snapshot that was
+-- sent makes "what they approved" and "what they saw" provably the same document.
+--
+-- NULL = published before revisions existed → fall back to live drafts.data, i.e.
+-- exactly today's behaviour. Self-heals on that project's next send.
+alter table public.portal_proposals add column if not exists current_revision_no int;
+
 -- ── Customer read state (notification bell) ───────────────────────────────────
 -- Per (reader, proposal), NOT per session: sessions expire and are replaced, so a
 -- re-login would reset the marker. Keyed on email like portal_proposal_recipients,

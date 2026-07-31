@@ -159,6 +159,19 @@ _SIGNATURE_HTML = (
 )
 
 
+def _otp_headers(email: str) -> dict[str, str]:
+    """A thread anchor for login codes ONLY, separate from the proposal thread.
+
+    Access codes are transient noise: a customer may request several while reading
+    one proposal, and threading them in with the proposal, replies and invoice
+    buried the conversation under a pile of expired codes. Codes now thread with
+    each other (one tidy "access code" conversation per recipient) and never with
+    the proposal."""
+    anchor = hashlib.sha1((email or "").strip().lower().encode()).hexdigest()[:24]
+    mid = f"<treadwell-otp.{anchor}@wetreadwell.com>"
+    return {"References": mid, "In-Reply-To": mid}
+
+
 def send_otp(email: str, code: str, project_name: str) -> bool:
     body = (
         f'<p>Use this code to view your proposal for <strong>{project_name}</strong>:</p>'
@@ -166,7 +179,7 @@ def send_otp(email: str, code: str, project_name: str) -> bool:
         f'<p style="color:#64748b">This code expires in {config.OTP_TTL_MINUTES} minutes.</p>'
     )
     return _send([email], "Your Treadwell proposal access code", _wrap("Your access code", body),
-                 _thread_headers(email))
+                 _otp_headers(email))
 
 
 def proposal_reply_to(token: str) -> str | None:
@@ -189,7 +202,11 @@ def proposal_reply_to(token: str) -> str | None:
 
 def send_portal_link(email: str, name: str, url: str, project_name: str,
                      reply_to: str | None = None, note: str | None = None,
-                     token: str | None = None) -> bool:
+                     token: str | None = None, revised: bool = False) -> bool:
+    """`revised` marks a re-send that carries genuinely different numbers, so the
+    customer isn't left wondering whether this is the same proposal again. It also
+    tells them the earlier version no longer stands — the portal has reopened it for
+    approval, and silently resending "your proposal is ready" would hide that."""
     # Greet by FIRST name only; `note` is the estimator's optional personal message
     # (entered on the Done page before sending) shown above the button.
     note_html = ""
@@ -198,15 +215,22 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
             f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
             f'border-left:3px solid {_BRAND_RED};white-space:pre-wrap">{_esc(note)}</p>'
         )
+    lead = ("A revised proposal for <strong>%s</strong> is ready to review. It replaces the "
+            "version we sent previously." % _esc(project_name)) if revised else \
+           ("Your proposal for <strong>%s</strong> is ready to review." % _esc(project_name))
     body = (
         f'<p>Hi {_esc(_first_name(name) or "there")},</p>'
-        f'<p>Your proposal for <strong>{_esc(project_name)}</strong> is ready to review.</p>'
+        f'<p>{lead}</p>'
         f'{note_html}'
         f'<p style="margin:20px 0"><a href="{url}" style="background:{_BRAND_RED};color:#fff;'
-        f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View your proposal</a></p>'
+        f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">'
+        f'{"View the revised proposal" if revised else "View your proposal"}</a></p>'
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
-    return _send([email], f"Your Treadwell proposal — {project_name}", _wrap("Your proposal is ready", body),
+    subject = (f"Your revised Treadwell proposal — {project_name}" if revised
+               else f"Your Treadwell proposal — {project_name}")
+    return _send([email], subject,
+                 _wrap("Your revised proposal is ready" if revised else "Your proposal is ready", body),
                  _thread_headers(email, token), reply_to=reply_to)
 
 
