@@ -175,3 +175,105 @@ def test_naive_timestamps_from_the_database_are_treated_as_utc():
     naive = ENROLLED.replace(tzinfo=None)
     dues = fr.due_now(_p(followup_enrolled_at=naive), ENROLLED + timedelta(hours=25))
     assert [d.template for d in of(dues, "customer")] == ["not_viewed"]
+
+
+# ── next_due_at: the Follow-ups page's "Next reminder" column ───────────────
+# It must mirror due_now exactly. If the two drift, the page states a schedule that
+# exists nowhere else a human can check, and nobody would ever notice it was wrong.
+def _row(**kw):
+    base = {"followup_enrolled_at": None, "followup_disabled_at": None,
+            "followup_paused_until": None, "cycle_viewed_at": None,
+            "proposal_status": "sent"}
+    base.update(kw)
+    return base
+
+
+def _ago(now, hours):
+    return now - timedelta(hours=hours)
+
+
+def test_nothing_is_due_when_nothing_is_chasing():
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    assert fr.next_due_at(_row(), now) is None                    # not enrolled
+    assert fr.next_due_at(
+        _row(followup_enrolled_at=_ago(now, 100), followup_disabled_at=_ago(now, 1)), now) is None
+    assert fr.next_due_at(
+        _row(followup_enrolled_at=_ago(now, 100), proposal_status="approved"), now) is None
+    assert fr.next_due_at(
+        _row(followup_enrolled_at=_ago(now, 100), proposal_status="closed_lost"), now) is None
+
+
+def test_the_first_reminder_lands_24h_after_the_send():
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    sent = _ago(now, 2)
+    assert fr.next_due_at(_row(followup_enrolled_at=sent), now) == sent + timedelta(hours=24)
+
+
+def test_after_a_view_the_clock_restarts_on_the_view():
+    """cycle_viewed_at is the anchor once they open it — that's what due_now uses, so a
+    proposal viewed an hour ago is 24h from its next email regardless of when it was sent."""
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    viewed = _ago(now, 1)
+    got = fr.next_due_at(
+        _row(followup_enrolled_at=_ago(now, 200), cycle_viewed_at=viewed,
+             proposal_status="viewed"), now)
+    assert got == viewed + timedelta(hours=24)
+
+
+def test_a_pause_pushes_it_to_the_morning_after_the_window_closes():
+    """The customer said "come back in two months". The cadence must not fire ON the last
+    day of their window — is_paused covers the whole of that final day."""
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    got = fr.next_due_at(
+        _row(followup_enrolled_at=_ago(now, 100), followup_paused_until="2026-09-01"), now)
+    assert got.date().isoformat() == "2026-09-02"
+    assert fr.is_paused(
+        _row(followup_paused_until="2026-09-01"),
+        datetime(2026, 9, 1, 23, 0, tzinfo=timezone.utc)) is True
+
+
+def test_it_always_points_at_a_future_occurrence_for_an_active_proposal():
+    """The real contract, and it took a failing test to pin it down.
+
+    `next_due_at` sees only the proposal row — never `portal_followups` — so it cannot
+    know whether the occurrence that has just matured was already sent. It therefore
+    reports the next time the cadence MATURES, which for any active proposal is always
+    ahead of now: the worker ticks every 15 minutes, so anything ripe right now goes out
+    within the quarter hour.
+
+    That gives the column a second, useful meaning the page relies on: a date in the PAST
+    means the cadence matured and nothing sent it — automation is off globally, or the
+    worker is down. It is a stalled-sender warning, not a late-by-six-days complaint."""
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    cases = [
+        ("too soon to nudge", _row(followup_enrolled_at=_ago(now, 2))),
+        ("unopened, first due", _row(followup_enrolled_at=_ago(now, 30))),
+        ("unopened, recurring", _row(followup_enrolled_at=_ago(now, 100))),
+        ("viewed, too soon", _row(followup_enrolled_at=_ago(now, 50),
+                                  cycle_viewed_at=_ago(now, 2), proposal_status="viewed")),
+        ("viewed, 24h due", _row(followup_enrolled_at=_ago(now, 50),
+                                 cycle_viewed_at=_ago(now, 30), proposal_status="viewed")),
+        ("viewed, 72h due", _row(followup_enrolled_at=_ago(now, 200),
+                                 cycle_viewed_at=_ago(now, 100), proposal_status="viewed")),
+    ]
+    for name, row in cases:
+        nxt = fr.next_due_at(row, now)
+        assert nxt is not None and nxt > now, f"{name}: got {nxt}"
+
+
+def test_the_next_occurrence_is_one_full_step_past_the_matured_one():
+    """Concretely: unopened for 30h means the 24h nudge is ripe now, so the next
+    scheduled one is the first recurring step — 24h + 72h from the send."""
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    sent = _ago(now, 30)
+    assert [d.template for d in fr.due_now(_row(followup_enrolled_at=sent), now)
+            if d.audience == "customer"] == ["not_viewed"]
+    assert fr.next_due_at(_row(followup_enrolled_at=sent), now) == sent + timedelta(hours=24 + 72)
+
+
+def test_an_exhausted_cadence_reports_no_more():
+    """MAX_RECURRING is the hard stop that keeps us from chasing somebody forever. The
+    page has to say "—", not invent a reminder that will never be sent."""
+    now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
+    ancient = _ago(now, 24 + 72 * (fr.MAX_RECURRING + 2))
+    assert fr.next_due_at(_row(followup_enrolled_at=ancient), now) is None

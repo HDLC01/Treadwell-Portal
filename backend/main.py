@@ -1515,6 +1515,11 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # when: dating a card "Viewed 7/12" when the real event was a customer
             # message on 7/30 reads as a stale deal that nobody has touched.
             "last_message_at": _iso(r.get("last_message_at")),
+            # When the cadence will next email this customer. Computed from the same
+            # anchors due_now() uses, so the Follow-ups page can show a schedule that
+            # otherwise exists nowhere a human can see. None = nothing is coming
+            # (not automated, switched off, approved, closed, or cadence exhausted).
+            "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc())),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
             # staff side picks the latest of these — it also owns turning the

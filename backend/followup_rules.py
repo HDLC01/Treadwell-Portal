@@ -132,6 +132,51 @@ def _recurring_index(elapsed: timedelta, first: timedelta) -> int:
     return min(MAX_RECURRING, int((elapsed - first) // RECURRING))
 
 
+def next_due_at(p: dict, now: datetime) -> Optional[datetime]:
+    """When the next CUSTOMER reminder is due, or None if none ever will be.
+
+    Read-only companion to `due_now` for the Follow-ups page, which needs to say "next
+    reminder: in 2 days" rather than only "one is due right now". Mirrors the same
+    anchors and thresholds deliberately: if this drifts from `due_now`, the page lies
+    about a schedule nobody can see any other way.
+
+    Returns a time in the past when one is already overdue — the page renders that as
+    "due now", and the difference between "overdue by six days" and "due tomorrow" is
+    the whole reason to look at this screen. Ignores the 8am-6pm send window on purpose:
+    the window delays an email by hours, and rounding a date forward for it would make
+    the column disagree with itself overnight.
+    """
+    enrolled = _aware(p.get("followup_enrolled_at"))
+    if not enrolled or p.get("followup_disabled_at"):
+        return None                                     # not automated
+    if (p.get("proposal_status") or "") not in ("sent", "viewed"):
+        return None                                     # approved, or closed lost
+
+    until = _as_date(p.get("followup_paused_until"))
+    if until and business_today(now) <= until:
+        # Paused. The cadence resumes the morning after the customer's window closes.
+        return datetime(until.year, until.month, until.day,
+                        SEND_START_HOUR, tzinfo=BUSINESS_TZ) + timedelta(days=1)
+
+    viewed = _aware(p.get("cycle_viewed_at"))
+    anchor = viewed or enrolled
+    first = FIRST_NUDGE if viewed is None else SECOND_NUDGE
+    elapsed = now - anchor
+
+    if elapsed < FIRST_NUDGE:
+        return anchor + FIRST_NUDGE                     # the first one hasn't matured
+    if viewed is not None and elapsed < SECOND_NUDGE:
+        return anchor + SECOND_NUDGE                    # viewed: 24h one is done, 72h next
+
+    # Into the recurring stage. `_recurring_index` is what due_now uses to decide which
+    # occurrence has matured, so the next one is simply the step after it — capped, so a
+    # proposal that has exhausted MAX_RECURRING correctly reports "no more".
+    n = _recurring_index(elapsed, first)
+    if n >= MAX_RECURRING:
+        return None
+    return anchor + first + RECURRING * (n + 1)
+
+
 def due_now(p: dict, now: datetime) -> list[Due]:
     """The rules that have matured for this proposal, at most one per audience."""
     enrolled = _aware(p.get("followup_enrolled_at"))
