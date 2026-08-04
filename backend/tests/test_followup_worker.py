@@ -204,3 +204,34 @@ def test_the_tick_interval_is_clamped(monkeypatch):
     assert fw._interval() == 3600
     monkeypatch.setenv("FOLLOWUP_TICK_SECONDS", "nonsense")
     assert fw._interval() == 900
+
+
+# ── the default, pinned ───────────────────────────────────────────────
+# Added 2026-08-04 on Hanz's instruction: "email follow ups should be automatically off."
+#
+# The two defaults are not symmetric. Default ON and be wrong, and automated follow-up mail
+# goes to real customers from whatever box happens to be running. Default OFF and be wrong,
+# and nothing sends until somebody notices a missing reminder. Nothing pinned this before,
+# so it defaulted to "true" and production was safe only because the compose file happened
+# to say otherwise.
+def test_follow_up_automation_is_off_when_nobody_has_said_otherwise(monkeypatch):
+    monkeypatch.delenv("FOLLOWUP_AUTOMATION_ENABLED", raising=False)
+    assert fw._enabled() is False
+
+
+def test_a_missing_config_attribute_does_not_re_enable_automation(monkeypatch):
+    """The fallback used to be `getattr(config, ..., True)`, so a build where the config
+    attribute went missing would have quietly switched customer email back ON — the one case
+    you least want it guessing."""
+    import config
+    monkeypatch.delenv("FOLLOWUP_AUTOMATION_ENABLED", raising=False)
+    monkeypatch.delattr(config, "FOLLOWUP_AUTOMATION_ENABLED", raising=False)
+    assert fw._enabled() is False
+
+
+def test_anything_that_is_not_an_explicit_yes_leaves_automation_off(monkeypatch):
+    """Fails closed on junk, including near-misses: "of" and "truee" are typos somebody
+    will make in a compose file, and neither should mail a customer."""
+    for junk in ("", "of", "truee", "maybe", "disabled", "off", "0", "no"):
+        monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", junk)
+        assert fw._enabled() is False, junk

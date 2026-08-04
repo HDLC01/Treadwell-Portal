@@ -119,7 +119,11 @@ INBOUND_SENDER_FALLBACK = _env("INBOUND_SENDER_FALLBACK", "false").strip().lower
 # Ships FALSE in production and TRUE on staging: staging's database holds only test
 # customers, so the cadence can be exercised for real there, while production stays
 # off until Hanz decides to turn it on.
-FOLLOWUP_AUTOMATION_ENABLED = _env("FOLLOWUP_AUTOMATION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# OFF unless explicitly switched on. This drives automatic follow-up EMAIL to real
+# customers, so the two defaults are not symmetric: defaulting on and being wrong mails
+# customers from whatever box is running, while defaulting off and being wrong sends
+# nothing and somebody notices. Opt in per environment.
+FOLLOWUP_AUTOMATION_ENABLED = _env("FOLLOWUP_AUTOMATION_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 # Seconds between sweeps. Clamped 60..3600 by the worker. Lower it on staging to
 # exercise a multi-day cadence in minutes.
 FOLLOWUP_TICK_SECONDS = _env("FOLLOWUP_TICK_SECONDS", "900")

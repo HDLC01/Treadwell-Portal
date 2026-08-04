@@ -38,8 +38,11 @@ _started = False
 # production is an env change plus a restart, and the flag has to be believed
 # immediately rather than at whatever value it held when the module loaded.
 def _enabled() -> bool:
+    # The fallback default is FALSE at both levels — the env var and the config attribute.
+    # `getattr(..., True)` would have quietly re-enabled automation on any build where the
+    # config attribute went missing, which is the one case you least want it guessing.
     raw = os.environ.get("FOLLOWUP_AUTOMATION_ENABLED",
-                         "true" if getattr(config, "FOLLOWUP_AUTOMATION_ENABLED", True) else "false")
+                         "true" if getattr(config, "FOLLOWUP_AUTOMATION_ENABLED", False) else "false")
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
