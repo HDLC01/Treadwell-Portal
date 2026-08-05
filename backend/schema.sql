@@ -354,6 +354,17 @@ alter table public.portal_proposals add column if not exists cycle_viewed_at tim
 -- milestones were previously status flips with no time recorded, so "Deposit
 -- received, most recent first" was unanswerable.
 alter table public.portal_proposals add column if not exists last_viewed_at timestamptz;
+-- Somebody followed the link in the notification email. DELIBERATELY separate from the
+-- viewed_* columns and from proposal_status.
+--
+-- A click is a weaker fact than a view: Outlook SafeLinks and mail scanners follow links
+-- without a human reading anything, and the landing page serves before any login. Writing it
+-- into proposal_status='viewed' would also move cycle_viewed_at, which is the anchor
+-- followup_rules.py uses to switch a customer from the not-opened reminder track to the
+-- opened one — so a scanner could silently change which emails a customer receives. These two
+-- columns let the board say "the email got through" without claiming anybody read the bid.
+alter table public.portal_proposals add column if not exists link_clicked_at timestamptz;
+alter table public.portal_proposals add column if not exists last_link_clicked_at timestamptz;
 alter table public.portal_proposals add column if not exists deposit_submitted_at timestamptz;
 alter table public.portal_proposals add column if not exists deposit_received_at timestamptz;
 alter table public.portal_proposals add column if not exists contacts_received_at timestamptz;

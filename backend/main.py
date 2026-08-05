@@ -327,7 +327,28 @@ def root() -> FileResponse:
 
 
 @app.get("/p/{token}")
-def portal_page(token: str) -> FileResponse:
+def portal_page(token: str, request: Request) -> FileResponse:
+    """The landing page for the link in every notification email.
+
+    Recording the visit answers a question the Follow-ups board could not answer before: a
+    proposal that has sat in Sent for a week is a completely different problem depending on
+    whether the email was ever opened, and "we might have the wrong address" was
+    indistinguishable from "they are thinking about it".
+
+    It is only ever a SOFT signal. This serves before any login, so a click is not a read, and
+    `mark_link_clicked` keeps it away from proposal_status and cycle_viewed_at for that reason.
+    HEAD is skipped because that is prefetchers and link checkers rather than people.
+
+    Serving the page must not depend on any of this working — a database hiccup here would
+    otherwise take the customer's proposal offline, which is far worse than a missing
+    timestamp."""
+    if request.method == "GET":
+        try:
+            p = db.get_proposal_by_token(token)
+            if p:
+                db.mark_link_clicked(p["proposal_id"])
+        except Exception:                     # noqa: BLE001 — never block the page
+            log.warning("mark_link_clicked failed for token %s", token[:8], exc_info=True)
     return FileResponse(FRONTEND_DIR / "index.html", headers=_NO_CACHE)
 
 
@@ -1505,6 +1526,12 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # Per-stage dates so each board column sorts by its own milestone rather
             # than by whatever was touched last.
             "last_viewed_at": _iso(r.get("last_viewed_at")),
+            # Somebody followed the email link. A soft signal, reported separately from
+            # `viewed` on purpose (see db.mark_link_clicked): it tells the board that the
+            # email reached a mailbox, which is what distinguishes "they haven't decided"
+            # from "we may have the wrong address" on a proposal stuck in Sent.
+            "link_clicked_at": _iso(r.get("link_clicked_at")),
+            "last_link_clicked_at": _iso(r.get("last_link_clicked_at")),
             "deposit_submitted_at": _iso(r.get("deposit_submitted_at")),
             "deposit_received_at": _iso(r.get("deposit_received_at")),
             "contacts_received_at": _iso(r.get("contacts_received_at")),
