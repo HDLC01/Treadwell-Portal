@@ -380,6 +380,26 @@ def latest_approval(proposal_id: str) -> Optional[dict[str, Any]]:
     )
 
 
+def mark_link_clicked(proposal_id: str) -> None:
+    """Somebody followed the link in the notification email.
+
+    A SOFT signal, and kept away from everything that means "the customer read it". It does not
+    touch proposal_status, viewed_at or cycle_viewed_at: the landing page serves before any
+    login, and Outlook SafeLinks and mail scanners follow links on their own. Moving the status
+    on a click would also move cycle_viewed_at, which anchors the follow-up cadence — a scanner
+    would quietly change which reminders a customer gets.
+
+    What it is good for is the opposite question. When a proposal has been sitting in Sent for a
+    week, "the email was delivered and the link was followed" and "we may have the wrong address"
+    are very different problems, and until now the board could not tell them apart."""
+    execute(
+        "update public.portal_proposals set "
+        "link_clicked_at = coalesce(link_clicked_at, now()), "
+        "last_link_clicked_at = now() where proposal_id = %s",
+        (proposal_id,),
+    )
+
+
 def mark_viewed(proposal_id: str) -> None:
     """Three different "viewed" facts, which is why this writes three columns.
 
