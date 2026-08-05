@@ -259,6 +259,20 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # customer last did anything, and when THIS estimator last chased them.
         "(select max(q.created_at) from public.portal_questions q "
         "   where q.proposal_id = p.proposal_id) as last_message_at, "
+        # Has the CUSTOMER ever come back to us, and when last.
+        #
+        # `last_message_at` above cannot answer this: it is the newest message from either side,
+        # so a proposal where we sent the last note looks identical to one the customer answered.
+        # The staff board needs to tell "they have never responded" from "they replied and we
+        # are mid-conversation", and those call for opposite actions — chase versus answer.
+        #
+        # Counts ANY customer-authored row, not just msg_type='text'. A customer who answered
+        # the status card ("still deciding, ask me in two weeks") has responded just as surely
+        # as one who typed a sentence, and filing them under "never replied" would misrepresent
+        # them and earn them a chasing email they had already pre-empted.
+        "(select max(q.created_at) from public.portal_questions q "
+        "   where q.proposal_id = p.proposal_id and q.author_kind = 'customer') "
+        "   as customer_replied_at, "
         # OUTREACH only. `staff_note` carries two different things: a note an
         # estimator typed, and the system's own bookkeeping (reassigned, automation
         # on/off, paused, closed). Bookkeeping rows are the ones with an `action`

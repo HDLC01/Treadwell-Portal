@@ -154,3 +154,40 @@ def test_the_columns_exist_in_the_schema():
     sql = (pathlib.Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
     for col in ("link_clicked_at", "last_link_clicked_at"):
         assert ("add column if not exists %s timestamptz" % col) in sql, col
+
+
+# ── has the customer ever come back to us? ────────────────────────────────────
+def test_the_query_fetches_when_the_customer_last_replied(monkeypatch):
+    """`last_message_at` is the newest message from EITHER side, so a proposal where we sent the
+    last note looks identical to one the customer answered. The board has to tell "never
+    responded" from "mid-conversation" because those call for opposite actions — chase versus
+    answer — so it needs a customer-only timestamp.
+
+    Both the SELECT and the response dict are asserted: adding the field to only one of them is
+    the exact bug that shipped with link_clicked_at, where the key was present and always null.
+    """
+    seen = {}
+    monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    db.list_all_portal_proposals()
+    sql = " ".join(seen["sql"].split())
+    assert "as customer_replied_at" in sql
+    assert "q.author_kind = 'customer'" in sql, "the subquery is not restricted to the customer"
+
+    import inspect
+    assert '"customer_replied_at": _iso(r.get("customer_replied_at"))' in inspect.getsource(main)
+
+
+def test_the_reply_signal_counts_a_status_card_answer_too(monkeypatch):
+    """A customer who answered the status card ("still deciding, ask me in two weeks") HAS
+    responded. Restricting this to msg_type='text' would file them under "never replied" and earn
+    them a chasing email they had already pre-empted — so the subquery deliberately does not
+    filter on msg_type, unlike the unread count next to it."""
+    seen = {}
+    monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    db.list_all_portal_proposals()
+    sql = " ".join(seen["sql"].split())
+    # Isolate the customer_replied_at subquery and check it carries no msg_type restriction.
+    frag = sql[:sql.index("as customer_replied_at")]
+    frag = frag[frag.rindex("(select max(q.created_at)"):]
+    assert "msg_type" not in frag, (
+        "customer_replied_at filters on msg_type; a status-card answer would not count as a reply")

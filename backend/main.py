@@ -1542,6 +1542,10 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # when: dating a card "Viewed 7/12" when the real event was a customer
             # message on 7/30 reads as a stale deal that nobody has touched.
             "last_message_at": _iso(r.get("last_message_at")),
+            # When the CUSTOMER last came back to us — null means they never have. The staff
+            # board sorts "seen but never answered" from "mid-conversation" on this, and
+            # last_message_at cannot tell them apart (it counts our own messages too).
+            "customer_replied_at": _iso(r.get("customer_replied_at")),
             # When the cadence will next email this customer. Computed from the same
             # anchors due_now() uses, so the Follow-ups page can show a schedule that
             # otherwise exists nowhere a human can see. None = nothing is coming
