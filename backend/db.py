@@ -248,7 +248,18 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # Whether the notification email's link was ever followed. Separate from the viewed_*
         # columns on purpose (see mark_link_clicked): it says the email reached a mailbox, not
         # that anybody read the bid, and the board renders it with that caveat.
-        "p.link_clicked_at, p.last_link_clicked_at, "
+        #
+        # Read through `to_jsonb` rather than as `p.link_clicked_at` because prod cannot apply
+        # its own DDL — `APPLY_SCHEMA_ON_BOOT` is false when `IS_PROD`, so an owner runs the
+        # ALTERs by hand and the code can arrive first. Named directly, a missing column makes
+        # psycopg raise `UndefinedColumn`; this is the ONLY pipeline query, so the staff CRM
+        # board AND the Follow-ups page would both die with an error that blames portal
+        # reachability, sending somebody to check nginx over one missing ALTER. A jsonb key
+        # lookup returns NULL for an absent key instead, so the board simply shows no click
+        # badge, and it starts working the moment the column lands — no restart, no cache.
+        # Verified against the prod database: absent key -> NULL, present key -> identical value.
+        "(to_jsonb(p) ->> 'link_clicked_at')::timestamptz as link_clicked_at, "
+        "(to_jsonb(p) ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
         # Follow-up automation state.
         "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
         "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "
@@ -390,14 +401,54 @@ def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     )
 
 
+class SettingsUnreadable(Exception):
+    """The settings row could not be read, and we do not know what it says.
+
+    Distinct from "there is no row yet", which `get_settings` reports as None. The difference
+    matters because the editor OVERWRITES the whole row: told "nothing saved", it shows the
+    shipped defaults and the next Save replaces somebody's hand-written customer emails with
+    them. A read that failed must therefore not be reported as an empty one.
+    """
+
+
+def _is_missing_table(exc: BaseException) -> bool:
+    """Is this "the table has not been created here yet" rather than a real failure?
+
+    Prod cannot apply its own DDL (`APPLY_SCHEMA_ON_BOOT` is false when `IS_PROD`), so code
+    routinely arrives before its table. That state is normal and means "as shipped". Matched on
+    the class where psycopg gives us one, with a string fallback because the same condition can
+    surface wrapped by the pool.
+    """
+    import psycopg
+
+    for e in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if e is None:
+            continue
+        if isinstance(e, psycopg.errors.UndefinedTable):
+            return True
+        if getattr(e, "sqlstate", None) == "42P01":     # undefined_table
+            return True
+    text = str(exc).lower()
+    return "does not exist" in text and "relation" in text
+
+
 def get_settings(key: str) -> Optional[dict[str, Any]]:
     """One settings row's value, or None when it has never been saved.
 
     None is a normal answer, not an error: `followup_settings.merge()` lays stored values over the
     shipped defaults, so an absent row means "the cadence as shipped". That is what lets the code
     deploy before the DDL is applied — the worker keeps sending exactly as it did before.
+
+    A table that does not exist yet is also None, for the same reason. Anything else raises
+    `SettingsUnreadable`, because "the read failed" and "nothing is saved" must not look alike to
+    a caller that will offer to overwrite the row.
     """
-    row = q1("select value from public.portal_settings where id=%s", (key,))
+    try:
+        row = q1("select value from public.portal_settings where id=%s", (key,))
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_table(exc):
+            return None
+        raise SettingsUnreadable(str(exc)) from exc
     if not row:
         return None
     val = row.get("value")

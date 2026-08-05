@@ -174,6 +174,11 @@ def _clean_text(raw: Any, limit: int) -> str:
     s = str(raw or "")
     s = re.sub(r"<[^>]*>", "", s)                     # no HTML into a customer email
     s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Control characters out, keeping newlines and tabs. Two reasons, both real: Postgres jsonb
+    # rejects a NUL outright, so one pasted from a spreadsheet would fail the save with a
+    # message about a missing table; and email_sender marks the {link} position with a control
+    # character while escaping, which is only safe because a stored body can never contain one.
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)                  # cap the blank runs, keep paragraphs
     return s.strip()[:limit]

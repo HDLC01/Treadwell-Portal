@@ -269,6 +269,42 @@ def _cta(url: str, label: str) -> str:
             f'{label}</a></p>')
 
 
+# Stands in for {link} while an edited body is escaped, so the anchor markup is added AFTER the
+# escaping rather than being mangled by it.
+#
+# Wrapped in control characters rather than being a word like TWLINK, which somebody could type
+# and have silently turned into a link they never asked for. `_clean_text` strips control
+# characters from every stored body, so this cannot appear in a saved template at all. It exists
+# only in memory, between render and escape. Written as escapes, never as raw bytes in source.
+_LINK_MARK = "\u0001TWLINK\u0001"
+
+
+def _inline_link(url: str, label: str) -> str:
+    """A link inside a sentence. Not the button.
+
+    A big red block button dropped mid-paragraph reads as a mistake, so an inline mention gets an
+    ordinary underlined link in the brand colour instead. Both routes end up clickable, which is
+    the part that matters."""
+    return (f'<a href="{url}" style="color:{_BRAND_RED};font-weight:600">{label}</a>')
+
+
+def _block_html(block: str, url: str, label: str) -> str:
+    """One blank-line-separated block of an edited body, as email HTML.
+
+    Escape first, then place the link, so a `{link}` written into a sentence produces a real
+    anchor instead of escaped source text. A block that is ONLY the link keeps the branded button;
+    anywhere else it becomes an inline link.
+    """
+    if block.lstrip().startswith("<"):
+        return block                                   # already-built markup (the shipped bodies)
+    if block.strip() == _LINK_MARK:
+        return _cta(url, label)
+    html = _esc(block).replace("\n", "<br>")
+    if _LINK_MARK in html:
+        html = html.replace(_LINK_MARK, _inline_link(url, label))
+    return f"<p>{html}</p>"
+
+
 def send_followup(email: str, url: str, project_name: str, template: str, *,
                   name: str = "", deposit_required: bool = True,
                   reply_to: str | None = None, token: str | None = None,
@@ -288,18 +324,24 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
     # well-worded email, and "as shipped" is a better failure mode than a blank body.
     saved = (templates or {}).get(template) if isinstance(templates, dict) else None
     if isinstance(saved, dict) and saved.get("body"):
+        # The link is rendered as a MARKER first, and turned into markup per block below.
+        #
+        # It used to be substituted as finished HTML before the escape pass, which worked only
+        # while `{link}` sat alone on its own line. Written into a sentence — "just click {link}
+        # when you get a moment" — the block no longer began with "<", so the whole thing went
+        # through _esc and the customer received the anchor tag as visible source text with
+        # nothing clickable in the email at all. The editor inserts the token at the caret, so
+        # mid-sentence is exactly what its own UI invites.
+        label = saved.get("cta") or "View your proposal"
         rendered = followup_settings.render(
             saved,
             first_name=_first_name(name) or "there",
             project=project_name,
             need=need,
-            link_html=_cta(url, saved.get("cta") or "View your proposal"),
+            link_html=_LINK_MARK,
         )
         body_html = "".join(
-            # The stored body is plain text by design (no HTML can reach a customer email), so
-            # blank-line-separated blocks become paragraphs and the CTA passes through as the
-            # markup it already is.
-            block if block.lstrip().startswith("<") else f'<p>{_esc(block)}</p>'
+            _block_html(block, url, label)
             for block in [b.strip() for b in rendered["body"].split("\n\n")] if block
         )
         if include_status_ask and token:

@@ -1689,12 +1689,30 @@ def admin_get_followup_settings(request: Request) -> JSONResponse:
     normal state on any environment where the DDL has not been applied yet."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    # Two reads, two separate guards, because they carry different weight.
+    #
+    # `get_settings` is material: this editor REPLACES the whole row, so if a failed read were
+    # reported as "nothing saved", the page would show the shipped defaults, say "never changed",
+    # and the next Save would overwrite four hand-written customer emails with boilerplate —
+    # attributed to whoever pressed the button. A missing table is the one failure that really
+    # does mean "as shipped" (prod cannot apply its own DDL), and `get_settings` returns None for
+    # that case alone; anything else raises and is reported as unreadable so the editor can refuse
+    # to write over what it cannot see.
+    #
+    # `settings_meta` is only the "who last changed this" caption. It used to share this try, so a
+    # blip on a decorative query threw away a config that had been read perfectly well.
+    stored, read_failed = None, False
     try:
         stored = db.get_settings(followup_settings.ROW_ID)
-        meta = db.settings_meta(followup_settings.ROW_ID)
-    except Exception as exc:  # noqa: BLE001 — the table may not exist yet
-        log.warning("[settings] could not read follow-up settings: %s", exc)
-        stored, meta = None, {}
+    except Exception as exc:  # noqa: BLE001
+        log.error("[settings] could not read follow-up settings: %s", exc)
+        read_failed = True
+    meta = {}
+    if not read_failed:
+        try:
+            meta = db.settings_meta(followup_settings.ROW_ID)
+        except Exception as exc:  # noqa: BLE001 — the caption is not worth failing a page over
+            log.warning("[settings] could not read the audit line: %s", exc)
     cfg = followup_settings.merge(stored)
     return _json({
         "ok": True,
@@ -1702,6 +1720,10 @@ def admin_get_followup_settings(request: Request) -> JSONResponse:
         # `saved` tells the editor whether it is showing somebody's choices or the shipped
         # defaults — without it a fresh install looks identical to an edited one.
         "saved": stored is not None,
+        # Set when we could not read the row at all. The editor must then neither claim the
+        # cadence has never been changed nor allow a save, because it does not know what it
+        # would be replacing.
+        "read_failed": read_failed,
         "updated_at": _iso(meta.get("updated_at")),
         "updated_by": meta.get("updated_by") or "",
         "previews": {k: followup_settings.preview(cfg, k)

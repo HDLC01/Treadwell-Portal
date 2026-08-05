@@ -123,3 +123,57 @@ def test_note_and_message_are_html_escaped(monkeypatch):
                         note="<script>alert(1)</script>")
     assert "<script>" not in box["html"]
     assert "&lt;script&gt;" in box["html"]
+
+
+# ── an edited follow-up body: where the {link} ends up ─────────────────────────
+# Found by an adversarial audit of the editable-cadence batch, not by the 108 tests over it.
+# The link was substituted as finished HTML BEFORE the escape pass, so it survived only while
+# {link} sat alone on its own line. Written into a sentence, the block no longer started with "<",
+# went through html.escape, and the customer received the anchor tag as visible source text with
+# nothing clickable anywhere in the email. The editor inserts the token at the caret, so
+# mid-sentence is precisely what its own UI invites.
+def _followup(monkeypatch, body, cta="View your proposal"):
+    box = _capture(monkeypatch)
+    es.send_followup("c@x.com", "https://portal.example/p/tok", "Westport Retail Center",
+                     "checkin", name="Dave Brown",
+                     templates={"checkin": {"subject": "Checking in on {project}",
+                                            "title": "Checking in",
+                                            "body": body, "cta": cta}})
+    return box["html"]
+
+
+def test_link_on_its_own_line_is_the_branded_button(monkeypatch):
+    html = _followup(monkeypatch, "Hi {first_name},\n\nStill open.\n\n{link}")
+    assert 'href="https://portal.example/p/tok"' in html
+    assert es._BRAND_RED in html, "the button lost its brand colour"
+    assert "padding:12px 20px" in html, "this is not the button, it is an inline link"
+
+
+def test_link_inside_a_sentence_is_a_real_link_not_escaped_source(monkeypatch):
+    html = _followup(monkeypatch, "Hi {first_name},\n\nJust click {link} when you get a moment.")
+    assert 'href="https://portal.example/p/tok"' in html, (
+        "the customer received an email with NOTHING clickable in it")
+    assert "&lt;a href" not in html, "the anchor tag was escaped and shown as visible text"
+    assert "Just click" in html and "when you get a moment" in html
+    # Mid-sentence it must be an inline link, because a block button dropped into a paragraph
+    # reads as a mistake.
+    assert "padding:12px 20px" not in html
+
+
+def test_a_link_marker_cannot_be_typed_into_a_body(monkeypatch):
+    """The marker is a control character precisely so a body cannot contain one. A word-shaped
+    marker would let somebody's text become a link they never asked for."""
+    import followup_settings as fs
+    assert any(ord(c) < 32 for c in es._LINK_MARK), "the marker is typeable"
+    cleaned = fs.validate({"templates": {"checkin": {
+        "body": "Hi" + es._LINK_MARK + "there {link}"}}})["templates"]["checkin"]["body"]
+    assert es._LINK_MARK not in cleaned, "a stored body kept the marker"
+
+
+def test_the_shipped_wording_still_sends_the_button(monkeypatch):
+    """No templates argument at all: the hardcoded fallback path must be untouched."""
+    box = _capture(monkeypatch)
+    es.send_followup("c@x.com", "https://portal.example/p/tok", "Westport", "not_viewed",
+                     name="Dave")
+    assert 'href="https://portal.example/p/tok"' in box["html"]
+    assert "padding:12px 20px" in box["html"]

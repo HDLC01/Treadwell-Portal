@@ -140,13 +140,21 @@ def test_the_pipeline_query_actually_selects_the_click_columns(monkeypatch):
     staging and noticing the field was present in the JSON and always empty.
 
     A dict key and a SELECT list are two separate places that have to agree, so both get
-    asserted."""
+    asserted.
+
+    Asserts the column is FETCHED and aliased, not the syntax used to fetch it. The original
+    version required the literal `p.link_clicked_at`, which is exactly what a later fix had to
+    stop doing: naming a column prod does not have yet 500s the only pipeline query and takes the
+    whole staff board down until an owner runs the ALTER. Pinning the spelling would have made
+    that fix look like a regression."""
     seen = {}
     monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
     db.list_all_portal_proposals()
     sql = " ".join(seen["sql"].split())
-    assert "p.link_clicked_at" in sql, "the query does not fetch link_clicked_at"
-    assert "p.last_link_clicked_at" in sql, "the query does not fetch last_link_clicked_at"
+    for col in ("link_clicked_at", "last_link_clicked_at"):
+        assert col in sql, "the query does not fetch %s at all" % col
+        assert "as %s" % col in sql or "p.%s" % col in sql, (
+            "%s is mentioned but never lands under that name, so r.get() reads null forever" % col)
 
 
 def test_the_columns_exist_in_the_schema():

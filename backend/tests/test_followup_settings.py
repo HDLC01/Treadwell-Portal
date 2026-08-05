@@ -640,3 +640,113 @@ def test_the_endpoints_require_the_service_token(monkeypatch):
     assert client.get("/api/admin/settings/followups").status_code == 401
     assert client.put("/api/admin/settings/followups", json={}).status_code == 401
     assert client.post("/api/admin/settings/followups/preview", json={}).status_code == 401
+
+
+# ── a read that FAILED is not a read that came back empty ──────────────────────
+# The worst finding of the audit over this batch. The GET collapsed every failure of get_settings
+# to stored=None, returned 200 with saved:false, and the editor then showed the shipped defaults
+# under the words "Never changed". One press of Save replaced the real row - five intervals, the
+# send window and the hand-written wording of all four customer emails - with boilerplate, on a
+# single-row table with no history, attributed to whoever pressed the button.
+class _Undefined(Exception):
+    sqlstate = "42P01"                    # undefined_table
+
+
+def test_a_missing_table_still_means_as_shipped(monkeypatch):
+    """The one failure that really does mean "nothing is configured": prod cannot apply its own
+    DDL, so code arrives before the table and the cadence must keep working."""
+    monkeypatch.setattr(db, "q1", lambda *a, **k: (_ for _ in ()).throw(_Undefined("no relation")))
+    assert db.get_settings("followups") is None
+
+
+def test_any_other_read_failure_is_reported_not_swallowed(monkeypatch):
+    """Because the caller will offer to OVERWRITE the row it could not read."""
+    monkeypatch.setattr(db, "q1",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("connection reset")))
+    with pytest.raises(db.SettingsUnreadable):
+        db.get_settings("followups")
+
+
+def test_missing_table_is_told_apart_from_a_real_failure():
+    assert db._is_missing_table(_Undefined("relation does not exist")) is True
+    assert db._is_missing_table(RuntimeError('relation "portal_settings" does not exist')) is True
+    assert db._is_missing_table(RuntimeError("connection reset by peer")) is False
+    assert db._is_missing_table(TimeoutError()) is False
+
+
+def test_a_wrapped_missing_table_is_still_recognised():
+    """The pool can re-raise, so the sqlstate may be one level down."""
+    outer = RuntimeError("query failed")
+    outer.__cause__ = _Undefined("nope")
+    assert db._is_missing_table(outer) is True
+
+
+def test_get_reports_an_unreadable_row_instead_of_calling_it_never_configured(monkeypatch):
+    def boom(_k):
+        raise db.SettingsUnreadable("connection reset")
+    monkeypatch.setattr(portal_main.db, "get_settings", boom)
+    monkeypatch.setattr(portal_main.db, "settings_meta", lambda k: {})
+    j = client.get("/api/admin/settings/followups").json()
+    assert j["ok"] is True, "the page must still render, with the defaults, to say what happened"
+    assert j["read_failed"] is True, (
+        "a failed read looks identical to an empty one, so the editor will offer to overwrite it")
+    assert j["saved"] is False
+
+
+def test_a_missing_table_is_not_reported_as_a_failed_read(monkeypatch):
+    """Otherwise every environment awaiting its DDL shows a scary warning and a dead Save."""
+    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: None)
+    monkeypatch.setattr(portal_main.db, "settings_meta", lambda k: {})
+    j = client.get("/api/admin/settings/followups").json()
+    assert j["read_failed"] is False and j["saved"] is False
+
+
+def test_a_blip_on_the_decorative_caption_does_not_discard_the_config(monkeypatch):
+    """settings_meta only feeds "who last changed this". It used to share the try with the real
+    read, so a failure on the caption threw away a config that had been read perfectly well."""
+    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: {"recurring_hours": 120})
+    monkeypatch.setattr(portal_main.db, "settings_meta",
+                        lambda k: (_ for _ in ()).throw(RuntimeError("statement timeout")))
+    j = client.get("/api/admin/settings/followups").json()
+    assert j["settings"]["recurring_hours"] == 120, "a saved cadence was thrown away"
+    assert j["saved"] is True
+    assert j["read_failed"] is False
+
+
+def test_the_worker_keeps_sending_when_the_settings_read_fails(monkeypatch):
+    """Falling back to the shipped cadence is right for the WORKER - stopping the chase would be
+    worse than chasing on the old schedule. Only the editor must refuse to act."""
+    monkeypatch.setattr(W.db, "get_settings",
+                        lambda k: (_ for _ in ()).throw(db.SettingsUnreadable("reset")))
+    cfg = W._settings()
+    assert cfg["recurring_hours"] == fs.DEFAULTS["recurring_hours"]
+
+
+def test_the_pipeline_reads_the_new_columns_so_a_pre_DDL_prod_survives():
+    """The audit's worst finding, and nothing tested this query.
+
+    `list_all_portal_proposals` is the ONLY pipeline query. Naming a column prod does not have yet
+    makes psycopg raise UndefinedColumn, which 500s /api/admin/pipeline, which the tool turns into
+    a 502 on both the CRM board and the Follow-ups page — with an error that blames portal
+    reachability, so somebody goes looking at nginx over one missing ALTER. Prod cannot apply its
+    own DDL, so the code genuinely does arrive first.
+
+    A jsonb key lookup returns NULL for an absent key instead, and starts working the moment the
+    column lands. Verified against the prod database before relying on it."""
+    seen = {}
+    import db as real_db
+    orig = real_db.qall
+    try:
+        real_db.qall = lambda sql, params=(): seen.setdefault("sql", " ".join(sql.split())) and []
+        real_db.list_all_portal_proposals()
+    finally:
+        real_db.qall = orig
+    sql = seen["sql"]
+    for col in ("link_clicked_at", "last_link_clicked_at"):
+        assert "p.%s" % col not in sql, (
+            "%s is named directly; a prod that has not had the ALTER applied will 500 the whole "
+            "staff board on this one query" % col)
+        assert "to_jsonb(p) ->> '%s'" % col in sql, "%s is not read at all any more" % col
+    # The columns that have always existed stay direct — the indirection is only for the new ones,
+    # and turning the whole select into jsonb lookups would hide a genuine typo.
+    assert "p.proposal_status" in sql and "p.viewed_at" in sql
