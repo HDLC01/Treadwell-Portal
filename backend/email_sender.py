@@ -11,6 +11,7 @@ import logging
 import httpx
 
 import config
+import followup_settings
 
 log = logging.getLogger("portal.email")
 
@@ -271,14 +272,40 @@ def _cta(url: str, label: str) -> str:
 def send_followup(email: str, url: str, project_name: str, template: str, *,
                   name: str = "", deposit_required: bool = True,
                   reply_to: str | None = None, token: str | None = None,
-                  include_status_ask: bool = False) -> bool:
-    """One automated follow-up. `template` comes from followup_rules.Due.
+                  include_status_ask: bool = False,
+                  templates: dict | None = None) -> bool:
+    """One automated follow-up. `template` names which of the four; `templates` is the wording
+    staff have saved (followup_settings), and None means use the wording as shipped.
 
     The deposit sentence is conditional: promising "signed proposal and deposit" on a
     job sent without a deposit requirement would be wrong, and GC work usually is."""
     greeting = f'<p>Hi {_esc(_first_name(name) or "there")},</p>' if name else ""
     need = ("your signed approval and the deposit" if deposit_required
             else "your signed approval")
+
+    # Saved wording wins when there is any. The hardcoded versions below stay as the fallback
+    # rather than being deleted: an absent, partial or hand-broken settings row must still send a
+    # well-worded email, and "as shipped" is a better failure mode than a blank body.
+    saved = (templates or {}).get(template) if isinstance(templates, dict) else None
+    if isinstance(saved, dict) and saved.get("body"):
+        rendered = followup_settings.render(
+            saved,
+            first_name=_first_name(name) or "there",
+            project=project_name,
+            need=need,
+            link_html=_cta(url, saved.get("cta") or "View your proposal"),
+        )
+        body_html = "".join(
+            # The stored body is plain text by design (no HTML can reach a customer email), so
+            # blank-line-separated blocks become paragraphs and the CTA passes through as the
+            # markup it already is.
+            block if block.lstrip().startswith("<") else f'<p>{_esc(block)}</p>'
+            for block in [b.strip() for b in rendered["body"].split("\n\n")] if block
+        )
+        if include_status_ask and token:
+            body_html += _status_ask_html(token)
+        return _send([email], rendered["subject"], _wrap(rendered["title"], body_html),
+                     _thread_headers(email, token), reply_to=reply_to)
 
     if template == "not_viewed":
         subject = f"Your Treadwell proposal for {project_name} is ready when you are"

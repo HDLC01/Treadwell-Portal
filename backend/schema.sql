@@ -405,3 +405,23 @@ create unique index if not exists portal_followups_rule_uidx
   on public.portal_followups (proposal_id, (detail->>'rule_key'))
   where kind = 'auto_email' and (detail->>'rule_key') is not null;
 alter table public.portal_followups enable row level security;
+
+-- ── Settings ──────────────────────────────────────────────────────────────
+-- Key/value JSON, one row per area of the app. Currently one row: 'followups', holding the
+-- chase cadence and the wording of the four automated emails (see followup_settings.py).
+--
+-- A TABLE rather than environment variables because these are edited by staff in the tool, and
+-- an env var needs a redeploy and a person with SSH. Key/value rather than a column per setting
+-- because the cadence will grow another knob and an ALTER on every one of them is how a settings
+-- table becomes something nobody wants to touch.
+--
+-- Deliberately NOT seeded. followup_settings.merge() lays stored values over the shipped
+-- defaults, so an absent row means "the cadence as shipped" and the worker keeps sending exactly
+-- as it did before this table existed. That is what makes the DDL safe to apply after the code.
+create table if not exists public.portal_settings (
+  id          text primary key,
+  value       jsonb not null default '{}'::jsonb,
+  updated_at  timestamptz not null default now(),
+  updated_by  text
+);
+alter table public.portal_settings enable row level security;

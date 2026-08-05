@@ -55,6 +55,49 @@ STAFF_PERSONAL = timedelta(hours=48)   # viewed but still pending
 MAX_RECURRING = 20
 
 
+# ── the cadence as data ───────────────────────────────────────────────────────
+# The constants above are the SHIPPED cadence and remain the defaults. Staff can now edit the
+# intervals (followup_settings.py), so every function that uses them takes an optional `cfg`.
+#
+# Optional, rather than required, on purpose: `cfg=None` resolves to exactly the constants, so
+# every existing caller and all 24 rule tests behave as they did. The alternative — module-level
+# mutable config set once per tick — would have made those tests order-dependent and broken this
+# module's "pure functions, no I/O" contract, which is what makes the cadence testable at all.
+class _Cadence:
+    """The seven numbers this module needs, resolved once per call."""
+
+    __slots__ = ("first", "second", "recurring", "staff_personal", "max_recurring",
+                 "start_hour", "end_hour")
+
+    def __init__(self, cfg: Optional[dict] = None):
+        c = cfg or {}
+
+        def hours(key: str, fallback: timedelta) -> timedelta:
+            v = c.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                return fallback
+            return timedelta(hours=float(v))
+
+        def whole(key: str, fallback: int, lo: int, hi: int) -> int:
+            v = c.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return fallback
+            return max(lo, min(hi, int(v)))
+
+        self.first = hours("first_nudge_hours", FIRST_NUDGE)
+        self.second = hours("second_nudge_hours", SECOND_NUDGE)
+        self.recurring = hours("recurring_hours", RECURRING)
+        self.staff_personal = hours("staff_personal_hours", STAFF_PERSONAL)
+        self.max_recurring = whole("max_recurring", MAX_RECURRING, 1, 200)
+        self.start_hour = whole("send_start_hour", SEND_START_HOUR, 0, 23)
+        self.end_hour = whole("send_end_hour", SEND_END_HOUR, 1, 24)
+        # A window that ends before it opens would silence every customer email. Settings
+        # validation already prevents it; this is the second line of defence, because a
+        # hand-edited settings row reaches this code without passing through that validation.
+        if self.end_hour <= self.start_hour:
+            self.start_hour, self.end_hour = SEND_START_HOUR, SEND_END_HOUR
+
+
 @dataclass(frozen=True)
 class Due:
     rule_key: str          # dedupe identity: unique per proposal per occurrence
@@ -68,9 +111,10 @@ def cycle_key(enrolled_at: datetime) -> str:
     return "c%d" % int(enrolled_at.timestamp())
 
 
-def in_send_window(now: datetime) -> bool:
+def in_send_window(now: datetime, cfg: Optional[dict] = None) -> bool:
     """Is it a civil hour to email a customer, in Treadwell's timezone?"""
-    return SEND_START_HOUR <= now.astimezone(BUSINESS_TZ).hour < SEND_END_HOUR
+    c = _Cadence(cfg)
+    return c.start_hour <= now.astimezone(BUSINESS_TZ).hour < c.end_hour
 
 
 def business_today(now: datetime) -> date:
@@ -125,14 +169,16 @@ def is_paused(p: dict, now: datetime) -> bool:
     return bool(until and business_today(now) <= until)
 
 
-def _recurring_index(elapsed: timedelta, first: timedelta) -> int:
+def _recurring_index(elapsed: timedelta, first: timedelta,
+                     c: Optional["_Cadence"] = None) -> int:
     """How many recurring steps have matured past `first`. 0 = none yet."""
-    if elapsed < first + RECURRING:
+    c = c or _Cadence()
+    if elapsed < first + c.recurring:
         return 0
-    return min(MAX_RECURRING, int((elapsed - first) // RECURRING))
+    return min(c.max_recurring, int((elapsed - first) // c.recurring))
 
 
-def next_due_at(p: dict, now: datetime) -> Optional[datetime]:
+def next_due_at(p: dict, now: datetime, cfg: Optional[dict] = None) -> Optional[datetime]:
     """When the next CUSTOMER reminder is due, or None if none ever will be.
 
     Read-only companion to `due_now` for the Follow-ups page, which needs to say "next
@@ -146,6 +192,7 @@ def next_due_at(p: dict, now: datetime) -> Optional[datetime]:
     the window delays an email by hours, and rounding a date forward for it would make
     the column disagree with itself overnight.
     """
+    c = _Cadence(cfg)
     enrolled = _aware(p.get("followup_enrolled_at"))
     if not enrolled or p.get("followup_disabled_at"):
         return None                                     # not automated
@@ -156,29 +203,30 @@ def next_due_at(p: dict, now: datetime) -> Optional[datetime]:
     if until and business_today(now) <= until:
         # Paused. The cadence resumes the morning after the customer's window closes.
         return datetime(until.year, until.month, until.day,
-                        SEND_START_HOUR, tzinfo=BUSINESS_TZ) + timedelta(days=1)
+                        c.start_hour, tzinfo=BUSINESS_TZ) + timedelta(days=1)
 
     viewed = _aware(p.get("cycle_viewed_at"))
     anchor = viewed or enrolled
-    first = FIRST_NUDGE if viewed is None else SECOND_NUDGE
+    first = c.first if viewed is None else c.second
     elapsed = now - anchor
 
-    if elapsed < FIRST_NUDGE:
-        return anchor + FIRST_NUDGE                     # the first one hasn't matured
-    if viewed is not None and elapsed < SECOND_NUDGE:
-        return anchor + SECOND_NUDGE                    # viewed: 24h one is done, 72h next
+    if elapsed < c.first:
+        return anchor + c.first                         # the first one hasn't matured
+    if viewed is not None and elapsed < c.second:
+        return anchor + c.second                        # viewed: first one done, second next
 
     # Into the recurring stage. `_recurring_index` is what due_now uses to decide which
     # occurrence has matured, so the next one is simply the step after it — capped, so a
     # proposal that has exhausted MAX_RECURRING correctly reports "no more".
-    n = _recurring_index(elapsed, first)
-    if n >= MAX_RECURRING:
+    n = _recurring_index(elapsed, first, c)
+    if n >= c.max_recurring:
         return None
-    return anchor + first + RECURRING * (n + 1)
+    return anchor + first + c.recurring * (n + 1)
 
 
-def due_now(p: dict, now: datetime) -> list[Due]:
+def due_now(p: dict, now: datetime, cfg: Optional[dict] = None) -> list[Due]:
     """The rules that have matured for this proposal, at most one per audience."""
+    c = _Cadence(cfg)
     enrolled = _aware(p.get("followup_enrolled_at"))
     if not enrolled or p.get("followup_disabled_at"):
         return []
@@ -201,8 +249,8 @@ def due_now(p: dict, now: datetime) -> list[Due]:
 
     if viewed is None:
         elapsed = now - enrolled
-        if elapsed >= FIRST_NUDGE:
-            n = _recurring_index(elapsed, FIRST_NUDGE)
+        if elapsed >= c.first:
+            n = _recurring_index(elapsed, c.first, c)
             if n:
                 # Still unopened days later. This is exactly the proposal that needs
                 # the "delayed / not moving forward" escape hatch offered.
@@ -212,17 +260,17 @@ def due_now(p: dict, now: datetime) -> list[Due]:
             out.append(Due("%s:nv1_staff" % ck, "staff", "staff_not_viewed"))
     else:
         elapsed = now - viewed
-        n = _recurring_index(elapsed, SECOND_NUDGE)
+        n = _recurring_index(elapsed, c.second, c)
         if n:
             out.append(Due("%s:vr%d" % (ck, n), "customer", "checkin", True))
-        elif elapsed >= SECOND_NUDGE:
+        elif elapsed >= c.second:
             out.append(Due("%s:v2" % ck, "customer", "second_nudge"))
-        elif elapsed >= FIRST_NUDGE:
+        elif elapsed >= c.first:
             out.append(Due("%s:v1" % ck, "customer", "next_steps"))
-        if elapsed >= STAFF_PERSONAL:
+        if elapsed >= c.staff_personal:
             out.append(Due("%s:v48_staff" % ck, "staff", "staff_personal_followup"))
 
     # Latest-only, per audience: never send two customer emails in one tick.
-    if not in_send_window(now):
+    if not in_send_window(now, cfg):
         out = [d for d in out if d.audience != "customer"]
     return out

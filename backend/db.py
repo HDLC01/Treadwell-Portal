@@ -390,6 +390,42 @@ def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     )
 
 
+def get_settings(key: str) -> Optional[dict[str, Any]]:
+    """One settings row's value, or None when it has never been saved.
+
+    None is a normal answer, not an error: `followup_settings.merge()` lays stored values over the
+    shipped defaults, so an absent row means "the cadence as shipped". That is what lets the code
+    deploy before the DDL is applied — the worker keeps sending exactly as it did before.
+    """
+    row = q1("select value from public.portal_settings where id=%s", (key,))
+    if not row:
+        return None
+    val = row.get("value")
+    return val if isinstance(val, dict) else None
+
+
+def save_settings(key: str, value: dict[str, Any], by: Optional[str] = None) -> None:
+    """Upsert one settings row.
+
+    `updated_by` is recorded because these settings send email to CUSTOMERS: when somebody asks
+    why the wording changed, "who and when" has to be answerable without reading a git log that
+    contains nothing about it.
+    """
+    execute(
+        "insert into public.portal_settings (id, value, updated_at, updated_by) "
+        "values (%s, %s, now(), %s) "
+        "on conflict (id) do update set value = excluded.value, "
+        "  updated_at = now(), updated_by = excluded.updated_by",
+        (key, Jsonb(value), by),
+    )
+
+
+def settings_meta(key: str) -> dict[str, Any]:
+    """Who last changed this, and when — for the editor to show above the form."""
+    row = q1("select updated_at, updated_by from public.portal_settings where id=%s", (key,))
+    return row or {}
+
+
 def latest_approval(proposal_id: str) -> Optional[dict[str, Any]]:
     return q1(
         "select name, title, approved_date, total, option_label, options, signed_at, approver_email "

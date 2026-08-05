@@ -28,6 +28,7 @@ import config
 import db
 import email_sender
 import followup_rules as rules
+import followup_settings
 
 log = logging.getLogger("portal")
 
@@ -111,7 +112,20 @@ def _staff_recipients(p: dict) -> list[str]:
         return []
 
 
-def _send_customer(p: dict, due) -> bool:
+def _settings() -> dict:
+    """The cadence and wording staff have saved, laid over the shipped defaults.
+
+    Never raises. A settings table that does not exist yet, or a database blip, must not stop the
+    cadence — it falls back to the cadence as shipped, which is what every environment ran before
+    these settings existed. That is also what lets this code deploy before the DDL is applied."""
+    try:
+        return followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not read settings (%s) - using the shipped cadence", exc)
+        return followup_settings.defaults()
+
+
+def _send_customer(p: dict, due, templates: dict | None = None) -> bool:
     token = p.get("token")
     url = f"{config.PUBLIC_BASE_URL}/p/{token}"
     reply_to = email_sender.proposal_reply_to(token)
@@ -121,7 +135,7 @@ def _send_customer(p: dict, due) -> bool:
     for i, addr in enumerate(_customer_recipients(p)):
         try:
             sent = email_sender.send_followup(
-                addr, url, project, due.template,
+                addr, url, project, due.template, templates=templates,
                 # Only the primary gets the first-name greeting, matching publish.
                 name=name if i == 0 else "",
                 deposit_required=p.get("deposit_required") is not False,
@@ -183,6 +197,10 @@ def _tick(now: datetime | None = None) -> None:
     if not _enabled():
         return
     now = now or datetime.now(timezone.utc)
+    # One read per tick, so every proposal in this pass is judged by the same cadence. Reading it
+    # per row would let an edit landing mid-tick apply to half the candidates and not the rest,
+    # which is the kind of inconsistency nobody would ever reproduce.
+    cfg = _settings()
     try:
         candidates = db.list_followup_candidates()
     except Exception as exc:  # noqa: BLE001
@@ -199,14 +217,14 @@ def _tick(now: datetime | None = None) -> None:
             if fresh.get("followup_disabled_at") or \
                     (fresh.get("proposal_status") or "") not in ("sent", "viewed"):
                 continue
-            for due in rules.due_now(fresh, now):
+            for due in rules.due_now(fresh, now, cfg):
                 rid = db.reserve_followup(pid, due.rule_key, {
                     "audience": due.audience, "template": due.template,
                 })
                 if rid is None:
                     continue        # already sent — a prior tick, or the twin container
-                ok = _send_customer(fresh, due) if due.audience == "customer" \
-                    else _send_staff(fresh, due)
+                ok = _send_customer(fresh, due, (cfg or {}).get("templates")) \
+                    if due.audience == "customer" else _send_staff(fresh, due)
                 if not ok:
                     # Nothing went out, so release the claim and let the next tick try.
                     # A systemic outage therefore retries at tick cadence rather than

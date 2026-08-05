@@ -30,6 +30,7 @@ import customer_auth as ca
 import db
 import email_sender
 import followup_rules
+import followup_settings
 import followup_worker
 import inbound
 import invoice
@@ -1674,6 +1675,87 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
 _STAFF_FOLLOWUP_KINDS = ("staff_call", "staff_email", "staff_text", "staff_note")
 _LOST_REASONS = ("price", "another_contractor", "canceled", "scope_changed", "timing", "other")
 _PAUSE_MONTHS = (1, 2, 3, 4)
+
+
+# ── the follow-up cadence, as settings ────────────────────────────────────────
+# Hanz asked for the chase schedule AND the four customer emails to be editable rather than
+# constants in the code. One global cadence, editable by any signed-in staff member (the tool's
+# own sign-in is the gate; this endpoint sees only the service token).
+@app.get("/api/admin/settings/followups")
+def admin_get_followup_settings(request: Request) -> JSONResponse:
+    """The current cadence, plus a preview of each email as a customer would receive it.
+
+    Always returns a usable cadence: an absent settings row means "as shipped", which is the
+    normal state on any environment where the DDL has not been applied yet."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    try:
+        stored = db.get_settings(followup_settings.ROW_ID)
+        meta = db.settings_meta(followup_settings.ROW_ID)
+    except Exception as exc:  # noqa: BLE001 — the table may not exist yet
+        log.warning("[settings] could not read follow-up settings: %s", exc)
+        stored, meta = None, {}
+    cfg = followup_settings.merge(stored)
+    return _json({
+        "ok": True,
+        "settings": cfg,
+        # `saved` tells the editor whether it is showing somebody's choices or the shipped
+        # defaults — without it a fresh install looks identical to an edited one.
+        "saved": stored is not None,
+        "updated_at": _iso(meta.get("updated_at")),
+        "updated_by": meta.get("updated_by") or "",
+        "previews": {k: followup_settings.preview(cfg, k)
+                     for k in followup_settings.TEMPLATE_KEYS},
+        "tokens": list(followup_settings.TOKENS),
+    })
+
+
+@app.put("/api/admin/settings/followups")
+async def admin_put_followup_settings(request: Request) -> JSONResponse:
+    """Save the cadence. Returns what was actually stored, including any clamping.
+
+    Returning the stored values rather than an empty ok is deliberate: numbers get pulled into
+    range on the way in, and somebody who typed 2 hours needs to see that they got 4 rather than
+    believe their edit took."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    try:
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+    except followup_settings.ValidationError as exc:
+        return _json({"ok": False, "error": str(exc)}, 400)
+    by = _cap(body.get("by"), 120) or None
+    try:
+        db.save_settings(followup_settings.ROW_ID, cfg, by)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[settings] could not save follow-up settings: %s", exc)
+        return _json({"ok": False, "error": "Couldn't save that — the settings table may be "
+                                            "missing on this environment."}, 500)
+    return _json({
+        "ok": True,
+        "settings": cfg,
+        "previews": {k: followup_settings.preview(cfg, k)
+                     for k in followup_settings.TEMPLATE_KEYS},
+    })
+
+
+@app.post("/api/admin/settings/followups/preview")
+async def admin_preview_followup_settings(request: Request) -> JSONResponse:
+    """Render the wording being typed, WITHOUT saving it.
+
+    The whole safety net for editable email: an unfilled token or a deleted button is obvious in a
+    preview and invisible in a form. Validation errors come back as 400 with the reason, so the
+    editor can show "this will not send" before anybody commits it."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    try:
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+    except followup_settings.ValidationError as exc:
+        return _json({"ok": False, "error": str(exc)}, 400)
+    return _json({"ok": True,
+                  "previews": {k: followup_settings.preview(cfg, k)
+                               for k in followup_settings.TEMPLATE_KEYS}})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/assign")
