@@ -245,6 +245,10 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # Per-stage timestamps so each board column can sort by its OWN date.
         "p.last_viewed_at, p.deposit_submitted_at, p.deposit_received_at, "
         "p.contacts_received_at, p.scheduled_at, "
+        # Whether the notification email's link was ever followed. Separate from the viewed_*
+        # columns on purpose (see mark_link_clicked): it says the email reached a mailbox, not
+        # that anybody read the bid, and the board renders it with that caveat.
+        "p.link_clicked_at, p.last_link_clicked_at, "
         # Follow-up automation state.
         "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
         "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "

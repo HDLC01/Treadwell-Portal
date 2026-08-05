@@ -131,6 +131,24 @@ def test_the_pipeline_row_carries_the_click_fields():
     assert '"last_link_clicked_at": _iso(r.get("last_link_clicked_at"))' in src
 
 
+def test_the_pipeline_query_actually_selects_the_click_columns(monkeypatch):
+    """Building the response dict from `r.get("link_clicked_at")` is not enough on its own.
+
+    This is the bug that shipped. The dict referenced the field and the test above passed, but
+    the SELECT list never fetched the column — so every row reported null, the staff board
+    silently never drew the hint, and nothing failed. Found only by clicking a real link on
+    staging and noticing the field was present in the JSON and always empty.
+
+    A dict key and a SELECT list are two separate places that have to agree, so both get
+    asserted."""
+    seen = {}
+    monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    db.list_all_portal_proposals()
+    sql = " ".join(seen["sql"].split())
+    assert "p.link_clicked_at" in sql, "the query does not fetch link_clicked_at"
+    assert "p.last_link_clicked_at" in sql, "the query does not fetch last_link_clicked_at"
+
+
 def test_the_columns_exist_in_the_schema():
     import pathlib
     sql = (pathlib.Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
