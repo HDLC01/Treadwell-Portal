@@ -404,20 +404,27 @@ def get_settings(key: str) -> Optional[dict[str, Any]]:
     return val if isinstance(val, dict) else None
 
 
-def save_settings(key: str, value: dict[str, Any], by: Optional[str] = None) -> None:
-    """Upsert one settings row.
+def save_settings(key: str, value: dict[str, Any], by: Optional[str] = None) -> dict[str, Any]:
+    """Upsert one settings row, and hand back the audit values it just wrote.
 
     `updated_by` is recorded because these settings send email to CUSTOMERS: when somebody asks
     why the wording changed, "who and when" has to be answerable without reading a git log that
     contains nothing about it.
+
+    `returning` rather than a second `settings_meta()` read: the editor shows that line straight
+    after saving, and a follow-up select would be one more round trip that can fail or hang on a
+    path that has already succeeded. The timestamp also has to be the one `now()` actually stored,
+    not a second reading taken a moment later.
     """
-    execute(
+    row = q1(
         "insert into public.portal_settings (id, value, updated_at, updated_by) "
         "values (%s, %s, now(), %s) "
         "on conflict (id) do update set value = excluded.value, "
-        "  updated_at = now(), updated_by = excluded.updated_by",
+        "  updated_at = now(), updated_by = excluded.updated_by "
+        "returning updated_at, updated_by",
         (key, Jsonb(value), by),
     )
+    return row or {}
 
 
 def settings_meta(key: str) -> dict[str, Any]:

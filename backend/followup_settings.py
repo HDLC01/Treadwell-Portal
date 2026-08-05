@@ -71,6 +71,22 @@ BOUNDS: Dict[str, tuple] = {
 TEMPLATE_KEYS = ("not_viewed", "next_steps", "second_nudge", "checkin")
 TOKENS = ("{first_name}", "{project}", "{need}", "{link}")
 
+# What each email is CALLED on screen. The keys are database identifiers, and a refusal that says
+# "the not viewed email needs {link}" makes somebody hunt for a tab with that name — there isn't
+# one. Naming lives here rather than in the page so the message and the tab cannot disagree; the
+# editor reads these off the GET response.
+LABELS: Dict[str, str] = {
+    "not_viewed": "Not opened yet",
+    "next_steps": "After they open it",
+    "second_nudge": "Second reminder",
+    "checkin": "Recurring check-in",
+}
+
+
+def label(key: str) -> str:
+    """The on-screen name of one email, for use in a message somebody has to act on."""
+    return LABELS.get(key, str(key).replace("_", " "))
+
 _MAX_SUBJECT = 200
 _MAX_TITLE = 120
 _MAX_BODY = 4000
@@ -182,8 +198,8 @@ def validate_template(key: str, raw: Any) -> Dict[str, str]:
     raw_body = _clean_text(src.get("body"), _MAX_BODY * 4)
     if len(raw_body) > _MAX_BODY:
         raise ValidationError(
-            "That %s email is %d characters — the limit is %d. Trim it rather than letting it be "
-            "cut off mid-sentence." % (key.replace("_", " "), len(raw_body), _MAX_BODY))
+            "The “%s” email is %d characters — the limit is %d. Trim it rather than "
+            "letting it be cut off mid-sentence." % (label(key), len(raw_body), _MAX_BODY))
     body = raw_body or base["body"]
 
     # The one hard rule. These emails exist to get somebody back to the proposal; without the
@@ -191,8 +207,8 @@ def validate_template(key: str, raw: Any) -> Dict[str, str]:
     # appending a button somebody deliberately deleted, so this one says no.
     if "{link}" not in body:
         raise ValidationError(
-            "The %s email needs {link} somewhere in the body — that is the button the customer "
-            "clicks to see the proposal." % key.replace("_", " "))
+            "The “%s” email needs {link} somewhere in the body — that is the button the "
+            "customer clicks to see the proposal." % label(key))
 
     unknown = set(re.findall(r"\{[a-z_]+\}", subject + " " + body)) - set(TOKENS)
     if unknown:

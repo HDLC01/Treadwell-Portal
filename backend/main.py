@@ -1707,6 +1707,9 @@ def admin_get_followup_settings(request: Request) -> JSONResponse:
         "previews": {k: followup_settings.preview(cfg, k)
                      for k in followup_settings.TEMPLATE_KEYS},
         "tokens": list(followup_settings.TOKENS),
+        # The editor labels its tabs from these, so a refusal that names an email ("the
+        # “Second reminder” email needs {link}") points at a tab that exists.
+        "labels": dict(followup_settings.LABELS),
     })
 
 
@@ -1726,14 +1729,20 @@ async def admin_put_followup_settings(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": str(exc)}, 400)
     by = _cap(body.get("by"), 120) or None
     try:
-        db.save_settings(followup_settings.ROW_ID, cfg, by)
+        meta = db.save_settings(followup_settings.ROW_ID, cfg, by) or {}
     except Exception as exc:  # noqa: BLE001
         log.error("[settings] could not save follow-up settings: %s", exc)
         return _json({"ok": False, "error": "Couldn't save that — the settings table may be "
                                             "missing on this environment."}, 500)
+    # The same audit fields the GET returns, carried back by the write itself. Without them the
+    # editor still read "never changed" underneath the edit it had just stored, until somebody
+    # reloaded — the one question that line exists to answer, answered wrongly.
     return _json({
         "ok": True,
         "settings": cfg,
+        "saved": True,
+        "updated_at": _iso(meta.get("updated_at")),
+        "updated_by": meta.get("updated_by") or by or "",
         "previews": {k: followup_settings.preview(cfg, k)
                      for k in followup_settings.TEMPLATE_KEYS},
     })

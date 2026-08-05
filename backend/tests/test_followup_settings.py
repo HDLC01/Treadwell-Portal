@@ -138,6 +138,35 @@ def test_a_template_without_the_link_is_refused():
     assert "{link}" in str(e.value)
 
 
+@pytest.mark.parametrize("key,label", list(fs.LABELS.items()))
+def test_a_refusal_names_the_email_the_way_the_screen_does(key, label):
+    """Read on staging: "The not viewed email needs {link}". That is a database key with the
+    underscore taken out, and there is no tab called that — the tabs read "Not opened yet",
+    "Recurring check-in". Somebody sent to fix the wrong one of four emails is worse off than
+    somebody sent to fix none of them."""
+    with pytest.raises(fs.ValidationError) as e:
+        fs.validate({"templates": {key: {"body": "No button here at all."}}})
+    msg = str(e.value)
+    assert label in msg, "the refusal does not name the tab the person is looking at"
+    assert key.replace("_", " ") not in msg or key == label, (
+        "the refusal still leaks the raw database key")
+
+
+def test_an_over_long_body_is_refused_by_its_screen_name_too():
+    """The other refusal a person has to act on. Same reasoning."""
+    with pytest.raises(fs.ValidationError) as e:
+        fs.validate({"templates": {"second_nudge": {"body": "x" * 4100 + " {link}"}}})
+    assert "Second reminder" in str(e.value)
+    assert "4000" in str(e.value), "the limit is not stated, so there is nothing to trim towards"
+
+
+def test_every_email_has_a_screen_name():
+    """A missing label would silently fall back to the raw key — the bug this fixes."""
+    assert set(fs.LABELS) == set(fs.TEMPLATE_KEYS)
+    assert all(fs.label(k) == fs.LABELS[k] for k in fs.TEMPLATE_KEYS)
+    assert "_" not in "".join(fs.LABELS.values())
+
+
 def test_an_unknown_placeholder_is_refused_with_the_list_of_real_ones():
     """A typo like {name} would reach a customer verbatim. The message names the alternatives so
     nobody has to guess."""
@@ -481,6 +510,80 @@ def test_put_saves_and_returns_what_was_actually_stored(monkeypatch):
     assert j["settings"]["recurring_hours"] == 4, "the clamp is not reflected back"
     assert saved["value"]["recurring_hours"] == 4, "the unclamped value was stored"
     assert saved["by"] == "hanz@wetreadwell.com"
+
+
+def test_put_returns_the_audit_line_so_the_editor_need_not_reload(monkeypatch):
+    """Found on staging. The save stored the edit and the page went on saying "Never changed —
+    this is the cadence as shipped" until somebody reloaded, because only the GET carried these
+    fields. The line exists to answer one question and was answering it wrongly at the one moment
+    anybody had reason to read it."""
+    monkeypatch.setattr(portal_main.db, "save_settings",
+                        lambda k, v, by=None: {"updated_at": NOW, "updated_by": by})
+    j = client.put("/api/admin/settings/followups",
+                   json={"settings": {}, "by": "kyle@wetreadwell.com"}).json()
+    assert j["saved"] is True
+    assert j["updated_by"] == "kyle@wetreadwell.com"
+    assert j["updated_at"], "no timestamp, so the editor cannot say when"
+
+
+def test_the_audit_line_comes_back_from_the_write_not_a_second_query(monkeypatch):
+    """One round trip. A follow-up select would be another chance to fail or hang on a path that
+    has already succeeded, and would read a timestamp taken slightly after the one stored."""
+    monkeypatch.setattr(portal_main.db, "save_settings",
+                        lambda k, v, by=None: {"updated_at": NOW, "updated_by": by})
+    monkeypatch.setattr(portal_main.db, "settings_meta",
+                        lambda k: pytest.fail("the save path re-read the audit row"))
+    r = client.put("/api/admin/settings/followups",
+                   json={"settings": {}, "by": "will@wetreadwell.com"})
+    assert r.status_code == 200 and r.json()["updated_by"] == "will@wetreadwell.com"
+
+
+def test_a_save_whose_audit_values_come_back_empty_still_reports_the_save(monkeypatch):
+    """The write succeeded. Going quiet about it, or failing the request, would tell somebody
+    their edit was lost when it was not."""
+    monkeypatch.setattr(portal_main.db, "save_settings", lambda k, v, by=None: {})
+    r = client.put("/api/admin/settings/followups",
+                   json={"settings": {}, "by": "will@wetreadwell.com"})
+    j = r.json()
+    assert r.status_code == 200 and j["ok"] is True and j["saved"] is True
+    assert j["updated_by"] == "will@wetreadwell.com", (
+        "with no audit values returned, fall back to who the request said it was")
+
+
+def test_the_upsert_asks_for_its_own_audit_values_back(monkeypatch):
+    """Every other test here replaces save_settings, so nothing exercised the statement itself —
+    a mutation removing the `returning` clause passed the whole suite. The endpoint's contract is
+    that the write hands back what it wrote; this is the only test that holds the write to it."""
+    seen = {}
+
+    def fake_q1(sql, params=()):
+        seen["sql"] = " ".join(sql.split())
+        seen["params"] = params
+        return {"updated_at": NOW, "updated_by": "kyle@wetreadwell.com"}
+
+    monkeypatch.setattr(portal_main.db, "q1", fake_q1)
+    got = portal_main.db.save_settings("followups", {"recurring_hours": 72}, "kyle@wetreadwell.com")
+
+    assert "returning updated_at, updated_by" in seen["sql"].lower(), (
+        "the write does not ask for the audit values, so the editor cannot show them")
+    assert "on conflict" in seen["sql"].lower(), "an upsert that would fail the second time"
+    assert got["updated_by"] == "kyle@wetreadwell.com", "the returned row is dropped on the floor"
+
+
+def test_a_write_that_returns_nothing_gives_back_a_dict_not_none(monkeypatch):
+    """The endpoint does `or {}`, but a None here would also break any future caller that reads
+    the result directly."""
+    monkeypatch.setattr(portal_main.db, "q1", lambda sql, params=(): None)
+    assert portal_main.db.save_settings("followups", {}, None) == {}
+
+
+def test_get_tells_the_editor_what_each_email_is_called(monkeypatch):
+    """So the tab labels and the refusal messages come from one place and cannot disagree."""
+    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: None)
+    monkeypatch.setattr(portal_main.db, "settings_meta", lambda k: {})
+    j = client.get("/api/admin/settings/followups").json()
+    assert j["labels"] == dict(fs.LABELS)
+    assert set(j["labels"]) == set(j["previews"]), "a preview with no name, or a name with none"
 
 
 def test_put_refuses_a_template_that_will_not_send(monkeypatch):
