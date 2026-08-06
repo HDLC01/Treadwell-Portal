@@ -425,3 +425,12 @@ create table if not exists public.portal_settings (
   updated_by  text
 );
 alter table public.portal_settings enable row level security;
+-- RLS on with no grant and no policy reads as "locked down" and is actually broken on PROD only.
+-- The portal connects there as portal_app, which is least-privilege and does not bypass RLS, so
+-- this table would have returned zero rows: the cadence editor would have shown the shipped
+-- defaults and refused every save, right after the DDL was applied. Staging never caught it
+-- because it connects as a broad role. Same pair as portal_proposals and portal_questions.
+grant select, insert, update, delete on public.portal_settings to portal_app;
+drop policy if exists portal_app_rw on public.portal_settings;
+create policy portal_app_rw on public.portal_settings
+  for all to portal_app using (true) with check (true);
