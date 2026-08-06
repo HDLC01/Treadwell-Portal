@@ -13,6 +13,17 @@ TZ = fr.BUSINESS_TZ
 ENROLLED = datetime(2026, 8, 1, 15, 0, tzinfo=timezone.utc)
 
 
+def occ(anchor, first_hours, n, recurring_hours=72):
+    """The dedupe key suffix for recurring occurrence `n`, as a time.
+
+    The key used to be the ordinal ("vr3"). That broke silently once the interval became
+    editable: raising it made the same elapsed time yield a smaller n, landing on a key already
+    consumed, so sends were deduped away for months. Keys are derived from WHEN the occurrence
+    falls now, and these tests pin the same occurrences by computing that time."""
+    at = anchor + timedelta(hours=first_hours) + timedelta(hours=recurring_hours) * n
+    return at.astimezone(timezone.utc).strftime("%Y%m%dT%H")
+
+
 def _p(**over):
     p = {"proposal_id": "p1", "proposal_status": "sent",
          "followup_enrolled_at": ENROLLED, "followup_disabled_at": None,
@@ -48,7 +59,7 @@ def test_an_unopened_proposal_keeps_nudging_with_a_way_out():
     dues = fr.due_now(_p(), ENROLLED + timedelta(hours=24 + 72 + 1))
     cust = of(dues, "customer")[0]
     assert cust.template == "not_viewed" and cust.include_status_ask is True
-    assert cust.rule_key.endswith(":nvr1")
+    assert cust.rule_key.endswith(":nvr@" + occ(ENROLLED, 24, 1)), cust.rule_key
 
 
 # ── viewed track ─────────────────────────────────────────────────────────────
@@ -65,12 +76,15 @@ def test_viewed_track_walks_24h_then_48h_then_every_three_days():
     assert [d.template for d in of(fr.due_now(p, at72), "customer")] == ["second_nudge"]
 
     p, at144 = _viewed(144)          # 72 + 72
+    v144 = fr._aware(p["cycle_viewed_at"])
     c = of(fr.due_now(p, at144), "customer")[0]
     assert c.template == "checkin" and c.include_status_ask is True
-    assert c.rule_key.endswith(":vr1")
+    assert c.rule_key.endswith(":vr@" + occ(v144, 72, 1)), c.rule_key
 
     p, at216 = _viewed(216)
-    assert of(fr.due_now(p, at216), "customer")[0].rule_key.endswith(":vr2")
+    v216 = fr._aware(p["cycle_viewed_at"])
+    assert of(fr.due_now(p, at216), "customer")[0].rule_key.endswith(
+        ":vr@" + occ(v216, 72, 2))
 
 
 def test_the_estimator_is_told_to_get_personal_at_48h():
@@ -89,8 +103,14 @@ def test_only_one_customer_email_per_tick_however_late_we_are():
 
 def test_the_recurring_series_is_capped():
     p, absurdly_late = _viewed(24 * 400)
+    v = fr._aware(p["cycle_viewed_at"])
     key = of(fr.due_now(p, absurdly_late), "customer")[0].rule_key
-    assert key.endswith(":vr%d" % fr.MAX_RECURRING)
+    assert key.endswith(":vr@" + occ(v, 72, fr.MAX_RECURRING)), key
+    # And it STAYS there. Asserting the ordinal only ever said "it is 20"; this says the series
+    # stops advancing, which is what "capped" actually means.
+    p2, even_later = _viewed(24 * 900)
+    assert of(fr.due_now(p2, even_later), "customer")[0].rule_key.endswith(
+        ":vr@" + occ(fr._aware(p2["cycle_viewed_at"]), 72, fr.MAX_RECURRING))
 
 
 # ── stop conditions ──────────────────────────────────────────────────────────
@@ -277,3 +297,90 @@ def test_an_exhausted_cadence_reports_no_more():
     now = datetime(2026, 8, 3, 15, 0, tzinfo=timezone.utc)
     ancient = _ago(now, 24 + 72 * (fr.MAX_RECURRING + 2))
     assert fr.next_due_at(_row(followup_enrolled_at=ancient), now) is None
+
+
+# ── an expired pause must RESUME the chase, not end it ────────────────────────
+# From the adversarial audit. due_now emitted the staff "pause expired" note and returned, and
+# nothing ever clears followup_paused_until, so every later tick took the same branch and returned
+# the same note its own dedupe key had already consumed. The customer was never chased again —
+# while the board showed a next-reminder date, because next_due_at fell through to normal
+# scheduling. Every customer who clicked "Project delayed" left the chase permanently.
+def _paused(days_ago_end, viewed_hours_before_pause=1):
+    """A proposal whose pause ended `days_ago_end` days ago."""
+    v = ENROLLED + timedelta(hours=viewed_hours_before_pause)
+    ended = (ENROLLED + timedelta(days=60)).date()
+    now = datetime.combine(ended, datetime.min.time(),
+                           tzinfo=timezone.utc) + timedelta(days=days_ago_end, hours=18)
+    return _p(proposal_status="viewed", cycle_viewed_at=v, followup_paused_until=ended), now, ended
+
+
+def test_a_live_pause_still_silences_everything():
+    p, _, ended = _paused(0)
+    during = datetime.combine(ended, datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=5)
+    assert fr.due_now(p, during) == []
+
+
+def test_an_expired_pause_tells_the_estimator_AND_resumes_the_customer_chase():
+    p, now, ended = _paused(30)
+    dues = fr.due_now(p, now)
+    assert [d.template for d in of(dues, "staff")][:1] == ["staff_pause_expired"], (
+        "the estimator is not told the customer's window closed")
+    assert of(dues, "customer"), (
+        "the chase did not resume — this customer would never be emailed again")
+
+
+def test_the_paused_months_do_not_count_as_elapsed():
+    """Otherwise a two-month pause drops the proposal straight past max_recurring, and somebody
+    who asked for time is punished with "cadence exhausted, nothing more is coming"."""
+    p, now, ended = _paused(1)
+    resumed = datetime(ended.year, ended.month, ended.day, 8,
+                       tzinfo=fr.BUSINESS_TZ) + timedelta(days=1)
+    # One day after the pause ended, the clock has just restarted: the first post-pause reminder
+    # is still ahead, so nothing recurring has matured.
+    nxt = fr.next_due_at(p, now)
+    assert nxt is not None, "the board says nothing is coming, so the cap was hit by the pause"
+    assert nxt >= resumed, "the next reminder is dated before the pause even ended"
+
+
+def test_the_board_and_the_worker_agree_after_a_pause_expires():
+    """The specific inconsistency the audit found: the page showed a date the worker would never
+    act on."""
+    p, now, _ = _paused(30)
+    nxt = fr.next_due_at(p, now)
+    fired = of(fr.due_now(p, now), "customer")
+    # next_due_at names the occurrence AFTER the one that has matured, so it is legitimately in
+    # the future while due_now fires. What must never happen is the two disagreeing about whether
+    # this proposal is being chased at all - which is what the audit found: the board showed a
+    # date and the worker had quietly stopped for good.
+    assert fired, "the worker is not chasing"
+    assert nxt is not None, "the board says nothing is coming while the worker is chasing"
+    assert nxt > now, "the next occurrence should be ahead of the one just fired"
+
+
+# ── raising an interval must not silence the chase ────────────────────────────
+def test_raising_the_interval_does_not_replay_a_consumed_key():
+    """The ordinal bug. At 12 days elapsed, "every 3 days" is occurrence 3 and "every 5 days" is
+    occurrence 1 — the old key format made the slower schedule collide with keys the faster one
+    had already used, so the customer heard nothing until the count climbed past the old high
+    water mark. Months, silently."""
+    p, at = _viewed(24 * 12)          # whole days: same local hour, inside the send window
+    fast = of(fr.due_now(p, at, {"recurring_hours": 72}), "customer")[0].rule_key
+    slow = of(fr.due_now(p, at, {"recurring_hours": 120}), "customer")[0].rule_key
+    assert fast != slow, (
+        "the same key is reused across two different intervals, so the send is deduped away")
+
+
+def test_the_key_is_the_occurrence_time_not_the_count():
+    p, at = _viewed(24 * 12)
+    key = of(fr.due_now(p, at), "customer")[0].rule_key
+    assert "@" in key and key.split("@")[-1].isdigit() is False
+    assert len(key.split("@")[-1]) == 11, "expected a YYYYMMDDTHH stamp, got %r" % key
+
+
+def test_two_ticks_in_the_same_occurrence_still_dedupe_to_one_key():
+    """The property the ordinal gave us for free, which the new scheme must keep: the worker runs
+    every few minutes and must not email on each pass."""
+    p, at = _viewed(150)
+    a = of(fr.due_now(p, at), "customer")[0].rule_key
+    b = of(fr.due_now(p, at + timedelta(minutes=20)), "customer")[0].rule_key
+    assert a == b

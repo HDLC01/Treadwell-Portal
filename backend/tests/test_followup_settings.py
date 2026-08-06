@@ -282,14 +282,31 @@ def test_a_shorter_first_nudge_brings_it_forward():
 
 
 def test_the_recurring_interval_is_honoured():
-    """Unviewed and long past the first nudge: how many recurrences have matured depends on the
-    interval, and the rule key carries the number — so a wrong interval would also break the
-    dedupe that stops a customer being emailed twice."""
+    """Unviewed and long past the first nudge: which occurrence has matured depends on the
+    interval, so the two schedules must land on different occurrences.
+
+    This test used to assert the ORDINAL inside the rule key ("nvr3" vs "nvr9"), and its own
+    docstring called that carrying "the number". That was the defect, not the design: raising an
+    interval made the same elapsed time yield a SMALLER ordinal, colliding with a key already
+    consumed, and the send was deduped away for months. Keys are the occurrence time now, so the
+    property to hold is that two intervals cannot produce the same key."""
     p = _sent(24 + 72 * 3 + 1)
-    slow = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 72})]
-    fast = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 24})]
-    assert any("nvr3" in k for k in slow), slow
-    assert any("nvr9" in k or "nvr10" in k for k in fast), fast
+    slow = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 72}) if "nvr" in d.rule_key]
+    fast = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 50}) if "nvr" in d.rule_key]
+    assert slow and fast, (slow, fast)
+    assert slow != fast, (
+        "both intervals produced the same dedupe key, so changing the cadence silences the chase")
+
+
+def test_two_schedules_that_genuinely_coincide_still_dedupe():
+    """Not every collision is a bug. 24h and 72h share occurrences — every third one of the fast
+    schedule IS one of the slow schedule — so when both mature at the same moment, one email is
+    the right answer. The key is the occurrence time precisely so that this case, and only this
+    case, collides."""
+    p = _sent(24 + 72 * 3 + 1)
+    a = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 72}) if "nvr" in d.rule_key]
+    b = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 24}) if "nvr" in d.rule_key]
+    assert a == b, (a, b)
 
 
 def test_the_recurring_cap_is_honoured():
@@ -750,3 +767,40 @@ def test_the_pipeline_reads_the_new_columns_so_a_pre_DDL_prod_survives():
     # The columns that have always existed stay direct — the indirection is only for the new ones,
     # and turning the whole select into jsonb lookups would hide a genuine typo.
     assert "p.proposal_status" in sql and "p.viewed_at" in sql
+
+
+def test_the_board_dates_come_from_the_saved_cadence_not_the_shipped_one(monkeypatch):
+    """From the audit. The worker used the saved cadence and this column used the constants, so
+    the moment anybody edited "every 3 days" every date on the board was wrong — and with a raised
+    max_recurring it reads "Nothing scheduled" while emails keep going out."""
+    enrolled = NOW - timedelta(hours=400)
+    viewed = NOW - timedelta(hours=400)
+    row = {"proposal_id": "p1", "token": "t", "customer_email": "c@x.com",
+           "proposal_status": "viewed", "deposit_status": "pending", "schedule_status": "pending",
+           "followup_enrolled_at": enrolled, "cycle_viewed_at": viewed, "created_at": enrolled}
+    monkeypatch.setattr(portal_main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(portal_main.db, "list_all_portal_proposals", lambda: [row])
+
+    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: None)
+    shipped = client.get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
+
+    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: {"recurring_hours": 240})
+    saved = client.get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
+
+    assert shipped and saved, "the board stopped reporting a next reminder entirely"
+    assert shipped != saved, (
+        "changing the cadence did not move the board's date, so it is still using the constants")
+
+
+def test_an_unreadable_cadence_does_not_take_the_whole_board_down(monkeypatch):
+    """The same mistake as the click columns would have been. Falling back to the shipped cadence
+    is what the worker does too."""
+    row = {"proposal_id": "p1", "token": "t", "customer_email": "c@x.com",
+           "proposal_status": "sent", "deposit_status": "pending", "schedule_status": "pending",
+           "created_at": NOW}
+    monkeypatch.setattr(portal_main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(portal_main.db, "list_all_portal_proposals", lambda: [row])
+    monkeypatch.setattr(portal_main.db, "get_settings",
+                        lambda k: (_ for _ in ()).throw(db.SettingsUnreadable("reset")))
+    r = client.get("/api/admin/pipeline")
+    assert r.status_code == 200 and len(r.json()["proposals"]) == 1

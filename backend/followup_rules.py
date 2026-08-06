@@ -178,6 +178,54 @@ def _recurring_index(elapsed: timedelta, first: timedelta,
     return min(c.max_recurring, int((elapsed - first) // c.recurring))
 
 
+def _occurrence_key(ck: str, tag: str, anchor: datetime, first: timedelta,
+                    n: int, c: "_Cadence") -> str:
+    """Dedupe identity for one recurring occurrence, derived from WHEN it falls.
+
+    It used to be the ordinal — `vr3`, the third recurring send. That silently broke the moment
+    the interval became editable. Raise "every 3 days" to "every 5" and the same elapsed time
+    yields a SMALLER n, so the key lands back on one already used; the send is deduped away and
+    the customer hears nothing for as long as it takes the new, slower count to climb past the
+    old one. Months, for a proposal that had been running a while — the exact opposite of what
+    the editor promises, and invisible, because a deduped send logs nothing.
+
+    Keying on the occurrence TIME instead means changing the interval moves the occurrences, so
+    the new schedule cannot collide with the old one. Hour granularity is enough: the floor on
+    every interval is four hours, so two occurrences can never share an hour.
+
+    Migration note: this changes the key format, so a proposal already mid-cadence when the
+    change deploys has no matching key for its next occurrence and may get one extra email. Once
+    only, and `due_now` emits at most the latest matured occurrence, so it cannot cascade.
+    """
+    at = anchor + first + c.recurring * n
+    return "%s:%s@%s" % (ck, tag, at.astimezone(timezone.utc).strftime("%Y%m%dT%H"))
+
+
+def _resume_anchor(p: dict, now: datetime, c: "_Cadence") -> Optional[datetime]:
+    """When an EXPIRED pause restarts the clock, or None if there is no expired pause.
+
+    A pause is the customer saying "ask me in two months". Two things follow, and neither was
+    true before:
+
+    * The chase has to actually resume. `due_now` used to emit the staff "pause expired" note and
+      `return` — and nothing ever clears `followup_paused_until` (only an explicit human action
+      does), so every later tick took the same branch and returned the same note, which its own
+      dedupe key had already consumed. The customer was never chased again. The board said
+      otherwise, because `next_due_at` fell through to normal scheduling: it showed a date the
+      worker was never going to act on.
+    * The paused months must not count as elapsed. Counting them would drop the proposal straight
+      into a high recurring ordinal — often past `max_recurring`, which reads as "cadence
+      exhausted, nothing more is coming". Somebody who asked for time would be punished for it.
+      The clock restarts the morning after their window closes, which is what the board has been
+      promising all along.
+    """
+    until = _as_date(p.get("followup_paused_until"))
+    if not until or business_today(now) <= until:
+        return None
+    return datetime(until.year, until.month, until.day,
+                    c.start_hour, tzinfo=BUSINESS_TZ) + timedelta(days=1)
+
+
 def next_due_at(p: dict, now: datetime, cfg: Optional[dict] = None) -> Optional[datetime]:
     """When the next CUSTOMER reminder is due, or None if none ever will be.
 
@@ -208,6 +256,11 @@ def next_due_at(p: dict, now: datetime, cfg: Optional[dict] = None) -> Optional[
     viewed = _aware(p.get("cycle_viewed_at"))
     anchor = viewed or enrolled
     first = c.first if viewed is None else c.second
+    # An expired pause restarts the clock, exactly as due_now does it. These two functions have to
+    # agree about every anchor or this column states a date the worker will not act on.
+    resume = _resume_anchor(p, now, c)
+    if resume and resume > anchor:
+        anchor = resume
     elapsed = now - anchor
 
     if elapsed < c.first:
@@ -238,31 +291,38 @@ def due_now(p: dict, now: datetime, cfg: Optional[dict] = None) -> list[Due]:
     # A pause expiring is the one thing that fires while paused — the estimator needs
     # to know the customer's window has closed and the cadence is live again.
     until = _as_date(p.get("followup_paused_until"))
-    if until:
-        if business_today(now) <= until:
-            return []
+    if until and business_today(now) <= until:
+        return []
+    resume = _resume_anchor(p, now, c)
+    if resume:
+        # Tell the estimator once (the key is the pause date, so later ticks dedupe), and then
+        # CARRY ON. This used to `return` here, which is why an expired pause ended a customer's
+        # chase for good — see _resume_anchor.
         out.append(Due("pe:%s" % until.isoformat(), "staff", "staff_pause_expired"))
-        return out
 
     ck = cycle_key(enrolled)
     viewed = _aware(p.get("cycle_viewed_at"))
 
     if viewed is None:
-        elapsed = now - enrolled
+        anchor = enrolled if not (resume and resume > enrolled) else resume
+        elapsed = now - anchor
         if elapsed >= c.first:
             n = _recurring_index(elapsed, c.first, c)
             if n:
                 # Still unopened days later. This is exactly the proposal that needs
                 # the "delayed / not moving forward" escape hatch offered.
-                out.append(Due("%s:nvr%d" % (ck, n), "customer", "not_viewed", True))
+                out.append(Due(_occurrence_key(ck, "nvr", anchor, c.first, n, c),
+                               "customer", "not_viewed", True))
             else:
                 out.append(Due("%s:nv1" % ck, "customer", "not_viewed"))
             out.append(Due("%s:nv1_staff" % ck, "staff", "staff_not_viewed"))
     else:
-        elapsed = now - viewed
+        anchor = viewed if not (resume and resume > viewed) else resume
+        elapsed = now - anchor
         n = _recurring_index(elapsed, c.second, c)
         if n:
-            out.append(Due("%s:vr%d" % (ck, n), "customer", "checkin", True))
+            out.append(Due(_occurrence_key(ck, "vr", anchor, c.second, n, c),
+                           "customer", "checkin", True))
         elif elapsed >= c.second:
             out.append(Due("%s:v2" % ck, "customer", "second_nudge"))
         elif elapsed >= c.first:

@@ -1508,6 +1508,21 @@ def admin_pipeline(request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     unread = db.unread_counts()
+    # The SAVED cadence, read once for the whole board rather than per row.
+    #
+    # `next_due_at` used to be called with no cfg, so this column was computed from the shipped
+    # constants while the worker used whatever staff had saved. Change "every 3 days" to "every 5"
+    # and every date on the board is wrong; raise `max_recurring` and it reads "Nothing scheduled"
+    # while emails keep going out. A schedule nobody can see anywhere else has to be the real one.
+    #
+    # Guarded, because an unreadable settings row must not take down the pipeline the way the
+    # unguarded click columns would have — the shipped cadence is the right answer when we cannot
+    # read the saved one, and it is what the worker falls back to as well.
+    try:
+        followup_cfg = followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[pipeline] could not read the cadence, showing the shipped one: %s", exc)
+        followup_cfg = followup_settings.defaults()
     out = []
     for r in db.list_all_portal_proposals():
         out.append({
@@ -1551,7 +1566,7 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # anchors due_now() uses, so the Follow-ups page can show a schedule that
             # otherwise exists nowhere a human can see. None = nothing is coming
             # (not automated, switched off, approved, closed, or cadence exhausted).
-            "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc())),
+            "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc(), followup_cfg)),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
             # staff side picks the latest of these — it also owns turning the
