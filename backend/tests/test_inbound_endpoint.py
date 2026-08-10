@@ -50,12 +50,15 @@ def env(monkeypatch):
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: [CUSTOMER])
     monkeypatch.setattr(main.db, "add_message",
                         lambda *a, **k: calls["messages"].append({"args": a, "kwargs": k}))
-    monkeypatch.setattr(email_sender, "staff_emails", lambda: {STAFF})
+    # Optional proposal_id, matching the real signature: the endpoint re-checks the roster
+    # once it knows the project, so this project's per-project additions count too.
+    monkeypatch.setattr(email_sender, "staff_emails", lambda proposal_id=None: {STAFF})
     monkeypatch.setattr(email_sender, "_resolve_notify", lambda *a, **k: ["bids@wetreadwell.com"])
     monkeypatch.setattr(email_sender, "_send",
                         lambda to, subj, html_body, *a, **k:
                         calls["sends"].append({"to": to, "subject": subj, "html": html_body,
-                                               "reply_to": k.get("reply_to")}) or True)
+                                               "reply_to": k.get("reply_to"),
+                                               "headers": k.get("headers")}) or True)
     monkeypatch.setattr(
         email_sender, "send_reply_notification",
         lambda email, url, project, reply_to=None, message=None, token=None:

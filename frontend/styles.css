@@ -222,9 +222,11 @@ textarea { min-height: 96px; resize: vertical; }
 /* Q&A thread */
 .thread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
 .msg { max-width: 85%; padding: 10px 14px; border-radius: var(--radius-lg); }
-.msg .who { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
+/* An emailed reply arrives with its own line breaks. Without pre-wrap they collapse into one
+   run, which is most of why a signature read as a wall of text. `anywhere`, not break-word,
+   so a long tracking URL cannot push the bubble past its max-width. */
+.msg .mbody { white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.customer { align-self: flex-end; background: var(--primary); color: #fff; }
-.msg.customer .who { color: var(--primary-tint); }
 .msg.staff { align-self: flex-start; background: var(--surface-high); color: var(--fg); }
 .msg .when { font-size: .68rem; opacity: .75; margin-top: 4px; }
 .msg .via-email {

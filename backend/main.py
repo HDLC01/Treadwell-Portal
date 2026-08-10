@@ -583,7 +583,7 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
         f"<blockquote>{html.escape(text)}</blockquote>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
     )
     return _json({"ok": True, "question": _q(row), "message": _msg(row)})
 
@@ -701,7 +701,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
                 "their project contacts.</p>")
         + f"<p>Project: {html.escape(project_name)}.</p>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
     )
     # Confirm the approval to the customer in writing. They'd just committed to a
     # price and heard nothing back except (later) an invoice.
@@ -854,7 +854,8 @@ def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:
             return
         email_sender.notify_team(subject, body_html, recipients=to,
                                  reply_link=_staff_link(pid), proposal_id=pid,
-                                 reply_to=email_sender.proposal_reply_to(p.get("token")))
+                                 reply_to=email_sender.proposal_reply_to(p.get("token")),
+                                 token=p.get("token"))
     except Exception as exc:  # noqa: BLE001
         log.warning("status notify failed for %s: %s", pid, exc)
 
@@ -941,7 +942,7 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     email_sender.notify_team(
         subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
     )
     _notify_customer(
         p, "We've received your deposit details",
@@ -1013,7 +1014,7 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
     )
     _notify_customer(
         p, "Thanks — we have your project contacts",
@@ -1138,7 +1139,10 @@ def _inbound_body(email_id: str, data: dict) -> tuple[str, dict] | None:
     if not text.strip():
         html_body = (full.get("html") or "")[:300_000]
         text = html.unescape(re.sub(r"<[^>]{0,300}>", " ", html_body))
-    body_txt = _cap(inbound.strip_quoted(text), 4000)
+    # Quoted history first, then the sender's own contact block. Both server-side, so the
+    # staff CRM and the customer's portal show the same trimmed message rather than each
+    # trying to tidy it up in the browser.
+    body_txt = _cap(inbound.strip_signature(inbound.strip_quoted(text)), 4000)
     names = [(_cap(a.get("filename"), 120) or "attachment")
              for a in (data.get("attachments") or [])[:10] if isinstance(a, dict)]
     if names:
@@ -1149,10 +1153,17 @@ def _inbound_body(email_id: str, data: dict) -> tuple[str, dict] | None:
 def _inbound_forward(to: list[str], subject_line: str, heading: str, banner: str,
                      from_email: str, project: str, subject: str, body_txt: str,
                      link: str | None = None, reply_to: str | None = None,
-                     verb: str = "emailed") -> None:
+                     verb: str = "emailed", token: str | None = None) -> None:
     """Forward an inbound email to staff. Best-effort — a mail failure must never
     turn into a webhook error, because by here the CRM insert may already be done
-    and a Svix retry would only duplicate work."""
+    and a Svix retry would only duplicate work.
+
+    `token` stamps the project into the threading headers. This is the forward staff
+    actually hit Reply on — "Customer replied by email" — so without it their answer
+    came back to us carrying nothing that named the project, and bounced around the
+    roster instead of reaching the customer. Omitted for an UNMATCHED email, which by
+    definition has no project, and for an unverified sender, where Reply-To points at
+    the sender rather than at us."""
     if not to:
         log.info("inbound: no notify recipients after roster/overrides — forward skipped")
         return
@@ -1166,7 +1177,8 @@ def _inbound_forward(to: list[str], subject_line: str, heading: str, banner: str
     if link:
         body += f'<p><a href="{link}">Open in the proposal tool</a></p>'
     try:
-        email_sender._send(to, subject_line, email_sender._wrap(heading, body), reply_to=reply_to)
+        email_sender._send(to, subject_line, email_sender._wrap(heading, body), reply_to=reply_to,
+                           headers=email_sender.project_thread_headers(token))
     except Exception as exc:  # noqa: BLE001
         log.error("inbound: forward failed: %s", exc)
 
@@ -1304,6 +1316,20 @@ async def api_inbound_resend(request: Request):
     project = p.get("project_name") or "proposal"
     meta = {"source": "email", "email_id": email_id, "from": from_email}
 
+    authorized = set(e.lower() for e in (db.get_recipients(pid) or []))
+    authorized.add((p.get("customer_email") or "").strip().lower())
+
+    # Now that the project is known, widen the roster check to include the people added
+    # to THIS project. The earlier global check (before matching) is deliberately the
+    # narrow one: it only gates the sender fallback, where no project exists yet.
+    #
+    # But NEVER promote one of this proposal's own recipients. A per-project override is
+    # typed into a box by hand, so a customer's address can land there by mistake in a
+    # way it cannot land on the global roster — and staff is the privileged path that
+    # relays a message to every recipient as Treadwell. Being on the proposal wins.
+    if not is_staff and from_email and from_email not in authorized:
+        is_staff = from_email in email_sender.staff_emails(pid)
+
     # Staff is tested BEFORE the customer: if one address were somehow on both
     # lists, filing staff as the customer would put our words in their mouth.
     #
@@ -1335,8 +1361,6 @@ async def api_inbound_resend(request: Request):
             log.error("inbound: staff relay to the customer failed: %s", exc)
         return _json({"ok": True, "staff": True})
 
-    authorized = set(e.lower() for e in (db.get_recipients(pid) or []))
-    authorized.add((p.get("customer_email") or "").strip().lower())
     # A sender-matched proposal is verified by construction — that match WAS the
     # sender's address appearing on exactly one proposal.
     verified = bool(from_email) and (from_email in authorized or matched_by == "sender")
@@ -1367,6 +1391,7 @@ async def api_inbound_resend(request: Request):
         # reply to the sender — we don't know who they are, so nothing of theirs
         # should be posted on the customer's behalf.
         reply_to=(email_sender.proposal_reply_to(p["token"]) if verified else (from_email or None)),
+        token=(p["token"] if verified else None),
         verb="replied by email")
     return _json({"ok": True, "verified": verified})
 
@@ -2016,7 +2041,7 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
         f"<p>The deposit for <strong>{html.escape(project)}</strong> is marked received. "
         f"The customer has been asked for their project contacts.</p>",
         kind="deposit", reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
     )
     _notify_customer(
         p, "Deposit received — thank you",
@@ -2100,7 +2125,7 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
         f"Project SCHEDULED — {project}",
         f"<p><strong>{html.escape(project)}</strong> is marked scheduled.</p>",
         reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
     )
     _notify_customer(
         p, "Your project is scheduled",

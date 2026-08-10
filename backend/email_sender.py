@@ -40,6 +40,29 @@ def proposal_anchor(token: str) -> str:
     return f"<tw-proposal.{token}@wetreadwell.com>"
 
 
+def project_thread_headers(token: str | None) -> dict[str, str] | None:
+    """Threading headers for a STAFF email about one project. None without a token.
+
+    The proposal anchor and nothing else, because a team email has no single
+    recipient to anchor per-person (`_thread_headers` hashes one address, and
+    notify_team sends to the whole roster in one call). Every staff member
+    therefore gets one conversation per project, which is how they read it anyway.
+
+    Hanz, 2026-08-11: "When a Treadwell employee replies through email it doesn't
+    get captured by the Proposal CRM and doesn't get sent out to the customer."
+    This was the cause. The inbound webhook routes a reply by finding a token —
+    first in the recipient address, then in these headers. Since INBOUND_REPLY_ADDRESS
+    made the visible Reply-To ONE address for every project, the headers became the
+    only route left, and staff notifications were the one kind of mail that never
+    carried them. So a staff reply matched no proposal, took the "unmatched" branch,
+    and was forwarded back to the roster instead of reaching the customer. Customer
+    replies were unaffected: send_reply_notification has always passed a token."""
+    if not token:
+        return None
+    anchor = proposal_anchor(token)
+    return {"References": anchor, "In-Reply-To": anchor}
+
+
 def _thread_headers(email: str, token: str | None = None) -> dict[str, str]:
     """Group portal email into inbox threads AND carry the proposal identity.
 
@@ -616,9 +639,15 @@ def _resolve_notify(kind: str, proposal_id: str | None = None) -> list[str]:
                                      configured=configured)
 
 
-def staff_emails() -> set[str]:
+def staff_emails(proposal_id: str | None = None) -> set[str]:
     """Lowercase addresses of everyone on the notification roster (enabled rows,
     both kinds) — the allowlist for "this inbound email came from staff".
+
+    With `proposal_id`, this project's per-project ADDS count too. They have to: an
+    override is how somebody gets a project's notification emails without being on
+    the global roster, so leaving them out meant the exact person we had just mailed
+    could not reply to it. Mutes are NOT subtracted — muting somebody stops this
+    project's mail reaching them, it does not make them a customer.
 
     Deliberately narrower than "any @wetreadwell.com address": a From header is
     forgeable, and the inbound webhook's signature proves the message came from
@@ -631,26 +660,43 @@ def staff_emails() -> set[str]:
 
     On DB failure, fall back to the env lists (same posture as _resolve_notify:
     don't lose the allowlist because the table blinked)."""
+    def _adds() -> set[str]:
+        """This project's per-project additions; {} on any failure — a missing override
+        must narrow the allowlist, never widen or break it."""
+        if not proposal_id:
+            return set()
+        try:
+            import db
+            return {o["email"].strip().lower() for o in db.list_notify_overrides(proposal_id)
+                    if o.get("mode") == "add" and o.get("email")}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("staff-roster override lookup failed for %s (%s)", proposal_id, exc)
+            return set()
+
     try:
         import db  # local import: avoid a hard DB dependency at module import time
         rows = db.list_notify_recipients()
         if rows:
             return {r["email"].strip().lower() for r in rows
-                    if r.get("enabled", True) and r.get("email")}
+                    if r.get("enabled", True) and r.get("email")} | _adds()
     except Exception as exc:  # noqa: BLE001 — DB down / table missing → env fallback
         log.warning("staff-roster lookup failed (%s); using env fallback", exc)
-    return {e.strip().lower() for e in [*config.NOTIFY_EMAILS, *config.DEPOSIT_NOTIFY_EMAILS] if e}
+    return {e.strip().lower() for e in [*config.NOTIFY_EMAILS,
+                                        *config.DEPOSIT_NOTIFY_EMAILS] if e} | _adds()
 
 
 def notify_team(subject: str, body_html: str, kind: str = "general",
                 recipients: list[str] | None = None, reply_link: str | None = None,
-                proposal_id: str | None = None, reply_to: str | None = None) -> bool:
+                proposal_id: str | None = None, reply_to: str | None = None,
+                token: str | None = None) -> bool:
     """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
     `kind` from the UI-managed roster, applying this proposal's per-project overrides
     (`proposal_id`). `reply_link` appends a "Reply in Portal" button that deep-links
     staff to the proposal in the staff tool. `reply_to` (the proposal's inbound
     address) makes a plain reply from a staff inbox land in the thread too, so the
-    button is the convenient path rather than the only one."""
+    button is the convenient path rather than the only one — but ONLY together with
+    `token`, which carries the project in the threading headers. Reply-To alone gets
+    the reply to our inbox; the token is what tells us which project it belongs to."""
     to = recipients if recipients is not None else _resolve_notify(kind, proposal_id)
     if not to:
         log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
@@ -659,7 +705,11 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
             f'<p style="margin-top:16px"><a href="{reply_link}" style="background:{_BRAND_RED};color:#fff;'
             f'padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">Reply in Portal</a></p>'
         )
-    if reply_to:
+    # Only promise reply-by-email when a reply can actually be routed. Reply-To without
+    # a token lands the message in our inbox with nothing to match it to, which is the
+    # bug this line used to advertise.
+    if reply_to and token:
         body_html += ('<p style="color:#64748b;font-size:13px;margin-top:12px">Replying to this email '
                       'posts your message to the customer\'s portal thread and notifies them.</p>')
-    return _send(to, subject, _wrap(subject, body_html), reply_to=reply_to)
+    return _send(to, subject, _wrap(subject, body_html), reply_to=reply_to,
+                 headers=project_thread_headers(token))

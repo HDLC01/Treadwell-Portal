@@ -274,8 +274,14 @@ def test_sender_authenticated_requires_both_spf_and_dkim():
 
 
 def test_notify_team_passes_reply_to(monkeypatch):
-    """Team notifications carry the proposal's inbound address, so replying from a
-    staff inbox reaches the thread instead of the send-only From address."""
+    """Team notifications carry the proposal's inbound address AND its anchor, so replying
+    from a staff inbox reaches the thread instead of the send-only From address.
+
+    The anchor half was missing, and this test asserted the promise ("you can just reply")
+    without asserting the mechanism that keeps it — so it passed while every staff reply
+    was being dropped. Reply-To gets the mail to us; the anchor is what tells us which
+    project it belongs to, since INBOUND_REPLY_ADDRESS leaves no token in the address.
+    Full story in test_staff_reply_by_email.py."""
     captured = {}
 
     def fake_post(url, headers=None, json=None, timeout=None):  # noqa: A002
@@ -290,13 +296,16 @@ def test_notify_team_passes_reply_to(monkeypatch):
     monkeypatch.setattr(email_sender.httpx, "post", fake_post)
 
     email_sender.notify_team("Subj", "<p>x</p>", recipients=["team@x.com"],
-                             reply_to=f"tok@{PRIMARY}")
+                             reply_to=f"tok@{PRIMARY}", token="tokABC123")
     assert captured["reply_to"] == f"tok@{PRIMARY}"
     assert "posts your message to the customer" in captured["html"]
+    # The mechanism behind that sentence: the reply comes back naming this project.
+    assert inbound.find_thread_token(captured["headers"]) == "tokABC123"
 
     captured.clear()
     email_sender.notify_team("Subj", "<p>x</p>", recipients=["team@x.com"])
     assert "reply_to" not in captured
+    assert "headers" not in captured
 
 
 # ── quoted-reply stripping ────────────────────────────────────────────────────
