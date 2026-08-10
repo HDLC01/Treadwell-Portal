@@ -31,12 +31,41 @@ services:
       PROPOSAL_TOOL_PUBLIC_URL: "https://staging.proposals.wetreadwell.com"
       # Inbound email capture (Resend receiving): per-proposal Reply-To =
       # <token>@<domain>; replies webhook back into the CRM thread. The svix
-      # signing secret (RESEND_WEBHOOK_SECRET) lives in .env on the VPS. Every
-      # captured reply is also forwarded to INBOUND_FORWARD_EMAIL (per Hanz).
-      RESEND_INBOUND_DOMAIN: "piaxenoizh.resend.app"
-      # Staging forwards to Hanz only (per Hanz — don't email Will on staging).
-      # will@wetreadwell.com gets added to this list on PROD, not here.
-      INBOUND_FORWARD_EMAIL: "hanz@wetreadwell.com"
+      # signing secret (RESEND_WEBHOOK_SECRET) lives in .env on the VPS.
+      #
+      # Staging mints and receives on the BRANDED domain, same as prod.
+      #
+      # Sharing one receiving domain across environments is fine, and the token is
+      # why: a reply goes to <token>@notify.wetreadwell.com, Resend delivers the
+      # same event to BOTH webhook endpoints, and each environment resolves that
+      # token against its own database. Staging tokens only exist in staging,
+      # prod's only in prod, so each drops what isn't its own. No separate
+      # receiving domain needed.
+      #
+      # The one behaviour that needs a single owner is UNTOKENED mail — a bare
+      # proposals@notify.wetreadwell.com with no token to resolve. Sender matching
+      # is the only way to place it, and both environments would attempt it. That
+      # is what INBOUND_SENDER_FALLBACK below decides, per environment.
+      RESEND_INBOUND_DOMAIN: "notify.wetreadwell.com"
+      # ONE clean address on every customer email. No token in what anyone reads —
+      # the proposal rides in the Message-ID/References headers instead, which mail
+      # clients quote back on reply (verified against a real Gmail reply).
+      INBOUND_REPLY_ADDRESS: "proposals@notify.wetreadwell.com"
+      # Accepted, never minted: staging proposals sent before this change carry a
+      # resend.app reply address, and those replies must still land.
+      RESEND_INBOUND_LEGACY_DOMAINS: "piaxenoizh.resend.app"
+      # Match untokened mail (someone emails proposals@ directly) to a single
+      # proposal by sender; otherwise forward to the roster.
+      #
+      # OFF here because PROD owns untokened mail (2026-07-31). Both environments
+      # receive the same account-wide Resend events, so with this on in both, one
+      # bare proposals@ email whose sender also exists in the staging database
+      # would be filed twice — once per environment. Prod is where real customers
+      # send, so prod wins.
+      #
+      # Token-addressed replies are unaffected and still work here: staging mints
+      # and resolves its own tokens on the branded domain, prod resolves its own.
+      INBOUND_SENDER_FALLBACK: "false"
     networks:
       - shared
 

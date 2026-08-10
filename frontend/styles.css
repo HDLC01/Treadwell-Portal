@@ -69,10 +69,48 @@ a { color: var(--primary); }
   color: var(--primary); font-weight: 900; font-size: 1.2rem;
   letter-spacing: -0.01em; text-transform: uppercase;
 }
+/* Bison mark, left of the wordmark. Height is pinned under the 60px bar so the
+   bar can't grow, and flex:none keeps the art from being squashed — the
+   switcher label truncates instead. */
+.site-header .brand-bison { flex: none; display: block; }
+/* The bar is exactly full at 375px, so something has to give to fit the mark.
+   Drop the words "Secure proposal portal" rather than the logo: the padlock
+   beside them carries the same reassurance, and most customers read this on a
+   phone — hiding the brand there hides it from nearly everyone. */
+@media (max-width: 480px) { .site-header .tag .tag-text { display: none; } }
 .site-header .tag {
   margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
   font-size: .8rem; color: var(--secondary);
 }
+
+/* "My projects" switcher — only rendered when the customer has 2+ projects. */
+.switcher { position: relative; margin-left: 18px; }
+.switcher-btn {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  background: none; border: 1px solid var(--outline); border-radius: 8px;
+  color: var(--fg); font: inherit; font-size: .82rem; font-weight: 600;
+  padding: 6px 10px; line-height: 1;
+}
+.switcher-btn:hover { background: var(--surface-low); }
+/* The label is the current project's name, which can be long — truncate it
+   rather than let the header grow or wrap. */
+.switcher-btn #proj-switch-label {
+  max-width: min(46vw, 320px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.switcher-btn svg { flex: none; }
+.switcher-menu {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
+  width: min(420px, calc(100vw - 32px));
+  background: var(--bg); border: 1px solid var(--outline); border-radius: 12px;
+  box-shadow: var(--shadow-lg, 0 16px 44px rgba(0,0,0,.28)); padding: 4px 14px;
+  max-height: 60vh; overflow-y: auto;
+}
+.switcher-menu .proj-row:first-child { border-top: 0; }
+.switcher-menu .proj-row { padding: 12px 0; }
+/* One line per project: the name truncates, the badge never wraps. */
+.switcher-menu .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.switcher-menu .badge { white-space: nowrap; flex: none; }
+.proj-row.current { opacity: .65; pointer-events: none; }
 .wrap { max-width: var(--maxw); margin: 0 auto; padding: 24px 16px 72px; }
 
 /* Labels — uppercase label-caps */
@@ -131,7 +169,20 @@ textarea { min-height: 96px; resize: vertical; }
 
 /* Status tracker */
 .tracker { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-.tracker .step { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 14px; background: var(--surface-low); }
+/* Tiles are <button>s that navigate to their step, so the browser defaults
+   (centred text, its own font) have to be reset. */
+.tracker .step { border: 1px solid var(--surface-highest); border-radius: var(--radius); padding: 14px;
+  background: var(--surface-low); font: inherit; text-align: left; width: 100%; cursor: pointer;
+  display: block; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+.tracker .step:hover { border-color: var(--outline); background: var(--surface); }
+.tracker .step:focus-visible { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-tint); }
+.tracker .step.is-active { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-tint); }
+/* Brief highlight so it's obvious which card a tile jumped you to. */
+.step-flash { animation: step-flash 1.4s ease; }
+@keyframes step-flash {
+  0%, 30% { box-shadow: 0 0 0 3px var(--primary-tint); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
 .tracker .step .lbl { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary); font-weight: 700; }
 .tracker .step .val { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; font-weight: 700; font-size: .95rem; }
 .tracker .step.is-done { border-color: var(--success); background: var(--success-bg); }
@@ -158,10 +209,14 @@ textarea { min-height: 96px; resize: vertical; }
 .option.opt-check input[type="checkbox"]:disabled { cursor: default; }
 .option.opt-check .opt-main { flex: 1; min-width: 0; }
 .selected-total {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  display: flex; flex-direction: column; gap: 6px;
   margin-top: 14px; padding-top: 14px; border-top: 2px solid var(--surface-highest);
   font-weight: 700;
 }
+.selected-total .st-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.selected-total .st-dep { font-weight: 600; }
+.selected-total .st-dep span { color: var(--secondary); font-size: .9rem; }
+.selected-total .st-dep strong { font-size: 1.05rem !important; color: var(--secondary) !important; }
 .selected-total strong { font-size: 1.35rem; color: var(--primary); font-variant-numeric: tabular-nums; }
 
 /* Q&A thread */
@@ -196,9 +251,21 @@ textarea { min-height: 96px; resize: vertical; }
   border-radius: var(--radius-lg); padding: 14px 16px; box-shadow: var(--shadow-sm);
 }
 .chat-card.deposit { border-left-color: var(--success); }
+/* Status lines (approved, deposit initiated, …) — same card shape as the deposit
+   card so the thread reads consistently, in a muted tone since they're FYI. */
+.chat-card.system { border-left-color: var(--secondary); }
+/* A replaced invoice: kept for the record, visibly not the one to pay. */
+.chat-card.is-superseded { opacity: .6; border-left-color: var(--surface-highest); }
+.chat-card .cc-tag { font-size: .62rem; font-weight: 800; text-transform: uppercase;
+  letter-spacing: .05em; border: 1px solid currentColor; border-radius: 999px;
+  padding: 1px 7px; margin-left: 6px; vertical-align: middle; color: var(--secondary); }
+.chat-card.system .cc-title { font-size: .95rem; }
+.chat-card.system .cc-body { margin-bottom: 0; }
 .chat-card .cc-title { font-weight: 800; margin-bottom: 4px; }
 .chat-card .cc-body { color: var(--secondary); font-size: .9rem; margin-bottom: 12px; }
 .chat-card .cc-amt { color: var(--success); font-variant-numeric: tabular-nums; }
+.chat-card .cc-meta { color: var(--secondary); font-size: .78rem; margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.chat-card .cc-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .chat-card .btn { min-height: 40px; padding: 0 18px; }
 
 /* sticky composer */
@@ -220,6 +287,13 @@ textarea { min-height: 96px; resize: vertical; }
 /* deposit bank-transfer instructions */
 .deposit-section-label { margin: 4px 0 -2px; font-size: .78rem; font-weight: 700; color: var(--secondary); text-transform: uppercase; letter-spacing: .04em; }
 .deposit-section-label + .field { margin-top: 2px; }
+/* Live ✓/✗ verifier — shown INLINE beside the field's label; the input border
+   also turns green (valid) / red (invalid) as you type. */
+.ach-ind { margin-left: 8px; font-size: .78rem; font-weight: 600; text-transform: none; letter-spacing: 0; }
+.ach-ind.ok { color: #1f7a34; }
+.ach-ind.bad { color: var(--error); }
+input.ach-ok { border-color: #1f7a34 !important; box-shadow: 0 0 0 1px #1f7a34; }
+input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var(--error); }
 .deposit-instructions { border: 1px solid var(--surface-highest); border-radius: var(--radius); overflow: hidden; }
 .di-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--surface-highest); }
 .di-row:first-child { border-top: none; }
@@ -235,6 +309,12 @@ textarea { min-height: 96px; resize: vertical; }
 .contact-row-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .contact-role { font-weight: 700; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--primary); }
 .contact-role-sel { width: auto; margin: 0; padding: 4px 8px; min-height: 34px; }
+/* "Same as primary" — the mirrored row's fields are filled from the primary and
+   locked, so it's obvious they're not independently editable. */
+.contact-same { display: inline-flex; align-items: center; gap: 6px; margin-right: auto;
+  font-size: .8rem; color: var(--secondary); white-space: nowrap; cursor: pointer; }
+.contact-same input { width: auto; min-height: 0; margin: 0; }
+.contact-row.is-mirrored .contact-grid input { background: var(--surface-low); color: var(--secondary); }
 .contact-remove { color: var(--secondary); }
 .contact-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .contact-grid input { margin: 0; }
@@ -277,8 +357,14 @@ textarea { min-height: 96px; resize: vertical; }
 .pdf-preview:hover, .pdf-preview:focus-visible {
   border-color: var(--primary); box-shadow: 0 6px 20px rgba(0,0,0,.18); outline: none;
 }
-.pdf-preview-frame { position: relative; width: 100%; height: 520px; background: var(--surface-low); }
-.pdf-inline-frame { width: 100%; height: 100%; border: 0; display: block; pointer-events: none; }
+/* overflow:hidden backs up the #scrollbar=0 viewer flag for engines that ignore it —
+   the preview must never show a scrollbar it can't honour (pointer-events are off). */
+.pdf-preview-frame { position: relative; width: 100%; height: 520px; background: var(--surface-low); overflow: hidden; }
+/* Chromium's PDF viewer ignores #scrollbar=0, and the frame is pointer-events:none
+   (clicks belong to the enlarge button), so its scrollbar would render but never
+   work. Overhang the iframe by roughly one scrollbar width and let the wrapper's
+   overflow:hidden clip it — with view=FitH the page still fills the visible area. */
+.pdf-inline-frame { width: calc(100% + 16px); height: 100%; border: 0; display: block; pointer-events: none; }
 .pdf-preview-hint {
   position: absolute; right: 12px; bottom: 12px; z-index: 2;
   display: inline-flex; align-items: center; gap: 6px;
@@ -322,3 +408,38 @@ textarea { min-height: 96px; resize: vertical; }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* ── Project status card ──────────────────────────────────────────────────────
+   The customer's way out of the follow-up cadence: "we're delayed" or "we're not
+   moving forward". Deliberately quiet — a bordered panel rather than an alert, so
+   it reads as an offer rather than a warning. */
+.status-card {
+  border: 1px solid var(--outline);
+  border-radius: var(--radius);
+  background: var(--surface-low);
+  padding: 14px 16px;
+  margin: 0 0 12px;
+}
+.status-card .sc-title { font-weight: 700; margin: 0 0 4px; }
+.status-card .sc-lead { margin: 0 0 12px; }
+.status-card .sc-choices,
+.status-card .sc-months,
+.status-card .sc-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.status-card .sc-panel { margin-top: 12px; }
+.status-card .sc-panel > p { margin: 0 0 8px; }
+.status-card .sc-reasons { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.status-card .sc-reasons label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.status-card textarea {
+  width: 100%; box-sizing: border-box; font: inherit; padding: 8px 10px;
+  border: 1px solid var(--outline); border-radius: 8px; resize: vertical; margin-bottom: 10px;
+}
+/* A text-weight button for "never mind" — cancelling should not compete visually
+   with the actual choices. */
+.btn-link {
+  background: none; border: none; color: var(--secondary);
+  text-decoration: underline; padding: 8px 4px; box-shadow: none;
+}
+.btn-link:hover { color: var(--fg); background: none; }
+/* Resting state once they have told us something. */
+.status-card.is-settled { background: var(--surface); }
+.status-card #sc-alert:not(:empty) { margin-top: 10px; font-size: .85rem; color: var(--danger, #b3261e); }

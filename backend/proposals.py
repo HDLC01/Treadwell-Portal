@@ -28,15 +28,28 @@ def pricing_options(data: dict[str, Any]) -> list[dict[str, Any]]:
             total = _num(bid.get("total"))
             if total is None:
                 continue
+            is_base = bool(r.get("is_base"))
+            # price_mode mirrors the proposal tool: "total" = a standalone all-in
+            # price, "deduct" = a value-engineering add/deduct measured AGAINST the
+            # base bid. A VE row's `total` is what the job costs if you take that
+            # alternative — NOT an amount to add on top of the base, so it must
+            # never be summed as a lump sum (that overcharges the customer).
+            mode = "deduct" if (not is_base and r.get("price_mode") == "deduct") else "total"
+            base_total = _num(r.get("base_total"))
             opt = {
-                "label": r.get("name") or ("Base Bid" if r.get("is_base") else "Option"),
+                "label": r.get("name") or ("Base Bid" if is_base else "Option"),
                 "total": total,
                 "system_desc": r.get("system_desc") or "",
-                "is_base": bool(r.get("is_base")),
+                "is_base": is_base,
+                "price_mode": mode,
             }
-            base_total = _num(r.get("base_total"))
-            if r.get("show_diff") and base_total is not None:
-                opt["diff"] = round(total - base_total, 2)
+            if base_total is not None:
+                # Signed difference vs the base, same formula the document uses:
+                # negative → "Deduct ($X)", positive → "Add $X".
+                delta = round(total - base_total, 2)
+                opt["delta"] = delta
+                if r.get("show_diff"):
+                    opt["diff"] = delta
             options.append(opt)
     else:
         base = ((data.get("computed_bid") or {}).get("full_bid") or {})
@@ -98,8 +111,22 @@ def resolve_selection(data: dict[str, Any], labels) -> tuple[list[dict[str, Any]
             raise ValueError("unknown_option")
         seen.add(lbl)
         chosen.append(opt)
-    total = round(sum(o["total"] for o in chosen), 2)
-    return chosen, total
+
+    # A value-engineering row (price_mode "deduct") is an alternative measured
+    # against the base bid, so it contributes its DELTA, not its standalone total.
+    # Summing VE rows as lump sums is what made the portal quote the wrong number.
+    ve = [o for o in chosen if o.get("price_mode") == "deduct" and not o.get("is_base")]
+    total = round(sum(o["total"] for o in chosen if o not in ve), 2)
+    if ve:
+        if not any(o.get("is_base") for o in chosen):
+            # An add/deduct on its own is meaningless — it prices the base job
+            # differently. Fold the base in so the customer approves a real total.
+            base = next((o for o in pricing_options(data) if o.get("is_base")), None)
+            if base is not None:
+                chosen.insert(0, base)
+                total += base["total"]
+        total += sum((o.get("delta") or 0) for o in ve)
+    return chosen, round(total, 2)
 
 
 def addons(data: dict[str, Any]) -> list[dict[str, Any]]:

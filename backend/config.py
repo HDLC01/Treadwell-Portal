@@ -34,11 +34,10 @@ RATE_WINDOW_SEC = int(_env("PORTAL_RATE_WINDOW_SEC", "900"))            # 15 min
 RATE_REQUESTS_PER_IP = int(_env("PORTAL_RATE_PER_IP", "40"))            # auth POSTs per IP per window
 
 # ── Deposit (shown to the customer; exact instructions provided by Treadwell) ──
-# Cheque mailing address + who the cheque is payable to. Set the real address in
-# the VPS .env (never committed) — the defaults are placeholders until then.
-# ACH needs no bank details here: the customer self-records where they sent the
-# transfer, so we never store Treadwell's receiving account in the app.
-CHECK_ADDRESS = _env("PORTAL_CHECK_ADDRESS", "Treadwell — Attn: Accounts Receivable (mailing address provided by your representative)")
+# Cheque mailing address + who the cheque is payable to. Override via the VPS .env
+# (PORTAL_CHECK_ADDRESS) if it ever changes. ACH collects the customer's own account
+# details (double-entry verified) so Treadwell can initiate the debit.
+CHECK_ADDRESS = _env("PORTAL_CHECK_ADDRESS", "Treadwell, 1707 E. 123rd Ter, Olathe, KS 66061")
 PAYABLE_TO = _env("PORTAL_DEPOSIT_PAYABLE_TO", "Treadwell")
 
 # ── Service token (admin proposal tool -> this portal /api/notify) ────────────
@@ -72,15 +71,62 @@ DEPOSIT_NOTIFY_EMAILS = [
 EMAIL_REPLY_TO = _env("EMAIL_REPLY_TO", "")
 
 # ── Inbound email (Resend receiving) → CRM chat thread ────────────────────────
-# When RESEND_INBOUND_DOMAIN is set, per-proposal customer emails get
+# When RESEND_INBOUND_DOMAIN is set, per-proposal emails get
 # Reply-To: <proposal-token>@<domain> so an email reply routes back to Resend,
 # which webhooks POST /api/inbound/resend (armed only when the signing secret is
-# set). INBOUND_FORWARD_EMAIL gets a copy of every captured reply.
+# set). Ideally this is the SAME branded domain we send From, so one address both
+# sends and receives.
 RESEND_INBOUND_DOMAIN = _env("RESEND_INBOUND_DOMAIN", "")
+# Domains we still ACCEPT on ingest but no longer MINT. When the receiving domain
+# moves (e.g. Resend's shared piaxenoizh.resend.app → notify.wetreadwell.com),
+# every Reply-To already sitting in a customer's inbox points at the old one —
+# list it here so those replies keep landing in the thread. Drop entries once the
+# old addresses have aged out.
+RESEND_INBOUND_LEGACY_DOMAINS = [
+    d.strip().lower() for d in _env("RESEND_INBOUND_LEGACY_DOMAINS", "").split(",") if d.strip()
+]
+# Accepted on ingest = primary + legacy. Only RESEND_INBOUND_DOMAIN mints Reply-To.
+RESEND_INBOUND_DOMAINS = [
+    d for d in [RESEND_INBOUND_DOMAIN.strip().lower(), *RESEND_INBOUND_LEGACY_DOMAINS] if d
+]
 RESEND_WEBHOOK_SECRET = _env("RESEND_WEBHOOK_SECRET", "")
-# Comma-separated list — every address here gets a copy of each captured
-# customer email reply (with Reply-To set to the customer).
-INBOUND_FORWARD_EMAILS = [e.strip() for e in _env("INBOUND_FORWARD_EMAIL", "").split(",") if e.strip()]
+# ONE clean, legible Reply-To for every customer email (e.g.
+# proposals@notify.wetreadwell.com) instead of <token>@domain. Customers should
+# never be asked to reply to a wall of random characters — Will's objection, and a
+# fair one. Routing does not depend on this address: the proposal identity rides in
+# the Message-ID / References headers (email_sender.proposal_anchor), which mail
+# clients echo back on reply. Must be an address AT a receiving domain above, or
+# replies to it go nowhere. Empty → fall back to the old <token>@domain form.
+INBOUND_REPLY_ADDRESS = _env("INBOUND_REPLY_ADDRESS", "")
+# Resend receives mail for EVERY address at the receiving domain, so mail can
+# arrive whose local part is not a proposal token (someone emails the From
+# address, or a reply loses the token). With this on, we try to match the SENDER
+# to exactly one proposal and file it there; ambiguous or unknown senders get
+# forwarded to the notification roster instead of being dropped.
+#
+# PROD ONLY — deliberately off on staging. Both environments' webhooks receive
+# the same account-wide Resend events, and exact-token matching is what keeps
+# them apart (a token only resolves in its own database). Sender matching is
+# fuzzier, so leaving it off on staging is what stops staging from filing or
+# forwarding a production customer's email.
+INBOUND_SENDER_FALLBACK = _env("INBOUND_SENDER_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
+
+# ── Proposal follow-up automation ─────────────────────────────────────────────
+# The cadence that chases sent proposals (followup_rules / followup_worker). The
+# worker re-reads BOTH of these from the environment on every tick, so production
+# can be stopped with an env change plus a restart rather than a deploy.
+#
+# Ships FALSE in production and TRUE on staging: staging's database holds only test
+# customers, so the cadence can be exercised for real there, while production stays
+# off until Hanz decides to turn it on.
+# OFF unless explicitly switched on. This drives automatic follow-up EMAIL to real
+# customers, so the two defaults are not symmetric: defaulting on and being wrong mails
+# customers from whatever box is running, while defaulting off and being wrong sends
+# nothing and somebody notices. Opt in per environment.
+FOLLOWUP_AUTOMATION_ENABLED = _env("FOLLOWUP_AUTOMATION_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+# Seconds between sweeps. Clamped 60..3600 by the worker. Lower it on staging to
+# exercise a multi-day cadence in minutes.
+FOLLOWUP_TICK_SECONDS = _env("FOLLOWUP_TICK_SECONDS", "900")
 
 # ── Google Sign-In for customers (optional alt to email OTP) ──────────────────
 # A Google OAuth *Web Client ID* (public). The button only renders when set; the

@@ -39,6 +39,17 @@ drop policy if exists portal_app_read_drafts on public.drafts;
 create policy portal_app_read_drafts on public.drafts
   for select to portal_app using (true);
 
+-- 3b) Read-only on draft_revisions — the snapshot of the estimate as it was SENT.
+--     The customer's proposal page, its PDF and the approval check all read the
+--     pinned revision rather than the live draft, so without this grant a pinned
+--     proposal silently falls back to live data and mid-edit changes become visible
+--     to the customer again. Also owned by the proposal tool (its
+--     supabase_schema.sql creates the table); same role-scoped policy as drafts.
+grant select on public.draft_revisions to portal_app;
+drop policy if exists portal_app_read_draft_revisions on public.draft_revisions;
+create policy portal_app_read_draft_revisions on public.draft_revisions
+  for select to portal_app using (true);
+
 -- 4) Full DML on the portal's own tables, plus row policies so the RLS enabled
 --    in schema.sql admits portal_app to its own tables while still denying the
 --    anon/public REST role.
@@ -79,5 +90,27 @@ grant select, insert, update, delete on public.portal_contacts to portal_app;
 drop policy if exists portal_app_rw on public.portal_contacts;
 create policy portal_app_rw on public.portal_contacts for all to portal_app using (true) with check (true);
 
+-- Customer notification bell: per-(reader, proposal) last-seen markers.
+-- RLS is enabled in schema.sql, so the POLICY is required — grants alone are
+-- default-deny.
+grant select, insert, update, delete on public.portal_read_state to portal_app;
+drop policy if exists portal_app_rw on public.portal_read_state;
+create policy portal_app_rw on public.portal_read_state for all to portal_app using (true) with check (true);
+
+-- Deposit invoice numbering: portal_app must be able to call nextval() when it
+-- issues an invoice number. A sequence needs its OWN grant — the table grants
+-- above do not cover it, and without this the first invoice fails with
+-- "permission denied for sequence portal_invoice_seq".
+grant usage, select on sequence public.portal_invoice_seq to portal_app;
+
 -- NOTE: portal_app is deliberately granted NOTHING on public.events or
 -- public.profiles, and only SELECT (no write) on public.drafts. Do not widen.
+
+-- 3c) Proposal Follow-Up System: the activity log (portal-owned). RLS is enabled in
+--     schema.sql, so grants alone are default-deny — the policy is required.
+--     Without this the follow-up worker cannot reserve a send, which means it would
+--     either re-nag customers on every tick or stop entirely.
+grant select, insert, update, delete on public.portal_followups to portal_app;
+drop policy if exists portal_app_rw_followups on public.portal_followups;
+create policy portal_app_rw_followups on public.portal_followups
+  for all to portal_app using (true) with check (true);

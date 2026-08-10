@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Optional
@@ -29,7 +29,11 @@ import config
 import customer_auth as ca
 import db
 import email_sender
+import followup_rules
+import followup_settings
+import followup_worker
 import inbound
+import invoice
 import proposals
 import ratelimit
 
@@ -71,6 +75,13 @@ def _startup() -> None:
                  " + dev seed" if config.DEV_SEED else "")
     except Exception as exc:  # noqa: BLE001
         log.error("startup failed: %s", exc)
+    # Started here rather than lazily off a request: the proposals that most need
+    # chasing are the ones nobody is looking at, so waiting for traffic would mean
+    # the quiet ones never get followed up. Guarded internally by the env flag.
+    try:
+        followup_worker.ensure_started()
+    except Exception as exc:  # noqa: BLE001 — never block boot on the worker
+        log.error("follow-up worker failed to start: %s", exc)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -92,6 +103,45 @@ def _client_ip(request: Request) -> str:
 
 def _cap(v, n: int) -> str:
     return (v or "").strip()[:n]
+
+
+def _iso(v):
+    """A timestamp as an ISO string, or None. Tolerates an already-string value
+    so a caller never has to know whether psycopg parsed the column."""
+    return v.isoformat() if hasattr(v, "isoformat") else (v or None)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _followup_state(p: dict) -> dict:
+    """Where this proposal stands in follow-up automation, for the staff board.
+
+    `enrolled` false means nothing is chasing it — either a legacy proposal published
+    before automation existed, or one an estimator took off. The board renders paused
+    and closed-lost as badges, so both need to travel."""
+    return {
+        "enrolled": bool(p.get("followup_enrolled_at")),
+        "enabled": bool(p.get("followup_enrolled_at")) and not p.get("followup_disabled_at"),
+        "paused_until": _iso(p.get("followup_paused_until")),
+        "closed_lost_reason": p.get("closed_lost_reason"),
+        "closed_at": _iso(p.get("closed_at")),
+    }
+
+
+def _last_activity(p: dict):
+    """The most recent thing that happened on this proposal, from either side.
+
+    The board dates cards by it and the digest scores "customer silence" from it, so
+    it spans the customer's messages, the estimator's logged outreach and the
+    milestones themselves — whichever is latest."""
+    stamps = [p.get(k) for k in (
+        "last_message_at", "last_staff_followup_at", "scheduled_at", "contacts_received_at",
+        "deposit_received_at", "deposit_submitted_at", "approved_at", "last_viewed_at",
+        "viewed_at", "created_at")]
+    real = [s for s in stamps if hasattr(s, "isoformat")]
+    return max(real) if real else None
 
 
 def _set_session_cookie(resp: Response, token: str) -> None:
@@ -184,6 +234,24 @@ def _contact(row: dict) -> dict:
             "phone": row.get("phone"), "label": row.get("label")}
 
 
+def _notify_customer(p: dict, heading: str, body_html: str) -> None:
+    """Email the milestone to EVERY recipient on the proposal.
+
+    The third channel alongside the chat line and the team email. Best-effort:
+    a mail failure must never fail the action the customer just completed."""
+    try:
+        pid = p["proposal_id"]
+        link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+        rt = email_sender.proposal_reply_to(p["token"])
+        project = p.get("project_name") or "your project"
+        for e in (db.get_recipients(pid) or [p.get("customer_email")]):
+            if e:
+                email_sender.send_customer_update(e, link, project, heading, body_html,
+                                                  reply_to=rt, token=p["token"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("customer update email failed for %s: %s", p.get("proposal_id"), exc)
+
+
 def _staff_link(proposal_id: str) -> str:
     """Deep-link a staff notification email into the proposal in the staff tool
     (so staff answer in-portal rather than replying to the email)."""
@@ -191,12 +259,19 @@ def _staff_link(proposal_id: str) -> str:
 
 
 def _proposal_card(row: dict) -> dict:
+    """One row in the customer's project list (login page + in-portal switcher)."""
+    created = row.get("created_at")
     return {
         "token": row["token"],
         "project_name": row.get("project_name") or "Your Proposal",
         "proposal_status": row.get("proposal_status"),
         "deposit_status": row.get("deposit_status"),
         "schedule_status": row.get("schedule_status"),
+        "contacts_status": row.get("contacts_status") or "pending",
+        "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+        # So the card doesn't say "Deposit due" on a job that never needs one.
+        "deposit_required": row.get("deposit_required") is not False,
+        "deposit_requested": bool(row.get("deposit_requested_at")),
     }
 
 
@@ -242,14 +317,40 @@ def healthz() -> dict:
     return {"ok": True}
 
 
+# Always revalidate the app shell + its assets. See the asset() docstring: without
+# this, browsers heuristically cached them and customers ran stale JS after a deploy.
+_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
 @app.get("/")
 def root() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "login.html")
+    return FileResponse(FRONTEND_DIR / "login.html", headers=_NO_CACHE)
 
 
 @app.get("/p/{token}")
-def portal_page(token: str) -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "index.html")
+def portal_page(token: str, request: Request) -> FileResponse:
+    """The landing page for the link in every notification email.
+
+    Recording the visit answers a question the Follow-ups board could not answer before: a
+    proposal that has sat in Sent for a week is a completely different problem depending on
+    whether the email was ever opened, and "we might have the wrong address" was
+    indistinguishable from "they are thinking about it".
+
+    It is only ever a SOFT signal. This serves before any login, so a click is not a read, and
+    `mark_link_clicked` keeps it away from proposal_status and cycle_viewed_at for that reason.
+    HEAD is skipped because that is prefetchers and link checkers rather than people.
+
+    Serving the page must not depend on any of this working — a database hiccup here would
+    otherwise take the customer's proposal offline, which is far worse than a missing
+    timestamp."""
+    if request.method == "GET":
+        try:
+            p = db.get_proposal_by_token(token)
+            if p:
+                db.mark_link_clicked(p["proposal_id"])
+        except Exception:                     # noqa: BLE001 — never block the page
+            log.warning("mark_link_clicked failed for token %s", token[:8], exc_info=True)
+    return FileResponse(FRONTEND_DIR / "index.html", headers=_NO_CACHE)
 
 
 @app.get("/api/public-config")
@@ -317,6 +418,68 @@ def auth_logout(request: Request) -> JSONResponse:
     return resp
 
 
+_EVENT_ICONS = {"text": "💬", "deposit_request": "🧾", "system": "🔔"}
+
+
+def _event(row: dict, seen) -> dict:
+    """One bell item. `title` carries the project name because the feed spans
+    every project this customer can reach."""
+    kind = row.get("msg_type") or "text"
+    body = (row.get("body") or "").strip()
+    if kind == "text":
+        head = "Treadwell replied"
+    elif kind == "deposit_request":
+        head = "Deposit invoice"
+    else:
+        head = (body.split(" — ", 1)[0] if " — " in body[:60] else "Update")
+        body = body.split(" — ", 1)[1] if " — " in body[:60] else body
+    ts = row.get("created_at")
+    link = f"/p/{row['token']}" + ("#proposal" if kind == "deposit_request" else "")
+    return {
+        "id": f"ev:{row.get('id')}",
+        "kind": kind,
+        "icon": _EVENT_ICONS.get(kind, "•"),
+        "title": f"{head} · {row.get('project_name') or 'your project'}",
+        "body": body[:240],
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else ts,
+        "link": link,
+        "unread": bool(ts and (seen.get(row["proposal_id"]) is None or ts > seen[row["proposal_id"]])),
+    }
+
+
+@app.get("/api/me/notifications")
+def me_notifications(request: Request) -> JSONResponse:
+    """The customer's bell: staff replies, deposit invoices and status changes
+    across ALL their projects, newest first, with a per-reader unread count."""
+    se = _session_email(request)
+    if not se:
+        return _json({"ok": True, "authed": False, "items": [], "unread": 0})
+    try:
+        seen = db.get_read_state(se)
+        items = [_event(r, seen) for r in db.list_customer_events(se)]
+    except Exception as exc:  # noqa: BLE001 — the bell must never break the page
+        log.warning("customer notifications failed for %s: %s", se, exc)
+        return _json({"ok": True, "authed": True, "items": [], "unread": 0})
+    return _json({"ok": True, "authed": True, "items": items,
+                  "unread": sum(1 for i in items if i["unread"])})
+
+
+@app.post("/api/me/notifications/seen")
+async def me_notifications_seen(request: Request) -> JSONResponse:
+    """Clear this reader's badge. Per-customer, unlike the staff bell's single
+    shared marker — a shared one would leak read state between customers."""
+    se = _session_email(request)
+    if not se:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    try:
+        pids = [r["proposal_id"] for r in db.list_proposals_by_email(se)]
+        db.mark_read(se, pids)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mark_read failed for %s: %s", se, exc)
+        return _json({"ok": False}, 500)
+    return _json({"ok": True})
+
+
 @app.get("/api/me/proposals")
 def me_proposals(request: Request) -> JSONResponse:
     se = _session_email(request)
@@ -338,7 +501,8 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
             "wrong_account": bool(se and not authed)}
     if not authed:
         return _json(base)
-    data = db.get_draft_data(p["proposal_id"]) or {}
+    # The snapshot they were SENT, not whatever an estimator has since typed.
+    data = db.get_pinned_draft_data(p) or {}
     db.mark_viewed(p["proposal_id"])
     p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
@@ -352,18 +516,32 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     vm["deposit"] = {
         "due": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
         "ref": proposals.deposit_ref(p["proposal_id"]),
-        # No pre-configured Treadwell bank details are shown; the customer records
-        # where they sent the transfer themselves (see the ACH form).
-        # so the customer sees a "recorded" state on reload instead of a blank
-        # form they might resubmit (deposit_status only flips when staff confirm).
+        # `submitted` lets the customer see a "recorded" state on reload instead of a
+        # blank form they might resubmit. Derived from the deposit rows, not from
+        # deposit_status, so the banner survives staff moving the status either way.
         "submitted": bool(_latest),
         "submitted_method": _latest["method"] if _latest else None,
-        "submitted_sent_date": (_latest["sent_date"].isoformat()
-                                if _latest and _latest.get("sent_date") else None),
-        "submitted_check_number": _latest.get("check_number") if _latest else None,
+        # Present once the invoice has been issued — drives the download button on
+        # the chat card and the thank-you card.
+        "invoice_no": p.get("deposit_invoice_no"),
+        # Does this job collect a deposit at all? False hides the whole Deposit
+        # step. An issued invoice overrides it (staff can invoice a no-deposit job
+        # later), so the UI gates on `required || invoice_no`.
+        "required": p.get("deposit_required") is not False,
     }
     if config.PROPOSAL_TOOL_URL:   # official PDF available via on-demand render
         vm["has_pdf"] = True
+    # Which version of the document this is. Lets the client notice a revision
+    # landing mid-session and re-fetch the PDF instead of showing the old one.
+    vm["revision_no"] = p.get("current_revision_no")
+    # Where the customer has told us the project stands, and how long it has been
+    # sitting — the status card uses both to decide whether offering a way out is
+    # helpful or presumptuous.
+    vm["project_status"] = {
+        "paused_until": _iso(p.get("followup_paused_until")),
+        "closed": (p.get("proposal_status") or "") == "closed_lost",
+    }
+    vm["sent_at"] = _iso(p.get("created_at"))
     base["view"] = vm
     return _json(base)
 
@@ -405,6 +583,7 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
         f"<blockquote>{html.escape(text)}</blockquote>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
     return _json({"ok": True, "question": _q(row), "message": _msg(row)})
 
@@ -421,9 +600,24 @@ def api_messages(token: str, request: Request) -> JSONResponse:
     except (ValueError, TypeError):
         after = 0
     msgs = [_msg(m) for m in db.list_messages(p["proposal_id"], after)]
+    # The client re-renders the whole page when ANY of these changes, so anything a
+    # customer would otherwise have to reload to see belongs here. Issuing an
+    # invoice or a staff amount edit never moves deposit_status, so without
+    # invoice_no/amount the page kept saying "your invoice is on its way" while the
+    # invoice sat in the chat below it.
     return _json({"ok": True, "messages": msgs, "status": {
         "proposal": p["proposal_status"], "deposit": p["deposit_status"],
-        "contacts": p.get("contacts_status") or "pending", "schedule": p["schedule_status"]}})
+        "contacts": p.get("contacts_status") or "pending", "schedule": p["schedule_status"],
+        "invoice_no": p.get("deposit_invoice_no"),
+        "deposit_amount": (float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None),
+        "deposit_required": p.get("deposit_required") is not False,
+        # A revision landing while the customer has the page open changes the whole
+        # document — the client re-renders and re-fetches the PDF off this.
+        "revision_no": p.get("current_revision_no"),
+        # So the status card updates in the tab the customer left open — including
+        # when STAFF pause or close it from the drawer.
+        "paused_until": _iso(p.get("followup_paused_until")),
+        "closed": (p.get("proposal_status") or "") == "closed_lost"}})
 
 
 @app.post("/api/portal/{token}/approve")
@@ -431,13 +625,31 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    # Idempotent: a double-submit (or a re-opened tab) must not re-run the approval
+    # email + automations, which would issue a second invoice.
+    #
+    # approved_at as well as the status, since staff got the power to file a signed job
+    # as lost (2026-08-10). That deliberately keeps the approval on the row under a
+    # 'closed_lost' status, and keyed on the status alone this guard stopped firing for
+    # exactly those rows: the customer's portal went back to reading "Awaiting your
+    # approval" with a live Approve button, and one click wrote a second portal_approvals
+    # row, re-sent both approval emails and put the job back in Approved, undoing a staff
+    # decision nobody told them about. A closed-lost proposal that was NEVER signed stays
+    # approvable, since a customer who changes their mind is welcome back, and so does a
+    # revised one: reset_for_revision nulls approved_at whenever it retires an approval.
+    if p.get("proposal_status") == "approved" or p.get("approved_at"):
+        return _json({"ok": True, "already_approved": True})
     body = await _body(request)
     name = _cap(body.get("name"), 120)
     title = _cap(body.get("title"), 120)
     if not name:
         return _json({"ok": False, "error": "Name is required."}, 400)
 
-    data = db.get_draft_data(p["proposal_id"]) or {}
+    # Validate the approval against the SAME snapshot the customer was shown, so the
+    # option labels they ticked always exist and the total they agreed to is the
+    # total we record. Reading live data here meant a mid-edit rename could orphan
+    # their selection between page load and pressing Approve.
+    data = db.get_pinned_draft_data(p) or {}
     options = proposals.pricing_options(data)
 
     # Multi-select (option_labels[]) is the V1 path; option_label (single string)
@@ -475,15 +687,45 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     db.add_message(p["proposal_id"], "staff", None,
                    f"Approved by {name} — {sel_txt}. Total ${total:,.2f}.", msg_type="system")
 
+    # Staff decided at send time whether this job collects a deposit. When it
+    # doesn't, every mention of one has to go — promising an invoice that will
+    # never arrive is worse than saying nothing.
+    deposit_due = p.get("deposit_required") is not False
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
         f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
         f"<strong>{html.escape(option_summary)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
         f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
-        f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>"
-        f"<p>Project: {html.escape(project_name)}.</p>",
+        + (f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>" if deposit_due
+           else "<p>No deposit required for this project — the customer has been asked for "
+                "their project contacts.</p>")
+        + f"<p>Project: {html.escape(project_name)}.</p>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
     )
+    # Confirm the approval to the customer in writing. They'd just committed to a
+    # price and heard nothing back except (later) an invoice.
+    _notify_customer(
+        p, "Thank you — your proposal is approved",
+        f"<p>We've recorded your approval of <strong>{html.escape(project_name)}</strong>"
+        f"{(' by ' + html.escape(name)) if name else ''} on {approved_date}.</p>"
+        f"<p>Approved: <strong>{html.escape(option_summary)}</strong> — "
+        f"<strong>${total:,.2f}</strong>.</p>"
+        + (f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves your place on our "
+           f"schedule; the invoice follows separately.</p>" if deposit_due
+           else "<p>No deposit is needed. Next, please add your project contacts so we can "
+                "schedule the work.</p>"),
+    )
+    if not deposit_due:
+        # The contacts prompt normally rides on deposit-received (admin_deposit_received).
+        # With no deposit there is no such moment, so ask now — otherwise the thread
+        # goes quiet and the project stalls waiting for contacts nobody requested.
+        try:
+            db.add_message(p["proposal_id"], "staff", None,
+                           "Approved — thank you! Please add your project contacts so we can "
+                           "schedule the work.", msg_type="system")
+        except Exception as exc:  # noqa: BLE001 — the approval itself must still succeed
+            log.warning("could not post the contacts prompt for %s: %s", p["proposal_id"], exc)
     try:
         automations.run_on_approval(p, project_name)
     except Exception as exc:  # noqa: BLE001
@@ -491,73 +733,224 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
+_LOST_REASON_LABELS = {
+    "price": "Price", "another_contractor": "Selected another contractor",
+    "canceled": "Project canceled", "scope_changed": "Scope changed",
+    "timing": "Timing", "other": "Other",
+}
+
+
+@app.post("/api/portal/{token}/project-status")
+async def api_project_status(token: str, request: Request) -> JSONResponse:
+    """The customer tells us where the project actually stands.
+
+    The point of the whole follow-up system: a customer who has gone quiet usually
+    isn't ignoring us, they're waiting on a budget or they've gone elsewhere. Give
+    them one click to say so and the reminders stop being noise — for them and for
+    the estimator.
+
+    Rate-limited by IP: unlike /questions this fans out email to the estimator and
+    the roster and mutates pipeline state, so it is worth the cheap guard."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP,
+                              config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "rate_limited"}, 429)
+    if (p.get("proposal_status") or "") == "approved":
+        return _json({"ok": False, "error": "already_approved"}, 400)
+
+    body = await _body(request)
+    status = str(body.get("status") or "").strip().lower()
+    pid = p["proposal_id"]
+    who = _session_email(request) or p.get("customer_email")
+    name = p.get("customer_name") or who or "the customer"
+    project = p.get("project_name") or "the project"
+
+    if status == "delayed":
+        try:
+            months = int(body.get("months") or 0)
+        except (TypeError, ValueError):
+            months = 0
+        if months not in _PAUSE_MONTHS:
+            return _json({"ok": False, "error": "invalid_months"}, 400)
+        until = followup_rules.add_months(followup_rules.business_today(_now_utc()), months)
+        # Saying "two months" twice — a second click from an older email — must not
+        # fire another notification at the estimator.
+        if followup_rules.as_date(p.get("followup_paused_until")) == until:
+            return _json({"ok": True, "project_status": {"paused_until": until.isoformat(),
+                                                         "closed": False}})
+        db.pause_followups(pid, until)
+        window = "4+ months" if months == 4 else f"{months} month{'s' if months > 1 else ''}"
+        db.add_message(pid, "customer", who,
+                       f"Project delayed — revisiting in about {window}.",
+                       msg_type="status_update",
+                       meta={"status": "delayed", "months": months,
+                             "paused_until": until.isoformat()})
+        db.add_followup(pid, "customer_status",
+                        {"status": "delayed", "months": months, "until": until.isoformat()}, who)
+        _notify_staff_status(
+            p, f"Project delayed — {project}",
+            f"<p><strong>{html.escape(str(name))}</strong> says "
+            f"<strong>{html.escape(project)}</strong> is delayed by about "
+            f"{html.escape(window)}.</p>"
+            f"<p>Automated follow-ups are paused until "
+            f"{html.escape(until.isoformat())}, and you'll get a reminder then.</p>")
+        return _json({"ok": True, "project_status": {"paused_until": until.isoformat(),
+                                                     "closed": False}})
+
+    if status == "not_moving_forward":
+        reason = str(body.get("reason") or "").strip().lower() or None
+        if reason and reason not in _LOST_REASONS:
+            return _json({"ok": False, "error": "invalid_reason"}, 400)
+        note = _cap(body.get("note"), 1000) or None
+        if (p.get("proposal_status") or "") == "closed_lost":
+            return _json({"ok": True, "project_status": {"paused_until": None, "closed": True}})
+        if not db.close_lost(pid, reason):
+            return _json({"ok": False, "error": "already_approved"}, 400)
+        label = _LOST_REASON_LABELS.get(reason or "", "")
+        db.add_message(pid, "customer", who,
+                       "Not moving forward with this project."
+                       + (f" Reason: {label}." if label else ""),
+                       msg_type="status_update",
+                       meta={"status": "not_moving_forward", "reason": reason, "note": note})
+        db.add_followup(pid, "customer_status",
+                        {"status": "not_moving_forward", "reason": reason, "note": note}, who)
+        _notify_staff_status(
+            p, f"Closed–Lost — {project}",
+            f"<p><strong>{html.escape(str(name))}</strong> is not moving forward with "
+            f"<strong>{html.escape(project)}</strong>.</p>"
+            + (f"<p>Reason: <strong>{html.escape(label)}</strong></p>" if label else "")
+            + (f"<blockquote>{html.escape(note)}</blockquote>" if note else "")
+            + "<p>Follow-ups have stopped and the opportunity is marked Closed–Lost.</p>")
+        return _json({"ok": True, "project_status": {"paused_until": None, "closed": True}})
+
+    if status == "resume":
+        db.resume_followups(pid)
+        db.add_message(pid, "customer", who, "Ready to move forward again.",
+                       msg_type="status_update", meta={"status": "resume"})
+        db.add_followup(pid, "customer_status", {"status": "resume"}, who)
+        _notify_staff_status(
+            p, f"Back on — {project}",
+            f"<p><strong>{html.escape(str(name))}</strong> says "
+            f"<strong>{html.escape(project)}</strong> is ready to move forward again.</p>")
+        return _json({"ok": True, "project_status": {"paused_until": None, "closed": False}})
+
+    return _json({"ok": False, "error": "invalid_status"}, 400)
+
+
+def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:
+    """Tell the assigned estimator (and the roster) what the customer just said.
+
+    Best-effort: the customer's answer is already recorded, and an email failure must
+    not make their click look broken."""
+    pid = p["proposal_id"]
+    try:
+        to = email_sender._resolve_notify("general", pid) or []
+        assigned = (p.get("assigned_estimator") or "").strip()
+        if assigned and assigned.lower() not in [t.lower() for t in to]:
+            to = [assigned] + to
+        if not to:
+            return
+        email_sender.notify_team(subject, body_html, recipients=to,
+                                 reply_link=_staff_link(pid), proposal_id=pid,
+                                 reply_to=email_sender.proposal_reply_to(p.get("token")))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("status notify failed for %s: %s", pid, exc)
+
+
 @app.post("/api/portal/{token}/deposit")
 async def api_deposit(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
+    # Don't accept money nobody asked for. An invoice existing overrides the flag:
+    # staff can always choose to invoice a no-deposit job later, and once they have,
+    # the customer must be able to pay it.
+    if p.get("deposit_required") is False and not p.get("deposit_invoice_no"):
+        return _json({"ok": False, "error": "deposit_not_required"}, 400)
     body = await _body(request)
     method = (body.get("method") or "").strip().lower()
     if method not in ("ach", "check"):
         return _json({"ok": False, "error": "Choose ACH or check."}, 400)
     account_name = _cap(body.get("account_name"), 120) or None
-    bank_name = _cap(body.get("bank_name"), 120) or None
     note = _cap(body.get("note"), 1000) or None
-    trace_ref = _cap(body.get("trace_ref"), 60) or None
-    # Customer-recorded destination ("where you sent it"). This is Treadwell's own
-    # receiving account (self-reported by the customer for reconciliation), not the
-    # customer's account — the source account number is still never collected.
-    sent_to_beneficiary = _cap(body.get("sent_to_beneficiary"), 120) or None
-    sent_to_bank = _cap(body.get("sent_to_bank"), 120) or None
-    sent_to_routing = _cap(body.get("sent_to_routing"), 40) or None
-    sent_to_account = _cap(body.get("sent_to_account"), 40) or None
-    # account_last4 is optional and only ever stored masked (never the full number).
-    last4 = "".join(ch for ch in (body.get("account_last4") or "") if ch.isdigit())[-4:]
-    masked_ref = f"••••{last4}" if last4 else None
-    try:
-        sent_date = date.fromisoformat(body["sent_date"]) if body.get("sent_date") else None
-    except (ValueError, TypeError):
-        sent_date = None
-    # Pay-by-check: the check number off the mailed cheque. Collapse inner
-    # whitespace (_cap only trims the ends) so it stays clean in the email + chat.
-    check_number = _cap(" ".join(str(body.get("check_number") or "").split()), 40) or None
 
-    db.add_deposit(p["proposal_id"], method, account_name, bank_name, masked_ref, note,
-                   sent_date=sent_date, trace_ref=trace_ref,
-                   sent_to_beneficiary=sent_to_beneficiary, sent_to_bank=sent_to_bank,
-                   sent_to_routing=sent_to_routing, sent_to_account=sent_to_account,
-                   check_number=check_number)
+    # ACH: the customer's OWN routing + account numbers (double-entry verified on the
+    # client). We store the full numbers so Treadwell can initiate the debit; the team
+    # email + chat only ever show the last-4 mask. Normalize to digits before storing.
+    routing_number = account_number = masked_ref = account_type = None
+    if method == "ach":
+        routing_number = "".join(ch for ch in str(body.get("routing_number") or "") if ch.isdigit())
+        account_number = "".join(ch for ch in str(body.get("account_number") or "") if ch.isdigit())
+        account_type = (str(body.get("account_type") or "").strip().lower() or None)
+        if not account_name:
+            return _json({"ok": False, "error": "Please enter the account name."}, 400)
+        # Length floor only, no exact-length rule: routing formats vary by bank and
+        # country and may change, so pinning 9 digits would reject a valid payer.
+        # 4 is just enough to reject an empty/garbage field (same floor as account).
+        if len(routing_number) < 4:
+            return _json({"ok": False, "error": "Routing number must be at least 4 digits."}, 400)
+        if len(account_number) < 4:
+            return _json({"ok": False, "error": "Account number must be at least 4 digits."}, 400)
+        if account_type not in ("checking", "savings"):
+            return _json({"ok": False, "error": "Please choose an account type (checking or savings)."}, 400)
+        masked_ref = f"••••{account_number[-4:]}"
+
+    db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
+                   routing_number=routing_number, account_number=account_number,
+                   account_type=account_type)
+    # Move the board card off 'pending' so staff can see money is in flight — until
+    # now the only signal a customer had paid was one email, leaving a paid project
+    # indistinguishable from an approved-but-unpaid one. Guarded in SQL so a
+    # resubmission can't un-receive a deposit staff already verified.
+    db.mark_deposit_submitted(p["proposal_id"])
     project_name = p.get("project_name") or "proposal"
     ref = proposals.deposit_ref(p["proposal_id"])
-    # A system line records it in the chat so both sides see the deposit is in flight.
+    # A chat line records it so both sides see the deposit is in flight. Filed as a
+    # CUSTOMER-authored 'deposit_submitted' row (it is the customer's action, not
+    # ours) — that is what puts it in the staff notification bell feed, which only
+    # carries customer-originated rows.
+    # (No account details or internal ref in the customer-visible message.)
     who = account_name or "The customer"
-    action = (f"sent a bank transfer{f' on {sent_date}' if sent_date else ''}" if method == "ach"
-              else f"is mailing a check{f' (#{check_number})' if check_number else ''}")
-    db.add_message(p["proposal_id"], "staff", None,
-                   f"Deposit initiated — {who} {action} (ref {ref}). We'll confirm once it clears.",
-                   msg_type="system")
+    chat = (f"Deposit initiated — {who} provided ACH payment details for {project_name}. "
+            "We'll confirm once the transfer clears." if method == "ach"
+            else f"Deposit initiated — a check is on its way for {project_name}. "
+                 "We'll confirm once it arrives.")
+    db.add_message(p["proposal_id"], "customer", _session_email(request), chat,
+                   msg_type="deposit_submitted")
+
     if method == "ach":
         detail = (
-            f"<p>From: {html.escape(account_name or '—')} · Bank: {html.escape(bank_name or '—')} · "
-            f"Sent: {sent_date or '—'} · Trace: {html.escape(trace_ref or '—')}"
-            f"{f' · Acct {masked_ref}' if masked_ref else ''}</p>"
-            f"<p>Sent to (customer-recorded): {html.escape(sent_to_beneficiary or '—')} · "
-            f"Bank: {html.escape(sent_to_bank or '—')} · Routing: {html.escape(sent_to_routing or '—')} · "
-            f"Acct: {html.escape(sent_to_account or '—')}</p>"
+            f"<p>Name on account: {html.escape(account_name or '—')} · "
+            f"Type: {html.escape((account_type or '—').title())} · "
+            f"Routing: {html.escape(routing_number or '—')} · "
+            f"Account: {masked_ref or '—'} · Note: {html.escape(note or '—')}</p>"
+            f"<p>Full account number is in the proposal's admin view.</p>"
         )
+        lead = (f"Customer provided ACH details to pay the deposit for "
+                f"<strong>{html.escape(project_name)}</strong> ({html.escape(ref)}).")
+        closing = "Initiate the debit, then mark the deposit Received in the proposal tool."
+        subject = f"Deposit details — {project_name} ({ref})"
     else:   # check
-        detail = (
-            f"<p>Check #: {html.escape(check_number or '—')} · Name on check: {html.escape(account_name or '—')} · "
-            f"Bank: {html.escape(bank_name or '—')} · Sent: {sent_date or '—'}</p>"
-        )
+        detail = f"<p>Note: {html.escape(note or '—')}</p>"
+        lead = (f"Paying by check for <strong>{html.escape(project_name)}</strong> "
+                f"({html.escape(ref)}) — the memo line will show the project name.")
+        closing = "Confirm it arrived, then mark the deposit Received in the proposal tool."
+        subject = f"Deposit by check — {project_name} ({ref})"
     email_sender.notify_team(
-        f"Deposit {'sent' if method == 'ach' else 'method'} — {project_name} ({ref})",
-        f"<p>{'Bank transfer sent' if method == 'ach' else 'Paying by check'} for "
-        f"<strong>{html.escape(project_name)}</strong> — match reference <strong>{html.escape(ref)}</strong> "
-        f"on the statement.</p>"
-        + detail
-        + f"<p>Confirm it landed, then mark the deposit Received in the proposal tool.</p>",
+        subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+    )
+    _notify_customer(
+        p, "We've received your deposit details",
+        f"<p>Thanks — we've recorded your "
+        f"{'bank transfer' if method == 'ach' else 'check'} for "
+        f"<strong>{html.escape(project_name)}</strong>.</p>"
+        f"<p>We'll confirm here as soon as it "
+        f"{'clears' if method == 'ach' else 'arrives'}. Nothing else is needed from you "
+        f"right now.</p>",
     )
     return _json({"ok": True})
 
@@ -620,6 +1013,13 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+    )
+    _notify_customer(
+        p, "Thanks — we have your project contacts",
+        f"<p>We've saved the contacts for <strong>{html.escape(project)}</strong>:</p>"
+        f"<ul>{rows}</ul>"
+        f"<p>You can update them any time before we schedule the work.</p>",
     )
     return _json({"ok": True})
 
@@ -636,9 +1036,14 @@ def api_pdf(token: str, request: Request):
     # Preferred: render the real Treadwell PDF on demand from the proposal tool.
     if config.PROPOSAL_TOOL_URL and config.SERVICE_TOKEN:
         try:
+            # Render the pinned revision, so the downloaded document and the prices
+            # on the page can never disagree. Omitted for legacy rows → live draft.
+            params = {"draft_id": pid}
+            if p.get("current_revision_no"):
+                params["revision_no"] = int(p["current_revision_no"])
             r = httpx.get(
                 config.PROPOSAL_TOOL_URL + "/api/admin/proposal-pdf",
-                params={"draft_id": pid},
+                params=params,
                 headers={"X-Service-Token": config.SERVICE_TOKEN},
                 timeout=90,
             )
@@ -651,6 +1056,36 @@ def api_pdf(token: str, request: Request):
     if p.get("pdf_path"):  # fallback: a stored Storage URL (prod option)
         return RedirectResponse(p["pdf_path"])
     return _json({"ok": False, "error": "no_pdf"}, 404)
+
+
+@app.get("/api/portal/{token}/deposit-invoice.pdf")
+def api_deposit_invoice_pdf(token: str, request: Request):
+    """The deposit invoice document. Rendered on demand from the stored columns
+    (no blob storage) — the invoice NUMBER is what's persisted, so the document is
+    always reproducible and always matches what was emailed."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    invoice_no = p.get("deposit_invoice_no")
+    amount = p.get("deposit_amount")
+    if not invoice_no or amount is None:
+        return _json({"ok": False, "error": "no_invoice"}, 404)
+    try:
+        payload = invoice.invoice_payload(p, float(amount), invoice_no,
+                                          draft=db.get_pinned_draft_data(p) or {})
+        pdf = invoice.render_invoice_pdf(payload)
+    except invoice.InvoiceUnavailable as exc:
+        log.error("deposit invoice unavailable for %s: %s", p["proposal_id"], exc)
+        return _json({"ok": False, "error": "render_failed"}, 502)
+    except Exception as exc:  # noqa: BLE001
+        log.error("deposit invoice render failed for %s: %s", p["proposal_id"], exc)
+        return _json({"ok": False, "error": "render_failed"}, 500)
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{invoice.invoice_filename(invoice_no)}"',
+                 "Cache-Control": "private, max-age=0, no-store"},
+    )
 
 
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
@@ -672,23 +1107,77 @@ async def api_notify(request: Request) -> JSONResponse:
     if kind == "published":
         for e in recipients:
             email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project,
-                                          reply_to=rt)
+                                          reply_to=rt, token=p["token"])
     elif kind == "reply":
+        # Carry the reply TEXT through. Without it this path emailed a bare
+        # "Treadwell replied to your question" + button — the same email the
+        # staff-drawer path (admin_reply) already sends WITH the snippet.
+        msg = _cap(body.get("message") or body.get("body"), 4000) or None
         for e in recipients:
-            email_sender.send_reply_notification(e, link, project, reply_to=rt)
+            email_sender.send_reply_notification(e, link, project, reply_to=rt, message=msg,
+                                                 token=p["token"])
     else:
         return _json({"ok": False, "error": "unknown_type"}, 400)
     return _json({"ok": True})
 
 
 # ── inbound email (Resend receiving webhook) → CRM chat thread ─────────────────
+def _inbound_body(email_id: str, data: dict) -> tuple[str, dict] | None:
+    """Fetch the message from Resend (the webhook carries metadata only) and
+    reduce it to the text we store or forward. None on fetch failure — the caller
+    answers non-2xx so Svix retries, which is safe before anything is inserted."""
+    try:
+        r = httpx.get(f"https://api.resend.com/emails/receiving/{email_id}",
+                      headers={"Authorization": f"Bearer {config.RESEND_API_KEY}"}, timeout=10)
+        r.raise_for_status()
+        full = r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("inbound: body fetch failed for %s: %s", email_id, exc)
+        return None
+    text = (full.get("text") or "")[:100_000]
+    if not text.strip():
+        html_body = (full.get("html") or "")[:300_000]
+        text = html.unescape(re.sub(r"<[^>]{0,300}>", " ", html_body))
+    body_txt = _cap(inbound.strip_quoted(text), 4000)
+    names = [(_cap(a.get("filename"), 120) or "attachment")
+             for a in (data.get("attachments") or [])[:10] if isinstance(a, dict)]
+    if names:
+        body_txt = (body_txt + "\n" + "\n".join(f"[Attachment: {n}]" for n in names)).strip()
+    return (body_txt or "(empty email)"), (full if isinstance(full, dict) else {})
+
+
+def _inbound_forward(to: list[str], subject_line: str, heading: str, banner: str,
+                     from_email: str, project: str, subject: str, body_txt: str,
+                     link: str | None = None, reply_to: str | None = None,
+                     verb: str = "emailed") -> None:
+    """Forward an inbound email to staff. Best-effort — a mail failure must never
+    turn into a webhook error, because by here the CRM insert may already be done
+    and a Svix retry would only duplicate work."""
+    if not to:
+        log.info("inbound: no notify recipients after roster/overrides — forward skipped")
+        return
+    where = f" on <strong>{html.escape(project)}</strong>" if project else ""
+    esc_body = html.escape(body_txt).replace("\n", "<br>")
+    body = (
+        f"{banner}<p><strong>{html.escape(from_email or 'unknown')}</strong> {verb}{where}"
+        f"{(' — ' + html.escape(subject)) if subject else ''}:</p>"
+        f"<blockquote>{esc_body}</blockquote>"
+    )
+    if link:
+        body += f'<p><a href="{link}">Open in the proposal tool</a></p>'
+    try:
+        email_sender._send(to, subject_line, email_sender._wrap(heading, body), reply_to=reply_to)
+    except Exception as exc:  # noqa: BLE001
+        log.error("inbound: forward failed: %s", exc)
+
+
 @app.post("/api/inbound/resend")
 async def api_inbound_resend(request: Request):
     """Resend `email.received` webhook. Auth = svix signature (no session/token).
-    Flow: verify → match the proposal by the token in the recipient address →
-    dedup → fetch the body from Resend → insert as a customer chat message →
-    forward a copy + notify the team (best-effort). Non-2xx makes Svix retry, so
-    only pre-insert failures return errors."""
+    Flow: verify → match a proposal (by the token in the recipient address, or —
+    production only — by the sender's own address) → dedup → fetch the body from
+    Resend → file it in the chat thread as the customer or as staff → notify.
+    Non-2xx makes Svix retry, so only pre-insert failures return errors."""
     if not config.RESEND_WEBHOOK_SECRET:
         return _json({"ok": False, "error": "not_configured"}, 503)
     raw = await request.body()
@@ -717,80 +1206,168 @@ async def api_inbound_resend(request: Request):
         rcpts += v if isinstance(v, list) else ([v] if v else [])
     if data.get("received_for"):
         rcpts.append(data["received_for"])
-    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAIN)
-    p = (db.get_proposal_by_token(token) or db.get_proposal_by_token_ci(token)) if token else None
+    from_email = (parseaddr(str(data.get("from") or ""))[1] or "").strip().lower()
+    subject = _cap(data.get("subject"), 200)
+    # Mail that appears to come from us is a loop — a forward or a customer relay
+    # delivered straight back into this webhook. An empty From is equally unusable.
+    if inbound.is_own_address(from_email, config.EMAIL_FROM, config.RESEND_INBOUND_DOMAINS):
+        log.info("inbound: ignoring mail from ourselves (%r)", from_email)
+        return _json({"ok": True, "ignored": "own_address"})
+
+    def _resolve(tok):
+        if not tok:
+            return None
+        return db.get_proposal_by_token(tok) or db.get_proposal_by_token_ci(tok)
+
+    # 1. Token in the recipient address. Every receiving domain we have ever minted
+    #    is accepted (primary + legacy), so a Reply-To sitting in an old email still
+    #    finds its thread. Tried first because it needs no message fetch.
+    token = inbound.find_token(rcpts, config.RESEND_INBOUND_DOMAINS)
+    p = _resolve(token)
+    matched_by = "address" if p else None
+    is_staff = bool(from_email) and from_email in email_sender.staff_emails()
+    fetched = None
+
     if not p:
-        log.info("inbound: no proposal match (token=%r)", token)
-        return _json({"ok": True, "ignored": "no_match"})
+        # Everything below needs the message itself — the threading headers live in
+        # the fetched payload, not the webhook metadata. The fetch is a plain GET,
+        # so a Svix retry repeating it is harmless.
+        fetched = _inbound_body(email_id, data)
+        if fetched is None:
+            return _json({"ok": False, "error": "fetch_failed"}, 500)
+        body_txt, full = fetched
+        headers = full.get("headers")
+
+        # 2. Proposal anchor in In-Reply-To / References. This is what makes a single
+        #    clean Reply-To possible: the project rides in a header the customer
+        #    never sees, and their mail client quotes it back for us.
+        header_token = inbound.find_thread_token(headers)
+        p = _resolve(header_token)
+        if p:
+            matched_by = "header"
+            log.info("inbound: matched by thread header (token=%r)", header_token)
+
+        # 3. Nothing identifying in the mail at all — a freshly composed email to our
+        #    address. Match the SENDER, primary domain only, and only when it is
+        #    unambiguous. Staff are never sender-matched: their address appears on
+        #    proposals as a notify recipient, not as the customer.
+        if not p and config.INBOUND_SENDER_FALLBACK and not is_staff \
+                and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN):
+            try:
+                matches = db.list_proposals_by_email(from_email)
+            except Exception as exc:  # noqa: BLE001 — a lookup failure is ambiguous
+                log.warning("inbound: sender lookup failed for %r: %s", from_email, exc)
+                matches = []
+            if len(matches) == 1:
+                p, matched_by = matches[0], "sender"
+
+        if not p:
+            # 4. Unplaceable. Hand it to a human rather than dropping it — that is
+            #    the point of publishing a real address. Gated on the SAME conditions
+            #    as sender matching: the environment that owns untokened mail owns
+            #    forwarding it too, and only on the primary domain. Otherwise both
+            #    environments would forward the same stray email to their own roster,
+            #    and staging would forward production customers' mail.
+            if not (config.INBOUND_SENDER_FALLBACK
+                    and inbound.addressed_to_domain(rcpts, config.RESEND_INBOUND_DOMAIN)):
+                log.info("inbound: no proposal match (token=%r, from=%r)", token, from_email)
+                return _json({"ok": True, "ignored": "no_match"})
+            if inbound.is_auto_reply(subject, headers):
+                log.info("inbound: unmatched auto-reply dropped (%r)", from_email)
+                return _json({"ok": True, "ignored": "auto_reply"})
+            why = ("sent by staff, with no proposal in the message" if is_staff else
+                   "nothing in the message identifies a proposal, and no single "
+                   "proposal matches this sender")
+            log.info("inbound: unmatched email from %r — forwarding (%s)", from_email, why)
+            # No pid, so no dedup anchor: a Resend dashboard re-delivery could
+            # forward twice. Svix retries only fire on non-2xx, so normal traffic
+            # forwards once.
+            _inbound_forward(
+                email_sender._resolve_notify("general"),
+                f"Unmatched email — {from_email or 'unknown sender'}",
+                "An email we could not place",
+                f"<p><strong>⚠ UNMATCHED — {html.escape(why)}. Not added to any portal "
+                f"thread.</strong></p>",
+                from_email, "", subject, body_txt, reply_to=from_email or None)
+            return _json({"ok": True, "unmatched": True})
+
     pid = p["proposal_id"]
     if db.has_email_message(pid, email_id):
         return _json({"ok": True, "ignored": "duplicate"})
 
-    # Fetch the body (webhook is metadata-only). Failure → 500 so Svix retries;
-    # nothing has been inserted yet, so the retry is safe.
-    try:
-        r = httpx.get(f"https://api.resend.com/emails/receiving/{email_id}",
-                      headers={"Authorization": f"Bearer {config.RESEND_API_KEY}"}, timeout=10)
-        r.raise_for_status()
-        full = r.json()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("inbound: body fetch failed for %s: %s", email_id, exc)
-        return _json({"ok": False, "error": "fetch_failed"}, 500)
+    if fetched is None:
+        fetched = _inbound_body(email_id, data)
+        if fetched is None:
+            return _json({"ok": False, "error": "fetch_failed"}, 500)
+    body_txt, full = fetched
+    auto = inbound.is_auto_reply(subject, full.get("headers"))
+    project = p.get("project_name") or "proposal"
+    meta = {"source": "email", "email_id": email_id, "from": from_email}
 
-    text = (full.get("text") or "")[:100_000]
-    if not text.strip():
-        html_body = (full.get("html") or "")[:300_000]
-        text = html.unescape(re.sub(r"<[^>]{0,300}>", " ", html_body))
-    body_txt = _cap(inbound.strip_quoted(text), 4000)
-    names = [(_cap(a.get("filename"), 120) or "attachment")
-             for a in (data.get("attachments") or [])[:10] if isinstance(a, dict)]
-    if names:
-        body_txt = (body_txt + "\n" + "\n".join(f"[Attachment: {n}]" for n in names)).strip()
-    if not body_txt:
-        body_txt = "(empty email)"
+    # Staff is tested BEFORE the customer: if one address were somehow on both
+    # lists, filing staff as the customer would put our words in their mouth.
+    #
+    # A staff inbound email can speak AS Treadwell to a customer, so it is the one
+    # privileged path here and roster membership alone isn't enough — a From header
+    # is forgeable. Require the receiving MTA's SPF+DKIM verdict too. Failing closed
+    # just sends the message through the roster forward instead.
+    if is_staff and not inbound.sender_authenticated(full.get("headers")):
+        log.warning("inbound: %r is on the roster but SPF/DKIM did not both pass — "
+                    "refusing the staff path for proposal %s", from_email, pid)
+        is_staff = False
+    if is_staff:
+        if auto:
+            log.info("inbound: staff auto-reply ignored (%r)", from_email)
+            return _json({"ok": True, "ignored": "auto_reply"})
+        # The insert is the idempotency anchor: after this line, retries dedup.
+        db.add_message(pid, "staff", from_email, body_txt, msg_type="text", meta=meta)
+        # Same outcome as a staff reply typed in the portal: the customer sees it
+        # and gets the usual notification. No roster forward — the roster is where
+        # this came from. (Attachments arrive as [Attachment: name] markers only.)
+        try:
+            rt = email_sender.proposal_reply_to(p["token"])
+            for e in (db.get_recipients(pid) or [p.get("customer_email")]):
+                if e:
+                    email_sender.send_reply_notification(
+                        e, f"{config.PUBLIC_BASE_URL}/p/{p['token']}", project,
+                        reply_to=rt, message=body_txt, token=p["token"])
+        except Exception as exc:  # noqa: BLE001 — the thread insert already happened
+            log.error("inbound: staff relay to the customer failed: %s", exc)
+        return _json({"ok": True, "staff": True})
 
-    from_email = (parseaddr(str(data.get("from") or ""))[1] or "").strip().lower()
     authorized = set(e.lower() for e in (db.get_recipients(pid) or []))
     authorized.add((p.get("customer_email") or "").strip().lower())
-    verified = bool(from_email) and from_email in authorized
-    project = p.get("project_name") or "proposal"
-    subject = _cap(data.get("subject"), 200)
+    # A sender-matched proposal is verified by construction — that match WAS the
+    # sender's address appearing on exactly one proposal.
+    verified = bool(from_email) and (from_email in authorized or matched_by == "sender")
 
     if verified:
-        # The insert is the idempotency anchor: after this line, retries dedup.
-        db.add_message(pid, "customer", from_email, body_txt, msg_type="text",
-                       meta={"source": "email", "email_id": email_id, "from": from_email})
+        db.add_message(pid, "customer", from_email, body_txt, msg_type="text", meta=meta)
     else:
         # Never let an unverified From speak as the customer in the thread —
-        # staff still see it via the forward + team notification below.
+        # staff still see it via the forward below.
         log.warning("inbound: unverified sender %r for proposal %s", from_email, pid)
 
-    flag = "" if verified else "<p><strong>⚠ UNVERIFIED SENDER — not added to the portal thread.</strong></p>"
-    esc_body = html.escape(body_txt).replace("\n", "<br>")
-    fwd_html = (
-        f"{flag}<p><strong>{html.escape(from_email or 'unknown')}</strong> replied by email on "
-        f"<strong>{html.escape(project)}</strong>"
-        f"{(' — ' + html.escape(subject)) if subject else ''}:</p>"
-        f"<blockquote>{esc_body}</blockquote>"
-    )
-    link = _staff_link(pid)
+    if auto:
+        # Keep the record when it's really the customer, but don't page staff for
+        # an out-of-office, and never bounce one back at another autoresponder.
+        log.info("inbound: auto-reply for %s — no forward (verified=%s)", pid, verified)
+        return _json({"ok": True, "verified": verified, "ignored": "auto_reply"})
+
     # ONE send, governed by the notification roster + this project's overrides — the
     # same switch as every other portal notification (no separate hardcoded list).
-    # Sent via _send (not notify_team) so Reply-To stays the customer: a staff reply
-    # from their own inbox reaches the customer. Empty/muted roster → nobody emailed.
-    to = email_sender._resolve_notify("general", proposal_id=pid)
-    try:
-        if to:
-            email_sender._send(
-                to,
-                f"Customer email reply — {project}",
-                email_sender._wrap("Customer replied by email",
-                                   fwd_html + f'<p><a href="{link}">Open in the proposal tool</a></p>'),
-                reply_to=from_email or None)
-        else:
-            log.info("inbound: no notify recipients after roster/overrides for %s", pid)
-    except Exception as exc:  # noqa: BLE001 — the CRM insert already happened
-        log.error("inbound: forward failed: %s", exc)
+    _inbound_forward(
+        email_sender._resolve_notify("general", proposal_id=pid),
+        f"Customer email reply — {project}", "Customer replied by email",
+        "" if verified else "<p><strong>⚠ UNVERIFIED SENDER — not added to the "
+                            "portal thread.</strong></p>",
+        from_email, project, subject, body_txt, link=_staff_link(pid),
+        # Verified: Reply-To is the proposal, so a staff reply from their own inbox
+        # comes back here and reaches the customer through the thread. Unverified:
+        # reply to the sender — we don't know who they are, so nothing of theirs
+        # should be posted on the customer's behalf.
+        reply_to=(email_sender.proposal_reply_to(p["token"]) if verified else (from_email or None)),
+        verb="replied by email")
     return _json({"ok": True, "verified": verified})
 
 
@@ -833,18 +1410,71 @@ async def admin_publish(request: Request) -> JSONResponse:
     project = _cap(data.get("project_name"), 200) or "Your Proposal"
     pdf_path = (body.get("pdf_path") or "").strip() or None
     by = _cap(body.get("by"), 120) or None
+    # Optional personal note the estimator typed on the Done page — shown in the
+    # customer's proposal-ready email above the button.
+    note = _cap(body.get("message"), 2000) or None
+    # Whether this job collects a 25% deposit, decided by staff at send time. None
+    # (field absent — an older proposal tool) means "don't change it": on create
+    # that lands on the column default TRUE, on update it preserves what was sent.
+    rd = body.get("require_deposit")
+    require_deposit = None if rd is None else bool(rd)
+    # Which snapshot of the project this send represents. Absent → an older proposal
+    # tool that doesn't snapshot; the customer view falls back to the live draft,
+    # exactly as before.
+    raw_rev = body.get("revision_no")
+    try:
+        rev_no = int(raw_rev) if raw_rev is not None and int(raw_rev) > 0 else None
+    except (TypeError, ValueError):
+        rev_no = None
+    # Who owns chasing this proposal. The proposal tool requires it at send time;
+    # absent means an older tool, so the stored value is preserved.
+    assigned = (parseaddr(str(body.get("assigned_estimator") or ""))[1] or "").strip().lower()
+    if body.get("assigned_estimator") and not assigned:
+        return _json({"ok": False, "error": "invalid_estimator"}, 400)
 
     existing = db.get_proposal(draft_id)
+    revised = False
     if existing:
         token = existing["token"]
-        db.update_portal_proposal(draft_id, primary, name, project, pdf_path)
+        # Sending a new version to a lost opportunity puts it back in play — staff
+        # would otherwise have to remember to un-close it by hand, and the board
+        # would show a live proposal sitting in Closed-lost.
+        if existing.get("proposal_status") == "closed_lost" and db.reopen_if_closed(draft_id):
+            db.add_message(draft_id, "staff", None,
+                           "Re-opened — a new version of this proposal has been sent.",
+                           msg_type="system")
+        db.update_portal_proposal(draft_id, primary, name, project, pdf_path,
+                                  deposit_required=require_deposit, revision_no=rev_no)
         _pdf_cache_drop(draft_id)   # a re-publish may have changed the document — don't serve a stale render
+        # A second (or later) revision is a genuinely new document, not a re-send of
+        # the same one: reopen it for approval, retire the old card, post a new one.
+        if rev_no and rev_no > 1:
+            revised = True
+            was_approved = db.reset_for_revision(draft_id, rev_no)
+            db.supersede_proposal_cards(draft_id, rev_no)
+            db.add_message(draft_id, "staff", None,
+                           f"Revision {rev_no} of your proposal is ready to review.",
+                           msg_type="proposal_card", meta={"revision_no": rev_no})
+            if was_approved:
+                # Say plainly that the earlier agreement no longer stands, so nobody
+                # is left thinking a signed number still applies.
+                db.add_message(
+                    draft_id, "staff", None,
+                    f"Revision {rev_no} replaces the previous version. Your earlier approval "
+                    f"has been recorded for reference, and this revision needs a new approval.",
+                    msg_type="system")
+        elif rev_no:
+            # Re-send of the FIRST revision (e.g. adding a recipient). Just re-point.
+            db.reset_for_revision(draft_id, rev_no)
     else:
         token = ca.new_proposal_token()
-        db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by)
+        db.create_portal_proposal(draft_id, token, primary, name, project, pdf_path, by,
+                                  deposit_required=True if require_deposit is None else require_deposit,
+                                  revision_no=rev_no)
         # Seed the chat thread with the proposal card (first publish only).
         db.add_message(draft_id, "staff", None, "Your proposal is ready to review.",
-                       msg_type="proposal_card")
+                       msg_type="proposal_card",
+                       meta={"revision_no": rev_no} if rev_no else None)
 
     # Reconcile the recipient set.
     if recipients is None:                      # legacy call — preserve exact old semantics
@@ -863,9 +1493,24 @@ async def admin_publish(request: Request) -> JSONResponse:
     # never see each other's addresses). Only the primary gets the name greeting.
     rt = email_sender.proposal_reply_to(token)
     emailed = [e for e in send_list
-               if email_sender.send_portal_link(e, name if e == primary else "", link, project, reply_to=rt)]
+               if email_sender.send_portal_link(e, name if e == primary else "", link, project,
+                                                 reply_to=rt, note=note, token=token,
+                                                 revised=revised)]
+
+    # Enrol (or re-enrol) in follow-up automation. Stamped AFTER the emails go out so
+    # the cadence clock starts from the send the customer actually received, and last
+    # so a failure here can never stop a proposal from being delivered.
+    try:
+        if assigned:
+            db.set_assigned_estimator(draft_id, assigned)
+        db.enroll_followup(draft_id)
+    except Exception as exc:  # noqa: BLE001 — the proposal is sent; automation is secondary
+        log.warning("could not enrol %s in follow-ups: %s", draft_id, exc)
+
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
-                  "recipients": send_list, "emailed": emailed})
+                  "recipients": send_list, "emailed": emailed,
+                  "revision_no": rev_no, "revised": revised,
+                  "assigned_estimator": assigned or None})
 
 
 @app.get("/api/admin/pipeline")
@@ -873,6 +1518,21 @@ def admin_pipeline(request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     unread = db.unread_counts()
+    # The SAVED cadence, read once for the whole board rather than per row.
+    #
+    # `next_due_at` used to be called with no cfg, so this column was computed from the shipped
+    # constants while the worker used whatever staff had saved. Change "every 3 days" to "every 5"
+    # and every date on the board is wrong; raise `max_recurring` and it reads "Nothing scheduled"
+    # while emails keep going out. A schedule nobody can see anywhere else has to be the real one.
+    #
+    # Guarded, because an unreadable settings row must not take down the pipeline the way the
+    # unguarded click columns would have — the shipped cadence is the right answer when we cannot
+    # read the saved one, and it is what the worker falls back to as well.
+    try:
+        followup_cfg = followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[pipeline] could not read the cadence, showing the shipped one: %s", exc)
+        followup_cfg = followup_settings.defaults()
     out = []
     for r in db.list_all_portal_proposals():
         out.append({
@@ -883,9 +1543,88 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "contacts_status": r.get("contacts_status") or "pending",
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
             "deposit_amount": float(r["deposit_amount"]) if r.get("deposit_amount") is not None else None,
+            # Lets the board stop parking no-deposit jobs in a deposit column they
+            # can never leave. Legacy rows read as required.
+            "deposit_required": r.get("deposit_required") is not False,
+            # Who owns the follow-up, and where this proposal stands in automation.
+            "assigned_estimator": r.get("assigned_estimator"),
+            "followup_state": _followup_state(r),
+            # Per-stage dates so each board column sorts by its own milestone rather
+            # than by whatever was touched last.
+            "last_viewed_at": _iso(r.get("last_viewed_at")),
+            # Somebody followed the email link. A soft signal, reported separately from
+            # `viewed` on purpose (see db.mark_link_clicked): it tells the board that the
+            # email reached a mailbox, which is what distinguishes "they haven't decided"
+            # from "we may have the wrong address" on a proposal stuck in Sent.
+            "link_clicked_at": _iso(r.get("link_clicked_at")),
+            "last_link_clicked_at": _iso(r.get("last_link_clicked_at")),
+            "deposit_submitted_at": _iso(r.get("deposit_submitted_at")),
+            "deposit_received_at": _iso(r.get("deposit_received_at")),
+            "contacts_received_at": _iso(r.get("contacts_received_at")),
+            "scheduled_at": _iso(r.get("scheduled_at")),
+            "last_activity_at": _iso(_last_activity(r)),
+            "last_followup_at": _iso(r.get("last_staff_followup_at")),
+            # Named separately so the board can say WHAT last happened, not just
+            # when: dating a card "Viewed 7/12" when the real event was a customer
+            # message on 7/30 reads as a stale deal that nobody has touched.
+            "last_message_at": _iso(r.get("last_message_at")),
+            # When the CUSTOMER last came back to us — null means they never have. The staff
+            # board sorts "seen but never answered" from "mid-conversation" on this, and
+            # last_message_at cannot tell them apart (it counts our own messages too).
+            "customer_replied_at": _iso(r.get("customer_replied_at")),
+            # When the cadence will next email this customer. Computed from the same
+            # anchors due_now() uses, so the Follow-ups page can show a schedule that
+            # otherwise exists nowhere a human can see. None = nothing is coming
+            # (not automated, switched off, approved, closed, or cadence exhausted).
+            "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc(), followup_cfg)),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
+            # Who owns it, and the milestones the board dates a card by. The
+            # staff side picks the latest of these — it also owns turning the
+            # email into a name, because portal_app is denied `profiles`.
+            "estimator_email": r.get("estimator_email"),
+            "sent_at": _iso(r.get("created_at")),        # a row can't exist unsent
+            "viewed_at": _iso(r.get("viewed_at")),       # FIRST view only
+            "approved_at": _iso(r.get("approved_at")),
+            "deposit_requested_at": _iso(r.get("deposit_requested_at")),
         })
     return _json({"ok": True, "proposals": out})
+
+
+# Preview length for the bell/toast — enough to read at a glance, short enough
+# that the notification payload stays small.
+_RECENT_MSG_PREVIEW = 240
+
+
+def _recent_msg(row: dict) -> dict:
+    """One recent customer message shaped for the staff notification feed. Body is
+    truncated server-side; `created_at` is ISO (matches _msg). `msg_type` lets the
+    staff side tell a question apart from a deposit submission (defaults to 'text'
+    so an older row without one still renders)."""
+    body = (row.get("body") or "").strip()
+    if len(body) > _RECENT_MSG_PREVIEW:
+        body = body[:_RECENT_MSG_PREVIEW - 1].rstrip() + "…"
+    return {
+        "id": row.get("id"),
+        "proposal_id": row.get("proposal_id"),
+        "project_name": row.get("project_name"),
+        "customer_name": row.get("customer_name"),
+        "author_email": row.get("author_email"),
+        "msg_type": row.get("msg_type") or "text",
+        "body": body,
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
+
+
+@app.get("/api/admin/recent-messages")
+def admin_recent_messages(request: Request) -> JSONResponse:
+    """Newest customer messages across all proposals — drives the staff tool's
+    notification bell + bottom-right toast. Customer-originated rows only: chat
+    text plus deposit submissions (staff replies and staff system/card rows are
+    excluded by the query)."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    rows = db.list_recent_customer_messages(limit=25)
+    return _json({"ok": True, "messages": [_recent_msg(r) for r in rows]})
 
 
 @app.get("/api/admin/proposal/{proposal_id}")
@@ -896,8 +1635,15 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     appr = db.latest_approval(proposal_id)
+    # So the staff review form can prefill the invoice number instead of leaving
+    # it blank; peeking never consumes a sequence value.
+    try:
+        next_no = p.get("deposit_invoice_no") or db.peek_next_invoice_no()
+    except Exception:  # noqa: BLE001 — a missing sequence must not break the drawer
+        next_no = p.get("deposit_invoice_no")
     return _json({
         "ok": True,
+        "next_invoice_no": next_no,
         "proposal": {
             "proposal_id": p["proposal_id"], "token": p["token"],
             "url": f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
@@ -908,9 +1654,20 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "approved_total": float(p["approved_total"]) if p.get("approved_total") is not None else None,
             "deposit_amount": float(p["deposit_amount"]) if p.get("deposit_amount") is not None else None,
             "deposit_requested_at": p["deposit_requested_at"].isoformat() if p.get("deposit_requested_at") else None,
+            "deposit_required": p.get("deposit_required") is not False,
+            "assigned_estimator": p.get("assigned_estimator"),
+            "followup_state": _followup_state(p),
             "recipients": db.get_recipients(proposal_id),
         },
         "contacts": [_contact(c) for c in db.list_contacts(proposal_id)],
+        # Recent follow-up activity for the drawer: what the automation sent, what the
+        # estimator logged, and what the customer said about their timeline.
+        "followups": [{
+            "kind": f["kind"],
+            "detail": f.get("detail") or {},
+            "by": f.get("created_by"),
+            "created_at": _iso(f.get("created_at")),
+        } for f in db.list_followups(proposal_id)],
         "approval": ({
             "name": appr["name"], "title": appr.get("title"),
             "date": appr["approved_date"].isoformat() if appr.get("approved_date") else None,
@@ -924,6 +1681,8 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
         "deposits": [{
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
             "masked_ref": d.get("masked_ref"), "note": d.get("note"),
+            "routing_number": d.get("routing_number"), "account_number": d.get("account_number"),
+            "account_type": d.get("account_type"),
             "sent_date": d["sent_date"].isoformat() if d.get("sent_date") else None,
             "trace_ref": d.get("trace_ref"),
             "sent_to_beneficiary": d.get("sent_to_beneficiary"), "sent_to_bank": d.get("sent_to_bank"),
@@ -932,6 +1691,290 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "submitted_at": d["submitted_at"].isoformat() if d.get("submitted_at") else None,
         } for d in db.list_deposits(proposal_id)],
     })
+
+
+# ── follow-up automation (staff-facing) ───────────────────────────────────────
+# Kinds an estimator may log. `auto_email` and `customer_status` are minted by the
+# server only — letting staff post them would corrupt both the dedupe and the
+# digest's "has anyone actually chased this?" signal.
+_STAFF_FOLLOWUP_KINDS = ("staff_call", "staff_email", "staff_text", "staff_note")
+_LOST_REASONS = ("price", "another_contractor", "canceled", "scope_changed", "timing", "other")
+_PAUSE_MONTHS = (1, 2, 3, 4)
+
+
+# ── the follow-up cadence, as settings ────────────────────────────────────────
+# Hanz asked for the chase schedule AND the four customer emails to be editable rather than
+# constants in the code. One global cadence, editable by any signed-in staff member (the tool's
+# own sign-in is the gate; this endpoint sees only the service token).
+@app.get("/api/admin/settings/followups")
+def admin_get_followup_settings(request: Request) -> JSONResponse:
+    """The current cadence, plus a preview of each email as a customer would receive it.
+
+    Always returns a usable cadence: an absent settings row means "as shipped", which is the
+    normal state on any environment where the DDL has not been applied yet."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    # Two reads, two separate guards, because they carry different weight.
+    #
+    # `get_settings` is material: this editor REPLACES the whole row, so if a failed read were
+    # reported as "nothing saved", the page would show the shipped defaults, say "never changed",
+    # and the next Save would overwrite four hand-written customer emails with boilerplate —
+    # attributed to whoever pressed the button. A missing table is the one failure that really
+    # does mean "as shipped" (prod cannot apply its own DDL), and `get_settings` returns None for
+    # that case alone; anything else raises and is reported as unreadable so the editor can refuse
+    # to write over what it cannot see.
+    #
+    # `settings_meta` is only the "who last changed this" caption. It used to share this try, so a
+    # blip on a decorative query threw away a config that had been read perfectly well.
+    stored, read_failed = None, False
+    try:
+        stored = db.get_settings(followup_settings.ROW_ID)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[settings] could not read follow-up settings: %s", exc)
+        read_failed = True
+    meta = {}
+    if not read_failed:
+        try:
+            meta = db.settings_meta(followup_settings.ROW_ID)
+        except Exception as exc:  # noqa: BLE001 — the caption is not worth failing a page over
+            log.warning("[settings] could not read the audit line: %s", exc)
+    cfg = followup_settings.merge(stored)
+    return _json({
+        "ok": True,
+        "settings": cfg,
+        # `saved` tells the editor whether it is showing somebody's choices or the shipped
+        # defaults — without it a fresh install looks identical to an edited one.
+        "saved": stored is not None,
+        # Set when we could not read the row at all. The editor must then neither claim the
+        # cadence has never been changed nor allow a save, because it does not know what it
+        # would be replacing.
+        "read_failed": read_failed,
+        "updated_at": _iso(meta.get("updated_at")),
+        "updated_by": meta.get("updated_by") or "",
+        "previews": {k: followup_settings.preview(cfg, k)
+                     for k in followup_settings.TEMPLATE_KEYS},
+        "tokens": list(followup_settings.TOKENS),
+        # The editor labels its tabs from these, so a refusal that names an email ("the
+        # “Second reminder” email needs {link}") points at a tab that exists.
+        "labels": dict(followup_settings.LABELS),
+    })
+
+
+@app.put("/api/admin/settings/followups")
+async def admin_put_followup_settings(request: Request) -> JSONResponse:
+    """Save the cadence. Returns what was actually stored, including any clamping.
+
+    Returning the stored values rather than an empty ok is deliberate: numbers get pulled into
+    range on the way in, and somebody who typed 2 hours needs to see that they got 4 rather than
+    believe their edit took."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    try:
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+    except followup_settings.ValidationError as exc:
+        return _json({"ok": False, "error": str(exc)}, 400)
+    by = _cap(body.get("by"), 120) or None
+    try:
+        meta = db.save_settings(followup_settings.ROW_ID, cfg, by) or {}
+    except Exception as exc:  # noqa: BLE001
+        log.error("[settings] could not save follow-up settings: %s", exc)
+        return _json({"ok": False, "error": "Couldn't save that — the settings table may be "
+                                            "missing on this environment."}, 500)
+    # The same audit fields the GET returns, carried back by the write itself. Without them the
+    # editor still read "never changed" underneath the edit it had just stored, until somebody
+    # reloaded — the one question that line exists to answer, answered wrongly.
+    return _json({
+        "ok": True,
+        "settings": cfg,
+        "saved": True,
+        "updated_at": _iso(meta.get("updated_at")),
+        "updated_by": meta.get("updated_by") or by or "",
+        "previews": {k: followup_settings.preview(cfg, k)
+                     for k in followup_settings.TEMPLATE_KEYS},
+    })
+
+
+@app.post("/api/admin/settings/followups/preview")
+async def admin_preview_followup_settings(request: Request) -> JSONResponse:
+    """Render the wording being typed, WITHOUT saving it.
+
+    The whole safety net for editable email: an unfilled token or a deleted button is obvious in a
+    preview and invisible in a form. Validation errors come back as 400 with the reason, so the
+    editor can show "this will not send" before anybody commits it."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    try:
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+    except followup_settings.ValidationError as exc:
+        return _json({"ok": False, "error": str(exc)}, 400)
+    return _json({"ok": True,
+                  "previews": {k: followup_settings.preview(cfg, k)
+                               for k in followup_settings.TEMPLATE_KEYS}})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/assign")
+async def admin_assign(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    email = (parseaddr(str(body.get("estimator_email") or ""))[1] or "").strip().lower()
+    if not email:
+        return _json({"ok": False, "error": "invalid_estimator"}, 400)
+    by = _cap(body.get("by"), 120) or None
+    db.set_assigned_estimator(proposal_id, email)
+    db.add_followup(proposal_id, "staff_note", {"action": "reassigned", "to": email}, by)
+    return _json({"ok": True, "assigned_estimator": email})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/followup-automation")
+async def admin_followup_automation(proposal_id: str, request: Request) -> JSONResponse:
+    """Take a proposal off automation, or put it back on.
+
+    This is the spec's "estimator manually removes the proposal from automation" —
+    the deliberate human override, so it is sticky across re-publishes."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    enabled = bool(body.get("enabled"))
+    by = _cap(body.get("by"), 120) or None
+    db.set_followup_enabled(proposal_id, enabled)
+    db.add_followup(proposal_id, "staff_note",
+                    {"action": "automation_on" if enabled else "automation_off"}, by)
+    return _json({"ok": True, "followup_state": _followup_state(db.get_proposal(proposal_id) or p)})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/followups")
+async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse:
+    """Record that an estimator chased this one personally.
+
+    The digest reads these: a logged follow-up suppresses the recommendation, and its
+    absence is what "no follow-up logged in 9 days" means."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    kind = str(body.get("kind") or "").strip().lower()
+    if kind in ("call", "email", "text", "note"):
+        kind = "staff_" + kind          # accept the short form the drawer sends
+    if kind not in _STAFF_FOLLOWUP_KINDS:
+        return _json({"ok": False, "error": "invalid_kind"}, 400)
+    note = _cap(body.get("note"), 2000) or None
+    row = db.add_followup(proposal_id, kind, {"note": note}, _cap(body.get("by"), 120) or None)
+    return _json({"ok": True, "followup": {
+        "kind": row["kind"], "detail": row.get("detail") or {},
+        "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})
+
+
+@app.get("/api/admin/proposal/{proposal_id}/followups")
+def admin_list_followups(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    return _json({"ok": True, "followups": [{
+        "kind": f["kind"], "detail": f.get("detail") or {},
+        "by": f.get("created_by"), "created_at": _iso(f.get("created_at")),
+    } for f in db.list_followups(proposal_id)]})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/status")
+async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
+    """Staff-side equivalent of the customer's project-status card: pause the chase,
+    close the opportunity, or put it back in play. Same db helpers, so the two paths
+    can never diverge."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    status = str(body.get("status") or "").strip().lower()
+    by = _cap(body.get("by"), 120) or None
+
+    if status == "delayed":
+        try:
+            months = int(body.get("months") or 0)
+        except (TypeError, ValueError):
+            months = 0
+        if months not in _PAUSE_MONTHS:
+            return _json({"ok": False, "error": "invalid_months"}, 400)
+        until = followup_rules.add_months(followup_rules.business_today(_now_utc()), months)
+        db.pause_followups(proposal_id, until)
+        db.add_followup(proposal_id, "staff_note",
+                        {"action": "paused", "months": months, "until": until.isoformat()}, by)
+    elif status == "closed_lost":
+        reason = str(body.get("reason") or "").strip().lower() or None
+        if reason and reason not in _LOST_REASONS:
+            return _json({"ok": False, "error": "invalid_reason"}, 400)
+        # An approved proposal is closeable from here as of 2026-08-10, per Hanz: a customer
+        # can sign and the job still die, so staff need a way to file it as lost. The approval
+        # is kept rather than erased (close_lost leaves the approved_* columns and the
+        # portal_approvals rows alone) and moving the card back to Active restores 'approved',
+        # so the old "a stray click must not clobber a win" objection is covered without
+        # blocking the move. The only failure left is the row disappearing between the
+        # get_proposal above and this write.
+        if not db.close_lost(proposal_id, reason):
+            return _json({"ok": False, "error": "not_found"}, 404)
+        db.add_followup(proposal_id, "staff_note",
+                        {"action": "closed_lost", "reason": reason}, by)
+    elif status == "active":
+        db.resume_followups(proposal_id)
+        if p.get("proposal_status") == "closed_lost":
+            db.reopen_if_closed(proposal_id)
+        db.add_followup(proposal_id, "staff_note", {"action": "reactivated"}, by)
+    else:
+        return _json({"ok": False, "error": "invalid_status"}, 400)
+
+    fresh = db.get_proposal(proposal_id) or p
+    return _json({"ok": True, "proposal_status": fresh.get("proposal_status"),
+                  "followup_state": _followup_state(fresh)})
+
+
+@app.post("/api/admin/send-digest")
+async def admin_send_digest(request: Request) -> JSONResponse:
+    """Render and send one estimator's morning follow-up list.
+
+    The proposal tool decides WHO and WHAT — it owns the pipeline scoring and the
+    Claude call. This end owns the email: the branded template, the staff deep links
+    (only this side knows both base URLs) and Resend. Nothing is looked up here, so a
+    digest can be sent for a proposal this request never reads.
+
+    Items are treated as untrusted input all the way to the template, which escapes
+    every field — the tool is ours, but a rendered-to-HTML payload is exactly where a
+    stray customer-supplied project name would matter."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    email = (parseaddr(str(body.get("estimator_email") or ""))[1] or "").strip().lower()
+    if not email or "@" not in email:
+        return _json({"ok": False, "error": "invalid_email"}, 400)
+    raw = body.get("items")
+    if not isinstance(raw, list):
+        return _json({"ok": False, "error": "invalid_items"}, 400)
+    # Capped here as well as at the source: this endpoint must not be a way to send
+    # a hundred-row email, whatever the caller believes it is sending.
+    items = [i for i in raw if isinstance(i, dict)][:25]
+    if not items:
+        return _json({"ok": True, "sent": False, "reason": "empty"})
+    ok = email_sender.send_digest(email, items, name=_estimator_name(email),
+                                  staff_link=_staff_link)
+    return _json({"ok": True, "sent": bool(ok), "items": len(items)})
+
+
+def _estimator_name(email: str) -> str:
+    """A first name for the greeting, read off the address.
+
+    `portal_app` is denied the `profiles` table by design, so the real name isn't
+    reachable from here — and "Morning Kyle," off kyle@ is worth more than no
+    greeting at all."""
+    local = str(email or "").split("@")[0]
+    return " ".join(w.capitalize() for w in re.split(r"[._-]+", local) if w)
 
 
 @app.post("/api/admin/proposal/{proposal_id}/reply")
@@ -950,7 +1993,8 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
     project = p.get("project_name") or "your proposal"
     rt = email_sender.proposal_reply_to(p["token"])
     for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_reply_notification(e, link, project, reply_to=rt)
+        email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text,
+                                             token=p["token"])
     return _json({"ok": True})
 
 
@@ -965,13 +2009,33 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
     db.add_message(proposal_id, "staff", None,
                    "Deposit received — thank you! Please add your project contacts so we can schedule the work.",
                    msg_type="system")
+    p = db.get_proposal(proposal_id) or {}
+    project = p.get("project_name") or "your project"
+    email_sender.notify_team(
+        f"Deposit RECEIVED — {project}",
+        f"<p>The deposit for <strong>{html.escape(project)}</strong> is marked received. "
+        f"The customer has been asked for their project contacts.</p>",
+        kind="deposit", reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+    )
+    _notify_customer(
+        p, "Deposit received — thank you",
+        f"<p>We've received your deposit for <strong>{html.escape(project)}</strong>.</p>"
+        f"<p>Next: add your project contacts so we can schedule the work.</p>",
+    )
     return _json({"ok": True})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/deposit-request")
 async def admin_deposit_request(proposal_id: str, request: Request) -> JSONResponse:
-    """Staff-triggered (NEVER auto-sent): after internal review, push a deposit
-    request into the customer chat + email them. Requires an approved proposal."""
+    """Staff-triggered deposit invoice: mint/reuse the invoice number, post the
+    invoice to the customer chat and email it with the PDF attached. Requires an
+    approved proposal.
+
+    Note: approval ALSO issues this automatically (automations.run_on_approval,
+    Will's item 15). This endpoint stays for re-sends and for a staff-adjusted
+    amount; both paths share automations.issue_deposit_invoice so they can't
+    drift. The invoice NUMBER is issued once and reused on a re-send."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     p = db.get_proposal(proposal_id)
@@ -993,18 +2057,26 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
         amount = (float(p["deposit_amount"]) if p.get("deposit_amount") is not None
                   else proposals.deposit_amount(p.get("approved_total")))
 
-    msg = (f"Deposit requested: ${amount:,.2f}. Your deposit invoice will follow shortly."
-           if amount is not None else "Deposit requested. Your deposit invoice will follow shortly.")
-    db.add_message(proposal_id, "staff", None, msg, msg_type="deposit_request",
-                   meta={"amount": amount} if amount is not None else None)
-    db.set_deposit_requested(proposal_id)
+    if amount is None or amount <= 0:
+        return _json({"ok": False, "error": "invalid_amount"}, 400)   # nothing to invoice
 
-    link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+    # Whatever staff corrected on the review form. Capped and string-coerced here
+    # so nothing odd reaches the document renderer.
+    overrides = body.get("invoice")
+    overrides = ({str(k): _cap(v, 300) for k, v in overrides.items()
+                  if isinstance(k, str) and v is not None}
+                 if isinstance(overrides, dict) else None)
+
     project = p.get("project_name") or "your proposal"
-    rt = email_sender.proposal_reply_to(p["token"])
-    for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
-        email_sender.send_deposit_request(e, link, project, amount, reply_to=rt)
-    return _json({"ok": True, "amount": amount})
+    try:
+        # Staff resend = a genuinely new invoice that supersedes the last (Hanz's
+        # call). The auto path on approval keeps reusing its number.
+        result = automations.issue_deposit_invoice(p, project, amount, overrides=overrides,
+                                                   new_number=bool(p.get("deposit_invoice_no")))
+    except Exception as exc:  # noqa: BLE001
+        log.error("manual deposit invoice failed for %s: %s", proposal_id, exc)
+        return _json({"ok": False, "error": "invoice_failed"}, 500)
+    return _json({"ok": True, **result})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/scheduled")
@@ -1014,6 +2086,27 @@ def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
     if not db.get_proposal(proposal_id):
         return _json({"ok": False, "error": "not_found"}, 404)
     db.set_schedule_status(proposal_id, "scheduled")
+    # Every other status change leaves a trace in the thread; this one didn't, so
+    # the customer's bell and chat stayed silent while the tracker quietly moved.
+    try:
+        db.add_message(proposal_id, "staff", None,
+                       "Project scheduled — we'll confirm the dates with you shortly.",
+                       msg_type="system")
+    except Exception as exc:  # noqa: BLE001 — the status change is what matters
+        log.warning("could not post the scheduled system message for %s: %s", proposal_id, exc)
+    p = db.get_proposal(proposal_id) or {}
+    project = p.get("project_name") or "your project"
+    email_sender.notify_team(
+        f"Project SCHEDULED — {project}",
+        f"<p><strong>{html.escape(project)}</strong> is marked scheduled.</p>",
+        reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+    )
+    _notify_customer(
+        p, "Your project is scheduled",
+        f"<p><strong>{html.escape(project)}</strong> is on our schedule.</p>"
+        f"<p>Your Treadwell contact will confirm the dates with you shortly.</p>",
+    )
     return _json({"ok": True})
 
 
@@ -1118,8 +2211,16 @@ if FRONTEND_DIR.exists():
 
 @app.get("/{asset}")
 def asset(asset: str):
-    """Serve top-level static assets."""
+    """Serve top-level static assets.
+
+    `no-cache` means "revalidate every time", NOT "don't cache" — the browser
+    still stores the file and the ETag turns each check into a cheap 304. Without
+    it these responses carried only an ETag/Last-Modified, so browsers applied
+    HEURISTIC freshness and kept running yesterday's app.js after a deploy (a
+    customer saw the old deposit card with no invoice buttons). Correctness beats
+    saving a few hundred bytes on a handful of tiny files."""
     f = FRONTEND_DIR / asset
-    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js", "favicon.ico"}:
-        return FileResponse(f)
+    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js",
+                                 "projects.js", "shell.js", "favicon.ico"}:
+        return FileResponse(f, headers=_NO_CACHE)
     return _json({"ok": False, "error": "not_found"}, 404)
