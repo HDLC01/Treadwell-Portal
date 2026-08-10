@@ -234,3 +234,108 @@ def strip_quoted(text: str) -> str:
         kept.append(ln)
     out = "\n".join(kept).strip()
     return out if out else (text or "").strip()
+
+
+# A sender's own contact block, which every desktop and phone client bolts onto the end.
+_SIG_DELIM = re.compile(r"^--\s*$|^—\s*$|^Sent from my \w+", re.IGNORECASE)
+_EMAIL_IN = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_PHONE_IN = re.compile(r"(?:\+?\d[\d\s().-]{7,}\d)")
+_URL_IN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+# "*WILL* *BUCHANAN*" — the HTML-to-text pass turns bold into asterisks, and a name in
+# bold on its own line is the single most reliable signature tell in practice.
+_BOLD_NAME = re.compile(r"^\**[A-Z][A-Za-z.'-]*\**(\s+\**[A-Z][A-Za-z.'-]*\**){0,3}[\s*|]*$")
+_LABELLED = re.compile(r"^\**\s*(E|C|T|M|P|F|W|O|Cell|Mobile|Direct|Office|Tel|Fax|Phone|Web|"
+                       r"Email|Main)\s*[:.]", re.IGNORECASE)
+_ADDRESS = re.compile(r"\d+\s+[\w.\s]{2,40}\b(St|Street|Ave|Avenue|Rd|Road|Blvd|Ter|Terrace|"
+                      r"Dr|Drive|Ln|Lane|Ct|Court|Way|Pkwy|Suite|Ste|Hwy)\b", re.IGNORECASE)
+_CITY_ST_ZIP = re.compile(r"[A-Za-z.\s]+,\s*[A-Z]{2}\s*\d{5}")
+_COMPANY = re.compile(r"\b(LLC|L\.L\.C\.|Inc\.?|Ltd\.?|Corp\.?|Co\.|Capital|Partners|Group)\b")
+_MAX_SIG_LINES = 14
+
+
+def _hard_signature_signal(s: str) -> bool:
+    """A line that can only be contact details: an address, a phone, a labelled field.
+
+    A block has to contain at least one of these before any of it is dropped. Without that
+    requirement the soft tests below are enough on their own to eat a trailing "Thanks" —
+    or a one-word answer like "Yes" at the end of a real message.
+    """
+    return bool(_LABELLED.match(s) or _ADDRESS.search(s) or _CITY_ST_ZIP.search(s)
+                or _EMAIL_IN.search(s) or _URL_IN.search(s) or _PHONE_IN.search(s))
+
+
+_PROSE = re.compile(r"[a-z]{2,}\s+[a-z]{2,}\s+[a-z]{2,}")
+
+
+def _looks_like_signature_line(s: str) -> bool:
+    """One line of a trailing contact block, rather than something a person wrote to us."""
+    if not s:
+        return True
+    # Three lowercase words in a row is a sentence, and a sentence is content even when it
+    # holds a phone number. Without this, "Call me on 913-555-1234 before you order the
+    # material" reads as a signature line and the instruction is thrown away.
+    if _PROSE.search(s):
+        return False
+    if _hard_signature_signal(s):
+        return True
+    # Soft tells, only ever trusted alongside a hard one: a bolded name, a company, a
+    # "*|*" separator, any short line with no sentence in it.
+    if len(s) <= 70 and (_BOLD_NAME.match(s) or _COMPANY.search(s)
+                         or not re.search(r"[a-z]{2,}\s+[a-z]{2,}", s)):
+        return True
+    return False
+
+
+def strip_signature(text: str) -> str:
+    """Cut the sender's own contact block off the end of an inbound email.
+
+    Hanz, 2026-08-11, on a real reply of Will's landing in the thread as a wall of text:
+    "he is telling it is very clutter". strip_quoted removes the QUOTED HISTORY below a
+    reply; it never touched signatures, so every inbound message carried the sender's
+    name, mobile, office, website and street address into the chat bubble — on both the
+    staff CRM and the customer's portal.
+
+    Two passes, both conservative:
+
+      1. an explicit delimiter ("-- ", "Sent from my iPhone") cuts everything after it;
+      2. otherwise, walk BACKWARDS from the end dropping lines that read as contact
+         details, and stop at the first line with a sentence in it.
+
+    Never returns empty: if the whole message reads as a signature (someone replying
+    with just a phone number) the original is kept. Capped at 14 lines so a long message
+    that happens to end in contact details loses its footer, not its content.
+
+    Line-based, so a client that flattens the signature onto the same line as the message
+    keeps it. That is why the bubble also renders newlines now — the structure has to be
+    visible for this to have anything to work with.
+    """
+    lines = (text or "").splitlines()
+    cut = next((i for i, ln in enumerate(lines) if _SIG_DELIM.match(ln.strip())), None)
+    if cut is not None and cut > 0:
+        out = "\n".join(lines[:cut]).strip()
+        if out:
+            return out
+
+    first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    if first is None:
+        return (text or "").strip()
+
+    # Never past the first line somebody wrote. A one-word reply ("Approved.", "Yes") trips
+    # every soft test there is, so without this floor a short answer above a full Outlook
+    # block strips to nothing.
+    end = len(lines)
+    while end > first + 1 and (len(lines) - end) < _MAX_SIG_LINES:
+        if not _looks_like_signature_line(lines[end - 1].strip()):
+            break
+        end -= 1
+
+    # Only a block that proves itself is dropped. A trailing "Thanks", or a blank line, is
+    # every bit as strippable by the soft tests as a real signature is — and losing a
+    # customer's last word is a worse outcome than leaving their phone number on screen.
+    if not any(_hard_signature_signal(ln.strip()) for ln in lines[end:]):
+        return "\n".join(lines).strip()
+
+    # Accepted limit: a message that is ONLY a signature keeps its first line and loses the
+    # rest. Rare, and staff still have the original email in their own inbox.
+    out = "\n".join(lines[:end]).strip()
+    return out if out else (text or "").strip()

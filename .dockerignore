@@ -8,8 +8,12 @@
 .gitignore
 **/__pycache__/
 **/*.pyc
-.venv/
-venv/
+# Anchored patterns only match the root, and the virtualenv lives at backend/.venv, so a bare
+# ".venv/" missed it entirely: every build shipped 151MB of Windows virtualenv into the context
+# (115MB after compression) and the Dockerfile COPYs backend/ wholesale, so it was being baked
+# into a linux/amd64 image where it cannot run anyway.
+**/.venv/
+**/venv/
 node_modules/
 .DS_Store
 **/*.log
