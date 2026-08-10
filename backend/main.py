@@ -625,9 +625,19 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    if p.get("proposal_status") == "approved":
-        # Idempotent: a double-submit (or a re-opened tab) must not re-run the
-        # approval email + automations, which would issue a second invoice.
+    # Idempotent: a double-submit (or a re-opened tab) must not re-run the approval
+    # email + automations, which would issue a second invoice.
+    #
+    # approved_at as well as the status, since staff got the power to file a signed job
+    # as lost (2026-08-10). That deliberately keeps the approval on the row under a
+    # 'closed_lost' status, and keyed on the status alone this guard stopped firing for
+    # exactly those rows: the customer's portal went back to reading "Awaiting your
+    # approval" with a live Approve button, and one click wrote a second portal_approvals
+    # row, re-sent both approval emails and put the job back in Approved, undoing a staff
+    # decision nobody told them about. A closed-lost proposal that was NEVER signed stays
+    # approvable, since a customer who changes their mind is welcome back, and so does a
+    # revised one: reset_for_revision nulls approved_at whenever it retires an approval.
+    if p.get("proposal_status") == "approved" or p.get("approved_at"):
         return _json({"ok": True, "already_approved": True})
     body = await _body(request)
     name = _cap(body.get("name"), 120)
@@ -1902,9 +1912,15 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
         reason = str(body.get("reason") or "").strip().lower() or None
         if reason and reason not in _LOST_REASONS:
             return _json({"ok": False, "error": "invalid_reason"}, 400)
+        # An approved proposal is closeable from here as of 2026-08-10, per Hanz: a customer
+        # can sign and the job still die, so staff need a way to file it as lost. The approval
+        # is kept rather than erased (close_lost leaves the approved_* columns and the
+        # portal_approvals rows alone) and moving the card back to Active restores 'approved',
+        # so the old "a stray click must not clobber a win" objection is covered without
+        # blocking the move. The only failure left is the row disappearing between the
+        # get_proposal above and this write.
         if not db.close_lost(proposal_id, reason):
-            # An approved proposal is a win; refuse to record it as lost.
-            return _json({"ok": False, "error": "already_approved"}, 400)
+            return _json({"ok": False, "error": "not_found"}, 404)
         db.add_followup(proposal_id, "staff_note",
                         {"action": "closed_lost", "reason": reason}, by)
     elif status == "active":

@@ -710,19 +710,67 @@ def resume_followups(proposal_id: str) -> None:
 
 
 def close_lost(proposal_id: str, reason: Optional[str]) -> bool:
-    """Mark the opportunity lost. Guarded against clobbering an approval: a signed
-    proposal is a win, and a stray "not moving forward" click must not erase it.
-    Returns whether the row actually moved."""
+    """Mark the opportunity lost. Works from any stage now, approved included.
+
+    This used to carry `and proposal_status <> 'approved'`, on the grounds that a signed
+    proposal is a win and a stray "not moving forward" click must not erase it. Hanz reopened
+    that on 2026-08-10: "allow for the projects to be lost even its been approved". A customer
+    can sign and the job still die, financing falls through, the GC loses the bid, they go with
+    somebody else. Refusing left those rows parked in Approved on the board for good, with no
+    way out short of hand-written SQL.
+
+    The original worry is answered by KEEPING the approval rather than by blocking the move.
+    Nothing here touches approved_at, approved_total, approved_option/approved_options,
+    approved_name, approved_title, approved_date or the portal_approvals audit rows, so what
+    was agreed and when is still on the row, and reopen_if_closed reads approved_at back and
+    returns it to 'approved'. A mis-click costs a second click, not a lost win.
+
+    The customer's own view is NOT the same claim: app.js gates its approved banner, its
+    "Approved" badge and its thank-you card on status === 'approved', so while the job sits
+    closed they see the closed receipt from the status card instead of their approval. The
+    columns are what survives, not that rendering.
+
+    Note the customer-side ways out both stayed shut: /project-status refuses outright once
+    proposal_status is 'approved', and /approve treats a surviving approved_at as already
+    approved so this closed row cannot be signed a second time back into play. Closing a
+    signed job is a staff judgement, not something to offer the customer in their own portal.
+
+    Returns whether the row actually moved. False now means only that no such proposal_id
+    exists."""
     row = q1("update public.portal_proposals set proposal_status='closed_lost', "
              "closed_lost_reason=%s, closed_at=now(), updated_at=now() "
-             "where proposal_id=%s and proposal_status <> 'approved' "
+             "where proposal_id=%s "
              "returning proposal_id", ((reason or None), proposal_id))
     return bool(row)
 
 
 def reopen_if_closed(proposal_id: str) -> bool:
-    """A new version sent to a closed-lost proposal puts it back in play."""
-    row = q1("update public.portal_proposals set proposal_status='sent', "
+    """A closed-lost proposal goes back in play, at the stage it was at rather than at 'sent'.
+
+    Two callers: a new version being published to a lost opportunity, and staff moving the
+    card back to Active from the drawer.
+
+    This hardcoded proposal_status='sent', which was harmless while an approved proposal could
+    not be closed at all. The moment close_lost started accepting approved rows (Hanz,
+    2026-08-10) it turned into a silent demotion: reactivating a job the customer had signed
+    would have dropped it back into Sent, re-enrolled it in the chasing cadence and thrown
+    away the fact it was ever won.
+
+    approved_at is what the restore reads because set_approved always stamps it and
+    reset_for_revision nulls it whenever it clears an approval, so an approval a later
+    revision superseded stays dead instead of resurrecting here.
+
+    A previously-'viewed' row is deliberately still restored as 'sent'. Reopening is a fresh
+    chase, and cycle_viewed_at is what followup_rules reads to choose between the not-opened
+    and opened reminder tracks, so claiming the current send has been read would pick the
+    wrong track.
+
+    The publish path must keep calling this BEFORE reset_for_revision (see admin_publish):
+    reset_for_revision decides whether to clear the approved_* columns by reading
+    proposal_status, so it needs the restored 'approved' to notice there is an approval to
+    retire and to tell the customer their earlier agreement no longer stands."""
+    row = q1("update public.portal_proposals set "
+             "proposal_status = case when approved_at is not null then 'approved' else 'sent' end, "
              "closed_lost_reason=null, closed_at=null, updated_at=now() "
              "where proposal_id=%s and proposal_status='closed_lost' "
              "returning proposal_id", (proposal_id,))
