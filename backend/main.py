@@ -583,7 +583,8 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
         f"<blockquote>{html.escape(text)}</blockquote>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        token=p.get("token"), project=p.get("project_name"),
     )
     return _json({"ok": True, "question": _q(row), "message": _msg(row)})
 
@@ -701,7 +702,8 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
                 "their project contacts.</p>")
         + f"<p>Project: {html.escape(project_name)}.</p>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        token=p.get("token"), project=p.get("project_name"),
     )
     # Confirm the approval to the customer in writing. They'd just committed to a
     # price and heard nothing back except (later) an invoice.
@@ -855,7 +857,7 @@ def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:
         email_sender.notify_team(subject, body_html, recipients=to,
                                  reply_link=_staff_link(pid), proposal_id=pid,
                                  reply_to=email_sender.proposal_reply_to(p.get("token")),
-                                 token=p.get("token"))
+                                 token=p.get("token"), project=p.get("project_name"))
     except Exception as exc:  # noqa: BLE001
         log.warning("status notify failed for %s: %s", pid, exc)
 
@@ -942,7 +944,8 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     email_sender.notify_team(
         subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
         kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        token=p.get("token"), project=p.get("project_name"),
     )
     _notify_customer(
         p, "We've received your deposit details",
@@ -1014,7 +1017,8 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
-        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        token=p.get("token"), project=p.get("project_name"),
     )
     _notify_customer(
         p, "Thanks — we have your project contacts",
@@ -2031,9 +2035,19 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "not_found"}, 404)
     db.set_deposit_status(proposal_id, "received")
     # Prompt the customer, in-thread, for the project contacts we now need.
-    db.add_message(proposal_id, "staff", None,
-                   "Deposit received — thank you! Please add your project contacts so we can schedule the work.",
-                   msg_type="system")
+    #
+    # GUARDED, because the money is already recorded by the line above. Unguarded, a database
+    # blip on this write returned a 500 from an endpoint that had ALREADY marked the deposit
+    # received: the rep saw "Couldn't mark received" on an action that had half succeeded, and
+    # if they took that at face value the customer was never asked for contacts and the project
+    # stalled with nothing on screen to explain it. Same posture as the approval path's contacts
+    # prompt above — the status change is the thing that matters, the message is a courtesy.
+    try:
+        db.add_message(proposal_id, "staff", None,
+                       "Deposit received — thank you! Please add your project contacts so we "
+                       "can schedule the work.", msg_type="system")
+    except Exception as exc:  # noqa: BLE001 — the deposit is recorded; don't undo it over this
+        log.warning("could not post the contacts prompt for %s: %s", proposal_id, exc)
     p = db.get_proposal(proposal_id) or {}
     project = p.get("project_name") or "your project"
     email_sender.notify_team(
@@ -2041,7 +2055,8 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
         f"<p>The deposit for <strong>{html.escape(project)}</strong> is marked received. "
         f"The customer has been asked for their project contacts.</p>",
         kind="deposit", reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
-        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
+        reply_to=email_sender.proposal_reply_to(p.get("token")),
+        token=p.get("token"), project=p.get("project_name"),
     )
     _notify_customer(
         p, "Deposit received — thank you",
@@ -2104,35 +2119,18 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
     return _json({"ok": True, **result})
 
 
-@app.post("/api/admin/proposal/{proposal_id}/scheduled")
-def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
-    if not _admin_ok(request):
-        return _json({"ok": False, "error": "unauthorized"}, 401)
-    if not db.get_proposal(proposal_id):
-        return _json({"ok": False, "error": "not_found"}, 404)
-    db.set_schedule_status(proposal_id, "scheduled")
-    # Every other status change leaves a trace in the thread; this one didn't, so
-    # the customer's bell and chat stayed silent while the tracker quietly moved.
-    try:
-        db.add_message(proposal_id, "staff", None,
-                       "Project scheduled — we'll confirm the dates with you shortly.",
-                       msg_type="system")
-    except Exception as exc:  # noqa: BLE001 — the status change is what matters
-        log.warning("could not post the scheduled system message for %s: %s", proposal_id, exc)
-    p = db.get_proposal(proposal_id) or {}
-    project = p.get("project_name") or "your project"
-    email_sender.notify_team(
-        f"Project SCHEDULED — {project}",
-        f"<p><strong>{html.escape(project)}</strong> is marked scheduled.</p>",
-        reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
-        reply_to=email_sender.proposal_reply_to(p.get("token")), token=p.get("token"),
-    )
-    _notify_customer(
-        p, "Your project is scheduled",
-        f"<p><strong>{html.escape(project)}</strong> is on our schedule.</p>"
-        f"<p>Your Treadwell contact will confirm the dates with you shortly.</p>",
-    )
-    return _json({"ok": True})
+# The /scheduled endpoint was removed on 2026-08-11. Hanz: "We need to remove the schedule
+# status on the CRM and on the Customer portal Status", and when asked how far it should go he
+# chose to take the notification with it. It used to set schedule_status, post a system message
+# to the thread, tell the team, and email every recipient "Your project is scheduled".
+#
+# Treadwell books the date on the phone, so the customer already knows before any of that
+# fires. The staff button, the board column and the customer's tile all went together: a status
+# nobody sets is worse than no status, because the board would have shown every job stuck one
+# step short of done forever.
+#
+# schedule_status, scheduled_at and db.set_schedule_status are all still here and untouched, so
+# reinstating this is putting the route back rather than a migration.
 
 
 # ── admin: configurable team-notification recipients (roster) ─────────────────

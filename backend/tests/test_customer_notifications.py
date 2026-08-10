@@ -104,30 +104,18 @@ def test_seen_requires_a_session(monkeypatch):
     assert TestClient(main.app).post("/api/me/notifications/seen").status_code == 401
 
 
-def test_scheduling_leaves_a_trace_in_the_thread(monkeypatch):
-    """Every other status change posts a system line; this one used to flip the
-    tracker silently, so the customer's chat and bell said nothing."""
-    posted = []
-    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
-    monkeypatch.setattr(main.db, "get_proposal", lambda pid: {"proposal_id": pid})
-    monkeypatch.setattr(main.db, "set_schedule_status", lambda pid, s: None)
-    monkeypatch.setattr(main.email_sender, "notify_team", lambda *a, **k: None)
-    monkeypatch.setattr(main, "_notify_customer", lambda *a, **k: None)
-    monkeypatch.setattr(main.db, "add_message",
-                        lambda pid, kind, who, body, **k: posted.append((body, k.get("msg_type"))))
-    r = TestClient(main.app).post("/api/admin/proposal/p1/scheduled")
-    assert r.status_code == 200 and r.json()["ok"] is True
-    assert len(posted) == 1
-    assert posted[0][1] == "system" and "scheduled" in posted[0][0].lower()
+# The two scheduling tests that sat here were removed on 2026-08-11 with the /scheduled
+# endpoint itself. One checked that flipping the schedule status posted a system line to the
+# thread; the other checked that a failing chat write did not fail the status change.
+#
+# The second looked like a general invariant worth re-pointing at another milestone, and at the
+# time it was not: /scheduled and /approve were the only endpoints that wrapped add_message in a
+# try, so the same test aimed at deposit-received would have failed honestly rather than passed.
+#
+# It IS the invariant now. Marking a deposit received set the status before an unguarded chat
+# write, so a database blip left the money recorded while the request 500s — the rep reads
+# "Couldn't mark received" on an action that half succeeded. Guarded on 2026-08-11 and pinned by
+# test_milestone_notifications.py::test_the_money_is_never_undone_by_a_failed_chat_write.
+#
+# test_milestone_notifications.py::test_the_scheduled_route_is_gone pins the removal.
 
-
-def test_scheduling_still_succeeds_if_the_message_fails(monkeypatch):
-    """The status change is what matters — a chat hiccup must not fail it."""
-    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
-    monkeypatch.setattr(main.db, "get_proposal", lambda pid: {"proposal_id": pid})
-    monkeypatch.setattr(main.db, "set_schedule_status", lambda pid, s: None)
-    monkeypatch.setattr(main.email_sender, "notify_team", lambda *a, **k: None)
-    monkeypatch.setattr(main, "_notify_customer", lambda *a, **k: None)
-    monkeypatch.setattr(main.db, "add_message",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
-    assert TestClient(main.app).post("/api/admin/proposal/p1/scheduled").json()["ok"] is True

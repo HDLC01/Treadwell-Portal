@@ -88,6 +88,22 @@ def label(key: str) -> str:
     return LABELS.get(key, str(key).replace("_", " "))
 
 _MAX_SUBJECT = 200
+
+# ONE subject for every customer email about a project, editable on the Auto Followups page.
+#
+# Hanz, 2026-08-11: "for all updates to one project can we have it in one email thread?"
+# Gmail groups by the References chain AND the subject, so a per-template subject line was
+# what split a chased proposal into a conversation per email no matter what the headers said.
+#
+# This REPLACED a per-template "subject" field, which the editor still exposed as its own
+# input. Leaving that field in place while ignoring it would have been the worst of the three
+# options: somebody types a subject, saves, and nothing happens. So the field became this one,
+# moved up to project level, and the per-template "Heading inside the email" — which was
+# always separately editable — is what still varies per email.
+DEFAULT_THREAD_SUBJECT = "Your Treadwell proposal — {project}"
+# {first_name}/{need} are per-send and would make the subject differ between emails, which is
+# the whole thing being fixed. {link} in a subject line is meaningless.
+THREAD_SUBJECT_TOKENS = ("{project}",)
 _MAX_TITLE = 120
 _MAX_BODY = 4000
 
@@ -95,7 +111,6 @@ _MAX_BODY = 4000
 # exactly what customers have been receiving rather than a blank box.
 DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
     "not_viewed": {
-        "subject": "Your Treadwell proposal for {project} is ready when you are",
         "title": "Your proposal is waiting",
         "body": ("Hi {first_name},\n\n"
                  "We sent over the proposal for {project} and wanted to make sure it reached "
@@ -105,7 +120,6 @@ DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
         "cta": "View your proposal",
     },
     "next_steps": {
-        "subject": "Next steps for {project}",
         "title": "Getting you on the schedule",
         "body": ("Hi {first_name},\n\n"
                  "Thanks for taking a look at the proposal for {project}.\n\n"
@@ -116,7 +130,6 @@ DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
         "cta": "Review and approve",
     },
     "second_nudge": {
-        "subject": "Quick reminder — {project}",
         "title": "Still holding your spot",
         "body": ("Hi {first_name},\n\n"
                  "Just a nudge that the proposal for {project} is still pending. We need {need} "
@@ -126,7 +139,6 @@ DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
         "cta": "Review and approve",
     },
     "checkin": {
-        "subject": "Checking in on {project}",
         "title": "Checking in",
         "body": ("Hi {first_name},\n\n"
                  "Circling back on {project}. It's still open on our side and we need {need} "
@@ -184,6 +196,29 @@ def _clean_text(raw: Any, limit: int) -> str:
     return s.strip()[:limit]
 
 
+def validate_thread_subject(raw: Any) -> str:
+    """The one subject every project email carries, cleaned.
+
+    Empty falls back to the shipped wording rather than refusing: a blank subject is a broken
+    email in every client, and the intent of clearing the box is "put it back how it was".
+
+    {project} is the only token allowed. {first_name} and {need} vary per SEND, so allowing
+    them would let one project's emails carry different subjects again — which is the exact
+    splitting this field exists to stop. Refused loudly rather than stripped, because a subject
+    reading "Your proposal, " with the token silently removed is worse than a save that failed.
+    """
+    subject = _clean_text(raw, _MAX_SUBJECT)
+    if not subject:
+        return DEFAULT_THREAD_SUBJECT
+    unknown = set(re.findall(r"\{[a-z_]+\}", subject)) - set(THREAD_SUBJECT_TOKENS)
+    if unknown:
+        raise ValidationError(
+            "The email subject cannot use %s — it is the same for every update about a project, "
+            "so only %s makes sense there."
+            % (", ".join(sorted(unknown)), ", ".join(THREAD_SUBJECT_TOKENS)))
+    return subject
+
+
 def validate_template(key: str, raw: Any) -> Dict[str, str]:
     """One template, cleaned. Raises only for a missing {link}."""
     if key not in TEMPLATE_KEYS:
@@ -191,7 +226,6 @@ def validate_template(key: str, raw: Any) -> Dict[str, str]:
     src = raw if isinstance(raw, dict) else {}
     base = DEFAULT_TEMPLATES[key]
 
-    subject = _clean_text(src.get("subject"), _MAX_SUBJECT) or base["subject"]
     title = _clean_text(src.get("title"), _MAX_TITLE) or base["title"]
     cta = _clean_text(src.get("cta"), 60) or base["cta"]
 
@@ -215,13 +249,15 @@ def validate_template(key: str, raw: Any) -> Dict[str, str]:
             "The “%s” email needs {link} somewhere in the body — that is the button the "
             "customer clicks to see the proposal." % label(key))
 
-    unknown = set(re.findall(r"\{[a-z_]+\}", subject + " " + body)) - set(TOKENS)
+    unknown = set(re.findall(r"\{[a-z_]+\}", body)) - set(TOKENS)
     if unknown:
         raise ValidationError(
             "Unknown placeholder %s. The ones available are %s."
             % (", ".join(sorted(unknown)), ", ".join(TOKENS)))
 
-    return {"subject": subject, "title": title, "body": body, "cta": cta}
+    # No "subject": a project has ONE, at the top level. A stored template from before that
+    # change still parses — its subject is simply dropped here rather than migrated.
+    return {"title": title, "body": body, "cta": cta}
 
 
 def validate(raw: Any) -> Dict[str, Any]:
@@ -240,6 +276,8 @@ def validate(raw: Any) -> Dict[str, Any]:
         out["send_start_hour"] = int(DEFAULTS["send_start_hour"])
         out["send_end_hour"] = int(DEFAULTS["send_end_hour"])
 
+    out["thread_subject"] = validate_thread_subject(raw.get("thread_subject"))
+
     templates = raw.get("templates")
     src = templates if isinstance(templates, dict) else {}
     out["templates"] = {k: validate_template(k, src.get(k)) for k in TEMPLATE_KEYS}
@@ -249,6 +287,7 @@ def validate(raw: Any) -> Dict[str, Any]:
 def defaults() -> Dict[str, Any]:
     """The shipped cadence, as a settings dict."""
     out = dict(DEFAULTS)
+    out["thread_subject"] = DEFAULT_THREAD_SUBJECT
     out["templates"] = {k: dict(v) for k, v in DEFAULT_TEMPLATES.items()}
     return out
 
@@ -265,6 +304,14 @@ def merge(stored: Any) -> Dict[str, Any]:
     if out["send_end_hour"] <= out["send_start_hour"]:
         out["send_start_hour"] = int(DEFAULTS["send_start_hour"])
         out["send_end_hour"] = int(DEFAULTS["send_end_hour"])
+    if "thread_subject" in stored:
+        try:
+            out["thread_subject"] = validate_thread_subject(stored.get("thread_subject"))
+        except ValidationError:
+            # Same posture as a bad template below: a hand-edited row must not silence every
+            # customer email, it falls back to the shipped wording.
+            log.warning("[followups] stored thread_subject is invalid; using the default")
+
     t = stored.get("templates")
     if isinstance(t, dict):
         for key in TEMPLATE_KEYS:
@@ -293,7 +340,6 @@ def render(template: Dict[str, str], *, first_name: str, project: str, need: str
                  .replace("{link}", link))
 
     return {
-        "subject": sub(template.get("subject", ""), ""),   # no button in a subject line
         "title": sub(template.get("title", ""), ""),
         "body": sub(template.get("body", ""), link_html),
     }

@@ -59,8 +59,12 @@ def test_the_default_templates_are_the_four_the_worker_asks_for():
     assert set(fs.DEFAULT_TEMPLATES) == set(fs.TEMPLATE_KEYS)
     assert set(fs.TEMPLATE_KEYS) == {"not_viewed", "next_steps", "second_nudge", "checkin"}
     for key, t in fs.DEFAULT_TEMPLATES.items():
-        assert t["subject"] and t["title"] and t["body"] and t["cta"], key
+        assert t["title"] and t["body"] and t["cta"], key
         assert "{link}" in t["body"], key
+        assert "subject" not in t, (
+            "%s still carries its own subject; a project has ONE, shared by every update "
+            "about it, or Gmail files each email as a separate conversation" % key)
+    assert fs.DEFAULT_THREAD_SUBJECT and "{project}" in fs.DEFAULT_THREAD_SUBJECT
 
 
 # ── clamping, not rejecting ───────────────────────────────────────────
@@ -186,9 +190,12 @@ def test_html_is_stripped_rather_than_escaped():
 
 
 def test_a_blank_field_keeps_the_shipped_wording():
-    """Clearing a subject should not send an email with no subject."""
-    got = fs.validate({"templates": {"checkin": {"subject": "", "body": "Hi {link}"}}})
-    assert got["templates"]["checkin"]["subject"] == fs.DEFAULT_TEMPLATES["checkin"]["subject"]
+    """Clearing a field should not send an email missing it. The subject is now one per
+    project rather than one per template, so that is where this is asserted."""
+    got = fs.validate({"thread_subject": "", "templates": {"checkin": {"body": "Hi {link}"}}})
+    assert got["thread_subject"] == fs.DEFAULT_THREAD_SUBJECT
+    got = fs.validate({"templates": {"checkin": {"title": "", "body": "Hi {link}"}}})
+    assert got["templates"]["checkin"]["title"] == fs.DEFAULT_TEMPLATES["checkin"]["title"]
 
 
 def test_an_over_long_body_is_refused_rather_than_cut():
@@ -242,10 +249,10 @@ def test_a_stored_template_that_has_gone_bad_falls_back_to_just_that_one():
     take the other three emails with it."""
     got = fs.merge({"templates": {
         "checkin": {"body": "no link here"},                 # invalid
-        "not_viewed": {"body": "Fine {link}", "subject": "Kept"},
+        "not_viewed": {"body": "Fine {link}", "title": "Kept"},
     }})
     assert got["templates"]["checkin"] == fs.DEFAULT_TEMPLATES["checkin"]
-    assert got["templates"]["not_viewed"]["subject"] == "Kept"
+    assert got["templates"]["not_viewed"]["title"] == "Kept"
 
 
 def test_stored_numbers_are_clamped_on_the_way_out_too():
@@ -399,7 +406,10 @@ def captured(monkeypatch):
 
 def test_with_no_saved_wording_the_shipped_email_goes_out(captured):
     email_sender.send_followup("a@b.com", "https://x/p/tok", "Westport", "next_steps", name="Dave")
-    assert captured["subject"] == "Next steps for Westport"
+    # The SUBJECT belongs to the project thread now, shared with every other update about
+    # this job. A template controls the heading, the body and the button.
+    assert captured["subject"] == "Your Treadwell proposal — Westport"
+    assert "Getting you on the schedule" in captured["html"], "the shipped heading is gone"
     assert "Review and approve" in captured["html"]
 
 
@@ -410,7 +420,10 @@ def test_saved_wording_replaces_it(captured):
     email_sender.send_followup("a@b.com", "https://x/p/tok", "Westport", "next_steps",
                                name="Dave Smith", templates=tpl)
     h = captured["html"]
-    assert captured["subject"] == "Following up on Westport"
+    # A per-template subject is no longer part of the model. A stored template from before
+    # the change still parses; its subject is ignored rather than migrated, and this says so.
+    assert captured["subject"] == "Your Treadwell proposal — Westport"
+    assert "A nudge" in h, "the saved HEADING is what a template still controls"
     assert "Hi Dave," in h, "first name not substituted"
     assert "signed approval and the deposit" in h, "{need} not substituted"
     assert "Open the proposal" in h, "custom button label not used"
@@ -420,7 +433,7 @@ def test_saved_wording_replaces_it(captured):
 def test_the_deposit_phrase_still_follows_the_job(captured):
     """{need} exists because promising a deposit on a job sent without one would be wrong, and GC
     work usually is. An edited template must not lose that."""
-    tpl = {"checkin": {"subject": "s", "title": "t", "body": "We need {need}. {link}", "cta": "c"}}
+    tpl = {"checkin": {"title": "t", "body": "We need {need}. {link}", "cta": "c"}}
     email_sender.send_followup("a@b.com", "u", "P", "checkin", templates=tpl,
                                deposit_required=False)
     assert "signed approval" in captured["html"]
@@ -428,7 +441,7 @@ def test_the_deposit_phrase_still_follows_the_job(captured):
 
 
 def test_plain_text_becomes_paragraphs(captured):
-    tpl = {"checkin": {"subject": "s", "title": "t",
+    tpl = {"checkin": {"title": "t",
                        "body": "One.\n\nTwo.\n\n{link}\n\nThree.", "cta": "c"}}
     email_sender.send_followup("a@b.com", "u", "P", "checkin", templates=tpl)
     assert captured["html"].count("<p>") >= 3
@@ -438,13 +451,14 @@ def test_a_partial_saved_template_falls_back_for_that_email_only(captured):
     """Only three of four edited, or one cleared: the rest must still send properly."""
     email_sender.send_followup("a@b.com", "u", "Westport", "checkin",
                                templates={"next_steps": {"body": "{link}"}})
-    assert captured["subject"] == "Checking in on Westport", "should have used the shipped wording"
+    assert "Checking in" in captured["html"], "should have used the shipped wording"
+    assert captured["subject"] == "Your Treadwell proposal — Westport"
 
 
 def test_the_status_ask_survives_saved_wording(captured):
     """The "delayed / not moving forward" escape hatch is what stops the recurring series being a
     dead end for the customer. An edited template must not drop it."""
-    tpl = {"checkin": {"subject": "s", "title": "t", "body": "{link}", "cta": "c"}}
+    tpl = {"checkin": {"title": "t", "body": "{link}", "cta": "c"}}
     email_sender.send_followup("a@b.com", "u", "P", "checkin", templates=tpl,
                                token="tok", include_status_ask=True)
     assert "tok" in captured["html"]
@@ -455,8 +469,9 @@ def test_the_preview_fills_every_token():
     """The editor's whole safety net: an unfilled token or a missing button is obvious here and
     invisible in the form."""
     p = fs.preview(fs.defaults(), "next_steps")
+    assert "subject" not in p, "the preview is showing a subject a template no longer owns"
     for token in fs.TOKENS:
-        assert token not in p["subject"] and token not in p["body"], token
+        assert token not in p["title"] and token not in p["body"], token
     assert "Dave" in p["body"] and "Westport" in p["body"]
 
 
@@ -636,11 +651,11 @@ def test_preview_renders_without_saving(monkeypatch):
     monkeypatch.setattr(portal_main.db, "save_settings",
                         lambda *a, **k: called.append(1))
     r = client.post("/api/admin/settings/followups/preview", json={"settings": {"templates": {
-        "checkin": {"subject": "Hi {project}", "title": "t", "body": "Hello {first_name} {link}",
+        "checkin": {"title": "Hi {project}", "body": "Hello {first_name} {link}",
                     "cta": "Open"}}}})
     j = r.json()
     assert r.status_code == 200
-    assert j["previews"]["checkin"]["subject"] == "Hi Westport Retail Center"
+    assert j["previews"]["checkin"]["title"] == "Hi Westport Retail Center"
     assert "Dave" in j["previews"]["checkin"]["body"]
     assert not called, "a preview must never write"
 
