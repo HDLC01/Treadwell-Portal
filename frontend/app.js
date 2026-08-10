@@ -146,8 +146,6 @@ function renderPortal(vm) {
   // post-submission state, and POST /deposit has no approval precondition.
   setEligible("deposit-card", depositApplies());
   setEligible("contacts-card", true);
-  setEligible("schedule-card", true);
-  renderSchedule(vm.status);
 
   // Pre-fill the approver name from the contact we already have — editable, so a
   // different signer can overwrite. Only when empty, so a poll refetch (or the
@@ -240,7 +238,6 @@ function renderTracker(st) {
     { key: "deposit", label: "Deposit", done: st.deposit === "received",
       val: st.deposit === "received" ? "Received" : st.deposit === "submitted" ? "Sent" : "Pending" },
     { key: "contacts", label: "Contact info", done: st.contacts === "received", val: st.contacts === "received" ? "Received" : "Pending" },
-    { key: "schedule", label: "Schedule", done: st.schedule === "scheduled", val: st.schedule === "scheduled" ? "Scheduled" : "Pending" },
   ].filter((s) => s.key !== "deposit" || depositApplies());
   // Buttons, not divs: each tile navigates to that step. Customers can move back
   // and forth and skip ahead — nothing here gates on the previous step.
@@ -263,8 +260,10 @@ function defaultStep(st) {
   if (ACTIVE_STEP) return ACTIVE_STEP;
   if (st.proposal !== "approved") return "proposal";
   if (depositApplies() && st.deposit !== "received") return "deposit";
-  if (st.contacts !== "received") return "contacts";
-  return "schedule";
+  // Contacts is the last step now that Schedule is gone (2026-08-11). Returning
+  // "schedule" here would name a step with no tile and no cards, so focusStep would
+  // land the customer on a blank page once they had finished everything.
+  return "contacts";
 }
 
 // NOTE: no `window.focusStep = ...` alias here. app.js is a classic script, so
@@ -278,7 +277,6 @@ const STEP_CARDS = {
   proposal: ["approved-banner", "pdf-card", "options-card", "approve-card"],
   deposit: ["thankyou-card", "deposit-card"],
   contacts: ["contacts-card"],
-  schedule: ["schedule-card"],
 };
 const ALL_STEP_CARDS = Object.values(STEP_CARDS).flat();
 
@@ -501,21 +499,6 @@ function drawContacts() {
     };
     el.addEventListener("input", upd); el.addEventListener("change", upd);
   });
-}
-
-/** The Schedule step's destination. Treadwell books the date, so this explains
- *  where the customer stands rather than offering a self-service picker. */
-function renderSchedule(st) {
-  const el = $("schedule-help");
-  if (!el) return;
-  el.textContent = st.schedule === "scheduled"
-    ? "Your project is scheduled — your Treadwell contact will confirm the details with you."
-    : st.deposit === "received"
-      ? "We've received your deposit. We'll be in touch shortly to book your dates."
-      // No deposit gates this job, so don't tell them we're waiting on one.
-      : !depositApplies()
-        ? "We'll be in touch shortly to book your dates."
-        : "We book your dates once the deposit is received. Your Treadwell contact will confirm them with you.";
 }
 
 /** Copy the primary contact's details onto a mirrored row (role is preserved). */

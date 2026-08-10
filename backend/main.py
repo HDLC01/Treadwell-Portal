@@ -2079,35 +2079,18 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
     return _json({"ok": True, **result})
 
 
-@app.post("/api/admin/proposal/{proposal_id}/scheduled")
-def admin_scheduled(proposal_id: str, request: Request) -> JSONResponse:
-    if not _admin_ok(request):
-        return _json({"ok": False, "error": "unauthorized"}, 401)
-    if not db.get_proposal(proposal_id):
-        return _json({"ok": False, "error": "not_found"}, 404)
-    db.set_schedule_status(proposal_id, "scheduled")
-    # Every other status change leaves a trace in the thread; this one didn't, so
-    # the customer's bell and chat stayed silent while the tracker quietly moved.
-    try:
-        db.add_message(proposal_id, "staff", None,
-                       "Project scheduled — we'll confirm the dates with you shortly.",
-                       msg_type="system")
-    except Exception as exc:  # noqa: BLE001 — the status change is what matters
-        log.warning("could not post the scheduled system message for %s: %s", proposal_id, exc)
-    p = db.get_proposal(proposal_id) or {}
-    project = p.get("project_name") or "your project"
-    email_sender.notify_team(
-        f"Project SCHEDULED — {project}",
-        f"<p><strong>{html.escape(project)}</strong> is marked scheduled.</p>",
-        reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
-        reply_to=email_sender.proposal_reply_to(p.get("token")),
-    )
-    _notify_customer(
-        p, "Your project is scheduled",
-        f"<p><strong>{html.escape(project)}</strong> is on our schedule.</p>"
-        f"<p>Your Treadwell contact will confirm the dates with you shortly.</p>",
-    )
-    return _json({"ok": True})
+# The /scheduled endpoint was removed on 2026-08-11. Hanz: "We need to remove the schedule
+# status on the CRM and on the Customer portal Status", and when asked how far it should go he
+# chose to take the notification with it. It used to set schedule_status, post a system message
+# to the thread, tell the team, and email every recipient "Your project is scheduled".
+#
+# Treadwell books the date on the phone, so the customer already knows before any of that
+# fires. The staff button, the board column and the customer's tile all went together: a status
+# nobody sets is worse than no status, because the board would have shown every job stuck one
+# step short of done forever.
+#
+# schedule_status, scheduled_at and db.set_schedule_status are all still here and untouched, so
+# reinstating this is putting the route back rather than a migration.
 
 
 # ── admin: configurable team-notification recipients (roster) ─────────────────

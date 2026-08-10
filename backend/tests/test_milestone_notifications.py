@@ -2,8 +2,11 @@
 roster, and the CUSTOMER by email.
 
 Before this, no status event emailed the customer at all — they'd approve a
-price, or send a deposit, and hear nothing back. Two events (deposit received,
-scheduled) didn't even notify the team.
+price, or send a deposit, and hear nothing back, and deposit-received did not even
+notify the team.
+
+Scheduling was a fourth milestone until 2026-08-11, when it was removed from both
+apps at Hanz's request, the customer email included.
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -41,21 +44,27 @@ def test_deposit_received_reaches_all_three_channels(wired, monkeypatch):
     assert [e for e, _ in wired["customer"]] == ["dana@acme.com", "ap@acme.com"]
 
 
-def test_scheduled_reaches_all_three_channels(wired, monkeypatch):
-    monkeypatch.setattr(main.db, "set_schedule_status", lambda pid, s: None)
-    r = TestClient(main.app).post("/api/admin/proposal/p1/scheduled")
-    assert r.status_code == 200
-    assert any("scheduled" in b.lower() for b, _ in wired["chat"])
-    assert any("SCHEDULED" in s for s in wired["team"])
-    assert len(wired["customer"]) == 2
-
-
 def test_customer_email_failure_never_fails_the_action(wired, monkeypatch):
-    """A mail hiccup must not break the thing the customer just did."""
-    monkeypatch.setattr(main.db, "set_schedule_status", lambda pid, s: None)
+    """A mail hiccup must not break the thing the customer just did.
+
+    This used to fire at /scheduled, which was removed on 2026-08-11 with the rest of scheduling.
+    The invariant it guards has nothing to do with scheduling though, so it moved to a milestone
+    that still exists rather than being deleted alongside the feature: staff marking a deposit
+    received must succeed even when Resend is down, or the money looks unrecorded.
+    """
+    monkeypatch.setattr(main.db, "set_deposit_status", lambda pid, s: None)
     monkeypatch.setattr(main.email_sender, "send_customer_update",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("resend down")))
-    assert TestClient(main.app).post("/api/admin/proposal/p1/scheduled").json()["ok"] is True
+    r = TestClient(main.app).post("/api/admin/proposal/p1/deposit-received")
+    assert r.json()["ok"] is True
+
+
+def test_the_scheduled_route_is_gone(wired):
+    """Scheduling was removed in both apps on 2026-08-11, the customer email included. Pinned so
+    the route cannot come back on its own: a status staff can set but nobody displays would leave
+    every job reading one step short of done."""
+    r = TestClient(main.app).post("/api/admin/proposal/p1/scheduled")
+    assert r.status_code == 404, "the /scheduled endpoint is back"
 
 
 def test_notify_customer_falls_back_to_the_primary_email(monkeypatch):
