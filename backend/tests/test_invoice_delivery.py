@@ -52,7 +52,10 @@ def test_deposit_email_names_invoice_and_attaches(captured):
                                       invoice_filename="Treadwell-Invoice-TW-INV-01001.pdf",
                                       reference="TW-ABC123")
     p = captured["payload"]
-    assert p["subject"] == "Invoice TW-INV-01001 — deposit for Westport"
+    # The subject is the PROJECT now, one per thread (2026-08-11). The invoice number moved
+    # into the body, where it still has to be: a customer paying by check writes it on the
+    # memo line, so losing it from the subject must not mean losing it entirely.
+    assert p["subject"] == "Your Treadwell proposal — Westport"
     assert "TW-INV-01001" in p["html"]
     assert "$3,316.25" in p["html"]
     assert "TW-ABC123" in p["html"]
@@ -64,7 +67,9 @@ def test_deposit_email_without_pdf_falls_back(captured):
     """No PDF (e.g. render failed upstream) → still a valid email, old wording."""
     email_sender.send_deposit_request("a@x.com", "https://p/x", "Westport", 100.0)
     p = captured["payload"]
-    assert p["subject"] == "Deposit requested — Westport"
+    assert p["subject"] == "Your Treadwell proposal — Westport"
+    assert "Deposit invoice" in p["html"], (
+        "the subject stopped naming the event, so the heading has to")
     assert "will follow shortly" in p["html"]
     assert "attachments" not in p
 

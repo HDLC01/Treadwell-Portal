@@ -7,6 +7,7 @@ import base64
 import hashlib
 import html
 import logging
+import time
 
 import httpx
 
@@ -40,6 +41,9 @@ def proposal_anchor(token: str) -> str:
     return f"<tw-proposal.{token}@wetreadwell.com>"
 
 
+DEFAULT_THREAD_SUBJECT = followup_settings.DEFAULT_THREAD_SUBJECT
+
+
 def customer_thread_subject(project_name: str | None) -> str:
     """The ONE subject every customer email about a project carries.
 
@@ -56,8 +60,47 @@ def customer_thread_subject(project_name: str | None) -> str:
     Deliberately NOT applied to the access code or the morning digest. A code is transient
     and gets its own conversation (see _otp_headers, which Hanz confirmed he wants kept
     separate), and the digest spans every project rather than belonging to one.
+
+    EDITABLE, on the Auto Followups page. It has to be: the four follow-up emails already had
+    a per-template "Subject line" field there, and this change is what makes them share one.
+    Leaving that field on screen while ignoring it would have meant somebody types a subject,
+    saves, and nothing happens — so the field moved up to project level instead of dying.
+
+    Best-effort read. An unreadable settings row falls back to the shipped wording rather than
+    failing the send: an email with a slightly different subject is a split thread, an email
+    that never goes out is a customer who hears nothing.
     """
-    return f"Your Treadwell proposal — {project_name or 'your project'}"
+    return _thread_subject_template().replace("{project}", project_name or "your project")
+
+
+_SUBJECT_TTL = 60.0
+_subject_cache: tuple[float, str] | None = None
+
+
+def _thread_subject_template() -> str:
+    """The configured template, cached for a minute.
+
+    Cached because this is read on EVERY project email, and a send is not a place to be
+    waiting on the database: without it a connection-pool stall costs 30 seconds per email
+    before falling back to wording we already had in hand. A minute is short enough that an
+    edit on the Auto Followups page shows up on the next send.
+
+    Only SUCCESS is cached. Caching a failure would pin the shipped wording for a minute
+    after a single blip, which is the one thing that would actually split a live thread.
+    """
+    global _subject_cache
+    now = time.monotonic()
+    if _subject_cache and _subject_cache[0] > now:
+        return _subject_cache[1]
+    try:
+        import db  # local import: avoid a hard DB dependency at module import time
+        cfg = followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("thread subject unreadable (%s); using the shipped wording", exc)
+        return DEFAULT_THREAD_SUBJECT
+    template = cfg.get("thread_subject") or DEFAULT_THREAD_SUBJECT
+    _subject_cache = (now + _SUBJECT_TTL, template)
+    return template
 
 
 def staff_thread_subject(project_name: str | None) -> str:

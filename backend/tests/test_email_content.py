@@ -136,8 +136,7 @@ def _followup(monkeypatch, body, cta="View your proposal"):
     box = _capture(monkeypatch)
     es.send_followup("c@x.com", "https://portal.example/p/tok", "Westport Retail Center",
                      "checkin", name="Dave Brown",
-                     templates={"checkin": {"subject": "Checking in on {project}",
-                                            "title": "Checking in",
+                     templates={"checkin": {"title": "Checking in",
                                             "body": body, "cta": cta}})
     return box["html"]
 
