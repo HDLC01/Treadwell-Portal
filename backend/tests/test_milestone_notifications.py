@@ -75,3 +75,28 @@ def test_notify_customer_falls_back_to_the_primary_email(monkeypatch):
                         lambda e, *a, **k: sent.append(e))
     main._notify_customer(dict(PROP), "Heading", "<p>x</p>")
     assert sent == ["dana@acme.com"]
+
+
+def test_the_money_is_never_undone_by_a_failed_chat_write(wired, monkeypatch):
+    """deposit-received records the deposit BEFORE posting the contacts prompt, and that write
+    used to be unguarded. A database blip there returned a 500 from an endpoint that had already
+    marked the money received: the rep saw "Couldn't mark received" on an action that had half
+    succeeded, and taking that at face value meant the customer was never asked for contacts
+    and the project stalled with nothing on screen to explain it.
+
+    /approve and /scheduled always wrapped their equivalent write in a try. This one did not —
+    see the note in test_customer_notifications.py, which recorded it as a live gap before it
+    was closed on 2026-08-11.
+    """
+    calls = {"status": []}
+    monkeypatch.setattr(main.db, "set_deposit_status",
+                        lambda pid, s: calls["status"].append((pid, s)))
+    monkeypatch.setattr(main.db, "add_message",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("postgrest blip")))
+    r = TestClient(main.app).post("/api/admin/proposal/p1/deposit-received")
+    assert r.status_code == 200 and r.json()["ok"] is True, (
+        "a failed courtesy message still fails the whole request")
+    assert calls["status"] == [("p1", "received")], "the deposit was not recorded"
+    # And the parts that don't depend on the chat row still ran.
+    assert wired["team"], "the team was not told the deposit arrived"
+    assert wired["customer"], "the customer was not told the deposit arrived"

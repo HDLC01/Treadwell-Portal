@@ -108,11 +108,14 @@ def test_seen_requires_a_session(monkeypatch):
 # endpoint itself. One checked that flipping the schedule status posted a system line to the
 # thread; the other checked that a failing chat write did not fail the status change.
 #
-# The second looked like a general invariant worth re-pointing at another milestone, and is
-# not: /scheduled and /approve are the only endpoints that wrap add_message in a try. Marking a
-# deposit received does NOT, so the same test aimed there would fail honestly rather than pass.
-# Worth knowing on its own: deposit-received sets the status BEFORE its unguarded chat write,
-# so a database blip there leaves the deposit recorded while the request 500s.
+# The second looked like a general invariant worth re-pointing at another milestone, and at the
+# time it was not: /scheduled and /approve were the only endpoints that wrapped add_message in a
+# try, so the same test aimed at deposit-received would have failed honestly rather than passed.
+#
+# It IS the invariant now. Marking a deposit received set the status before an unguarded chat
+# write, so a database blip left the money recorded while the request 500s — the rep reads
+# "Couldn't mark received" on an action that half succeeded. Guarded on 2026-08-11 and pinned by
+# test_milestone_notifications.py::test_the_money_is_never_undone_by_a_failed_chat_write.
 #
 # test_milestone_notifications.py::test_the_scheduled_route_is_gone pins the removal.
 

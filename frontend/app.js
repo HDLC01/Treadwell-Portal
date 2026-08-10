@@ -735,10 +735,13 @@ function renderMsg(m) {
   }
   const mine = m.author_kind === "customer";
   const viaEmail = m.meta && m.meta.source === "email";
+  // Contents, date, and whether it came in by email — nothing else. The side of the thread
+  // already says who wrote it, so "You" / "Treadwell" was a line of chrome on every bubble.
+  // Kept identical to the staff CRM's msgHtml on purpose: the two views are meant to be the
+  // same conversation, and they drift the moment one of them gets its own layout.
   return `<div class="msg ${mine ? "customer" : "staff"}">
-    <div class="who">${mine ? "You" : "Treadwell"}${viaEmail ? ' <span class="via-email">via email</span>' : ""}</div>
-    <div>${esc(m.body || "")}</div>
-    <div class="when">${when}</div>
+    <div class="mbody">${esc(m.body || "")}</div>
+    <div class="when">${when}${viaEmail ? ' <span class="via-email">via email</span>' : ""}</div>
   </div>`;
 }
 

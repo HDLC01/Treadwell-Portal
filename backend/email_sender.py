@@ -40,6 +40,55 @@ def proposal_anchor(token: str) -> str:
     return f"<tw-proposal.{token}@wetreadwell.com>"
 
 
+def customer_thread_subject(project_name: str | None) -> str:
+    """The ONE subject every customer email about a project carries.
+
+    Hanz, 2026-08-11: "for all updates to one project can we have it in one email thread?"
+
+    The threading headers were already right — every project email shares the proposal
+    anchor. The subject was what kept splitting it. Gmail groups by the References chain
+    AND the subject, so "Your Treadwell proposal — X", then "Deposit requested — X", then
+    "Checking in on X" produced three conversations about one job no matter what the
+    headers said. A constant subject is the right answer for stricter clients too: it is
+    what the thread is ABOUT, and the specific event belongs in the heading, which is the
+    line Gmail shows as the snippet anyway.
+
+    Deliberately NOT applied to the access code or the morning digest. A code is transient
+    and gets its own conversation (see _otp_headers, which Hanz confirmed he wants kept
+    separate), and the digest spans every project rather than belonging to one.
+    """
+    return f"Your Treadwell proposal — {project_name or 'your project'}"
+
+
+def staff_thread_subject(project_name: str | None) -> str:
+    """The customer-facing wording read wrong in a shared bids@ inbox, so staff get their
+    own form of the same idea: the project IS the subject, the event is the heading."""
+    return f"[Treadwell] {project_name or 'proposal'}"
+
+
+def project_thread_headers(token: str | None) -> dict[str, str] | None:
+    """Threading headers for a STAFF email about one project. None without a token.
+
+    The proposal anchor and nothing else, because a team email has no single
+    recipient to anchor per-person (`_thread_headers` hashes one address, and
+    notify_team sends to the whole roster in one call). Every staff member
+    therefore gets one conversation per project, which is how they read it anyway.
+
+    Hanz, 2026-08-11: "When a Treadwell employee replies through email it doesn't
+    get captured by the Proposal CRM and doesn't get sent out to the customer."
+    This was the cause. The inbound webhook routes a reply by finding a token —
+    first in the recipient address, then in these headers. Since INBOUND_REPLY_ADDRESS
+    made the visible Reply-To ONE address for every project, the headers became the
+    only route left, and staff notifications were the one kind of mail that never
+    carried them. So a staff reply matched no proposal, took the "unmatched" branch,
+    and was forwarded back to the roster instead of reaching the customer. Customer
+    replies were unaffected: send_reply_notification has always passed a token."""
+    if not token:
+        return None
+    anchor = proposal_anchor(token)
+    return {"References": anchor, "In-Reply-To": anchor}
+
+
 def _thread_headers(email: str, token: str | None = None) -> dict[str, str]:
     """Group portal email into inbox threads AND carry the proposal identity.
 
@@ -228,9 +277,7 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
         f'{"View the revised proposal" if revised else "View your proposal"}</a></p>'
         f'<p style="color:#64748b">You can view it, ask questions, and approve it right on the page.</p>'
     )
-    subject = (f"Your revised Treadwell proposal — {project_name}" if revised
-               else f"Your Treadwell proposal — {project_name}")
-    return _send([email], subject,
+    return _send([email], customer_thread_subject(project_name),
                  _wrap("Your revised proposal is ready" if revised else "Your proposal is ready", body),
                  _thread_headers(email, token), reply_to=reply_to)
 
@@ -346,11 +393,14 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
         )
         if include_status_ask and token:
             body_html += _status_ask_html(token)
-        return _send([email], rendered["subject"], _wrap(rendered["title"], body_html),
+        return _send([email], customer_thread_subject(project_name),
+                     _wrap(rendered["title"], body_html),
                      _thread_headers(email, token), reply_to=reply_to)
 
+    # Each branch sets a `title` (the heading) and a body. It used to set a `subject` too,
+    # one per template, which is exactly what split a chased proposal into four separate
+    # Gmail conversations. The subject is now the project — see customer_thread_subject.
     if template == "not_viewed":
-        subject = f"Your Treadwell proposal for {project_name} is ready when you are"
         title = "Your proposal is waiting"
         body = (
             f'{greeting}'
@@ -361,7 +411,6 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
             f'it comes straight to us.</p>'
         )
     elif template == "next_steps":
-        subject = f"Next steps for {project_name}"
         title = "Getting you on the schedule"
         body = (
             f'{greeting}'
@@ -373,7 +422,6 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
             f'we\'d rather adjust it than have it sit.</p>'
         )
     elif template == "second_nudge":
-        subject = f"Quick reminder — {project_name}"
         title = "Still holding your spot"
         body = (
             f'{greeting}'
@@ -384,7 +432,6 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
             f'a reply is enough.</p>'
         )
     else:   # "checkin" — the recurring stage
-        subject = f"Checking in on {project_name}"
         title = "Checking in"
         body = (
             f'{greeting}'
@@ -395,7 +442,7 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
 
     if include_status_ask and token:
         body += _status_ask_html(token)
-    return _send([email], subject, _wrap(title, body),
+    return _send([email], customer_thread_subject(project_name), _wrap(title, body),
                  _thread_headers(email, token), reply_to=reply_to)
 
 
@@ -500,7 +547,7 @@ def send_reply_notification(email: str, url: str, project_name: str,
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">View the reply</a></p>'
         f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
     )
-    return _send([email], f"New reply on your proposal — {project_name}", _wrap("You have a new reply", body),
+    return _send([email], customer_thread_subject(project_name), _wrap("You have a new reply", body),
                  _thread_headers(email, token), reply_to=reply_to)
 
 
@@ -519,7 +566,7 @@ def send_customer_update(email: str, url: str, project_name: str, heading: str,
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">'
         f'View your project</a></p>'
     )
-    return _send([email], f"{heading} — {project_name}", _wrap(heading, body),
+    return _send([email], customer_thread_subject(project_name), _wrap(heading, body),
                  _thread_headers(email, token), reply_to=reply_to)
 
 
@@ -545,10 +592,8 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
         f'padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">Pay your deposit</a></p>'
         f'{ref}'
     )
-    subject = (f"Invoice {invoice_no} — deposit for {project_name}" if invoice_no
-               else f"Deposit requested — {project_name}")
     atts = [(invoice_filename or "Treadwell-Invoice.pdf", invoice_pdf)] if invoice_pdf else None
-    return _send([email], subject, _wrap("Deposit invoice", body),
+    return _send([email], customer_thread_subject(project_name), _wrap("Deposit invoice", body),
                  _thread_headers(email, token), reply_to=reply_to, attachments=atts)
 
 
@@ -616,9 +661,15 @@ def _resolve_notify(kind: str, proposal_id: str | None = None) -> list[str]:
                                      configured=configured)
 
 
-def staff_emails() -> set[str]:
+def staff_emails(proposal_id: str | None = None) -> set[str]:
     """Lowercase addresses of everyone on the notification roster (enabled rows,
     both kinds) — the allowlist for "this inbound email came from staff".
+
+    With `proposal_id`, this project's per-project ADDS count too. They have to: an
+    override is how somebody gets a project's notification emails without being on
+    the global roster, so leaving them out meant the exact person we had just mailed
+    could not reply to it. Mutes are NOT subtracted — muting somebody stops this
+    project's mail reaching them, it does not make them a customer.
 
     Deliberately narrower than "any @wetreadwell.com address": a From header is
     forgeable, and the inbound webhook's signature proves the message came from
@@ -631,26 +682,49 @@ def staff_emails() -> set[str]:
 
     On DB failure, fall back to the env lists (same posture as _resolve_notify:
     don't lose the allowlist because the table blinked)."""
+    def _adds() -> set[str]:
+        """This project's per-project additions; {} on any failure — a missing override
+        must narrow the allowlist, never widen or break it."""
+        if not proposal_id:
+            return set()
+        try:
+            import db
+            return {o["email"].strip().lower() for o in db.list_notify_overrides(proposal_id)
+                    if o.get("mode") == "add" and o.get("email")}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("staff-roster override lookup failed for %s (%s)", proposal_id, exc)
+            return set()
+
     try:
         import db  # local import: avoid a hard DB dependency at module import time
         rows = db.list_notify_recipients()
         if rows:
             return {r["email"].strip().lower() for r in rows
-                    if r.get("enabled", True) and r.get("email")}
+                    if r.get("enabled", True) and r.get("email")} | _adds()
     except Exception as exc:  # noqa: BLE001 — DB down / table missing → env fallback
         log.warning("staff-roster lookup failed (%s); using env fallback", exc)
-    return {e.strip().lower() for e in [*config.NOTIFY_EMAILS, *config.DEPOSIT_NOTIFY_EMAILS] if e}
+    return {e.strip().lower() for e in [*config.NOTIFY_EMAILS,
+                                        *config.DEPOSIT_NOTIFY_EMAILS] if e} | _adds()
 
 
 def notify_team(subject: str, body_html: str, kind: str = "general",
                 recipients: list[str] | None = None, reply_link: str | None = None,
-                proposal_id: str | None = None, reply_to: str | None = None) -> bool:
+                proposal_id: str | None = None, reply_to: str | None = None,
+                token: str | None = None, project: str | None = None) -> bool:
     """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
     `kind` from the UI-managed roster, applying this proposal's per-project overrides
     (`proposal_id`). `reply_link` appends a "Reply in Portal" button that deep-links
     staff to the proposal in the staff tool. `reply_to` (the proposal's inbound
     address) makes a plain reply from a staff inbox land in the thread too, so the
-    button is the convenient path rather than the only one."""
+    button is the convenient path rather than the only one — but ONLY together with
+    `token`, which carries the project in the threading headers. Reply-To alone gets
+    the reply to our inbox; the token is what tells us which project it belongs to."""
+    # The call site passes the EVENT ("Proposal APPROVED — Nearman Creek"). That stays the
+    # heading inside the email; the outgoing subject becomes the project, so every update
+    # about one job lands in one conversation. Without a project there is no thread to join.
+    heading = subject
+    if project and token:
+        subject = staff_thread_subject(project)
     to = recipients if recipients is not None else _resolve_notify(kind, proposal_id)
     if not to:
         log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
@@ -659,7 +733,11 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
             f'<p style="margin-top:16px"><a href="{reply_link}" style="background:{_BRAND_RED};color:#fff;'
             f'padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700">Reply in Portal</a></p>'
         )
-    if reply_to:
+    # Only promise reply-by-email when a reply can actually be routed. Reply-To without
+    # a token lands the message in our inbox with nothing to match it to, which is the
+    # bug this line used to advertise.
+    if reply_to and token:
         body_html += ('<p style="color:#64748b;font-size:13px;margin-top:12px">Replying to this email '
                       'posts your message to the customer\'s portal thread and notifies them.</p>')
-    return _send(to, subject, _wrap(subject, body_html), reply_to=reply_to)
+    return _send(to, subject, _wrap(heading, body_html), reply_to=reply_to,
+                 headers=project_thread_headers(token))
