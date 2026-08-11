@@ -154,6 +154,28 @@ def get_recipients(proposal_id: str) -> list[str]:
     )]
 
 
+def recipients_by_proposal() -> dict[str, list[str]]:
+    """{proposal_id: [emails]} for EVERY proposal, in one query.
+
+    The board reads this once per poll instead of calling get_recipients per card. Same shape and
+    ordering as get_recipients (added_at, id) so a card and its drawer list the contacts in the
+    same order — two orderings of the same two people reads as two different pairs.
+
+    {} on failure: the board must render without it, and every card falls back to its own
+    customer_email."""
+    try:
+        rows = qall(
+            "select proposal_id, email from public.portal_proposal_recipients "
+            "order by added_at, id", ())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("recipients unavailable for the board: %s", exc)
+        return {}
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["proposal_id"], []).append(r["email"])
+    return out
+
+
 def add_recipient(proposal_id: str, email: str, added_by: Optional[str] = None) -> None:
     execute(
         "insert into public.portal_proposal_recipients (proposal_id, email, added_by) "
@@ -391,12 +413,75 @@ def mark_read(email: str, proposal_ids: list[str]) -> None:
         )
 
 
+def record_view(proposal_id: str, email: str) -> None:
+    """Note that THIS recipient opened the proposal. Best-effort, never raises.
+
+    Hanz, 2026-08-11: "It should then highlight in the CRM who viewed it as well and who
+    replied." portal_proposals.viewed_at already says somebody opened it and stays exactly as
+    it was — the customer-facing status is shared by design. This answers the other question:
+    WHICH of two contacts has looked, which is the difference between chasing the right person
+    and chasing nobody.
+
+    `email` comes from the session, never from the client. Conflict target is lower(email)
+    because a recipient list is typed by hand and Dana@ and dana@ are one person; without it the
+    upsert inserts a second row and the CRM reports two of two viewed when one had.
+
+    Swallows everything, including the table not existing: this runs on the customer's page load
+    and a missing migration must cost the CRM a name, not cost the customer their proposal.
+    """
+    if not proposal_id or not (email or "").strip():
+        return
+    try:
+        execute(
+            "insert into public.portal_proposal_views (proposal_id, email) values (%s,%s) "
+            "on conflict (proposal_id, lower(email)) do update set "
+            "last_viewed_at = now(), view_count = public.portal_proposal_views.view_count + 1",
+            (proposal_id, email.strip()),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not record the view of %s by %s: %s", proposal_id, email, exc)
+
+
+def list_views(proposal_id: str) -> list[dict[str, Any]]:
+    """Per-recipient view rows for one proposal. [] when the table is missing."""
+    try:
+        return qall(
+            "select email, first_viewed_at, last_viewed_at, view_count "
+            "from public.portal_proposal_views where proposal_id=%s order by first_viewed_at asc",
+            (proposal_id,),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("view records unavailable for %s: %s", proposal_id, exc)
+        return []
+
+
+def views_by_proposal() -> dict[str, list[str]]:
+    """{proposal_id: [emails that have viewed]} for the WHOLE board, in one query.
+
+    One read rather than one per card: the Active Projects board polls every 25 seconds and
+    already carries a per-row cost for the test flag. {} when the table is missing, which makes
+    the board's "N viewed" line simply not render."""
+    try:
+        rows = qall("select proposal_id, email from public.portal_proposal_views", ())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("view records unavailable for the board: %s", exc)
+        return {}
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["proposal_id"], []).append(r["email"])
+    return out
+
+
 def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
     return qall(
         "select method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "
         "sent_to_beneficiary, sent_to_bank, sent_to_routing, sent_to_account, check_number, "
-        "routing_number, account_number, account_type, submitted_at "
-        "from public.portal_deposits where proposal_id=%s order by submitted_at desc",
+        "routing_number, account_number, account_type, submitted_at, "
+        # to_jsonb rather than a bare column so a database that has not had the ALTER yet
+        # returns null instead of erroring — the house trick, same as the columns above it
+        # were introduced with. Code can therefore ship before the migration.
+        "(to_jsonb(d) ->> 'submitted_by') as submitted_by "
+        "from public.portal_deposits d where proposal_id=%s order by submitted_at desc",
         (proposal_id,),
     )
 
@@ -1041,16 +1126,19 @@ def add_deposit(proposal_id, method, account_name, bank_name, masked_ref, note,
                 sent_to_beneficiary=None, sent_to_bank=None,
                 sent_to_routing=None, sent_to_account=None,
                 check_number=None, routing_number=None, account_number=None,
-                account_type=None) -> None:
+                account_type=None, submitted_by=None) -> None:
+    """`submitted_by` is which CONTACT paid. Named in the INSERT rather than read through
+    to_jsonb like the SELECT does, so this is the one place the migration has to be applied
+    first — a write cannot fall back to null the way a read can."""
     execute(
         "insert into public.portal_deposits "
         "(proposal_id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "
         "sent_to_beneficiary, sent_to_bank, sent_to_routing, sent_to_account, check_number, "
-        "routing_number, account_number, account_type) "
-        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "routing_number, account_number, account_type, submitted_by) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (proposal_id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref,
          sent_to_beneficiary, sent_to_bank, sent_to_routing, sent_to_account, check_number,
-         routing_number, account_number, account_type),
+         routing_number, account_number, account_type, submitted_by),
     )
 
 

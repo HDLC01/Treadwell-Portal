@@ -114,3 +114,13 @@ grant select, insert, update, delete on public.portal_followups to portal_app;
 drop policy if exists portal_app_rw_followups on public.portal_followups;
 create policy portal_app_rw_followups on public.portal_followups
   for all to portal_app using (true) with check (true);
+
+-- 3d) Per-recipient view records (portal-owned). RLS is enabled in schema.sql, so grants alone
+--     are default-deny — the policy is required. Without it the table reads as empty on prod and
+--     the CRM reports nobody has opened a proposal everybody has, while staging (broad role)
+--     looks correct. Mirrored here as well as in schema.sql because prod applies this file by
+--     hand as the owner; portal_app cannot GRANT to itself.
+grant select, insert, update, delete on public.portal_proposal_views to portal_app;
+drop policy if exists portal_app_rw on public.portal_proposal_views;
+create policy portal_app_rw on public.portal_proposal_views
+  for all to portal_app using (true) with check (true);

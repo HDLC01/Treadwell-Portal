@@ -533,6 +533,11 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     # The snapshot they were SENT, not whatever an estimator has since typed.
     data = db.get_pinned_draft_data(p) or {}
     db.mark_viewed(p["proposal_id"])
+    # And WHICH recipient it was. mark_viewed above is untouched: the customer-facing status is
+    # shared on purpose, one status for the whole project. This is the staff-side question of
+    # which of two contacts has actually opened it. record_view swallows its own failures, so a
+    # missing migration costs the CRM a name rather than costing the customer their proposal.
+    db.record_view(p["proposal_id"], se)
     p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]   # text-only (legacy UI)
@@ -552,6 +557,15 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         # deposit_status, so the banner survives staff moving the status either way.
         "submitted": bool(_latest),
         "submitted_method": _latest["method"] if _latest else None,
+        # WHO paid, when it was the other contact. Hanz's own example: one contact sends the
+        # deposit and the second must see that it is done — without this the banner said "we've
+        # recorded your check" to somebody who had not written one. First name only and never an
+        # address, the same rule as the chat thread; `_me` lets the client keep saying "your"
+        # to the person who actually paid.
+        "submitted_by_first_name": (_first_name_of(_latest.get("submitted_by"))
+                                    if _latest else ""),
+        "submitted_by_me": bool(_latest and se and (_latest.get("submitted_by") or "").strip().lower()
+                                == se.strip().lower()),
         # Present once the invoice has been issued — drives the download button on
         # the chat card and the thank-you card.
         "invoice_no": p.get("deposit_invoice_no"),
@@ -997,7 +1011,10 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
 
     db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
                    routing_number=routing_number, account_number=account_number,
-                   account_type=account_type)
+                   account_type=account_type,
+                   # Which contact paid. From the session, not from account_name — that is
+                   # a bank account holder and can be a company.
+                   submitted_by=_session_email(request))
     # Move the board card off 'pending' so staff can see money is in flight — until
     # now the only signal a customer had paid was one email, leaving a paid project
     # indistinguishable from an approved-but-unpaid one. Guarded in SQL so a
@@ -1674,6 +1691,12 @@ def admin_pipeline(request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         log.warning("[pipeline] could not read the cadence, showing the shipped one: %s", exc)
         followup_cfg = followup_settings.defaults()
+    # Recipients and who has viewed, both read ONCE for the whole board rather than per card.
+    # This endpoint is polled every 25 seconds; a query per row is how a 60-proposal board turns
+    # into 120 round-trips. Both degrade to {} on a database without the migration, which makes
+    # the "N recipients · M viewed" line simply not render.
+    viewed = db.views_by_proposal()
+    recips = db.recipients_by_proposal()
     out = []
     for r in db.list_all_portal_proposals():
         out.append({
@@ -1693,6 +1716,12 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # Per-stage dates so each board column sorts by its own milestone rather
             # than by whatever was touched last.
             "last_viewed_at": _iso(r.get("last_viewed_at")),
+            # WHICH contacts, not just whether somebody. Only ever more interesting than
+            # last_viewed_at on a proposal with more than one recipient, and the card only
+            # renders the line in that case. Full addresses: this payload is staff-only.
+            "recipients": recips.get(r["proposal_id"]) or (
+                [r["customer_email"]] if r.get("customer_email") else []),
+            "viewed_by": viewed.get(r["proposal_id"]) or [],
             # Somebody followed the email link. A soft signal, reported separately from
             # `viewed` on purpose (see db.mark_link_clicked): it tells the board that the
             # email reached a mailbox, which is what distinguishes "they haven't decided"
@@ -1734,6 +1763,57 @@ def admin_pipeline(request: Request) -> JSONResponse:
 # Preview length for the bell/toast — enough to read at a glance, short enough
 # that the notification payload stays small.
 _RECENT_MSG_PREVIEW = 240
+
+
+def _recipient_activity(proposal_id: str, proposal: dict, approval: Optional[dict]) -> list:
+    """Per-contact activity for the drawer: who opened it, who wrote, who paid, who signed.
+
+    Assembled from what each fact is actually stored against, which is four different places —
+    that is why it lives here rather than in a query. All four reads are guarded: this decorates
+    a drawer that has to open regardless.
+
+    Only worth rendering when there are two or more contacts, and the frontend gates on that. It
+    is still built for one, because a single-contact proposal showing "not viewed" next to the
+    only name is a legitimate thing an estimator might want.
+    """
+    emails = _recipients_or_empty(proposal_id, proposal)
+    if not emails:
+        return []
+    try:
+        views = {(v["email"] or "").strip().lower(): v for v in db.list_views(proposal_id)}
+    except Exception:  # noqa: BLE001
+        views = {}
+    replied: set = set()
+    paid: set = set()
+    try:
+        for m in db.list_messages(proposal_id):
+            if m.get("author_kind") == "customer" and m.get("author_email"):
+                replied.add(m["author_email"].strip().lower())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read the thread for recipient activity on %s: %s", proposal_id, exc)
+    try:
+        for d in db.list_deposits(proposal_id):
+            if d.get("submitted_by"):
+                paid.add(d["submitted_by"].strip().lower())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read deposits for recipient activity on %s: %s", proposal_id, exc)
+    approver = ((approval or {}).get("approver_email") or "").strip().lower()
+
+    out = []
+    for e in emails:
+        k = e.strip().lower()
+        v = views.get(k)
+        out.append({
+            "email": e,
+            "name": _first_name_of(e),
+            "viewed_at": _iso(v.get("first_viewed_at")) if v else None,
+            "last_viewed_at": _iso(v.get("last_viewed_at")) if v else None,
+            "view_count": (v.get("view_count") if v else 0) or 0,
+            "replied": k in replied,
+            "paid": k in paid,
+            "approved": bool(approver) and k == approver,
+        })
+    return out
 
 
 def _recipients_or_empty(proposal_id: str, proposal: dict) -> list:
@@ -1843,6 +1923,10 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
         # contact needs no label, which is why the label was removed in the first place.
         # Guarded: a missing recipients read must cost the names, not the drawer.
         "recipients": _recipients_or_empty(proposal_id, p),
+        # One row per contact: viewed / replied / paid / approved. This is the "highlight in the
+        # CRM who viewed it as well and who replied" half of what Hanz asked for — the peer
+        # notifications tell the other CONTACT, this tells the estimator.
+        "recipient_activity": _recipient_activity(proposal_id, p, appr),
         "questions": [_q(q) for q in db.list_questions(proposal_id)],   # text-only (legacy drawer)
         "messages": [_msg(m) for m in db.list_messages(proposal_id)],   # full thread (revamped drawer)
         "deposit_ref": proposals.deposit_ref(proposal_id),

@@ -949,8 +949,17 @@ function setupDeposit() {
   const reopen = () => { hide(recorded); show(tabs); (dep.submitted_method === "check" ? showCheck : showAch)(); };
   if (dep.submitted) {
     const isCheck = dep.submitted_method === "check";
-    $("deposit-recorded-msg").textContent =
-      `Thanks — we've recorded your ${isCheck ? "check" : "ACH transfer"}. We'll mark your deposit Received once it ${isCheck ? "arrives" : "clears"}.`;
+    const what = isCheck ? "check" : "ACH transfer";
+    const settles = isCheck ? "arrives" : "clears";
+    // "your check" is only true for the contact who wrote it. On a two-contact proposal the
+    // other one was being told we'd recorded a payment they never made, which reads as either
+    // a mistake or a second charge. The peer sees who actually paid — first name only, the
+    // same rule as the chat thread. An unnamed payer (a row from before submitted_by existed)
+    // falls back to the neutral wording rather than guessing.
+    const peer = dep.submitted_by_first_name && !dep.submitted_by_me;
+    $("deposit-recorded-msg").textContent = peer
+      ? `${dep.submitted_by_first_name} sent the ${what}. We'll mark the deposit Received once it ${settles}.`
+      : `Thanks — we've recorded your ${what}. We'll mark your deposit Received once it ${settles}.`;
     show(recorded); hide(tabs); hide(achPane); hide(checkPane);
   } else {
     hide(recorded); show(tabs); showAch();
