@@ -946,12 +946,29 @@ def list_followup_candidates() -> list[dict[str, Any]]:
     """Proposals the cadence should consider this tick.
 
     Paused rows are deliberately INCLUDED: the rule engine needs them to notice a
-    pause that has expired and remind the estimator. Approved and closed-lost are
-    excluded — there is nothing left to chase."""
+    pause that has expired and remind the estimator. Closed-lost is excluded — there
+    is nothing left to chase.
+
+    APPROVED is included while its deposit is still outstanding. Hanz, 2026-08-12:
+    "followups should be automated until a deposit has been received." It used to be
+    excluded here, which is why widening the rule engine alone would have changed
+    nothing — an approved proposal never reached it.
+
+    This clause is deliberately coarser than the rules are. `received` is the last
+    stop either audience has, so anything short of it is a candidate; whether THIS
+    tick owes the customer or only the estimator is followup_rules' decision, made
+    against the fresh row. A `deposit_required` of NULL predates the optional-deposit
+    column and means the default, which was required — and a FALSE with an invoice
+    raised against it anyway (`deposit_requested_at`) is staff deciding after the fact
+    that money is due, which is money worth chasing."""
     return qall(
         "select * from public.portal_proposals "
         "where followup_enrolled_at is not null and followup_disabled_at is null "
-        "  and proposal_status in ('sent','viewed') "
+        "  and (proposal_status in ('sent','viewed') "
+        "       or (proposal_status = 'approved' "
+        "           and (coalesce(deposit_required, true) "
+        "                or deposit_requested_at is not null) "
+        "           and coalesce(deposit_status, '') <> 'received')) "
         "order by followup_enrolled_at"
     )
 

@@ -11,11 +11,25 @@ import pytest
 # precisely to make that read fail: an autouse fixture that reaches into shared infrastructure
 # silently overrides the setup of every test that cares about it. This patch touches only the
 # email path, and a test that wants a configured subject overrides it again.
+#
+# `_sent_template` is here for exactly the same reason and was added a day later: the "your
+# proposal is ready" email became editable, so publishing now reads portal_settings once per
+# recipient. That put test_email_content back where the thread subject had been — 30s per send,
+# two minutes for the file. None is the shipped-copy fallback, which is what those tests assert.
 @pytest.fixture(autouse=True)
-def _shipped_thread_subject(monkeypatch):
+def _shipped_email_wording(request, monkeypatch):
+    # A test that INSPECTS one of these functions has to see the real one — `realwording` is its
+    # opt-out. Without it, inspect.getsource(email_sender._sent_template) returned the lambda two
+    # lines below, and test_the_template_read_is_cached failed looking for a cache in it. Third
+    # time an autouse fixture reaching into a shared module has bitten this file; the other two
+    # are documented above and below, and the pattern is always the same — patch narrowly, and
+    # give the tests that own the thing a way out.
+    if "realwording" in request.keywords:
+        return
     import email_sender
     monkeypatch.setattr(email_sender, "_thread_subject_template",
                         lambda: email_sender.DEFAULT_THREAD_SUBJECT, raising=False)
+    monkeypatch.setattr(email_sender, "_sent_template", lambda: None, raising=False)
 
 
 # ── the board's two per-poll decoration reads ────────────────────────────────
@@ -32,6 +46,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "realdb: keep the real db view/recipient helpers instead of the autouse stubs below")
+    config.addinivalue_line(
+        "markers",
+        "realwording: keep the real email-wording readers instead of the autouse stubs above")
 
 
 @pytest.fixture(autouse=True)

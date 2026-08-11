@@ -38,6 +38,13 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
         calls["candidates"] += 1
         return [p]
 
+    # The cadence settings, stubbed as ABSENT — which is the path these tests already took, just
+    # 30 seconds faster each. `_settings()` was the only unstubbed database call in the tick, so
+    # every test here paid a full connection timeout before falling back to the shipped cadence.
+    # Twenty tests, thirty seconds apiece: seven minutes of every CI run, and the assertions were
+    # identical either way because `merge(None)` IS the shipped cadence. A test that wants a
+    # specific cadence overrides this after _wire, as monkeypatch allows.
+    monkeypatch.setattr(fw.db, "get_settings", lambda key: None)
     monkeypatch.setattr(fw.db, "list_followup_candidates", _candidates)
     monkeypatch.setattr(fw.db, "get_proposal", lambda pid: p)
     monkeypatch.setattr(fw.db, "get_recipients", lambda pid: ["c@x.com", "b@x.com"])
@@ -129,13 +136,50 @@ def test_the_flag_is_read_every_tick_not_at_import(monkeypatch):
     assert fw._enabled() is True
 
 
-def test_a_proposal_approved_since_the_list_was_built_is_skipped(monkeypatch):
-    """The candidate list is minutes old by the time we reach a row. Someone who
-    approved in between must not get one last reminder."""
+def test_a_proposal_approved_since_the_list_was_built_is_not_nagged_to_approve(monkeypatch):
+    """The candidate list is minutes old by the time we reach a row, so the worker re-reads it.
+    Someone who approved in between must not get the reminder that was queued for them.
+
+    This test used to assert that they got NOTHING. Hanz, 2026-08-12: "followups should be
+    automated until a deposit has been received" — so approving moves them to the deposit stage
+    rather than ending the cadence. The re-read still has to be honoured, which is what this asserts:
+    not one of the four proposal-chasing emails goes out, and the deposit reminder is what does.
+
+    Sending "we need your signed approval and the deposit before we can book your dates" to
+    somebody who signed four minutes ago is the exact failure the re-read exists to prevent, and it
+    would be the DEFAULT if the stage fell through to the viewed branch instead of returning."""
+    stale = _proposal()
+    calls = _wire(monkeypatch, proposal=stale)
+    fresh = dict(stale, proposal_status="approved", approved_at=ENROLLED,
+                 cycle_viewed_at=ENROLLED, deposit_status="pending")
+    monkeypatch.setattr(fw.db, "get_proposal", lambda pid: fresh)
+    fw._tick(NOW)
+    sent = [c["template"] for c in calls["customer"]]
+    for chasing in ("not_viewed", "next_steps", "second_nudge", "checkin"):
+        assert chasing not in sent, (
+            "a customer who approved since the list was built is still being asked to approve")
+    assert sent and set(sent) == {"deposit_nudge"}, sent
+
+
+def test_a_proposal_approved_AND_PAID_since_the_list_was_built_is_skipped(monkeypatch):
+    """The case that really does end everything, and the one the old version of the test above was
+    reaching for. Nothing is even reserved: `in_scope` is checked before the rules run, so a row
+    that settled in the last few minutes costs one read and no send."""
     stale = _proposal()
     calls = _wire(monkeypatch, proposal=stale)
     monkeypatch.setattr(fw.db, "get_proposal",
-                        lambda pid: dict(stale, proposal_status="approved"))
+                        lambda pid: dict(stale, proposal_status="approved",
+                                         deposit_status="received"))
+    fw._tick(NOW)
+    assert calls["customer"] == [] and calls["reserved"] == []
+
+
+def test_a_proposal_closed_lost_since_the_list_was_built_is_skipped(monkeypatch):
+    """Same guard, the other terminal state — and the one that must never depend on a deposit."""
+    stale = _proposal()
+    calls = _wire(monkeypatch, proposal=stale)
+    monkeypatch.setattr(fw.db, "get_proposal",
+                        lambda pid: dict(stale, proposal_status="closed_lost"))
     fw._tick(NOW)
     assert calls["customer"] == [] and calls["reserved"] == []
 

@@ -7,6 +7,7 @@ The cadence Hanz specified:
                        → +48h: second reminder
                        → every 3 days after that, with a way out
     viewed, 48h, still pending → tell the estimator to make it personal
+    approved, deposit not in    → 24h: the deposit reserves the dates, then every 3 days
     a pause that has expired   → remind the estimator it's live again
 
 Three design choices carry most of the weight.
@@ -162,6 +163,55 @@ def as_date(v: Any) -> Optional[date]:
 _as_date = as_date          # internal alias, kept so existing call sites read the same
 
 
+def deposit_outstanding(p: dict, *, for_customer: bool) -> bool:
+    """Is this approved job still waiting on its deposit?
+
+    Hanz, 2026-08-12: "followups should be automated until a deposit has been received." The
+    cadence used to stop dead at approval, and nothing replaced it — an approved job got one
+    invoice email and then silence on every channel.
+
+    THE TWO AUDIENCES STOP AT DIFFERENT POINTS, which is the whole reason this takes a flag:
+
+      * the CUSTOMER stops at `submitted`. Once they have entered ACH details or told us the
+        cheque is posted, the money is in flight; chasing then reads as either a mistake or a
+        second charge. Same judgement as the peer-notification receipt split.
+      * the ESTIMATOR keeps going until `received`. A cheque that never arrives must not be able
+        to go quiet on the staff side — somebody has to still be asking.
+
+    `deposit_required is not False` because the flag is tri-state in practice: legacy rows have no
+    value and DO collect one, and a job sent with no deposit has nothing to chase.
+    """
+    # `deposit_required is False` means the proposal went out without one — GC work usually does.
+    # UNLESS an invoice was raised anyway: `deposit_requested_at` is staff deciding after the fact
+    # that money is due, and money that has been asked for is money worth chasing. This is the rule
+    # crm-core.depositSatisfied already used on the board, and the two disagreeing would have shown
+    # a staff drawer reading "following up until the deposit is in" while the worker sent nothing.
+    if p.get("deposit_required") is False and not p.get("deposit_requested_at"):
+        return False
+    status = str(p.get("deposit_status") or "").strip().lower()
+    done = ("submitted", "received") if for_customer else ("received",)
+    return status not in done
+
+
+def in_scope(p: dict) -> bool:
+    """Is there anything left to chase on this proposal at all?
+
+    ONE definition, because there are three places that have to agree: the SQL that lists
+    candidates, the worker's re-read a few minutes later, and the gate at the top of `due_now`.
+    The worker used to spell its own version out inline (`status not in ("sent", "viewed")`), and
+    widening the engine without it would have changed nothing observable — every approved row would
+    have been dropped one line before the rules ran.
+
+    Deliberately the STAFF reading of the deposit (the later of the two stops), because this only
+    decides whether to look. Which audience is owed a send this tick is `due_now`'s call."""
+    status = (p.get("proposal_status") or "")
+    if status in ("sent", "viewed"):
+        return True
+    if status != "approved":
+        return False
+    return deposit_outstanding(p, for_customer=False)
+
+
 def is_paused(p: dict, now: datetime) -> bool:
     """A pause covers the whole of its final day — the customer said "about two
     months", not "to the minute"."""
@@ -244,8 +294,15 @@ def next_due_at(p: dict, now: datetime, cfg: Optional[dict] = None) -> Optional[
     enrolled = _aware(p.get("followup_enrolled_at"))
     if not enrolled or p.get("followup_disabled_at"):
         return None                                     # not automated
-    if (p.get("proposal_status") or "") not in ("sent", "viewed"):
-        return None                                     # approved, or closed lost
+    status = (p.get("proposal_status") or "")
+    if status not in ("sent", "viewed", "approved"):
+        return None                                     # closed lost
+    # Approved counts only while the CUSTOMER is still being chased. The staff reminders run
+    # past that point, but this column is the customer's schedule — the Follow-ups page says
+    # "next reminder", and a date here that only a staff note will honour reads as a promise to
+    # the customer that nothing keeps.
+    if status == "approved" and not deposit_outstanding(p, for_customer=True):
+        return None
 
     until = _as_date(p.get("followup_paused_until"))
     if until and business_today(now) <= until:
@@ -254,6 +311,21 @@ def next_due_at(p: dict, now: datetime, cfg: Optional[dict] = None) -> Optional[
                         c.start_hour, tzinfo=BUSINESS_TZ) + timedelta(days=1)
 
     viewed = _aware(p.get("cycle_viewed_at"))
+    # Mirrors due_now's deposit stage: same anchor, same first threshold, same recurring step.
+    # If these two disagree the page states a date the worker will not act on.
+    if status == "approved":
+        anchor = _aware(p.get("approved_at")) or viewed or enrolled
+        resume = _resume_anchor(p, now, c)
+        if resume and resume > anchor:
+            anchor = resume
+        elapsed = now - anchor
+        if elapsed < c.first:
+            return anchor + c.first
+        n = _recurring_index(elapsed, c.first, c)
+        if n >= c.max_recurring:
+            return None
+        return anchor + c.first + c.recurring * (n + 1)
+
     anchor = viewed or enrolled
     first = c.first if viewed is None else c.second
     # An expired pause restarts the clock, exactly as due_now does it. These two functions have to
@@ -283,7 +355,10 @@ def due_now(p: dict, now: datetime, cfg: Optional[dict] = None) -> list[Due]:
     enrolled = _aware(p.get("followup_enrolled_at"))
     if not enrolled or p.get("followup_disabled_at"):
         return []
-    if (p.get("proposal_status") or "") not in ("sent", "viewed"):
+    status = (p.get("proposal_status") or "")
+    # APPROVED is now in scope, but only while a deposit is still outstanding. Everything else
+    # (closed lost, or approved-and-paid) is still out. See in_scope / deposit_outstanding.
+    if not in_scope(p):
         return []
 
     out: list[Due] = []
@@ -302,6 +377,44 @@ def due_now(p: dict, now: datetime, cfg: Optional[dict] = None) -> list[Due]:
 
     ck = cycle_key(enrolled)
     viewed = _aware(p.get("cycle_viewed_at"))
+
+    # ── approved, deposit outstanding ────────────────────────────────────────
+    # BEFORE the sent/viewed branches and returning, not falling through: an approved proposal
+    # has cycle_viewed_at set, so without this it would be chased with "next steps to get you on
+    # the schedule" — a job that is already won.
+    #
+    # Anchored on approved_at, a fresh clock, matching how every other move in this system
+    # re-anchors rather than replaying what was missed. Falls back to the viewed/enrolled anchor
+    # only if approved_at is somehow absent, so a missing stamp cannot mean "never chase".
+    if status == "approved":
+        anchor = _aware(p.get("approved_at")) or viewed or enrolled
+        if resume and resume > anchor:
+            anchor = resume
+        elapsed = now - anchor
+        if elapsed >= c.first and deposit_outstanding(p, for_customer=True):
+            n = _recurring_index(elapsed, c.first, c)
+            # NO include_status_ask, on the recurring occurrences either — the one place in this
+            # engine where the recurring stage does not offer it. That block asks "has your
+            # timeline changed?" over two buttons, and the second reads "Not moving forward",
+            # which sets closed_lost. Putting a one-click cancel on a job the customer has already
+            # signed and been invoiced for is the worst button we could send them, and a stray tap
+            # would close a won job. Somebody who genuinely wants out of signed work does it by
+            # phone; what they need HERE is the deposit step, which the link already opens.
+            if n:
+                out.append(Due(_occurrence_key(ck, "depr", anchor, c.first, n, c),
+                               "customer", "deposit_nudge"))
+            else:
+                out.append(Due("%s:dep1" % ck, "customer", "deposit_nudge"))
+        # The staff half runs on its own threshold and its own stop point — it keeps going after
+        # the customer's stops, which is the case Hanz asked for: a cheque that never arrives.
+        if elapsed >= c.staff_personal:
+            n = _recurring_index(elapsed, c.staff_personal, c)
+            key = (_occurrence_key(ck, "depsr", anchor, c.staff_personal, n, c) if n
+                   else "%s:dep_staff" % ck)
+            out.append(Due(key, "staff", "staff_deposit_outstanding"))
+        if not in_send_window(now, cfg):
+            out = [d for d in out if d.audience != "customer"]
+        return out
 
     if viewed is None:
         anchor = enrolled if not (resume and resume > enrolled) else resume

@@ -75,10 +75,13 @@ def test_the_worker_cannot_chase_with_the_sent_email():
     """THE one that matters. followup_rules and followup_worker walk TEMPLATE_KEYS; if "sent"
     were in it, a customer would get "your proposal is ready" again three days later."""
     assert followup_settings.SENT_KEY not in followup_settings.TEMPLATE_KEYS
-    assert followup_settings.TEMPLATE_KEYS == ("not_viewed", "next_steps", "second_nudge",
-                                               "checkin")
     assert followup_settings.SENT_KEY in followup_settings.ALL_TEMPLATE_KEYS
-    assert len(followup_settings.ALL_TEMPLATE_KEYS) == len(followup_settings.TEMPLATE_KEYS) + 1
+    # The sent email is the ONLY thing the editable set adds. Written as a difference rather than
+    # a literal tuple: the cadence set grew a deposit reminder on 2026-08-12, and a test that
+    # spells out today's four has to be edited every time the cadence gains a stage — which is how
+    # a real separation check turns into a chore somebody deletes.
+    assert set(followup_settings.ALL_TEMPLATE_KEYS) - set(followup_settings.TEMPLATE_KEYS) == {
+        followup_settings.SENT_KEY}
 
 
 def test_the_worker_still_only_knows_the_four():
@@ -199,6 +202,7 @@ def test_a_revised_send_does_not_even_read_the_template(sent, monkeypatch):
 
 
 # ── cost ─────────────────────────────────────────────────────────────────────
+@pytest.mark.realwording
 def test_the_template_read_is_cached():
     """It runs once per RECIPIENT on every publish. Without a cache a connection-pool stall costs
     30 seconds per address; success-only, so one blip cannot pin the fallback for a minute."""
