@@ -308,6 +308,48 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
             f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
             f'border-left:3px solid {_BRAND_RED};white-space:pre-wrap">{_esc(note)}</p>'
         )
+    # A FIRST send renders the editable "Proposal sent" template. Hanz, 2026-08-12: "Create the
+    # ability to change what the first proposal sent email looks like. from the heading to the
+    # content (this would be the global setting for the first proposal sent) Just like the emails
+    # for the follow ups." So it goes through exactly the pipeline send_followup uses — same
+    # tokens, same blank-line-separated blocks, same {link}-becomes-the-button rule — and the
+    # editor's preview is therefore honest about what goes out.
+    #
+    # A REVISED send does not. Its wording is the only thing telling the customer that the version
+    # they already have no longer stands, and the portal has reopened it for approval; letting an
+    # edited template silently replace that is how somebody approves the wrong numbers. Asked,
+    # Hanz chose first-send-only.
+    if not revised:
+        tpl = _sent_template()
+        # `tpl.get("body")` as well as `tpl`, even though _sent_template already refuses a
+        # body-less template: this is the branch that decides whether a customer gets an email
+        # with words in it, and the check costs nothing. A test that stubbed the reader straight
+        # past its own guard produced a letterhead with no content, which is exactly the outcome
+        # worth being defensive about twice.
+        if tpl and tpl.get("body"):
+            rendered = followup_settings.render(
+                tpl, first_name=_first_name(name), project=project_name,
+                need="your signed approval", link_html=_LINK_MARK)
+            # The button label comes off the RAW template, not off `rendered` — render() fills
+            # tokens in the title and body and deliberately returns nothing else, which is the
+            # same reason send_followup reads `saved.get("cta")` rather than the rendered dict.
+            label = tpl.get("cta") or "View your proposal"
+            blocks = [b.strip() for b in rendered["body"].split("\n\n") if b.strip()]
+            html_blocks = []
+            for block in blocks:
+                # The estimator's personal note keeps its position: immediately above the button,
+                # which is where it has always been. Inserted as its own block rather than
+                # appended, so an edited template that puts the link mid-body still reads right.
+                if note_html and block == _LINK_MARK:
+                    html_blocks.append(note_html)
+                    note_html = ""
+                html_blocks.append(_block_html(block, url, label))
+            if note_html:                      # a template with no {link} block of its own
+                html_blocks.append(note_html)
+            return _send([email], customer_thread_subject(project_name),
+                         _wrap(rendered["title"], "".join(html_blocks)),
+                         _thread_headers(email, token), reply_to=reply_to)
+
     lead = ("A revised proposal for <strong>%s</strong> is ready to review. It replaces the "
             "version we sent previously." % _esc(project_name)) if revised else \
            ("Your proposal for <strong>%s</strong> is ready to review." % _esc(project_name))
@@ -323,6 +365,38 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
     return _send([email], customer_thread_subject(project_name),
                  _wrap("Your revised proposal is ready" if revised else "Your proposal is ready", body),
                  _thread_headers(email, token), reply_to=reply_to)
+
+
+_SENT_TPL_TTL = 60.0
+_sent_tpl_cache: tuple[float, dict] | None = None
+
+
+def _sent_template() -> dict | None:
+    """The saved "Proposal sent" template, cached for a minute. None if it cannot be read.
+
+    None rather than the shipped default on failure, because the caller falls back to the
+    hardcoded copy below — which IS the shipped default, and is the one thing guaranteed to
+    render. Publishing a proposal must never fail over a settings read.
+
+    Cached for the same reason the thread subject is: this runs once per recipient on every
+    publish, and a connection-pool stall would otherwise cost 30 seconds per address. Success
+    only, so a single blip cannot pin the fallback for a minute.
+    """
+    global _sent_tpl_cache
+    now = time.monotonic()
+    if _sent_tpl_cache and _sent_tpl_cache[0] > now:
+        return _sent_tpl_cache[1]
+    try:
+        import db
+        cfg = followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+        tpl = (cfg.get("templates") or {}).get(followup_settings.SENT_KEY)
+        if not (tpl and tpl.get("body")):
+            return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sent-email template unreadable (%s); using the shipped copy", exc)
+        return None
+    _sent_tpl_cache = (now + _SENT_TPL_TTL, tpl)
+    return tpl
 
 
 # ── Automated follow-ups ──────────────────────────────────────────────────────

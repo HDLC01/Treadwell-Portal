@@ -474,3 +474,18 @@ create policy portal_app_rw on public.portal_proposal_views
 -- contact may pay it — but "we've recorded your check" has to go to the person who actually
 -- wrote it, and the CRM has to be able to say who that was after the fact.
 alter table public.portal_deposits add column if not exists submitted_by text;
+
+-- Does THIS contact get the automated follow-ups? Hanz, 2026-08-12: "just like the 25% deposit
+-- creat a checkbox for each contact if they will be able to receive the automated follow ups or
+-- no", and on the project itself "we must have the ability to add or remove COntacts who receive
+-- the follow ups".
+--
+-- Per RECIPIENT rather than per proposal, because the reason to turn it off is usually a person:
+-- an accounts-payable address that should get the invoice but not four chasing emails, or a
+-- second contact who asked not to be nagged. The proposal-level switch already exists
+-- (portal_followups / followup_state) and is untouched — that one stops the cadence entirely.
+--
+-- DEFAULT TRUE, not null: every recipient that exists today was receiving follow-ups, and the
+-- migration must not silently stop chasing a live bid. A row written before this column existed
+-- reads as true for the same reason.
+alter table public.portal_proposal_recipients add column if not exists followups boolean not null default true;

@@ -1550,6 +1550,12 @@ async def admin_publish(request: Request) -> JSONResponse:
     extras, err = _clean_emails(body.get("emails"))
     if err:
         return _json({"ok": False, "error": err}, 400)
+    # Which of those contacts should NOT be chased. Cleaned by the same helper, so a malformed
+    # address is refused here rather than silently ignored — an unparsed entry would mean somebody
+    # un-ticked a box and got chased anyway, which is the failure nobody would notice.
+    no_followups, err = _clean_emails(body.get("no_followups"))
+    if err:
+        return _json({"ok": False, "error": err}, 400)
     contact = (data.get("contact_email") or "").strip().lower()
     # Union semantics: the intake contact is ALWAYS a recipient (the Files-screen
     # modal never removes it — it only adds). `emails` absent → legacy behavior.
@@ -1643,7 +1649,11 @@ async def admin_publish(request: Request) -> JSONResponse:
         db.add_recipient(draft_id, primary, by)
         send_list = db.get_recipients(draft_id) or [primary]
     else:
-        db.set_recipients(draft_id, recipients, by)  # revokes any extra dropped from the list
+        # no_followups rides along so the flag is set in the SAME transaction that writes the
+        # recipients. Two calls would leave a window where a contact exists and is about to be
+        # chased; the worker runs on its own clock and does not wait for a second write.
+        db.set_recipients(draft_id, recipients, by,  # revokes any extra dropped from the list
+                          no_followups=no_followups)
         send_list = recipients
 
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
@@ -1783,6 +1793,13 @@ def _recipient_activity(proposal_id: str, proposal: dict, approval: Optional[dic
         views = {(v["email"] or "").strip().lower(): v for v in db.list_views(proposal_id)}
     except Exception:  # noqa: BLE001
         views = {}
+    # Who is being CHASED. Read as a set of the opted-in, so a database without the migration —
+    # where every row reads as opted in — produces every contact marked on, which is the truth.
+    try:
+        chased = {e.strip().lower() for e in db.get_followup_recipients(proposal_id)}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("follow-up recipients unavailable for %s: %s", proposal_id, exc)
+        chased = {e.strip().lower() for e in emails}
     replied: set = set()
     paid: set = set()
     try:
@@ -1811,6 +1828,7 @@ def _recipient_activity(proposal_id: str, proposal: dict, approval: Optional[dic
             "view_count": (v.get("view_count") if v else 0) or 0,
             "replied": k in replied,
             "paid": k in paid,
+            "followups": k in chased,
             "approved": bool(approver) and k == approver,
         })
     return out
@@ -2003,12 +2021,20 @@ def admin_get_followup_settings(request: Request) -> JSONResponse:
         "read_failed": read_failed,
         "updated_at": _iso(meta.get("updated_at")),
         "updated_by": meta.get("updated_by") or "",
+        # ALL_TEMPLATE_KEYS, not TEMPLATE_KEYS: the editor has a tab for the "Proposal sent"
+        # email too, and a tab with no preview renders as a broken panel. TEMPLATE_KEYS stays
+        # what the WORKER walks, so the cadence still cannot chase with the sent email.
         "previews": {k: followup_settings.preview(cfg, k)
-                     for k in followup_settings.TEMPLATE_KEYS},
+                     for k in followup_settings.ALL_TEMPLATE_KEYS},
         "tokens": list(followup_settings.TOKENS),
         # The editor labels its tabs from these, so a refusal that names an email ("the
         # “Second reminder” email needs {link}") points at a tab that exists.
         "labels": dict(followup_settings.LABELS),
+        # Longer, when-it-fires wording for the heading under the tabs. Separate from labels
+        # because labels are quoted verbatim in validation refusals, where a sentence reads
+        # badly. Served rather than hardcoded in the editor for the same reason labels are:
+        # the message that refuses a save and the heading above the form must not disagree.
+        "editor_titles": dict(followup_settings.EDITOR_TITLES),
     })
 
 
@@ -2042,8 +2068,11 @@ async def admin_put_followup_settings(request: Request) -> JSONResponse:
         "saved": True,
         "updated_at": _iso(meta.get("updated_at")),
         "updated_by": meta.get("updated_by") or by or "",
+        # ALL_TEMPLATE_KEYS, not TEMPLATE_KEYS: the editor has a tab for the "Proposal sent"
+        # email too, and a tab with no preview renders as a broken panel. TEMPLATE_KEYS stays
+        # what the WORKER walks, so the cadence still cannot chase with the sent email.
         "previews": {k: followup_settings.preview(cfg, k)
-                     for k in followup_settings.TEMPLATE_KEYS},
+                     for k in followup_settings.ALL_TEMPLATE_KEYS},
     })
 
 
@@ -2248,6 +2277,59 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
         email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text,
                                              token=p["token"])
     return _json({"ok": True})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/followup-recipient")
+async def admin_followup_recipient(proposal_id: str, request: Request) -> JSONResponse:
+    """Add a contact to the follow-up list, or turn one on/off.
+
+    Hanz, 2026-08-12: "on this project container on the follow ups we must have the ability to add
+    or remove COntacts who receive the follow ups."
+
+    "Remove" means STOP CHASING, not stop being a contact — the row stays and keeps receiving the
+    proposal, the invoice and every reply. Deleting the recipient would revoke their portal access,
+    which is a different and much larger decision than "don't nag this person".
+
+    Adding somebody sends them the proposal link, because a recipient who has never been sent one
+    cannot reach the portal: the link IS the access. That send uses the editable Proposal sent
+    template, same as a publish.
+    """
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    email = (body.get("email") or "").strip().lower()
+    if not email or not _EMAIL_RE.match(email) or len(email) > 254:
+        return _json({"ok": False, "error": "invalid_email"}, 400)
+    enabled = body.get("enabled") is not False          # absent means "on"
+    add = bool(body.get("add"))
+    # Same convention as every other admin endpoint here: the staff tool stamps who did it into
+    # the body (its own proxy fills it from the signed-in user), because this request arrives on a
+    # service token that identifies the APP, not a person.
+    by = _cap(body.get("by"), 120) or None
+
+    existing = [e.strip().lower() for e in (db.get_recipients(proposal_id) or [])]
+    if add and email not in existing:
+        if len(existing) >= MAX_RECIPIENTS:
+            return _json({"ok": False, "error": "too_many_recipients"}, 400)
+        db.add_recipient(proposal_id, email, by)
+        # They cannot reach the portal without the link, so adding somebody and not sending it
+        # would put a contact on the list who can never open the thing they are a contact for.
+        try:
+            email_sender.send_portal_link(
+                email, "", f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
+                p.get("project_name") or "your project",
+                reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"])
+        except Exception as exc:  # noqa: BLE001 — they are on the list; the link can be re-sent
+            log.error("could not send the portal link to a newly added contact: %s", exc)
+    elif email not in existing:
+        return _json({"ok": False, "error": "not_a_recipient"}, 404)
+
+    if not db.set_followup_recipient(proposal_id, email, enabled):
+        return _json({"ok": False, "error": "not_a_recipient"}, 404)
+    return _json({"ok": True, "email": email, "followups": enabled})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/deposit-received")

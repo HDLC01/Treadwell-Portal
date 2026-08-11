@@ -69,6 +69,18 @@ BOUNDS: Dict[str, tuple] = {
 }
 
 TEMPLATE_KEYS = ("not_viewed", "next_steps", "second_nudge", "checkin")
+
+# The FIRST proposal email, editable on the same page. Hanz, 2026-08-12: "Create the ability to
+# change what the first proposal sent email looks like. from the heading to the content (this
+# would be the global setting for the first proposal sent) Just like the emails for the follow
+# ups."
+#
+# Deliberately NOT in TEMPLATE_KEYS. That tuple is what followup_rules and followup_worker walk
+# to decide what to chase with; adding "sent" there would make the cadence send the
+# here-is-your-proposal email as a reminder. So the editable set is a superset and the cadence set
+# is untouched — every loop over the four stays a loop over the four.
+SENT_KEY = "sent"
+ALL_TEMPLATE_KEYS = TEMPLATE_KEYS + (SENT_KEY,)
 TOKENS = ("{first_name}", "{project}", "{need}", "{link}")
 
 # What each email is CALLED on screen. The keys are database identifiers, and a refusal that says
@@ -76,10 +88,29 @@ TOKENS = ("{first_name}", "{project}", "{need}", "{link}")
 # one. Naming lives here rather than in the page so the message and the tab cannot disagree; the
 # editor reads these off the GET response.
 LABELS: Dict[str, str] = {
+    "sent": "Proposal sent",
     "not_viewed": "Not opened yet",
     "next_steps": "After they open it",
     "second_nudge": "Second reminder",
     "checkin": "Recurring check-in",
+}
+
+
+# The same four emails, described by WHEN THEY FIRE rather than named. Hanz, 2026-08-12: "each
+# category in the emails should have different language or terms. For example if its in the Not
+# opened yet category the Label would be 'First Reminder after not Opening'. Just to clearly show
+# what category we are in."
+#
+# LABELS above stays as it is and stays short: it names tabs, and it is quoted verbatim in every
+# validation refusal ("the Not opened yet email needs {link}"), where a sentence would read
+# badly. These are the heading shown under the tabs once one is selected — the place there is
+# room to say what the email actually is.
+EDITOR_TITLES: Dict[str, str] = {
+    "sent": "Proposal sent — the first email, when you publish it",
+    "not_viewed": "First reminder — after not opening",
+    "next_steps": "Next steps — after they open it",
+    "second_nudge": "Second reminder — opened, still no decision",
+    "checkin": "Recurring check-in — repeats until they decide",
 }
 
 
@@ -110,6 +141,16 @@ _MAX_BODY = 4000
 # The wording as shipped, lifted from email_sender.send_followup so the editor opens showing
 # exactly what customers have been receiving rather than a blank box.
 DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
+    # The first send. Wording lifted from send_portal_link so the editor opens showing exactly
+    # what customers have been receiving, the same rule the four below follow.
+    "sent": {
+        "title": "Your proposal is ready",
+        "body": ("Hi {first_name},\n\n"
+                 "Your proposal for {project} is ready to review.\n\n"
+                 "{link}\n\n"
+                 "You can view it, ask questions, and approve it right on the page."),
+        "cta": "View your proposal",
+    },
     "not_viewed": {
         "title": "Your proposal is waiting",
         "body": ("Hi {first_name},\n\n"
@@ -221,7 +262,7 @@ def validate_thread_subject(raw: Any) -> str:
 
 def validate_template(key: str, raw: Any) -> Dict[str, str]:
     """One template, cleaned. Raises only for a missing {link}."""
-    if key not in TEMPLATE_KEYS:
+    if key not in ALL_TEMPLATE_KEYS:
         raise ValidationError("There is no follow-up email called %r." % key)
     src = raw if isinstance(raw, dict) else {}
     base = DEFAULT_TEMPLATES[key]
@@ -280,7 +321,7 @@ def validate(raw: Any) -> Dict[str, Any]:
 
     templates = raw.get("templates")
     src = templates if isinstance(templates, dict) else {}
-    out["templates"] = {k: validate_template(k, src.get(k)) for k in TEMPLATE_KEYS}
+    out["templates"] = {k: validate_template(k, src.get(k)) for k in ALL_TEMPLATE_KEYS}
     return out
 
 
@@ -314,7 +355,7 @@ def merge(stored: Any) -> Dict[str, Any]:
 
     t = stored.get("templates")
     if isinstance(t, dict):
-        for key in TEMPLATE_KEYS:
+        for key in ALL_TEMPLATE_KEYS:
             if not isinstance(t.get(key), dict):
                 continue
             try:

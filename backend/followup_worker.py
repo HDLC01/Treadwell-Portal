@@ -91,12 +91,36 @@ def _run() -> None:
 
 
 def _customer_recipients(p: dict) -> list[str]:
-    """Everyone on the proposal, same as every other customer-facing email."""
+    """The contacts who should be CHASED — not simply everyone on the proposal.
+
+    Hanz, 2026-08-12: "just like the 25% deposit creat a checkbox for each contact if they will
+    be able to receive the automated follow ups or no". An accounts-payable address wants the
+    invoice and not four reminders.
+
+    get_followup_recipients rather than get_recipients: every other customer-facing email still
+    goes to everybody, because opting out of the chase is not opting out of the proposal.
+
+    Falls back to the primary contact when the list is empty, exactly as before — but note the
+    difference between EMPTY and ALL-OPTED-OUT. An empty list means we could not read the
+    recipients, so the primary is the safe guess. Every contact opting out is a decision somebody
+    made, and honouring it means sending nothing; that is what the explicit flag below is for.
+    """
     try:
-        rec = db.get_recipients(p["proposal_id"]) or []
+        rec = db.get_followup_recipients(p["proposal_id"])
     except Exception:  # noqa: BLE001
-        rec = []
-    return rec or [e for e in [p.get("customer_email")] if e]
+        rec = None
+    if rec is None:                      # the read failed — behave as it always did
+        return [e for e in [p.get("customer_email")] if e]
+    if rec:
+        return rec
+    # Readable, and deliberately nobody. Distinguished from a failed read so a project whose
+    # contacts have all opted out is left alone instead of falling back to the primary.
+    try:
+        if db.get_recipients(p["proposal_id"]):
+            return []
+    except Exception:  # noqa: BLE001
+        pass
+    return [e for e in [p.get("customer_email")] if e]
 
 
 def _staff_recipients(p: dict) -> list[str]:
