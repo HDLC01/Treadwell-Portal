@@ -41,6 +41,11 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
     monkeypatch.setattr(fw.db, "list_followup_candidates", _candidates)
     monkeypatch.setattr(fw.db, "get_proposal", lambda pid: p)
     monkeypatch.setattr(fw.db, "get_recipients", lambda pid: ["c@x.com", "b@x.com"])
+    # The worker asks who should be CHASED, not who is on the proposal — a contact can be opted
+    # out of the automated follow-ups while still receiving the proposal, the invoice and every
+    # reply (see test_followup_optout.py). Both are stubbed here: get_recipients is still read to
+    # tell "nobody opted in" apart from "the read failed".
+    monkeypatch.setattr(fw.db, "get_followup_recipients", lambda pid: ["c@x.com", "b@x.com"])
 
     def _reserve(pid, key, detail):
         calls["reserved"].append(key)

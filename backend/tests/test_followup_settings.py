@@ -54,10 +54,14 @@ def test_the_defaults_are_exactly_the_constants_the_cadence_shipped_with():
     assert d["send_end_hour"] == R.SEND_END_HOUR == 18
 
 
-def test_the_default_templates_are_the_four_the_worker_asks_for():
-    """`Due.template` names one of these. A missing key would mean an email with no wording."""
-    assert set(fs.DEFAULT_TEMPLATES) == set(fs.TEMPLATE_KEYS)
+def test_the_default_templates_cover_every_editable_email():
+    """`Due.template` names one of the FOUR the worker chases with; the editor also owns the
+    proposal-sent email, which the worker must never use. Both sets are asserted here because
+    that separation is the one mistake in this area that reaches a customer: "sent" inside
+    TEMPLATE_KEYS would mail "your proposal is ready" as a three-day reminder."""
+    assert set(fs.DEFAULT_TEMPLATES) == set(fs.ALL_TEMPLATE_KEYS)
     assert set(fs.TEMPLATE_KEYS) == {"not_viewed", "next_steps", "second_nudge", "checkin"}
+    assert fs.SENT_KEY not in fs.TEMPLATE_KEYS
     for key, t in fs.DEFAULT_TEMPLATES.items():
         assert t["title"] and t["body"] and t["cta"], key
         assert "{link}" in t["body"], key
@@ -152,8 +156,13 @@ def test_a_refusal_names_the_email_the_way_the_screen_does(key, label):
         fs.validate({"templates": {key: {"body": "No button here at all."}}})
     msg = str(e.value)
     assert label in msg, "the refusal does not name the tab the person is looking at"
-    assert key.replace("_", " ") not in msg or key == label, (
-        "the refusal still leaks the raw database key")
+    # A SUBSTRING check was a false positive the moment a label legitimately contained its own
+    # key: "sent" is a word in "Proposal sent". What must not leak is the de-underscored key
+    # standing on its own — "the not viewed email" — so compare against the message with the
+    # label removed, which is the only place a leak could hide.
+    leaked = msg.replace(label, "")
+    assert key.replace("_", " ") not in leaked, (
+        "the refusal still leaks the raw database key %r" % key)
 
 
 def test_an_over_long_body_is_refused_by_its_screen_name_too():
@@ -166,7 +175,10 @@ def test_an_over_long_body_is_refused_by_its_screen_name_too():
 
 def test_every_email_has_a_screen_name():
     """A missing label would silently fall back to the raw key — the bug this fixes."""
-    assert set(fs.LABELS) == set(fs.TEMPLATE_KEYS)
+    # ALL_TEMPLATE_KEYS, not TEMPLATE_KEYS: the editor has a fifth tab (the proposal-sent
+    # email), and a tab with no screen name would render as its raw database key. The
+    # cadence set stays four — see test_the_default_templates_cover_every_editable_email.
+    assert set(fs.LABELS) == set(fs.ALL_TEMPLATE_KEYS)
     assert all(fs.label(k) == fs.LABELS[k] for k in fs.TEMPLATE_KEYS)
     assert "_" not in "".join(fs.LABELS.values())
 
@@ -234,7 +246,7 @@ def test_a_missing_or_corrupt_row_yields_the_shipped_cadence(stored):
     of a deploy — not an edge case."""
     got = fs.merge(stored)
     assert got["first_nudge_hours"] == 24
-    assert set(got["templates"]) == set(fs.TEMPLATE_KEYS)
+    assert set(got["templates"]) == set(fs.ALL_TEMPLATE_KEYS)
 
 
 def test_a_partial_row_keeps_the_defaults_for_everything_it_omits():
@@ -364,7 +376,7 @@ def test_the_worker_falls_back_when_the_settings_table_is_missing(monkeypatch):
     monkeypatch.setattr(W.db, "get_settings", boom)
     got = W._settings()
     assert got["first_nudge_hours"] == 24
-    assert set(got["templates"]) == set(fs.TEMPLATE_KEYS)
+    assert set(got["templates"]) == set(fs.ALL_TEMPLATE_KEYS)
 
 
 def test_the_worker_uses_a_saved_cadence(monkeypatch):
@@ -506,7 +518,7 @@ def test_get_returns_a_usable_cadence_even_with_no_row(monkeypatch):
     assert j["ok"] is True
     assert j["settings"]["first_nudge_hours"] == 24
     assert j["saved"] is False, "a fresh install must not look like somebody's choice"
-    assert set(j["previews"]) == set(fs.TEMPLATE_KEYS)
+    assert set(j["previews"]) == set(fs.ALL_TEMPLATE_KEYS)
 
 
 def test_get_survives_the_table_not_existing(monkeypatch):

@@ -154,6 +154,36 @@ def get_recipients(proposal_id: str) -> list[str]:
     )]
 
 
+def get_followup_recipients(proposal_id: str) -> list[str]:
+    """Only the contacts who should get AUTOMATED follow-ups.
+
+    Separate from get_recipients, which stays the list for everything else — the proposal itself,
+    the invoice, a reply, a milestone. Turning follow-ups off for somebody must not stop them
+    receiving the thing they are a contact for; it stops them being chased.
+
+    The flag is read through to_jsonb so a database without the migration answers null, which
+    `is not false` treats as opted IN. That matters more here than in most places: reading a
+    missing column as "off" would silently stop chasing every live bid.
+    """
+    rows = qall(
+        "select email, (to_jsonb(r) ->> 'followups') as followups "
+        "from public.portal_proposal_recipients r "
+        "where proposal_id = %s order by added_at, id",
+        (proposal_id,),
+    )
+    return [r["email"] for r in rows if str(r.get("followups")).lower() != "false"]
+
+
+def set_followup_recipient(proposal_id: str, email: str, enabled: bool) -> bool:
+    """Turn automated follow-ups on or off for ONE contact. False if there is no such recipient."""
+    row = q1(
+        "update public.portal_proposal_recipients set followups = %s "
+        "where proposal_id = %s and lower(email) = lower(%s) returning id",
+        (bool(enabled), proposal_id, (email or "").strip()),
+    )
+    return bool(row)
+
+
 def recipients_by_proposal() -> dict[str, list[str]]:
     """{proposal_id: [emails]} for EVERY proposal, in one query.
 
@@ -192,13 +222,22 @@ def remove_recipient(proposal_id: str, email: str) -> None:
     )
 
 
-def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] = None) -> None:
+def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] = None,
+                  no_followups: Optional[list[str]] = None) -> None:
     """Replace the recipient set in one transaction: drop rows not in `emails`,
     insert the rest (retained rows keep their added_at). `emails` must be
-    non-empty and already lowercased/deduped by the caller."""
+    non-empty and already lowercased/deduped by the caller.
+
+    `no_followups` is the subset the sender un-ticked on the send page. Written EXPLICITLY for
+    every row, not only for the un-ticked ones: a retained row keeps its existing value on
+    conflict, so leaving the ticked ones alone would make an earlier opt-out stick after somebody
+    ticked the box again and re-sent. None means the caller said nothing about follow-ups (a
+    legacy publish), and every row keeps whatever it already had.
+    """
     emails = [e.strip().lower() for e in emails if e and e.strip()]
     if not emails:
         return
+    off = {e.strip().lower() for e in (no_followups or []) if e and e.strip()}
     with pool().connection() as conn:
         conn.execute(
             "delete from public.portal_proposal_recipients "
@@ -211,6 +250,12 @@ def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] 
                 "values (%s,%s,%s) on conflict do nothing",
                 (proposal_id, e, added_by),
             )
+            if no_followups is not None:
+                conn.execute(
+                    "update public.portal_proposal_recipients set followups = %s "
+                    "where proposal_id = %s and lower(email) = %s",
+                    (e not in off, proposal_id, e),
+                )
 
 
 # ── admin (publish + pipeline) ──────────────────────────────────────────────────
