@@ -213,8 +213,12 @@ def approve_client(monkeypatch):
     monkeypatch.setattr(main.email_sender, "notify_team",
                         lambda subject, body, **k: calls["team"].append(subject))
     monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda t: None)
+    # **k, because the milestone now also takes actor_email / peer_heading / peer_body_html: the
+    # contact who approved keeps the receipt and the others get a named heads-up. A positional-only
+    # stub made this fail with a TypeError from inside the endpoint, which reads like a bug in the
+    # approve path rather than a stale test double.
     monkeypatch.setattr(main, "_notify_customer",
-                        lambda p, heading, body: calls["customer"].append(heading))
+                        lambda p, heading, body, **k: calls["customer"].append(heading))
     monkeypatch.setattr(main.automations, "run_on_approval",
                         lambda p, project: calls["automations"].append(project))
 

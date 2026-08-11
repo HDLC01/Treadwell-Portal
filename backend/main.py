@@ -234,18 +234,47 @@ def _contact(row: dict) -> dict:
             "phone": row.get("phone"), "label": row.get("label")}
 
 
-def _notify_customer(p: dict, heading: str, body_html: str) -> None:
+def _notify_customer(p: dict, heading: str, body_html: str, *,
+                     actor_email: Optional[str] = None,
+                     peer_heading: Optional[str] = None,
+                     peer_body_html: Optional[str] = None) -> None:
     """Email the milestone to EVERY recipient on the proposal.
 
     The third channel alongside the chat line and the team email. Best-effort:
-    a mail failure must never fail the action the customer just completed."""
+    a mail failure must never fail the action the customer just completed.
+
+    TWO VERSIONS WHEN ONE CONTACT ACTED FOR BOTH. Hanz, 2026-08-11: "For example one contact
+    sent the deposit it should update on the 2nd contact as well. But, we need to inform the
+    other contact of what has been done."
+
+    Everybody used to get the same second-person copy, so "we've recorded your check" landed on
+    the contact who had not paid — which reads as either a mistake or a second charge. With
+    `actor_email` the person who did it keeps the receipt and everyone else gets the
+    third-person heads-up, naming them by first name.
+
+    When the actor is UNKNOWN, everyone gets the peer version if there is one. A receipt must
+    never land on somebody who did nothing; the reverse ("Dana approved this" to Dana) is
+    merely redundant.
+    """
     try:
         pid = p["proposal_id"]
         link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
         rt = email_sender.proposal_reply_to(p["token"])
         project = p.get("project_name") or "your project"
+        actor = (actor_email or "").strip().lower()
         for e in (db.get_recipients(pid) or [p.get("customer_email")]):
-            if e:
+            if not e:
+                continue
+            # `bool(actor)` is redundant — an empty actor never equals a real address, and
+            # empty recipients are skipped above — but it is kept because it states the rule
+            # this function turns on: an unknown actor means NOBODY is the actor, so nobody
+            # gets a receipt. A mutation removing it is correctly equivalent, not a gap.
+            is_actor = bool(actor) and e.strip().lower() == actor
+            if peer_body_html and not is_actor:
+                email_sender.send_customer_update(e, link, project,
+                                                  peer_heading or heading, peer_body_html,
+                                                  reply_to=rt, token=p["token"])
+            else:
                 email_sender.send_customer_update(e, link, project, heading, body_html,
                                                   reply_to=rt, token=p["token"])
     except Exception as exc:  # noqa: BLE001
@@ -504,10 +533,17 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     # The snapshot they were SENT, not whatever an estimator has since typed.
     data = db.get_pinned_draft_data(p) or {}
     db.mark_viewed(p["proposal_id"])
+    # And WHICH recipient it was. mark_viewed above is untouched: the customer-facing status is
+    # shared on purpose, one status for the whole project. This is the staff-side question of
+    # which of two contacts has actually opened it. record_view swallows its own failures, so a
+    # missing migration costs the CRM a name rather than costing the customer their proposal.
+    db.record_view(p["proposal_id"], se)
     p = db.get_proposal(p["proposal_id"])
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]   # text-only (legacy UI)
-    vm["messages"] = [_msg(m) for m in db.list_messages(p["proposal_id"])]   # full chat thread (chat UI)
+    # _customer_msg, not _msg: `mine` has to be decided against the session that is asking, or
+    # the second contact on a proposal sees the first contact's reply as their own.
+    vm["messages"] = [_customer_msg(m, se) for m in db.list_messages(p["proposal_id"])]
     vm["contacts"] = [_contact(c) for c in db.list_contacts(p["proposal_id"])]
     vm["check_address"] = config.CHECK_ADDRESS
     vm["payable_to"] = config.PAYABLE_TO
@@ -521,6 +557,15 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         # deposit_status, so the banner survives staff moving the status either way.
         "submitted": bool(_latest),
         "submitted_method": _latest["method"] if _latest else None,
+        # WHO paid, when it was the other contact. Hanz's own example: one contact sends the
+        # deposit and the second must see that it is done — without this the banner said "we've
+        # recorded your check" to somebody who had not written one. First name only and never an
+        # address, the same rule as the chat thread; `_me` lets the client keep saying "your"
+        # to the person who actually paid.
+        "submitted_by_first_name": (_first_name_of(_latest.get("submitted_by"))
+                                    if _latest else ""),
+        "submitted_by_me": bool(_latest and se and (_latest.get("submitted_by") or "").strip().lower()
+                                == se.strip().lower()),
         # Present once the invoice has been issued — drives the download button on
         # the chat card and the thank-you card.
         "invoice_no": p.get("deposit_invoice_no"),
@@ -552,11 +597,59 @@ def _q(row: dict) -> dict:
 
 
 def _msg(row: dict) -> dict:
-    """A chat-thread message (any msg_type). Superset of _q with the id (for
-    incremental polling), msg_type, and meta payload."""
+    """A chat-thread message (any msg_type), for STAFF. Superset of _q with the id (for
+    incremental polling), msg_type, and meta payload.
+
+    Carries the full author address: staff need to know WHICH contact on a multi-recipient
+    proposal said something, and they already see every recipient's address in the drawer.
+    The customer-facing shape is _customer_msg below, which never ships one.
+    """
     return {"id": row.get("id"), "author_kind": row["author_kind"], "body": row["body"],
+            "author_email": row.get("author_email"),
             "msg_type": row.get("msg_type") or "text", "meta": row.get("meta"),
             "created_at": row["created_at"].isoformat() if row.get("created_at") else None}
+
+
+def _first_name_of(email: Optional[str]) -> str:
+    """"dana.reed@acme.com" → "Dana". Derived SERVER-side so a peer's raw address never
+    reaches another customer's browser."""
+    local = str(email or "").split("@")[0]
+    first = re.split(r"[._+-]", local)[0]
+    return first[:1].upper() + first[1:] if first else ""
+
+
+def _customer_msg(row: dict, viewer_email: Optional[str]) -> dict:
+    """One thread message as a CUSTOMER may see it.
+
+    Two recipients share one proposal, one token and one thread — that part has always been
+    true. What was wrong is who each message looked like it came from: `mine` was decided in
+    the browser as `author_kind === "customer"`, so EVERY customer message rendered as the
+    viewer's own. The second contact on a proposal saw the first contact's reply sitting on
+    their own side of the thread, in their own colour, as if they had written it.
+
+    So `mine` is decided here, against the session that is asking. A peer's message carries a
+    FIRST NAME only (Hanz: first name in the portal, full address staff-side) and never an
+    address — meta is whitelisted for the same reason, because an inbound-email row keeps the
+    sender's address in `meta.from`.
+
+    A legacy row with no author_email keeps the old behaviour and reads as the viewer's own.
+    Guessing the other way would relabel a customer's own history as somebody else's.
+    """
+    me = (viewer_email or "").strip().lower()
+    author = (row.get("author_email") or "").strip().lower()
+    customer = row["author_kind"] == "customer"
+    meta = row.get("meta") or {}
+    return {
+        "id": row.get("id"),
+        "author_kind": row["author_kind"],
+        "body": row["body"],
+        "msg_type": row.get("msg_type") or "text",
+        "mine": customer and (not author or author == me),
+        "author_first_name": _first_name_of(row.get("author_email")) if customer else "",
+        "meta": {k: meta[k] for k in ("source", "revision_no", "superseded", "superseded_by",
+                                     "amount", "invoice_no", "reference") if k in meta},
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
 
 
 def _require(request: Request, token: str):
@@ -586,7 +679,9 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
     )
-    return _json({"ok": True, "question": _q(row), "message": _msg(row)})
+    # `who` is this session, and this row is theirs — but route it through the same serializer
+    # so the shape the client appends matches the shape it polls. Easy one to miss.
+    return _json({"ok": True, "question": _q(row), "message": _customer_msg(row, who)})
 
 
 @app.get("/api/portal/{token}/messages")
@@ -600,7 +695,8 @@ def api_messages(token: str, request: Request) -> JSONResponse:
         after = int(request.query_params.get("after") or 0)
     except (ValueError, TypeError):
         after = 0
-    msgs = [_msg(m) for m in db.list_messages(p["proposal_id"], after)]
+    msgs = [_customer_msg(m, _session_email(request))
+            for m in db.list_messages(p["proposal_id"], after)]
     # The client re-renders the whole page when ANY of these changes, so anything a
     # customer would otherwise have to reload to see belongs here. Issuing an
     # invoice or a staff amount edit never moves deposit_status, so without
@@ -717,6 +813,19 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
            f"schedule; the invoice follows separately.</p>" if deposit_due
            else "<p>No deposit is needed. Next, please add your project contacts so we can "
                 "schedule the work.</p>"),
+        # The other contacts hear WHO approved rather than "your approval". Named from the typed
+        # signature, which every recipient already sees on the proposal itself, falling back to
+        # the first name of whoever was signed in.
+        actor_email=approver,
+        peer_heading="This proposal has been approved",
+        peer_body_html=(
+            f"<p><strong>{html.escape(name or _first_name_of(approver) or 'Someone on your team')}"
+            f"</strong> approved <strong>{html.escape(project_name)}</strong> on {approved_date}.</p>"
+            f"<p>Approved: <strong>{html.escape(option_summary)}</strong> — "
+            f"<strong>${total:,.2f}</strong>.</p>"
+            + (f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves the schedule; "
+               f"the invoice follows separately.</p>" if deposit_due
+               else "<p>No deposit is needed. Next, the project contacts.</p>")),
     )
     if not deposit_due:
         # The contacts prompt normally rides on deposit-received (admin_deposit_received).
@@ -902,7 +1011,10 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
 
     db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
                    routing_number=routing_number, account_number=account_number,
-                   account_type=account_type)
+                   account_type=account_type,
+                   # Which contact paid. From the session, not from account_name — that is
+                   # a bank account holder and can be a company.
+                   submitted_by=_session_email(request))
     # Move the board card off 'pending' so staff can see money is in flight — until
     # now the only signal a customer had paid was one email, leaving a paid project
     # indistinguishable from an approved-but-unpaid one. Guarded in SQL so a
@@ -955,6 +1067,16 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         f"<p>We'll confirm here as soon as it "
         f"{'clears' if method == 'ach' else 'arrives'}. Nothing else is needed from you "
         f"right now.</p>",
+        # THE example Hanz gave. "we've recorded your check" reaching the contact who did not
+        # pay reads as either a mistake or a second charge.
+        actor_email=_session_email(request),
+        peer_heading="The deposit for this project has been sent",
+        peer_body_html=(
+            f"<p><strong>{html.escape(_first_name_of(_session_email(request)) or 'Someone on your team')}"
+            f"</strong> sent the {'bank transfer' if method == 'ach' else 'check'} for "
+            f"<strong>{html.escape(project_name)}</strong>.</p>"
+            f"<p>We'll confirm here as soon as it "
+            f"{'clears' if method == 'ach' else 'arrives'}. Nothing is needed from you.</p>"),
     )
     return _json({"ok": True})
 
@@ -1025,6 +1147,13 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
         f"<p>We've saved the contacts for <strong>{html.escape(project)}</strong>:</p>"
         f"<ul>{rows}</ul>"
         f"<p>You can update them any time before we schedule the work.</p>",
+        actor_email=who,
+        peer_heading="The project contacts have been added",
+        peer_body_html=(
+            f"<p><strong>{html.escape(_first_name_of(who) or 'Someone on your team')}</strong> "
+            f"added the contacts for <strong>{html.escape(project)}</strong>:</p>"
+            f"<ul>{rows}</ul>"
+            f"<p>Anyone on the project can update them before we schedule the work.</p>"),
     )
     return _json({"ok": True})
 
@@ -1562,6 +1691,12 @@ def admin_pipeline(request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         log.warning("[pipeline] could not read the cadence, showing the shipped one: %s", exc)
         followup_cfg = followup_settings.defaults()
+    # Recipients and who has viewed, both read ONCE for the whole board rather than per card.
+    # This endpoint is polled every 25 seconds; a query per row is how a 60-proposal board turns
+    # into 120 round-trips. Both degrade to {} on a database without the migration, which makes
+    # the "N recipients · M viewed" line simply not render.
+    viewed = db.views_by_proposal()
+    recips = db.recipients_by_proposal()
     out = []
     for r in db.list_all_portal_proposals():
         out.append({
@@ -1581,6 +1716,12 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # Per-stage dates so each board column sorts by its own milestone rather
             # than by whatever was touched last.
             "last_viewed_at": _iso(r.get("last_viewed_at")),
+            # WHICH contacts, not just whether somebody. Only ever more interesting than
+            # last_viewed_at on a proposal with more than one recipient, and the card only
+            # renders the line in that case. Full addresses: this payload is staff-only.
+            "recipients": recips.get(r["proposal_id"]) or (
+                [r["customer_email"]] if r.get("customer_email") else []),
+            "viewed_by": viewed.get(r["proposal_id"]) or [],
             # Somebody followed the email link. A soft signal, reported separately from
             # `viewed` on purpose (see db.mark_link_clicked): it tells the board that the
             # email reached a mailbox, which is what distinguishes "they haven't decided"
@@ -1622,6 +1763,79 @@ def admin_pipeline(request: Request) -> JSONResponse:
 # Preview length for the bell/toast — enough to read at a glance, short enough
 # that the notification payload stays small.
 _RECENT_MSG_PREVIEW = 240
+
+
+def _recipient_activity(proposal_id: str, proposal: dict, approval: Optional[dict]) -> list:
+    """Per-contact activity for the drawer: who opened it, who wrote, who paid, who signed.
+
+    Assembled from what each fact is actually stored against, which is four different places —
+    that is why it lives here rather than in a query. All four reads are guarded: this decorates
+    a drawer that has to open regardless.
+
+    Only worth rendering when there are two or more contacts, and the frontend gates on that. It
+    is still built for one, because a single-contact proposal showing "not viewed" next to the
+    only name is a legitimate thing an estimator might want.
+    """
+    emails = _recipients_or_empty(proposal_id, proposal)
+    if not emails:
+        return []
+    try:
+        views = {(v["email"] or "").strip().lower(): v for v in db.list_views(proposal_id)}
+    except Exception:  # noqa: BLE001
+        views = {}
+    replied: set = set()
+    paid: set = set()
+    try:
+        for m in db.list_messages(proposal_id):
+            if m.get("author_kind") == "customer" and m.get("author_email"):
+                replied.add(m["author_email"].strip().lower())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read the thread for recipient activity on %s: %s", proposal_id, exc)
+    try:
+        for d in db.list_deposits(proposal_id):
+            if d.get("submitted_by"):
+                paid.add(d["submitted_by"].strip().lower())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read deposits for recipient activity on %s: %s", proposal_id, exc)
+    approver = ((approval or {}).get("approver_email") or "").strip().lower()
+
+    out = []
+    for e in emails:
+        k = e.strip().lower()
+        v = views.get(k)
+        out.append({
+            "email": e,
+            "name": _first_name_of(e),
+            "viewed_at": _iso(v.get("first_viewed_at")) if v else None,
+            "last_viewed_at": _iso(v.get("last_viewed_at")) if v else None,
+            "view_count": (v.get("view_count") if v else 0) or 0,
+            "replied": k in replied,
+            "paid": k in paid,
+            "approved": bool(approver) and k == approver,
+        })
+    return out
+
+
+def _recipients_or_empty(proposal_id: str, proposal: dict) -> list:
+    """Every address this proposal was sent to, primary first. [] on any failure.
+
+    Best-effort because it only drives labels: the staff drawer has to open even when this
+    read does not, and an unnamed bubble is the behaviour it had yesterday."""
+    try:
+        rows = db.get_recipients(proposal_id) or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("recipients unavailable for %s: %s", proposal_id, exc)
+        rows = []
+    primary = (proposal or {}).get("customer_email")
+    # get_recipients usually already includes the primary contact, so this dedupes rather than
+    # filters: case-insensitively, because a hand-typed recipient can differ only in case and a
+    # two-contact proposal showing three contacts would make the staff bubbles name everyone.
+    seen, uniq = set(), []
+    for e in ([primary] if primary else []) + list(rows):
+        k = str(e or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k); uniq.append(e)
+    return uniq
 
 
 def _recent_msg(row: dict) -> dict:
@@ -1704,6 +1918,15 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "option": appr.get("option_label"), "options": appr.get("options"),
             "approver_email": appr.get("approver_email"),
         } if appr else None),
+        # Who the proposal actually went to. The drawer needs it to say WHICH contact wrote a
+        # message, and the bubbles only name anyone when there is more than one — a single
+        # contact needs no label, which is why the label was removed in the first place.
+        # Guarded: a missing recipients read must cost the names, not the drawer.
+        "recipients": _recipients_or_empty(proposal_id, p),
+        # One row per contact: viewed / replied / paid / approved. This is the "highlight in the
+        # CRM who viewed it as well and who replied" half of what Hanz asked for — the peer
+        # notifications tell the other CONTACT, this tells the estimator.
+        "recipient_activity": _recipient_activity(proposal_id, p, appr),
         "questions": [_q(q) for q in db.list_questions(proposal_id)],   # text-only (legacy drawer)
         "messages": [_msg(m) for m in db.list_messages(proposal_id)],   # full thread (revamped drawer)
         "deposit_ref": proposals.deposit_ref(proposal_id),

@@ -733,13 +733,23 @@ function renderMsg(m) {
       <div class="cc-body">${esc(s.body)}</div>
     </div>`;
   }
-  const mine = m.author_kind === "customer";
+  // The SERVER decides this now. `m.author_kind === "customer"` was true for every customer
+  // message regardless of who wrote it, so on a two-contact proposal the second contact saw the
+  // first contact's reply on their own side of the thread, in their own colour, as if they had
+  // written it. The fallback keeps a pre-fix payload rendering the way it used to rather than
+  // putting every message on the staff side.
+  const mine = m.mine !== undefined ? !!m.mine : m.author_kind === "customer";
+  const peer = m.author_kind === "customer" && !mine;
   const viaEmail = m.meta && m.meta.source === "email";
   // Contents, date, and whether it came in by email — nothing else. The side of the thread
   // already says who wrote it, so "You" / "Treadwell" was a line of chrome on every bubble.
   // Kept identical to the staff CRM's msgHtml on purpose: the two views are meant to be the
   // same conversation, and they drift the moment one of them gets its own layout.
-  return `<div class="msg ${mine ? "customer" : "staff"}">
+  // A peer's message sits on the STAFF side (left, neutral) because the right-hand red bubble
+  // means "you". It is named, because "somebody on your side said this" with no name is worse
+  // than either alternative. First name only — the full address stays staff-side.
+  return `<div class="msg ${mine ? "customer" : "staff"}${peer ? " peer" : ""}">
+    ${peer ? `<div class="who">${esc(m.author_first_name || "Your team")}</div>` : ""}
     <div class="mbody">${esc(m.body || "")}</div>
     <div class="when">${when}${viaEmail ? ' <span class="via-email">via email</span>' : ""}</div>
   </div>`;
@@ -939,8 +949,17 @@ function setupDeposit() {
   const reopen = () => { hide(recorded); show(tabs); (dep.submitted_method === "check" ? showCheck : showAch)(); };
   if (dep.submitted) {
     const isCheck = dep.submitted_method === "check";
-    $("deposit-recorded-msg").textContent =
-      `Thanks — we've recorded your ${isCheck ? "check" : "ACH transfer"}. We'll mark your deposit Received once it ${isCheck ? "arrives" : "clears"}.`;
+    const what = isCheck ? "check" : "ACH transfer";
+    const settles = isCheck ? "arrives" : "clears";
+    // "your check" is only true for the contact who wrote it. On a two-contact proposal the
+    // other one was being told we'd recorded a payment they never made, which reads as either
+    // a mistake or a second charge. The peer sees who actually paid — first name only, the
+    // same rule as the chat thread. An unnamed payer (a row from before submitted_by existed)
+    // falls back to the neutral wording rather than guessing.
+    const peer = dep.submitted_by_first_name && !dep.submitted_by_me;
+    $("deposit-recorded-msg").textContent = peer
+      ? `${dep.submitted_by_first_name} sent the ${what}. We'll mark the deposit Received once it ${settles}.`
+      : `Thanks — we've recorded your ${what}. We'll mark your deposit Received once it ${settles}.`;
     show(recorded); hide(tabs); hide(achPane); hide(checkPane);
   } else {
     hide(recorded); show(tabs); showAch();

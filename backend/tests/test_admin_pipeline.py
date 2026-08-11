@@ -103,6 +103,12 @@ def pipeline(monkeypatch):
         monkeypatch.setattr(main, "_admin_ok", lambda request: True)
         monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: rows)
         monkeypatch.setattr(main.db, "unread_counts", lambda: unread or {})
+        # The cadence read. Unstubbed it waits out the full 30s connection-pool timeout before
+        # falling back to the shipped defaults — correct, but it made these nine tests 150
+        # seconds, and one that calls the pipeline twice took 60 on its own. Stubbed HERE rather
+        # than in conftest because test_followup_settings has a test that deliberately makes this
+        # read fail, and an autouse stub would silently override its setup.
+        monkeypatch.setattr(main.db, "get_settings", lambda key: None)
         import json
         resp = main.admin_pipeline(request=None)
         return json.loads(bytes(resp.body).decode())["proposals"]

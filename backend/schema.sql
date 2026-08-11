@@ -434,3 +434,43 @@ grant select, insert, update, delete on public.portal_settings to portal_app;
 drop policy if exists portal_app_rw on public.portal_settings;
 create policy portal_app_rw on public.portal_settings
   for all to portal_app using (true) with check (true);
+
+-- ── Who opened it ─────────────────────────────────────────────────────────
+-- One row per (proposal, recipient). Hanz, 2026-08-11: "It should then highlight in the CRM who
+-- viewed it as well and who replied."
+--
+-- portal_proposals.viewed_at / last_viewed_at already record that SOMEBODY opened the proposal,
+-- and that stays: the customer-facing status is deliberately shared, one status for the whole
+-- project. This table is the other question — WHICH of two contacts has actually looked at it,
+-- which is the difference between chasing the right person and chasing nobody.
+--
+-- Recorded from the SESSION, never from anything the client sends: the whole point is that it
+-- says who was signed in when the page was fetched.
+--
+-- The unique index is on lower(email) because a recipient list is typed by hand and
+-- "Dana@acme.com" and "dana@acme.com" are one person. Without it the upsert would insert a
+-- second row and the CRM would report two of two viewed when one had.
+create table if not exists public.portal_proposal_views (
+  id              bigint generated always as identity primary key,
+  proposal_id     text not null references public.portal_proposals(proposal_id) on delete cascade,
+  email           text not null,
+  first_viewed_at timestamptz not null default now(),
+  last_viewed_at  timestamptz not null default now(),
+  view_count      int not null default 1
+);
+create unique index if not exists portal_proposal_views_unique_idx
+  on public.portal_proposal_views (proposal_id, lower(email));
+alter table public.portal_proposal_views enable row level security;
+-- Grant AND policy, together. RLS on with neither reads as "locked down" and is broken on PROD
+-- only: the portal connects there as portal_app, which does not bypass RLS, so every read would
+-- return zero rows and every write would fail — while staging, on a broad role, looked fine.
+-- Same pair as portal_settings above, and the same mistake that shipped once already.
+grant select, insert, update, delete on public.portal_proposal_views to portal_app;
+drop policy if exists portal_app_rw on public.portal_proposal_views;
+create policy portal_app_rw on public.portal_proposal_views
+  for all to portal_app using (true) with check (true);
+
+-- Which contact sent the money. The deposit itself is shared — one deposit per proposal, either
+-- contact may pay it — but "we've recorded your check" has to go to the person who actually
+-- wrote it, and the CRM has to be able to say who that was after the fact.
+alter table public.portal_deposits add column if not exists submitted_by text;

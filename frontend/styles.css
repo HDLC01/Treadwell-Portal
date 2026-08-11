@@ -226,6 +226,15 @@ textarea { min-height: 96px; resize: vertical; }
    run, which is most of why a signature read as a wall of text. `anywhere`, not break-word,
    so a long tracking URL cannot push the bubble past its max-width. */
 .msg .mbody { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A message from the OTHER contact on the same proposal. Left side like ours, because the red
+   right-hand bubble means "you" — but named and tinted so it does not read as Treadwell
+   speaking. The name is the only label left on any bubble; every other one was removed when the
+   thread was simplified to contents + date. */
+.msg.peer { background: var(--surface-low, #f5f3f3); border: 1px solid var(--line, #dbdad9); }
+.msg.peer .who {
+  font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  margin-bottom: 2px; opacity: .8;
+}
 .msg.customer { align-self: flex-end; background: var(--primary); color: #fff; }
 .msg.staff { align-self: flex-start; background: var(--surface-high); color: var(--fg); }
 .msg .when { font-size: .68rem; opacity: .75; margin-top: 4px; }
