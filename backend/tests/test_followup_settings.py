@@ -55,13 +55,19 @@ def test_the_defaults_are_exactly_the_constants_the_cadence_shipped_with():
 
 
 def test_the_default_templates_cover_every_editable_email():
-    """`Due.template` names one of the FOUR the worker chases with; the editor also owns the
+    """`Due.template` names one of the emails the worker chases with; the editor ALSO owns the
     proposal-sent email, which the worker must never use. Both sets are asserted here because
     that separation is the one mistake in this area that reaches a customer: "sent" inside
-    TEMPLATE_KEYS would mail "your proposal is ready" as a three-day reminder."""
+    TEMPLATE_KEYS would mail "your proposal is ready" as a three-day reminder.
+
+    Not pinned to a count. This tuple grew by one when the deposit stage arrived (2026-08-12), and
+    the claim worth protecting was never "there are exactly four" — it is "every cadence email has
+    wording behind it, and the sent email is not a cadence email"."""
     assert set(fs.DEFAULT_TEMPLATES) == set(fs.ALL_TEMPLATE_KEYS)
-    assert set(fs.TEMPLATE_KEYS) == {"not_viewed", "next_steps", "second_nudge", "checkin"}
+    assert set(fs.TEMPLATE_KEYS) < set(fs.ALL_TEMPLATE_KEYS)
     assert fs.SENT_KEY not in fs.TEMPLATE_KEYS
+    assert set(fs.ALL_TEMPLATE_KEYS) - set(fs.TEMPLATE_KEYS) == {fs.SENT_KEY}, (
+        "an email is editable but unreachable by the cadence, and it is not the sent email")
     for key, t in fs.DEFAULT_TEMPLATES.items():
         assert t["title"] and t["body"] and t["cta"], key
         assert "{link}" in t["body"], key

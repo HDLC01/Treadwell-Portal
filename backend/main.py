@@ -2090,9 +2090,12 @@ async def admin_preview_followup_settings(request: Request) -> JSONResponse:
         cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
     except followup_settings.ValidationError as exc:
         return _json({"ok": False, "error": str(exc)}, 400)
+    # ALL_TEMPLATE_KEYS, matching the GET and the PUT. This endpoint is what runs as somebody
+    # TYPES, and it was the only one of the three still walking the cadence set — so editing the
+    # "Proposal sent" email showed a preview on load, then a blank panel on the first keystroke.
     return _json({"ok": True,
                   "previews": {k: followup_settings.preview(cfg, k)
-                               for k in followup_settings.TEMPLATE_KEYS}})
+                               for k in followup_settings.ALL_TEMPLATE_KEYS}})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/assign")

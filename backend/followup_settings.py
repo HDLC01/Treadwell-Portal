@@ -68,7 +68,10 @@ BOUNDS: Dict[str, tuple] = {
     "send_end_hour": (1, 24),
 }
 
-TEMPLATE_KEYS = ("not_viewed", "next_steps", "second_nudge", "checkin")
+# What the cadence chases with. `deposit_nudge` IS one of these — Hanz, 2026-08-12: "followups
+# should be automated until a deposit has been received." Before that, approval ended the cadence
+# and an approved job got one invoice email and then silence.
+TEMPLATE_KEYS = ("not_viewed", "next_steps", "second_nudge", "checkin", "deposit_nudge")
 
 # The FIRST proposal email, editable on the same page. Hanz, 2026-08-12: "Create the ability to
 # change what the first proposal sent email looks like. from the heading to the content (this
@@ -87,12 +90,18 @@ TOKENS = ("{first_name}", "{project}", "{need}", "{link}")
 # "the not viewed email needs {link}" makes somebody hunt for a tab with that name — there isn't
 # one. Naming lives here rather than in the page so the message and the tab cannot disagree; the
 # editor reads these off the GET response.
+#
+# The ORDER is the order the tabs appear in, and it is chronological: the send, then the chase,
+# then the deposit stage that only starts once they approve. The editor takes both the set and the
+# order from here rather than keeping its own list, so a template added in this file shows up on
+# the page without a second deploy.
 LABELS: Dict[str, str] = {
     "sent": "Proposal sent",
     "not_viewed": "Not opened yet",
     "next_steps": "After they open it",
     "second_nudge": "Second reminder",
     "checkin": "Recurring check-in",
+    "deposit_nudge": "Deposit reminder",
 }
 
 
@@ -111,6 +120,7 @@ EDITOR_TITLES: Dict[str, str] = {
     "next_steps": "Next steps — after they open it",
     "second_nudge": "Second reminder — opened, still no decision",
     "checkin": "Recurring check-in — repeats until they decide",
+    "deposit_nudge": "Deposit reminder — approved, deposit not yet in",
 }
 
 
@@ -186,6 +196,23 @@ DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
                  "whenever the timing works.\n\n"
                  "{link}"),
         "cta": "View your proposal",
+    },
+    # After approval. Deliberately does NOT use {need} — that phrase is "your signed approval and
+    # the deposit", and by the time this sends they have already signed. Asking again for something
+    # they have done is how a reminder reads as a mistake on our side.
+    #
+    # The last line is there because a cheque can be genuinely in the post while our column still
+    # says nothing. The customer chase stops the moment they tell us (deposit submitted), but until
+    # they do, we cannot tell "hasn't paid" from "hasn't mentioned it".
+    "deposit_nudge": {
+        "title": "Reserving your dates",
+        "body": ("Hi {first_name},\n\n"
+                 "Thanks for approving {project} — we're glad to be doing it.\n\n"
+                 "The deposit is what reserves your place on the schedule, so the sooner it's in, "
+                 "the tighter we can hold the dates you wanted.\n\n"
+                 "{link}\n\n"
+                 "If it's already on its way, tell us there and we'll stop the reminders."),
+        "cta": "Send your deposit",
     },
 }
 

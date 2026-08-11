@@ -123,6 +123,29 @@ def _customer_recipients(p: dict) -> list[str]:
     return [e for e in [p.get("customer_email")] if e]
 
 
+def _days_since(raw) -> int | None:
+    """Whole days between a stored timestamp and now, or None if it cannot be read.
+
+    None rather than 0: "approved 0 days ago" in a reminder about a job going quiet is worse than
+    not saying when, and a missing or malformed `approved_at` must not stop the email — the point
+    of the send is the outstanding deposit, not the date."""
+    try:
+        when = rules._aware(raw)
+        if when is None and isinstance(raw, str) and raw.strip():
+            # rules._aware takes a real datetime only, which is what psycopg hands back here. A
+            # STRING reaches this on any path that has been through JSON — a stubbed row in a
+            # test, or a row read back through PostgREST. Parsing it rather than giving up keeps
+            # the sentence honest instead of silently printing "recently" for every send.
+            when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            if not when.tzinfo:
+                when = when.replace(tzinfo=timezone.utc)
+        if when is None:
+            return None
+        return max(0, int((datetime.now(timezone.utc) - when).total_seconds() // 86400))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _staff_recipients(p: dict) -> list[str]:
     """The assigned estimator owns the follow-up. Proposals published before
     assignment was required fall back to the notification roster so the nudge still
@@ -152,6 +175,11 @@ def _settings() -> dict:
 def _send_customer(p: dict, due, templates: dict | None = None) -> bool:
     token = p.get("token")
     url = f"{config.PUBLIC_BASE_URL}/p/{token}"
+    # The deposit reminder lands them ON the deposit step rather than at the top of a proposal
+    # they have already read and approved. Same anchor the bell links use, so `applyHashView`
+    # already handles it — a made-up fragment would open the page and quietly do nothing.
+    if due.template == "deposit_nudge":
+        url += "#proposal/deposit"
     reply_to = email_sender.proposal_reply_to(token)
     project = p.get("project_name") or "your project"
     name = p.get("customer_name") or ""
@@ -182,7 +210,12 @@ def _send_staff(p: dict, due) -> bool:
     portal_url = f"{config.PUBLIC_BASE_URL}/p/{token}"
     crm_url = f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={pid}"
     who = p.get("customer_name") or p.get("customer_email") or "the customer"
-    amount = p.get("approved_total") or p.get("deposit_amount")
+    # For a deposit chase the figure that matters is the DEPOSIT, not the whole job — the estimator
+    # is about to ask for one specific number, and quoting the contract value would have them
+    # asking for the wrong one.
+    amount = (p.get("deposit_amount") or p.get("approved_total")
+              if due.template == "staff_deposit_outstanding"
+              else p.get("approved_total") or p.get("deposit_amount"))
     amount_txt = f"${float(amount):,.2f}" if amount is not None else "—"
 
     if due.template == "staff_not_viewed":
@@ -197,6 +230,30 @@ def _send_staff(p: dict, due) -> bool:
                 f"<strong>{email_sender._esc(project)}</strong> ended "
                 f"{email_sender._esc(until)}. Automated follow-ups have resumed.</p>"
                 f"<p>Worth a personal check-in before the reminders land.</p>")
+    elif due.template == "staff_deposit_outstanding":
+        # The half that keeps going after the customer's reminders stop. A cheque "in the post"
+        # that never lands has to stay somebody's problem, so this says WHICH of the two it is
+        # rather than one vague "deposit outstanding" — they are different phone calls.
+        submitted = str(p.get("deposit_status") or "").strip().lower() == "submitted"
+        days = _days_since(p.get("approved_at"))
+        ago = f"{days} day{'' if days == 1 else 's'} ago" if days is not None else "recently"
+        subject = (f"Deposit not in yet — {project}" if not submitted
+                   else f"Deposit still unconfirmed — {project}")
+        head = (f"<p><strong>{email_sender._esc(who)}</strong> approved "
+                f"<strong>{email_sender._esc(project)}</strong> {ago}, and the deposit ")
+        body = (head + ("has been recorded on their side but has not arrived yet.</p>"
+                        if submitted else "has not come in.</p>")
+                + f"<ul>"
+                + f"<li>Customer: {email_sender._esc(who)}</li>"
+                + f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
+                + f"<li>Amount: {amount_txt}</li>"
+                + f"<li>Proposal: <a href=\"{portal_url}\">{portal_url}</a></li>"
+                + f"</ul>"
+                + ("<p>Their own reminders have stopped — they've told us it's on the way, so "
+                   "this one is ours to chase. Mark it received in the CRM when it lands.</p>"
+                   if submitted else
+                   "<p>The customer is still being reminded automatically. Dates aren't held "
+                   "until the deposit is in, so a call is worth more than the next email.</p>"))
     else:   # staff_personal_followup
         subject = f"Time for a personal follow-up — {project}"
         body = (f"<p><strong>{email_sender._esc(who)}</strong> has read the proposal for "
@@ -238,8 +295,7 @@ def _tick(now: datetime | None = None) -> None:
             # this row, and a proposal approved or taken off automation in between
             # must not get one last nag.
             fresh = db.get_proposal(pid) or row
-            if fresh.get("followup_disabled_at") or \
-                    (fresh.get("proposal_status") or "") not in ("sent", "viewed"):
+            if fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
                 continue
             for due in rules.due_now(fresh, now, cfg):
                 rid = db.reserve_followup(pid, due.rule_key, {

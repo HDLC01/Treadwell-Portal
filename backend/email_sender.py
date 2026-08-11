@@ -645,11 +645,14 @@ def _digest_headers(email: str) -> dict:
 def send_reply_notification(email: str, url: str, project_name: str,
                             reply_to: str | None = None, message: str | None = None,
                             token: str | None = None) -> bool:
-    # Only advertise reply-by-email when inbound capture is armed (reply_to set);
-    # otherwise steer to the portal so nothing dead-ends.
-    nudge = ("You can reply right on your proposal page, or simply reply to this email."
-             if reply_to else
-             "Reply right on your proposal page (button above) so our team sees it fastest.")
+    # Hanz, 2026-08-12: 'Change it o jUST "View proposal here"'. It replaced two sentences
+    # explaining that you could reply on the page or to the email — both true, neither needed. A
+    # reply-by-email nudge under a "View the reply" button was answering a question nobody had
+    # asked, and replying to the email works whether or not we say so (the inbound webhook routes
+    # it either way — see the staff-reply fix). A link, not a sentence: it is the only thing left
+    # on the line, so it should do something.
+    nudge = (f'<a href="{url}" style="color:{_BRAND_RED};font-weight:600;'
+             f'text-decoration:none">View proposal here</a>')
     # Show the actual reply TEXT in the email (Will's ask) — not just a button.
     msg_html = ""
     if message and str(message).strip():

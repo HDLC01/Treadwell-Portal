@@ -114,10 +114,23 @@ def test_the_recurring_series_is_capped():
 
 
 # ── stop conditions ──────────────────────────────────────────────────────────
-def test_approved_and_closed_proposals_are_left_alone():
+def test_a_closed_lost_proposal_is_left_alone():
     p, at72 = _viewed(72)
-    for status in ("approved", "closed_lost"):
-        assert fr.due_now(dict(p, proposal_status=status), at72) == []
+    assert fr.due_now(dict(p, proposal_status="closed_lost"), at72) == []
+
+
+def test_an_approved_proposal_is_left_alone_ONCE_THE_DEPOSIT_IS_IN():
+    """This test used to cover "approved" alongside "closed_lost", because the cadence stopped
+    dead at approval. Hanz, 2026-08-12: "followups should be automated until a deposit has been
+    received." So approval is no longer the stop — the deposit is, and the two audiences stop at
+    different points (see test_followup_deposit_stage.py for the whole stage).
+
+    What survives here is the OTHER half of the old claim: a paid job is genuinely finished with
+    the cadence, and a job that never collected a deposit was never in the stage at all."""
+    p, at72 = _viewed(72)
+    approved = dict(p, proposal_status="approved", approved_at=p["cycle_viewed_at"])
+    assert fr.due_now(dict(approved, deposit_status="received"), at72) == []
+    assert fr.due_now(dict(approved, deposit_required=False), at72) == []
 
 
 def test_an_estimator_opt_out_stops_everything():
@@ -217,8 +230,11 @@ def test_nothing_is_due_when_nothing_is_chasing():
     assert fr.next_due_at(_row(), now) is None                    # not enrolled
     assert fr.next_due_at(
         _row(followup_enrolled_at=_ago(now, 100), followup_disabled_at=_ago(now, 1)), now) is None
+    # Approved is in scope now, so the reason it reports nothing has to be the DEPOSIT rather
+    # than the status. `received` is the case that ends the customer's schedule.
     assert fr.next_due_at(
-        _row(followup_enrolled_at=_ago(now, 100), proposal_status="approved"), now) is None
+        _row(followup_enrolled_at=_ago(now, 100), proposal_status="approved",
+             deposit_status="received"), now) is None
     assert fr.next_due_at(
         _row(followup_enrolled_at=_ago(now, 100), proposal_status="closed_lost"), now) is None
 
