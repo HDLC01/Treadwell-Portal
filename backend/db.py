@@ -1178,6 +1178,19 @@ def set_notify_override(proposal_id: str, email: str, mode: str) -> None:
     )
 
 
+def add_notify_override_if_absent(proposal_id: str, email: str) -> None:
+    """Record an implicit 'add' for this project, and never touch a row that already exists.
+
+    `set_notify_override` above UPSERTS, which is right when a person clicks something and wrong
+    here: this runs on every publish, so an upsert would turn a deliberate MUTE back into an add
+    the next time the proposal was sent. A mute that un-mutes itself is worse than no mute."""
+    execute(
+        "insert into public.portal_notify_overrides (proposal_id, email, mode) "
+        "values (%s,%s,'add') on conflict (proposal_id, lower(email)) do nothing",
+        (proposal_id, email.strip().lower()),
+    )
+
+
 def clear_notify_override(proposal_id: str, email: str) -> None:
     execute(
         "delete from public.portal_notify_overrides where proposal_id=%s and lower(email)=lower(%s)",

@@ -1706,6 +1706,34 @@ async def admin_publish(request: Request) -> JSONResponse:
                        msg_type="proposal_card",
                        meta={"revision_no": rev_no} if rev_no else None)
 
+    # Whoever BUILT this estimate hears about the project, roster or no roster.
+    #
+    # Will, via Hanz on 2026-08-13: "There are set members for the global notification. And this
+    # estimator or treadwell employee created an estimate, by default this estimator should be
+    # included." The assigned estimator was already folded in at notify time, but that is a
+    # different person: RJ can build a bid and hand it to Kyle, and today RJ hears nothing back
+    # from a job he priced.
+    #
+    # Written as a per-project ADD rather than resolved invisibly at send time, for two reasons.
+    # It appears on the Notification Sending page beside the hand-added people, so nobody needs to
+    # know a hidden rule to explain why RJ is on this thread. And it can be muted — with the mute
+    # surviving every later publish, which is why this inserts only when absent.
+    #
+    # Best-effort: a roster write must never be able to stop a proposal from being delivered.
+    # `parseaddr` alone is not validation: it turns "not an email" into "not", which would be
+    # written into the roster and later handed to the mailer as a recipient. Same regex every
+    # other address on this route goes through.
+    creator = (parseaddr(str(body.get("created_by") or ""))[1] or "").strip().lower()
+    if creator and (len(creator) > 254 or not _EMAIL_RE.match(creator)):
+        log.warning("ignoring an unusable created_by on %s: %r", draft_id, body.get("created_by"))
+        creator = ""
+    if creator:
+        try:
+            db.add_notify_override_if_absent(draft_id, creator)
+        except Exception as exc:  # noqa: BLE001 — the proposal matters more than the roster
+            log.warning("could not add the creator %s to %s's notifications: %s",
+                        creator, draft_id, exc)
+
     # Reconcile the recipient set.
     if recipients is None:                      # legacy call — preserve exact old semantics
         if existing:
