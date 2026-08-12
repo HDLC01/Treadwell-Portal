@@ -509,6 +509,67 @@ async def me_notifications_seen(request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
+FEEDBACK_CATEGORIES = ("question", "request", "problem", "other")
+
+
+@app.post("/api/me/feedback")
+async def me_feedback(request: Request) -> JSONResponse:
+    """What a customer wants from this portal — a question, a request, or a fault.
+
+    Hanz, 2026-08-13: "Here create a Feedback form for the customer of what queries or update
+    they want from this system."
+
+    Signed in only, and the address is taken from the SESSION rather than the body: feedback
+    that anybody could post under anybody's name is feedback nobody can act on, and an open
+    endpoint on a public host is a spam relay.
+
+    Stored AND emailed. Stored because an inbox is where suggestions go to die; emailed because
+    nobody would think to read a table. The email is a plain team notification with no project
+    threading — this is not about one job, so it must not land in a project's conversation.
+    A store failure is fatal (the customer is told it did not save); an EMAIL failure is not,
+    because their words are already safe and telling them otherwise would invite a duplicate."""
+    se = _session_email(request)
+    if not se:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    category = str(body.get("category") or "other").strip().lower()
+    if category not in FEEDBACK_CATEGORIES:
+        return _json({"ok": False, "error": "invalid_category"}, 400)
+    text = _cap(body.get("body"), 4000)
+    if not text:
+        return _json({"ok": False, "error": "empty"}, 400)
+    # Which project they were looking at, when they were looking at one. Recorded as context,
+    # never as ownership — see db.add_feedback.
+    #
+    # Resolved from the TOKEN through the same gate every per-project route uses, because the
+    # page never learns a proposal id and a client-supplied one would let any signed-in customer
+    # file feedback against somebody else's job. A token that does not resolve simply costs the
+    # context: the feedback is still saved, unattached.
+    pid = None
+    tok = str(body.get("token") or "").strip()
+    if tok:
+        p = _require(request, tok)
+        if p:
+            pid = p.get("proposal_id")
+    try:
+        row = db.add_feedback(se, category, text, pid)
+    except Exception as exc:  # noqa: BLE001 — the customer must know it did not save
+        log.error("feedback save failed for %s: %s", se, exc)
+        return _json({"ok": False, "error": "save_failed"}, 500)
+    try:
+        label = {"question": "Question", "request": "Feature request",
+                 "problem": "Problem report", "other": "Feedback"}[category]
+        email_sender.notify_team(
+            f"Portal {label.lower()} from {se}",
+            f"<p><strong>{html.escape(se)}</strong> sent {html.escape(label.lower())} about the "
+            f"customer portal:</p><blockquote>{html.escape(text)}</blockquote>"
+            + (f"<p class=\"muted\">While viewing project {html.escape(pid)}.</p>" if pid else ""),
+        )
+    except Exception as exc:  # noqa: BLE001 — saved already; a send failure is not the customer's
+        log.warning("feedback notify failed for %s: %s", se, exc)
+    return _json({"ok": True, "id": row.get("id") if isinstance(row, dict) else None})
+
+
 @app.get("/api/me/proposals")
 def me_proposals(request: Request) -> JSONResponse:
     se = _session_email(request)
@@ -678,6 +739,12 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
+        # The estimator who owns this job hears about a customer question whether or not
+        # they sit on the org-wide roster. Hanz, 2026-08-13, asking for chat to reach
+        # "whoever is set for the notification sending of that project" — with hanz@ and
+        # will@ the only enabled roster rows, a question on Kyle's job reached neither Kyle
+        # nor anybody who could answer it. A per-project mute still wins.
+        assigned_estimator=p.get("assigned_estimator"),
     )
     # `who` is this session, and this row is theirs — but route it through the same serializer
     # so the shape the client appends matches the shape it polls. Easy one to miss.
@@ -957,16 +1024,15 @@ def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:
     not make their click look broken."""
     pid = p["proposal_id"]
     try:
-        to = email_sender._resolve_notify("general", pid) or []
-        assigned = (p.get("assigned_estimator") or "").strip()
-        if assigned and assigned.lower() not in [t.lower() for t in to]:
-            to = [assigned] + to
-        if not to:
-            return
-        email_sender.notify_team(subject, body_html, recipients=to,
+        # This used to resolve the roster here and PREPEND the estimator itself, which meant a
+        # muted estimator was dragged back in — an explicit "don't email me about this job"
+        # silently overruled. Both rules now live in one place (_resolve_notify), so chat
+        # messages and status updates cannot disagree about who hears from a project.
+        email_sender.notify_team(subject, body_html,
                                  reply_link=_staff_link(pid), proposal_id=pid,
                                  reply_to=email_sender.proposal_reply_to(p.get("token")),
-                                 token=p.get("token"), project=p.get("project_name"))
+                                 token=p.get("token"), project=p.get("project_name"),
+                                 assigned_estimator=p.get("assigned_estimator"))
     except Exception as exc:  # noqa: BLE001
         log.warning("status notify failed for %s: %s", pid, exc)
 

@@ -489,3 +489,25 @@ alter table public.portal_deposits add column if not exists submitted_by text;
 -- migration must not silently stop chasing a live bid. A row written before this column existed
 -- reads as true for the same reason.
 alter table public.portal_proposal_recipients add column if not exists followups boolean not null default true;
+
+-- ── customer feedback about the PORTAL ITSELF ─────────────────────────────────
+-- Hanz, 2026-08-13: "Here create a Feedback form for the customer of what queries or update
+-- they want from this system."
+--
+-- Deliberately NOT a chat message. A request for a feature belongs to the product, not to a
+-- proposal — filing it in the thread would push it at the estimator as if it were a question
+-- about their job, and it would be lost the moment that job closed.
+--
+-- proposal_id is nullable and NOT a foreign key on purpose: feedback can be written from the
+-- projects list with no project open, and deleting a proposal must not erase what somebody
+-- told us about the software.
+create table if not exists public.portal_feedback (
+  id           bigint generated always as identity primary key,
+  proposal_id  text,
+  email        text not null,
+  category     text not null check (category in ('question','request','problem','other')),
+  body         text not null,
+  created_at   timestamptz not null default now()
+);
+create index if not exists portal_feedback_created_idx
+  on public.portal_feedback (created_at desc);

@@ -52,6 +52,20 @@ let STATE = null;
   else { renderGate(); }
 })();
 
+/** Tell the shell it may build its navigation — see the note at the bottom of shell.js for why
+ *  it must not build before this.
+ *
+ *  Called from inside `renderPortal` rather than from its nine call sites. renderPortal IS the
+ *  definition of "we hold an authenticated view", including the path where somebody has just
+ *  typed their one-time code, and one signal in one place cannot be the one somebody forgets to
+ *  add next time. Idempotent: the flag covers a shell that loads later, the event covers a shell
+ *  already loaded and waiting. */
+function signalAuthed() {
+  window.TW_PORTAL_AUTHED = true;
+  if (window.TWShell && window.TWShell.mount) window.TWShell.mount();
+  else document.dispatchEvent(new CustomEvent("tw-portal-authed"));
+}
+
 function renderNotFound() {
   hide($("loading"));
   const g = $("gate"); show(g);
@@ -96,6 +110,12 @@ const ICON_DOT = '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="curre
 
 let SHOWN_REVISION = null;
 function renderPortal(vm) {
+  // Reaching here means the session is valid, so the shell may build its navigation. First
+  // statement in the function on purpose: every route into the authenticated portal — first
+  // load, just-entered one-time code, project switch, post-approval refresh — comes through
+  // here, and putting the signal at the call sites instead would leave one of nine to be
+  // forgotten.
+  signalAuthed();
   // A revision landed: the document, prices and option labels are all different, so
   // force the cached PDF frames to re-fetch and drop any ticked options that no
   // longer exist. Otherwise the customer could approve a selection from the version
@@ -694,6 +714,32 @@ function splitSystem(body) {
   return { title: "Update", body: s };
 }
 
+// Our server writes every system row as author_kind 'staff', including the ones that record
+// something the CUSTOMER did — so on author_kind alone a customer's own approval sits on
+// Treadwell's side of their own thread. The row carries no actor field, so these prefixes are the
+// only signal available. Kept character-for-character identical to CUSTOMER_EVENTS in the staff
+// tool's portal.js: the two views are one conversation, and a card that changes sides between
+// them is worse than one that never moves. Reword one and the card just falls back to
+// author_kind — it loses its side, nothing breaks.
+const CUSTOMER_EVENTS = ["Approved by", "Project contacts received"];
+
+/** Which side of the thread an event card sits on, from the CUSTOMER's point of view.
+ *
+ *  Hanz, 2026-08-13: "If its the customer's action and chat it should appear to the right
+ *  Opposite of what it looks like to the chatbox in the proposal tool."
+ *
+ *  Every card used to render flush left here, so a customer saw their own approval and their own
+ *  deposit filed on Treadwell's side while their typed messages sat correctly on the right — the
+ *  thread contradicted itself about who had done what. The classification is the staff drawer's;
+ *  only the sides are swapped, because "mine" is the right-hand side for whoever is reading. */
+function cardSide(m) {
+  const body = String(m.body == null ? "" : m.body);
+  // `deposit_submitted` is the customer's own doing (it is what rings the staff bell).
+  if (m.msg_type === "deposit_submitted") return "mine";
+  if (m.msg_type === "system" && CUSTOMER_EVENTS.some((p) => body.startsWith(p))) return "mine";
+  return m.author_kind === "customer" ? "mine" : "theirs";
+}
+
 function renderMsg(m) {
   const when = m.created_at ? new Date(m.created_at).toLocaleString() : "";
   if (m.msg_type === "proposal_card") {
@@ -747,7 +793,7 @@ function renderMsg(m) {
   // it as a system card, not as one of the customer's own chat bubbles.
   if (m.msg_type === "system" || m.msg_type === "deposit_submitted") {
     const s = splitSystem(m.body);
-    return `<div class="chat-card system">
+    return `<div class="chat-card system ${cardSide(m)}">
       <div class="cc-title">${esc(s.title)}</div>
       <div class="cc-body">${esc(s.body)}</div>
     </div>`;

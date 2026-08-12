@@ -1098,6 +1098,21 @@ def add_question(proposal_id: str, author_kind: str, author_email: Optional[str]
     return add_message(proposal_id, author_kind, author_email, body, msg_type="text")
 
 
+def add_feedback(email: str, category: str, body: str,
+                 proposal_id: Optional[str] = None) -> dict[str, Any]:
+    """Record what a customer told us about the PORTAL — a question about how it works, a
+    request, or something broken.
+
+    Kept out of `portal_questions` deliberately: this is about the software, not about a job.
+    In the thread it would reach the estimator as if it were a question about their proposal
+    and would disappear with the project."""
+    return q1(
+        "insert into public.portal_feedback (proposal_id, email, category, body) "
+        "values (%s,%s,%s,%s) returning id, created_at",
+        (proposal_id or None, email, category, body),
+    )
+
+
 def has_email_message(proposal_id: str, email_id: str) -> bool:
     """Dedup for inbound email: has this Resend email_id already been inserted?
     (email_id is stable across Svix retries AND dashboard re-sends; scoping by

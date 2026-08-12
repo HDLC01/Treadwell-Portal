@@ -750,10 +750,23 @@ def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env
     return out
 
 
-def _resolve_notify(kind: str, proposal_id: str | None = None) -> list[str]:
+def _resolve_notify(kind: str, proposal_id: str | None = None,
+                    assigned_estimator: str | None = None) -> list[str]:
     """Resolve recipients from the roster (enabled rows only) plus this proposal's
     per-project overrides. On DB failure, fall back to env (don't go silent just
-    because the table was momentarily unreachable)."""
+    because the table was momentarily unreachable).
+
+    `assigned_estimator` is folded in as a per-project ADD, which is exactly what it is:
+    the person who owns THIS job hears about it whether or not they sit on the org-wide
+    roster. Hanz, 2026-08-13, asking for chat messages to reach "whoever is set for the
+    notification sending of that project" — and on 2026-08-13 the enabled roster was
+    hanz@ + will@ only, so a job assigned to Kyle emailed neither Kyle nor anybody who
+    knew about it.
+
+    Routed through `adds` rather than prepended by the caller so that a per-project MUTE
+    still wins: somebody who explicitly silenced one job does not get dragged back in by
+    being its estimator. That also collapses two rules into one — the status-update path
+    used to prepend the estimator itself, unconditionally, and therefore ignored mutes."""
     general, deposit, adds, mutes = [], [], [], []
     configured = False
     try:
@@ -776,6 +789,9 @@ def _resolve_notify(kind: str, proposal_id: str | None = None) -> list[str]:
                 (adds if o.get("mode") == "add" else mutes).append(o["email"])
         except Exception as exc:  # noqa: BLE001 — ignore overrides, keep the roster
             log.warning("notify-override lookup failed (%s); ignoring per-project overrides", exc)
+    est = (assigned_estimator or "").strip()
+    if est:
+        adds = list(adds) + [est]
     return resolve_notify_recipients(general, deposit, kind, config.NOTIFY_EMAILS,
                                      config.DEPOSIT_NOTIFY_EMAILS, adds=adds, mutes=mutes,
                                      configured=configured)
@@ -830,7 +846,8 @@ def staff_emails(proposal_id: str | None = None) -> set[str]:
 def notify_team(subject: str, body_html: str, kind: str = "general",
                 recipients: list[str] | None = None, reply_link: str | None = None,
                 proposal_id: str | None = None, reply_to: str | None = None,
-                token: str | None = None, project: str | None = None) -> bool:
+                token: str | None = None, project: str | None = None,
+                assigned_estimator: str | None = None) -> bool:
     """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
     `kind` from the UI-managed roster, applying this proposal's per-project overrides
     (`proposal_id`). `reply_link` appends a "Reply in Portal" button that deep-links
@@ -845,7 +862,8 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
     heading = subject
     if project and token:
         subject = staff_thread_subject(project)
-    to = recipients if recipients is not None else _resolve_notify(kind, proposal_id)
+    to = (recipients if recipients is not None
+          else _resolve_notify(kind, proposal_id, assigned_estimator))
     if not to:
         log.info("notify: no recipients after roster/overrides — skipped (%r)", subject)
     if reply_link:

@@ -56,6 +56,25 @@ html.shell-open #shell-back{display:block}
 #shell-burger{border:1px solid var(--outline);background:var(--bg);color:var(--fg);width:54px;height:34px;
  border-radius:8px;cursor:pointer;font-size:16px;line-height:1;flex:none}
 #shell-burger:hover{background:var(--surface-low)}
+/* Feedback dialog. z-index above the sidebar (800) and its scrim (790), below the PDF popup
+   (900/901) — the portal's own band, never the staff tool's 9990+. */
+#fb-back{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:870;display:flex;
+ align-items:center;justify-content:center;padding:18px}
+.fb-card{background:var(--surface);border:1px solid var(--surface-highest);
+ border-radius:var(--radius-lg);padding:20px;width:100%;max-width:460px;box-shadow:var(--shadow-sm);
+ max-height:90vh;overflow-y:auto}
+.fb-head{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:1.05rem}
+.fb-head .shell-x{margin-left:auto}
+.fb-lede{color:var(--secondary);font-size:.85rem;margin:0 0 14px}
+.fb-lbl{display:block;font-size:.68rem;font-weight:800;letter-spacing:.05em;text-transform:uppercase;
+ color:var(--secondary);margin:0 0 5px}
+.fb-in{width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);
+ border:1px solid var(--outline);border-radius:var(--radius);padding:10px 12px;font:inherit;
+ margin-bottom:14px}
+.fb-in:focus{outline:none;border-color:var(--primary)}
+textarea.fb-in{resize:vertical}
+.fb-err{color:var(--primary);font-size:.82rem;font-weight:600;margin:0 0 10px}
+.fb-foot{display:flex;gap:10px;justify-content:flex-end}
 .bell{position:relative;border:none;background:none;color:var(--secondary);font-size:17px;cursor:pointer;
  padding:5px 6px;border-radius:8px;line-height:1;margin-left:8px}
 .bell:hover{background:var(--surface-low);color:var(--primary)}
@@ -107,6 +126,9 @@ html.shell-open #shell-back{display:block}
        <a class="shell-item" href="/"><span class="shell-ico">▤</span><span>My projects</span></a>
        <div class="shell-sec" id="shell-steps-h" hidden>This project</div>
        <div id="shell-steps"></div>
+       <div class="shell-sec">Help us improve</div>
+       <button class="shell-item" id="shell-fb" type="button">
+         <span class="shell-ico">✎</span><span>Send feedback</span></button>
        <div class="shell-foot"><span id="shell-email"></span>
          <button id="shell-out" title="Sign out">⏻</button></div>`;
     document.body.appendChild(side);
@@ -129,6 +151,7 @@ html.shell-open #shell-back{display:block}
       try { await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }); } catch {}
       location.href = "/";
     });
+    $("shell-fb").addEventListener("click", () => { setOpen(false); openFeedback(); });
 
     // Burger + bell go INSIDE the existing sticky header — adding a second bar
     // would fight the sticky chat header already anchored at top:0.
@@ -287,6 +310,88 @@ html.shell-open #shell-back{display:block}
     }
   }
 
+  /** "Tell us what you need from this portal."
+   *
+   *  Hanz, 2026-08-13: "Here create a Feedback form for the customer of what queries or update
+   *  they want from this system", in the sidebar.
+   *
+   *  A dialog rather than a page: this is a thing you do while looking at something else, and a
+   *  navigation that loses the customer's place in their proposal to type two sentences is a
+   *  navigation they abandon. The category is asked for because "how do I pay by check" and "the
+   *  invoice button is broken" need different people to read them.
+   *
+   *  It does NOT post to the project chat — that would reach the estimator as if it were a
+   *  question about their job. See the note on the portal_feedback table. */
+  function openFeedback() {
+    if ($("fb-back")) return;
+    const back = document.createElement("div");
+    back.id = "fb-back";
+    back.innerHTML =
+      `<div class="fb-card" role="dialog" aria-modal="true" aria-labelledby="fb-h">
+         <div class="fb-head"><strong id="fb-h">Send feedback</strong>
+           <button class="shell-x" id="fb-x" title="Close">✕</button></div>
+         <p class="fb-lede">What would you like from this portal? A question about how something
+            works, something you wish it did, or something that looks wrong — it all reaches the
+            Treadwell team.</p>
+         <label class="fb-lbl" for="fb-cat">This is…</label>
+         <select id="fb-cat" class="fb-in">
+           <option value="question">A question about how something works</option>
+           <option value="request">Something I wish it did</option>
+           <option value="problem">Something looks wrong or broken</option>
+           <option value="other">Something else</option>
+         </select>
+         <label class="fb-lbl" for="fb-body">Your message</label>
+         <textarea id="fb-body" class="fb-in" rows="5"
+                   placeholder="Tell us in your own words…"></textarea>
+         <p class="fb-err" id="fb-err" hidden></p>
+         <div class="fb-foot">
+           <button class="btn btn-secondary" id="fb-cancel" type="button">Cancel</button>
+           <button class="btn btn-primary" id="fb-send" type="button">Send feedback</button>
+         </div>
+       </div>`;
+    document.body.appendChild(back);
+    const close = () => { back.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey);
+    $("fb-x").addEventListener("click", close);
+    $("fb-cancel").addEventListener("click", close);
+    back.addEventListener("click", (e) => { if (e.target === back) close(); });
+    setTimeout(() => { const t = $("fb-body"); if (t) t.focus(); }, 0);
+
+    $("fb-send").addEventListener("click", async () => {
+      const btn = $("fb-send"), err = $("fb-err");
+      const text = ($("fb-body").value || "").trim();
+      err.hidden = true;
+      if (!text) { err.textContent = "Add a message first."; err.hidden = false; return; }
+      btn.disabled = true; btn.textContent = "Sending…";
+      try {
+        const r = await fetch("/api/me/feedback", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          // The TOKEN, not a proposal id — this page never learns the id. The server resolves
+          // it through the same access check every other per-project route uses, so feedback
+          // cannot be filed against a project this session may not see.
+          body: JSON.stringify({ category: $("fb-cat").value, body: text,
+                                 token: TOKEN || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
+        back.querySelector(".fb-card").innerHTML =
+          `<div class="fb-head"><strong>Thank you</strong>
+             <button class="shell-x" id="fb-x2" title="Close">✕</button></div>
+           <p class="fb-lede">That has reached the Treadwell team. If it needs a reply, somebody
+              will come back to you by email.</p>
+           <div class="fb-foot"><button class="btn btn-primary" id="fb-done" type="button">Close</button></div>`;
+        $("fb-x2").addEventListener("click", close);
+        $("fb-done").addEventListener("click", close);
+      } catch (e) {
+        btn.disabled = false; btn.textContent = "Send feedback";
+        err.textContent = "That didn't send — check your connection and try again.";
+        err.hidden = false;
+      }
+    });
+  }
+
   function boot() {
     injectCss();
     buildSidebar();
@@ -300,6 +405,30 @@ html.shell-open #shell-back{display:block}
     document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
   }
 
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
-  else boot();
+  // NOTHING is built until the customer is signed in.
+  //
+  // Hanz, 2026-08-13: "For example a customer hasnt log in yet or doesnt get the OTP. it should
+  // not show the sidebar this is for safety purposes."
+  //
+  // This file used to boot straight off DOMContentLoaded, with no notion of auth — and it loads
+  // BEFORE app.js, which is the script that actually learns whether the session is valid. So
+  // somebody sitting on the one-time-code screen was shown the whole project navigation (Chat,
+  // My projects, Proposal, Deposit, Contact info, Schedule), the notification bell, and had
+  // `/api/me/proposals` called on their behalf. The routes behind those links refuse an
+  // unauthenticated caller, so nothing could be opened — but "My projects" on a login screen
+  // still tells a stranger this address has projects, and a navigation you cannot use is a
+  // promise the page has no business making before it knows who is reading it.
+  //
+  // app.js signals exactly once, from the one place that has the answer (`data.authed` on the
+  // portal payload). The flag is checked as well as the event because shell.js loads first
+  // today but load order is not something this file should depend on.
+  let booted = false;
+  function bootOnce() {
+    if (booted) return;
+    booted = true;
+    boot();
+  }
+  window.TWShell = Object.assign(window.TWShell || {}, { mount: bootOnce });
+  if (window.TW_PORTAL_AUTHED) bootOnce();
+  else document.addEventListener("tw-portal-authed", bootOnce, { once: true });
 })();

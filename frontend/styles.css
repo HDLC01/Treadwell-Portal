@@ -281,6 +281,14 @@ textarea { min-height: 96px; resize: vertical; }
   border: 1px solid var(--surface-highest); border-left: 4px solid var(--primary);
   border-radius: var(--radius-lg); padding: 14px 16px; box-shadow: var(--shadow-sm);
 }
+/* An event card takes the side of whoever caused it, same as the speech bubbles: the customer's
+   own approval and their own deposit belong on THEIR side of the thread, not Treadwell's. The
+   accent stripe swaps edges with it, so the card still points away from its author. */
+.chat-card.mine { align-self: flex-end; border-left-width: 1px; border-right: 4px solid var(--primary); }
+.chat-card.theirs { align-self: flex-start; }
+.chat-card.deposit.mine { border-right-color: var(--success); }
+.chat-card.system.mine { border-right-color: var(--secondary); }
+.chat-card.is-superseded.mine { border-right-color: var(--surface-highest); }
 .chat-card.deposit { border-left-color: var(--success); }
 /* Status lines (approved, deposit initiated, …) — same card shape as the deposit
    card so the thread reads consistently, in a muted tone since they're FYI. */
