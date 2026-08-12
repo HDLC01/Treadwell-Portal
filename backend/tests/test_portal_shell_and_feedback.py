@@ -328,6 +328,36 @@ def test_feedback_never_becomes_a_project_chat_message(monkeypatch):
     assert calls == [], "feedback was written into the project conversation"
 
 
+def test_every_rls_table_also_has_a_grant_and_a_policy():
+    """The mistake this file already documents twice, generalised so there is no third time.
+
+    On prod the portal connects as `portal_app`, which is least-privilege and does not bypass RLS.
+    A table with RLS enabled and no grant/policy pair reads as "locked down" and is silently
+    broken THERE ONLY — staging connects as a broad role and looks fine. It shipped that way once
+    for portal_settings and once for portal_proposal_views; `portal_feedback` was heading the same
+    way (every insert would fail, and the customer would be told their words did not save)."""
+    schema = (pathlib.Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
+    # Grants applied to prod by hand, before this file started carrying them. Verified present
+    # on the production database on 2026-08-13 (policy + INSERT + SELECT for portal_app on every
+    # one). They are listed rather than back-filled because editing the DDL of a live table to
+    # re-state a grant it already has buys nothing and risks a typo.
+    grants_applied_by_hand = {
+        "portal_approvals", "portal_contacts", "portal_deposits", "portal_followups",
+        "portal_login_codes", "portal_notify_overrides", "portal_notify_recipients",
+        "portal_proposal_recipients", "portal_proposals", "portal_questions", "portal_sessions",
+        "portal_read_state",   # declared here, does not exist on prod
+    }
+    rls = set(re.findall(r"alter table public\.(\w+)\s+enable row level security", schema))
+    assert rls, "the RLS declarations moved — this guard is now checking nothing"
+    assert rls - grants_applied_by_hand, "the guard is exempting every table it checks"
+    granted = set(re.findall(r"grant [^;]*on public\.(\w+) to portal_app", schema))
+    policied = set(re.findall(r"create policy \w+ on public\.(\w+)", schema))
+    missing = sorted((rls - grants_applied_by_hand) - (granted & policied))
+    assert missing == [], (
+        "RLS is on with no grant/policy for: %s — reads return nothing and writes fail on prod "
+        "only, where the app is portal_app" % ", ".join(missing))
+
+
 def test_the_table_is_declared_and_survives_a_deleted_proposal():
     """proposal_id is context, not ownership: deleting a job must not erase what somebody told us
     about the software, so it is deliberately not a cascading foreign key."""

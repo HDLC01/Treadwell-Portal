@@ -511,3 +511,12 @@ create table if not exists public.portal_feedback (
 );
 create index if not exists portal_feedback_created_idx
   on public.portal_feedback (created_at desc);
+alter table public.portal_feedback enable row level security;
+-- Grant AND policy, together — the third time this file has had to say so. RLS on with neither
+-- reads as "locked down" and is broken on PROD only, where the portal connects as portal_app and
+-- does not bypass RLS: every insert would fail and the customer would be told their feedback did
+-- not save, while staging, on a broad role, looked fine.
+grant select, insert, update, delete on public.portal_feedback to portal_app;
+drop policy if exists portal_app_rw on public.portal_feedback;
+create policy portal_app_rw on public.portal_feedback
+  for all to portal_app using (true) with check (true);
