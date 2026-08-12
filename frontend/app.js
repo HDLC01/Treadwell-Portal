@@ -366,10 +366,29 @@ function renderOptions(options, addons, approved) {
     const sub = ve
       ? `instead of the base bid — ${money(o.total)} total`
       : (o.diff != null && o.diff !== 0 ? `${o.diff > 0 ? "+" : ""}${money(o.diff)} vs base bid` : "");
+    // WHICH of these is the job and which is extra. Hanz, 2026-08-13: "Label whether the
+    // pricing sent to the customer is the base bid or the options."
+    //
+    // `is_base` has always been in the payload (proposals.pricing_options) and was never shown,
+    // so a customer looking at "EPOXY $29,942 / ROOM 1 $15,801" had no way to tell the main
+    // scope from an add-on — while both tick by default and SUM into the total they approve.
+    // A row they misread here becomes a number they sign for.
+    //
+    // Three kinds, because "option" alone would lie about a VE row: a value-engineering
+    // alternative REPLACES the base rather than adding to it (see updateSelectedTotal, which
+    // contributes its delta, not its total).
+    const kind = o.is_base ? "Base bid" : (ve ? "Alternative" : "Option");
+    const kindClass = o.is_base ? "is-base" : (ve ? "is-alt" : "is-opt");
+    const kindTitle = o.is_base
+      ? "The main scope of work — the bid this proposal is for."
+      : (ve ? "An alternative to the base bid. Choosing it changes the price of the job rather "
+            + "than adding to it."
+            : "An extra you can add to the base bid. Its price is added to your total.");
     return `<label class="option opt-check ${on ? "selected" : ""}">
       <input type="checkbox" ${on ? "checked" : ""} ${approved ? "disabled" : ""} data-label="${esc(o.label)}">
       <span class="opt-main">
         <span class="top"><span class="name">${esc(o.label)}</span><span class="price">${esc(price)}</span></span>
+        <span class="opt-kind ${kindClass}" title="${esc(kindTitle)}">${esc(kind)}</span>
         ${o.system_desc ? `<span class="meta">${esc(o.system_desc)}</span>` : ""}
         ${sub ? `<span class="meta">${esc(sub)}</span>` : ""}
       </span>
