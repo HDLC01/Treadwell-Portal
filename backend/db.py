@@ -1098,6 +1098,21 @@ def add_question(proposal_id: str, author_kind: str, author_email: Optional[str]
     return add_message(proposal_id, author_kind, author_email, body, msg_type="text")
 
 
+def add_feedback(email: str, category: str, body: str,
+                 proposal_id: Optional[str] = None) -> dict[str, Any]:
+    """Record what a customer told us about the PORTAL — a question about how it works, a
+    request, or something broken.
+
+    Kept out of `portal_questions` deliberately: this is about the software, not about a job.
+    In the thread it would reach the estimator as if it were a question about their proposal
+    and would disappear with the project."""
+    return q1(
+        "insert into public.portal_feedback (proposal_id, email, category, body) "
+        "values (%s,%s,%s,%s) returning id, created_at",
+        (proposal_id or None, email, category, body),
+    )
+
+
 def has_email_message(proposal_id: str, email_id: str) -> bool:
     """Dedup for inbound email: has this Resend email_id already been inserted?
     (email_id is stable across Svix retries AND dashboard re-sends; scoping by
@@ -1160,6 +1175,19 @@ def set_notify_override(proposal_id: str, email: str, mode: str) -> None:
         "insert into public.portal_notify_overrides (proposal_id, email, mode) values (%s,%s,%s) "
         "on conflict (proposal_id, lower(email)) do update set mode = excluded.mode",
         (proposal_id, email.strip().lower(), mode),
+    )
+
+
+def add_notify_override_if_absent(proposal_id: str, email: str) -> None:
+    """Record an implicit 'add' for this project, and never touch a row that already exists.
+
+    `set_notify_override` above UPSERTS, which is right when a person clicks something and wrong
+    here: this runs on every publish, so an upsert would turn a deliberate MUTE back into an add
+    the next time the proposal was sent. A mute that un-mutes itself is worse than no mute."""
+    execute(
+        "insert into public.portal_notify_overrides (proposal_id, email, mode) "
+        "values (%s,%s,'add') on conflict (proposal_id, lower(email)) do nothing",
+        (proposal_id, email.strip().lower()),
     )
 
 
