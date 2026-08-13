@@ -38,7 +38,9 @@ function mount(state, mounted) {
   const el = (id) => (nodes[id] = nodes[id] || {
     id, innerHTML: "", textContent: "", href: "",
     querySelectorAll: () => [], remove() {}, appendChild() {},
-    addEventListener() {}, setAttribute() {}, classList: { add() {}, remove() {}, toggle() {} },
+    // `contains` is here because resetPdfMounts asks whether the popup is open before remounting.
+    addEventListener() {}, setAttribute() {}, classList: { add() {}, remove() {}, toggle() {},
+                                                           contains: () => false },
   });
   const doc = {
     createElement: () => {
@@ -68,6 +70,62 @@ function mount(state, mounted) {
   return out;
 }
 
+/** Model the customer sitting on the page while staff re-send: mount at revision N, then run the
+ *  revision-change branch renderPortal uses, and report what the frames show afterwards.
+ *
+ *  This is the "do I have to reload?" question, and it is pure behaviour — `resetPdfMounts` cleared
+ *  an id that has never existed in index.html ("pdf-wrap"), so the popup's stale iframe survived
+ *  every revision while the latch said it had been torn down. */
+function resend(opts) {
+  const o = opts || {};
+  const wraps = {};                    // id -> {children: [iframe]}
+  const frames = [];
+  const mkFrame = () => {
+    const f = { className: "", title: "", src: "", removed: false,
+                setAttribute() {}, addEventListener() {},
+                remove() { this.removed = true; } };
+    frames.push(f);
+    return f;
+  };
+  const wrap = (id) => (wraps[id] = wraps[id] || {
+    id, _kids: [],
+    appendChild(f) { this._kids.push(f); },
+    querySelectorAll: () => wraps[id]._kids.filter((f) => !f.removed),
+    remove() {}, classList: { add() {}, remove() {}, contains: () => false },
+  });
+  const modal = { id: "pdf-modal", classList: { _h: !o.modalOpen,
+    add() { this._h = true; }, remove() { this._h = false; },
+    contains: (c) => c === "hidden" && modal.classList._h } };
+  const nodes = { "pdf-modal": modal, "pdf-scrim": wrap("pdf-scrim") };
+  const el = (id) => nodes[id] || (id.endsWith("-wrap") ? wrap(id)
+    : (nodes[id] = { id, href: "", textContent: "", remove() {},
+                     querySelectorAll: () => [], classList: { add() {}, remove() {}, contains: () => false } }));
+  const doc = { createElement: mkFrame, body: { style: {} } };
+
+  const scope = new Function(
+    "STATE", "TOKEN", "$", "document", "setEligible", "show", "hide", "MODAL_OPEN",
+    `let PDF_MOUNTED = false, INLINE_PDF_MOUNTED = false;
+     ${fn("pdfUrl")}
+     ${fn("renderPdf")}
+     ${fn("mountPdf")}
+     ${fn("mountInlinePdf")}
+     ${fn("resetPdfMounts")}
+     renderPdf(true);                       // first load: links + inline preview
+     if (MODAL_OPEN) mountPdf();            // the customer opened the full-size viewer
+     const first = { link: $("pdf-link").href };
+     STATE.revision_no = STATE.revision_no + 1;   // staff re-send lands
+     resetPdfMounts();                      // what renderPortal's revision branch calls
+     renderPdf(true);                       // …and the re-render that follows it
+     return { first, link: $("pdf-link").href };`);
+  const out = scope(
+    { has_pdf: true, revision_no: o.rev || 2 }, "tok-123", el, doc, () => {},
+    (x) => x && x.classList.remove("hidden"), (x) => x && x.classList.add("hidden"),
+    !!o.modalOpen);
+  out.live = frames.filter((f) => !f.removed).map((f) => f.src);
+  out.removed = frames.filter((f) => f.removed).map((f) => f.src);
+  return out;
+}
+
 const out = {};
 
 // A pinned revision — the normal case once staff have sent anything.
@@ -84,6 +142,12 @@ out.legacy = mount({ has_pdf: true, revision_no: null });
 // A frame that was already mounted before the revision landed: the reset + remount has to
 // produce the NEW url, which is the whole point of pairing resetPdfMounts with a versioned URL.
 out.remount = mount({ has_pdf: true, revision_no: 5 }, { popup: true, inline: true });
+
+// ── the customer does not have to reload ─────────────────────────────────────
+// Popup closed (the common case): only the inline preview is mounted.
+out.resendClosed = resend({ rev: 2 });
+// Popup OPEN while staff re-send: the full-size viewer has to swap under them.
+out.resendOpen = resend({ rev: 2, modalOpen: true });
 
 // The server ignores ?rev= when choosing a document; assert the client never asks it to select
 // one (no revision_no / revision param), only to bust the cache.

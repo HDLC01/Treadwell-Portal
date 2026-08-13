@@ -110,6 +110,54 @@ def test_the_client_never_asks_the_server_to_select_a_revision(ran):
         assert "revision_no" not in qs, qs
 
 
+# ── the customer never has to reload ─────────────────────────────────────────
+# Hanz, 2026-08-13: "is there a way where we just wouldnt need to reload the page for the new PDF
+# file to load in? It just automatically loads the pdf file after sending"
+#
+# The machinery already existed and could not work. Polling carries `revision_no` in its status key
+# (app.js statusKey), a change re-fetches the view model, and renderPortal's revision branch calls
+# `resetPdfMounts()`. But that function cleared an element id that HAS NEVER EXISTED in index.html
+# — "pdf-wrap", where the real wrapper is "pdf-frame-wrap". So the popup's stale iframe was never
+# removed: the latch flipped, a second iframe was appended over the superseded one, and the customer
+# kept reading the revision they had open. Paired with `?rev=` on the URL, the reset now actually
+# replaces the document.
+@needs_node
+def test_a_resend_swaps_the_preview_with_no_reload(ran):
+    """Popup closed — the common case. The inline preview is the one on screen."""
+    r = ran["resendClosed"]
+    assert r["first"]["link"].endswith("rev=2")
+    assert r["link"].endswith("rev=3"), "the download link still points at the old revision"
+    assert r["live"], "nothing was mounted after the revision landed"
+    for src in r["live"]:
+        assert "rev=3" in src, src
+    assert r["removed"], "the superseded iframe was never removed — this was the bug"
+    for src in r["removed"]:
+        assert "rev=2" in src, src
+
+
+@needs_node
+def test_a_resend_swaps_the_full_size_viewer_the_customer_is_reading(ran):
+    """Popup OPEN. `mountPdf` is lazy — it only runs when the popup is opened — so a revision
+    landing mid-read would otherwise leave an empty frame until they closed and reopened it."""
+    r = ran["resendOpen"]
+    live = r["live"]
+    assert any("#view=FitH" in s and "toolbar" not in s for s in live), \
+        f"the full-size viewer did not remount: {live}"
+    assert any("#toolbar=0" in s for s in live), f"the inline preview did not remount: {live}"
+    for src in live:
+        assert "rev=3" in src, src
+    assert len(r["removed"]) == 2, f"both stale frames should be gone: {r['removed']}"
+
+
+@needs_node
+def test_no_stale_frame_survives_the_swap(ran):
+    """The specific failure mode of the wrong id: the latch says torn down, the DOM still holds the
+    old iframe, and a second one is appended on top of it."""
+    for case in ("resendClosed", "resendOpen"):
+        for src in ran[case]["live"]:
+            assert "rev=2" not in src, f"{case} kept a superseded frame: {src}"
+
+
 # ── the server half: the route's own cache read ───────────────────────────────
 @pytest.fixture
 def served(monkeypatch):

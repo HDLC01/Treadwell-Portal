@@ -900,10 +900,19 @@ function mountPdf() {
 function resetPdfMounts() {
   PDF_MOUNTED = false;
   INLINE_PDF_MOUNTED = false;
-  for (const id of ["pdf-wrap", "pdf-inline-wrap"]) {
+  // "pdf-frame-wrap", not "pdf-wrap" — there has never been an element with that id (index.html
+  // calls it `pdf-frame-wrap`, and mountPdf appends into exactly that). So the popup's stale iframe
+  // was never removed: the latch flipped, a SECOND iframe was appended over the superseded one, and
+  // the customer kept reading the revision they had open. Half of "why doesn't the PDF refresh".
+  for (const id of ["pdf-frame-wrap", "pdf-inline-wrap"]) {
     const w = $(id);
     if (w) w.querySelectorAll("iframe").forEach((f) => f.remove());
   }
+  // Remount the full-size viewer NOW if the customer is looking at it. mountPdf is otherwise lazy —
+  // it only runs when the popup is opened — so a revision landing while the popup is open would
+  // leave them staring at an empty frame until they closed and reopened it.
+  const modal = $("pdf-modal");
+  if (modal && !modal.classList.contains("hidden")) mountPdf();
 }
 
 // Inline website-style preview inside the card. Non-interactive (pointer-events
