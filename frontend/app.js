@@ -573,10 +573,23 @@ function contactRow(c, i) {
   </div>`;
 }
 
+/** The PDF endpoint URL, stamped with the revision the page is currently showing.
+ *
+ *  The bytes change when staff re-send, but the URL didn't — so a browser holding a cached
+ *  response kept painting the previous revision's document next to the new prices. `rev` makes
+ *  every republish a different URL. The server IGNORES it when choosing what to render (it uses
+ *  the row's own revision), so this can only ever bust a cache, never select a document.
+ *
+ *  `hash` is the PDF-viewer fragment (#view=FitH etc.) and must stay AFTER the query string. */
+function pdfUrl(hash) {
+  const rev = (STATE && STATE.revision_no) != null ? STATE.revision_no : 0;
+  return `/api/portal/${TOKEN}/pdf?rev=${encodeURIComponent(rev)}${hash || ""}`;
+}
+
 function renderPdf(has) {
   setEligible("pdf-card", !!has);
   if (!has) return;
-  const src = `/api/portal/${TOKEN}/pdf`;
+  const src = pdfUrl();
   $("pdf-link").href = src;
   $("pdf-modal-link").href = src;
   $("pdf-modal-title").textContent = (STATE && STATE.project_name) || "Your proposal";
@@ -873,7 +886,7 @@ function mountPdf() {
   ifr.addEventListener("load", () => { const l = $("pdf-loading"); if (l) l.remove(); });
   // #view=FitH opens the native viewer fit-to-width (readable) instead of its
   // tiny default zoom; keep the toolbar so the customer can zoom/print/download.
-  ifr.src = `/api/portal/${TOKEN}/pdf#view=FitH`;
+  ifr.src = pdfUrl("#view=FitH");
   wrap.appendChild(ifr);
 }
 
@@ -912,7 +925,7 @@ function mountInlinePdf() {
   // scrollbars — the frame is pointer-events:none so clicks reach the enlarge
   // button, which meant the viewer's own scrollbars rendered but could never be
   // used. Reading happens in the full-size popup.
-  ifr.src = `/api/portal/${TOKEN}/pdf#toolbar=0&navpanes=0&scrollbar=0&view=FitH`;
+  ifr.src = pdfUrl("#toolbar=0&navpanes=0&scrollbar=0&view=FitH");
   wrap.appendChild(ifr);
 }
 function openPdfModal() {

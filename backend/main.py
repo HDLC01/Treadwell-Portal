@@ -1153,11 +1153,29 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
 _PDF_CACHE: dict[str, tuple[float, bytes]] = {}
 _PDF_TTL = 600.0   # seconds
 _PDF_CACHE_MAX = 64   # hard cap — PDFs are multi-MB; the VPS is RAM-constrained
-_PDF_HEADERS = {"Content-Disposition": 'inline; filename="proposal.pdf"',
-                "Cache-Control": "private, max-age=600"}
 
 
-def _pdf_cache_put(pid: str, content: bytes) -> None:
+def _pdf_cache_key(pid: str, rev: object) -> str:
+    """Cache under the REVISION, not just the proposal.
+
+    Keyed on pid alone, a re-send inside the 10-minute TTL kept serving the previous revision's
+    bytes — the page said one price and the PDF said another. `_pdf_cache_drop` covers the
+    re-publishes that go through this process, but the key itself is what makes a stale hit
+    impossible (two workers, a restart, a drop we forget to call)."""
+    return f"{pid}@{int(rev) if rev else 0}"
+
+
+def _pdf_headers(rev: object) -> dict[str, str]:
+    """A pinned revision's bytes are immutable, so let the browser keep them — the viewer's URL
+    carries ?rev= and a republish changes it. UNPINNED (legacy rows with no revision) renders the
+    LIVE draft, whose bytes change under the same URL, so it must never be cached: that is the
+    other half of "the PDF didn't update"."""
+    h = {"Content-Disposition": 'inline; filename="proposal.pdf"'}
+    h["Cache-Control"] = "private, max-age=600" if rev else "no-store, must-revalidate"
+    return h
+
+
+def _pdf_cache_put(pid: str, rev: object, content: bytes) -> None:
     """Store rendered bytes, sweeping expired entries and enforcing a hard cap so
     the cache can't grow unbounded (a bare dict would retain every viewed PDF for
     the life of the process)."""
@@ -1166,11 +1184,15 @@ def _pdf_cache_put(pid: str, content: bytes) -> None:
         _PDF_CACHE.pop(k, None)
     while len(_PDF_CACHE) >= _PDF_CACHE_MAX:
         _PDF_CACHE.pop(next(iter(_PDF_CACHE)), None)   # evict oldest-inserted
-    _PDF_CACHE[pid] = (now + _PDF_TTL, content)
+    _PDF_CACHE[_pdf_cache_key(pid, rev)] = (now + _PDF_TTL, content)
 
 
 def _pdf_cache_drop(pid: str) -> None:
-    _PDF_CACHE.pop(pid, None)
+    """Drop EVERY revision's bytes for this proposal — the keys are now pid-scoped, so popping
+    the bare pid would leave every rev entry behind."""
+    prefix = f"{pid}@"
+    for k in [k for k in _PDF_CACHE if k == pid or k.startswith(prefix)]:
+        _PDF_CACHE.pop(k, None)
 
 
 @app.post("/api/portal/{token}/contacts")
@@ -1230,17 +1252,20 @@ def api_pdf(token: str, request: Request):
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     pid = p["proposal_id"]
-    hit = _PDF_CACHE.get(pid)
+    # The ROW's revision, never the client's. `?rev=` on the viewer's URL is a cache-buster only;
+    # honouring it as a selector would let anyone read a superseded revision's document.
+    rev = p.get("current_revision_no") or 0
+    hit = _PDF_CACHE.get(_pdf_cache_key(pid, rev))
     if hit and hit[0] > time.monotonic():
-        return Response(content=hit[1], media_type="application/pdf", headers=_PDF_HEADERS)
+        return Response(content=hit[1], media_type="application/pdf", headers=_pdf_headers(rev))
     # Preferred: render the real Treadwell PDF on demand from the proposal tool.
     if config.PROPOSAL_TOOL_URL and config.SERVICE_TOKEN:
         try:
             # Render the pinned revision, so the downloaded document and the prices
             # on the page can never disagree. Omitted for legacy rows → live draft.
             params = {"draft_id": pid}
-            if p.get("current_revision_no"):
-                params["revision_no"] = int(p["current_revision_no"])
+            if rev:
+                params["revision_no"] = int(rev)
             r = httpx.get(
                 config.PROPOSAL_TOOL_URL + "/api/admin/proposal-pdf",
                 params=params,
@@ -1248,8 +1273,9 @@ def api_pdf(token: str, request: Request):
                 timeout=90,
             )
             if r.status_code == 200:
-                _pdf_cache_put(pid, r.content)
-                return Response(content=r.content, media_type="application/pdf", headers=_PDF_HEADERS)
+                _pdf_cache_put(pid, rev, r.content)
+                return Response(content=r.content, media_type="application/pdf",
+                                headers=_pdf_headers(rev))
             log.info("proposal-pdf upstream %s for %s", r.status_code, pid)
         except Exception as exc:  # noqa: BLE001
             log.warning("proposal-pdf fetch failed: %s", exc)
