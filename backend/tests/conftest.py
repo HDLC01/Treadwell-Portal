@@ -68,3 +68,7 @@ def _no_view_records(request, monkeypatch):
     # nobody investigates slow.
     monkeypatch.setattr(db, "record_view", lambda pid, email: None, raising=False)
     monkeypatch.setattr(db, "list_views", lambda pid: [], raising=False)
+    # Stamped on every publish. It swallows its own failures too, so leaving it real costs the
+    # publish fixtures a connection-pool timeout each — slow, not red, which is the worse of the
+    # two for exactly the reason above.
+    monkeypatch.setattr(db, "mark_last_sent", lambda pid: None, raising=False)

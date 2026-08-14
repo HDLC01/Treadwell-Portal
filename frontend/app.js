@@ -849,11 +849,38 @@ function openDeposit() {
  *  It used to be an equality test against "proposal", so every step-bearing
  *  link (the notification bell and toasts both emit `#proposal/deposit`) fell
  *  through to the else branch and dumped the customer back into chat. */
+/** Tell the server the customer is looking at the proposal step — the ONE thing that marks a
+ *  proposal viewed.
+ *
+ *  Latched per revision, because this runs on every hash change and on every poll-driven
+ *  re-render. `undefined` is the never-signalled sentinel and `null` is a REAL value: rows that
+ *  predate revisions carry `revision_no: null`, and using null as the sentinel would mean those
+ *  customers were never recorded as having read anything.
+ *
+ *  The latch is set BEFORE the request so a burst of hash changes sends one POST, and reverted if
+ *  the request failed, so the next navigation retries. A stale tab gets `marked:false` and keeps
+ *  its latch — it re-fires by itself once the poll hands it the new revision, which is exactly the
+ *  case where the customer is watching the document swap under them. */
+let VIEW_SIGNALED_REV;
+function signalProposalViewed() {
+  if (!STATE) return;
+  const rev = STATE.revision_no == null ? null : STATE.revision_no;
+  if (VIEW_SIGNALED_REV === rev) return;
+  VIEW_SIGNALED_REV = rev;
+  api("POST", "/viewed", { revision_no: rev }).then((r) => {
+    if (!r.ok) VIEW_SIGNALED_REV = undefined;   // network or 5xx — retry on the next navigation
+  });
+}
+
 function applyHashView(scroll) {
   const [view, step] = location.hash.replace("#", "").split("/");
   if (view === "proposal") {
     if (step && STEP_CARDS[step]) ACTIVE_STEP = step;
     hide($("chat-view")); show($("proposal-view"));
+    // Every route into the proposal step passes through here: the chat card's "View proposal"
+    // button, the deposit card, the sidebar steps, a bell/toast deep link, a direct #proposal on
+    // first load, and a poll re-render while the customer is already on it.
+    signalProposalViewed();
     applyStepPanel();
     if (scroll) window.scrollTo({ top: 0, behavior: "smooth" });   // only on a user nav, not a poll refetch
   } else {

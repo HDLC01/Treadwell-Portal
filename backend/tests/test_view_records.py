@@ -50,21 +50,50 @@ def _code():
                      if not l.strip().startswith("#"))
 
 
+def _route(name):
+    """The body of one route handler: from its `def` to the next decorator.
+
+    These assertions are about WHICH endpoint marks a view, so they have to be scoped to an
+    endpoint. Searched over the whole file they only proved the calls existed somewhere, which is
+    how they stayed green while the marking sat on the wrong route for months."""
+    code = _code()
+    start = code.index(f"def {name}(")
+    rest = code[start:]
+    end = rest.find("\n@app.")
+    return rest if end == -1 else rest[:end]
+
+
 # ── recording a view ─────────────────────────────────────────────────────────
 def test_the_view_is_recorded_against_the_SESSION():
     """The whole value is that it says who was signed in when the page was fetched. Anything
-    client-supplied would make it a claim rather than a record."""
-    code = _code()
-    assert 'db.record_view(p["proposal_id"], se)' in code, "the view is not recorded at all"
-    assert "se = _session_email(request)" in code[:code.index("db.record_view")]
+    client-supplied would make it a claim rather than a record — the endpoint takes a body now,
+    so a caller could otherwise nominate somebody else as the reader."""
+    body = _route("api_portal_viewed")
+    assert "db.record_view(" in body, "the view is not recorded at all"
+    assert "_session_email(request)" in body[body.index("db.record_view"):], (
+        "record_view is not passed the SESSION email")
 
 
 def test_the_shared_status_is_left_alone():
     """mark_viewed still runs, and first. One status for the project is what Hanz asked to keep;
     this table is additional, not a replacement."""
-    code = _code()
-    assert 'db.mark_viewed(p["proposal_id"])' in code
-    assert code.index("db.mark_viewed") < code.index("db.record_view")
+    body = _route("api_portal_viewed")
+    assert 'db.mark_viewed(p["proposal_id"])' in body
+    assert body.index("db.mark_viewed") < body.index("db.record_view")
+
+
+def test_merely_loading_the_portal_does_not_count_as_a_view():
+    """THE REGRESSION THIS CHANGE EXISTS TO CREATE, pinned so it cannot drift back.
+
+    Marking on the authenticated GET meant "Viewed" said the customer's BROWSER fetched the
+    portal. Hanz, 2026-08-13: "it should only move to viewed if they actually click view the
+    proposal … They need first to open the Status page under the Proposal Step." It also let an
+    open tab's 12-second poll re-mark a row seconds after a re-send had reset it to 'sent', which
+    is why a re-sent proposal never moved back on the board."""
+    for route in ("api_get_portal", "api_messages"):
+        body = _route(route)
+        assert "db.mark_viewed" not in body, f"{route} marks the proposal viewed"
+        assert "db.record_view" not in body, f"{route} records a view"
 
 
 def test_recording_never_breaks_the_customers_page(monkeypatch):

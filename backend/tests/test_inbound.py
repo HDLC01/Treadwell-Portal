@@ -179,12 +179,15 @@ REAL_AUTH = ("amazonses.com; spf=pass (spfCheck: domain of wetreadwell.com desig
 
 def test_outbound_stamps_the_proposal_anchor():
     h = email_sender._thread_headers("c@x.com", "TOK123abc")
-    assert email_sender.proposal_anchor("TOK123abc") in h["References"]
-    # Per-recipient anchor kept too, so the login code still threads with the proposal.
-    assert "treadwell-portal." in h["References"]
-    # In-Reply-To is the proposal, so a customer with several projects gets a
-    # thread per project rather than one merged pile.
-    assert h["In-Reply-To"] == email_sender.proposal_anchor("TOK123abc")
+    anchor = email_sender.proposal_anchor("TOK123abc")
+    assert h["References"] == anchor
+    assert h["In-Reply-To"] == anchor
+    # The per-recipient anchor is GONE from a project email, and its absence is the fix.
+    # Every access code sent before 2026-08-11 went out on <treadwell-portal.<sha1(email)>@…>;
+    # while project mail still carried that Message-ID in References, Gmail's threading graph
+    # filed the project conversation in with those old codes. Hanz, 2026-08-13: "the treadwell
+    # access code should not be the same email thread, only the projects."
+    assert "treadwell-portal." not in h["References"]
 
 
 def test_outbound_without_a_token_is_unchanged():

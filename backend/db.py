@@ -302,8 +302,9 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
     otherwise lose the estimator on exactly those rows. Reading `drafts` is
     already granted to portal_app in prod (security_prod.sql, portal_app_read_drafts).
 
-    `created_at` IS the sent-at: a row cannot exist before the email goes out.
-    Note `viewed_at` is FIRST view only (mark_viewed coalesces it)."""
+    `created_at` is when the FIRST send went out; `last_sent_at` moves with every re-send, and the
+    pipeline prefers it so a re-sent card shows when it was actually re-sent rather than the
+    original date. Note `viewed_at` is FIRST view only (mark_viewed coalesces it)."""
     return qall(
         "select p.proposal_id, p.token, p.customer_email, p.customer_name, p.project_name, "
         "p.proposal_status, p.deposit_status, p.contacts_status, p.schedule_status, "
@@ -327,6 +328,8 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # Verified against the prod database: absent key -> NULL, present key -> identical value.
         "(to_jsonb(p) ->> 'link_clicked_at')::timestamptz as link_clicked_at, "
         "(to_jsonb(p) ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
+        # When THIS send went out, for the same to_jsonb reason as the click columns above.
+        "(to_jsonb(p) ->> 'last_sent_at')::timestamptz as last_sent_at, "
         # Follow-up automation state.
         "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
         "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "
@@ -640,6 +643,21 @@ def mark_link_clicked(proposal_id: str) -> None:
         "last_link_clicked_at = now() where proposal_id = %s",
         (proposal_id,),
     )
+
+
+def mark_last_sent(proposal_id: str) -> None:
+    """When THIS send went out. `created_at` records the first one and never moves, so a re-sent
+    proposal used to re-enter the board's Sent column still showing the original date — staff
+    could see it had gone back to Sent but not that it had just been sent again.
+
+    Best-effort on purpose: prod applies its DDL by hand, so this column can arrive after the code
+    does, and a missing column must never stop a proposal being delivered. The pipeline falls back
+    to `created_at` until it lands."""
+    try:
+        execute("update public.portal_proposals set last_sent_at = now() where proposal_id = %s",
+                (proposal_id,))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not stamp last_sent_at on %s: %s", proposal_id, exc)
 
 
 def mark_viewed(proposal_id: str) -> None:

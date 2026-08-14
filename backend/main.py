@@ -593,13 +593,18 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         return _json(base)
     # The snapshot they were SENT, not whatever an estimator has since typed.
     data = db.get_pinned_draft_data(p) or {}
-    db.mark_viewed(p["proposal_id"])
-    # And WHICH recipient it was. mark_viewed above is untouched: the customer-facing status is
-    # shared on purpose, one status for the whole project. This is the staff-side question of
-    # which of two contacts has actually opened it. record_view swallows its own failures, so a
-    # missing migration costs the CRM a name rather than costing the customer their proposal.
-    db.record_view(p["proposal_id"], se)
-    p = db.get_proposal(p["proposal_id"])
+    # THIS ROUTE MARKS NOTHING. Signing in and landing in chat is not reading the proposal, and
+    # marking here made "Viewed" mean "their browser fetched the portal". Two consequences, both
+    # reported by Hanz on 2026-08-13:
+    #   • "it should only move to viewed if they actually click view the proposal … They need
+    #     first to open the Status page under the Proposal Step."
+    #   • "I have resent the proposal again but it didnt move back to sent?" — publish DOES reset
+    #     viewed→sent (db.reset_for_revision), but any open portal tab erased it within 12s: the
+    #     poll sees revision_no change, refetches this endpoint, and the row was marked viewed
+    #     again with nobody having read anything. That phantom also re-stamped cycle_viewed_at,
+    #     putting the follow-up cadence on the "they opened it" track off a view that never was.
+    # The signal now comes from POST /api/portal/{token}/viewed, which the page fires when the
+    # proposal step is actually shown. See api_portal_viewed.
     vm = proposals.build_view_model(p, data)
     vm["questions"] = [_q(q) for q in db.list_questions(p["proposal_id"])]   # text-only (legacy UI)
     # _customer_msg, not _msg: `mine` has to be decided against the session that is asking, or
@@ -647,7 +652,9 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         "paused_until": _iso(p.get("followup_paused_until")),
         "closed": (p.get("proposal_status") or "") == "closed_lost",
     }
-    vm["sent_at"] = _iso(p.get("created_at"))
+    # The LATEST send, so a fresh revision doesn't inherit the original send's age — this drives
+    # the customer's "not moving forward?" card, which only offers itself after a few quiet days.
+    vm["sent_at"] = _iso(p.get("last_sent_at") or p.get("created_at"))
     base["view"] = vm
     return _json(base)
 
@@ -782,6 +789,50 @@ def api_messages(token: str, request: Request) -> JSONResponse:
         # when STAFF pause or close it from the drawer.
         "paused_until": _iso(p.get("followup_paused_until")),
         "closed": (p.get("proposal_status") or "") == "closed_lost"}})
+
+
+@app.post("/api/portal/{token}/viewed")
+async def api_portal_viewed(token: str, request: Request) -> JSONResponse:
+    """The customer opened the PROPOSAL STEP — the page with the status card and the document.
+
+    This is the only thing that marks a proposal viewed. It used to happen on any authenticated
+    GET of the portal, which meant signing in and reading the chat counted, and — worse — an open
+    tab's 12-second poll re-marked the row seconds after a re-send had deliberately reset it to
+    'sent'. Hanz, 2026-08-13: "it should only move to viewed if they actually click view the
+    proposal in the chatbox inside the portal. Not by clicking the portal link only."
+
+    THE REVISION GUARD IS LOAD-BEARING. `reset_for_revision` puts the row back to 'sent' on a
+    re-send, and `mark_viewed` stamps `cycle_viewed_at` precisely when the status is 'sent' — so a
+    tab still showing the PREVIOUS revision, posting this on a hash change, would recreate the same
+    phantom view in a new shape and restart the follow-up cadence on the wrong track. A tab may
+    only mark the revision it is actually displaying.
+
+    A mismatch is a 200, not an error: the client latches on the response, and a stale tab must
+    stop asking rather than retry forever against a revision it will never hold. It re-fires
+    correctly once its poll delivers the new revision."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    raw = (await _body(request)).get("revision_no")
+    def _rev(v):
+        # Legacy rows have no revision at all; None is a real value here, not "missing".
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    if _rev(raw) != _rev(p.get("current_revision_no")):
+        return _json({"ok": True, "marked": False})
+    try:
+        # NOT self-guarded, unlike record_view — and it used to run inside the customer's main GET,
+        # where a database blip took the whole proposal page down with it.
+        db.mark_viewed(p["proposal_id"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mark_viewed failed for %s: %s", p["proposal_id"], exc)
+        return _json({"ok": True, "marked": False})
+    # WHICH recipient opened it — the staff-side question, separate from the shared status. The
+    # session decides, never the body: the email is what the drawer prints beside "Viewed".
+    db.record_view(p["proposal_id"], _session_email(request))
+    return _json({"ok": True, "marked": True})
 
 
 @app.post("/api/portal/{token}/approve")
@@ -1785,6 +1836,11 @@ async def admin_publish(request: Request) -> JSONResponse:
                                                  reply_to=rt, note=note, token=token,
                                                  revised=revised)]
 
+    # When this send went out, so a re-sent card shows the re-send date rather than the original.
+    # Stamped for every publish, including one that emailed nobody — same rule as created_at and
+    # the enrolment below, which also record the SEND rather than its delivery.
+    db.mark_last_sent(draft_id)
+
     # Enrol (or re-enrol) in follow-up automation. Stamped AFTER the emails go out so
     # the cadence clock starts from the send the customer actually received, and last
     # so a failure here can never stop a proposal from being delivered.
@@ -1882,7 +1938,10 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # staff side picks the latest of these — it also owns turning the
             # email into a name, because portal_app is denied `profiles`.
             "estimator_email": r.get("estimator_email"),
-            "sent_at": _iso(r.get("created_at")),        # a row can't exist unsent
+            # The LATEST send. created_at is the first one and never moves, so a re-sent card
+            # would otherwise re-enter Sent showing a date from weeks earlier. Coalesced in
+            # Python so rows predating the column (and every dict fixture) keep working.
+            "sent_at": _iso(r.get("last_sent_at") or r.get("created_at")),
             "viewed_at": _iso(r.get("viewed_at")),       # FIRST view only
             "approved_at": _iso(r.get("approved_at")),
             "deposit_requested_at": _iso(r.get("deposit_requested_at")),

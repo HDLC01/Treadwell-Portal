@@ -82,6 +82,8 @@ def publish(monkeypatch):
     monkeypatch.setattr(main.db, "set_assigned_estimator",
                         lambda pid, e: calls.setdefault("assigned", []).append(e))
     monkeypatch.setattr(main.db, "reopen_if_closed", lambda pid: False)
+    monkeypatch.setattr(main.db, "mark_last_sent",
+                        lambda pid: calls.setdefault("last_sent", []).append(pid))
     monkeypatch.setattr(main, "_pdf_cache_drop", lambda pid: None)
     monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda t: None)
     monkeypatch.setattr(main.email_sender, "send_portal_link",
@@ -110,6 +112,29 @@ def test_first_publish_pins_revision_one_and_sends_the_normal_email(publish):
     assert out["revised"] is False
     # No supersede on a first send — there is nothing to retire.
     assert calls["superseded"] == []
+
+
+def test_every_publish_stamps_when_this_send_went_out(publish):
+    """`created_at` records the FIRST send and never moves, so a re-sent proposal used to re-enter
+    the board's Sent column showing a date from weeks earlier — staff could see it had gone back to
+    Sent but not that it had just been sent again. Hanz, 2026-08-13: "I have resent the proposal
+    again but it didnt move back to sent?"
+
+    Asserted on the publish itself, not on the pipeline: a mutation deleting this call left every
+    other test green, because the read side coalesces to created_at and a column that is never
+    written simply stays null forever."""
+    _, calls = publish(None, {"draft_id": "p1", "revision_no": 1})
+    assert calls.get("last_sent") == ["p1"], "a first send did not record when it went out"
+
+    _, calls2 = publish(_EXISTING, {"draft_id": "p1", "revision_no": 2})
+    assert calls2.get("last_sent") == ["p1", "p1"], "a re-send did not move the sent date"
+
+
+def test_the_send_is_stamped_even_when_nobody_was_emailed(publish):
+    """Same rule as created_at and the follow-up enrolment beside it: they record the SEND, not
+    its delivery. A publish with no recipients still moved the proposal to the customer's portal."""
+    _, calls = publish(None, {"draft_id": "p1", "revision_no": 1, "emails": []})
+    assert calls.get("last_sent") == ["p1"]
 
 
 def test_revision_supersedes_the_old_card_and_posts_a_new_one(publish):

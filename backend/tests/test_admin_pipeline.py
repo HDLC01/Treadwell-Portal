@@ -118,10 +118,28 @@ def pipeline(monkeypatch):
 def test_card_carries_the_estimator_and_its_milestones(pipeline):
     card, = pipeline([_row()])
     assert card["estimator_email"] == "kyle@wetreadwell.com"
-    assert card["sent_at"].startswith("2026-07-20T14:00:00")     # created_at IS sent-at
+    # Never re-sent, so the first send stands: created_at is the fallback.
+    assert card["sent_at"].startswith("2026-07-20T14:00:00")
     assert card["viewed_at"].startswith("2026-07-22T09:30:00")
     assert card["approved_at"] is None
     assert card["deposit_requested_at"] is None
+
+
+def test_a_resent_card_shows_the_RESEND_date(pipeline):
+    """Hanz re-sent a revision and the card kept its original date, so "Sent" on the board could
+    mean "sent three weeks ago" for a proposal that went out ten minutes earlier. created_at
+    records the FIRST send and never moves; last_sent_at moves with every publish and wins."""
+    card, = pipeline([_row(last_sent_at=dt.datetime(2026, 8, 13, 21, 40, 0))])
+    assert card["sent_at"].startswith("2026-08-13T21:40:00")
+
+
+def test_a_row_without_the_column_falls_back(pipeline):
+    """Prod applies its DDL by hand, so this code can arrive before the column does. Until it
+    lands every row reads as never-re-sent rather than as never-sent."""
+    row = _row()
+    row.pop("last_sent_at", None)
+    card, = pipeline([row])
+    assert card["sent_at"].startswith("2026-07-20T14:00:00")
 
 
 def test_card_survives_a_missing_estimator(pipeline):

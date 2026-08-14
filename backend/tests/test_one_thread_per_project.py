@@ -134,6 +134,29 @@ def test_two_different_projects_are_two_different_threads(sent):
                                          message="b")
     assert sent[0]["subject"] != sent[1]["subject"]
     assert sent[0]["headers"]["In-Reply-To"] != sent[1]["headers"]["In-Reply-To"]
+    # References too, not just In-Reply-To. Gmail threads on the connectivity of the whole
+    # References GRAPH, so ONE shared Message-ID merges two conversations no matter how different
+    # their In-Reply-To and subject are. Until 2026-08-13 both projects carried the same
+    # per-recipient anchor here, so this pair was one node away from merging and the two
+    # assertions above could not see it.
+    assert sent[0]["headers"]["References"] != sent[1]["headers"]["References"]
+    refs = [set(m["headers"]["References"].split()) for m in sent[:2]]
+    assert not (refs[0] & refs[1]), f"two projects share a threading anchor: {refs[0] & refs[1]}"
+
+
+def test_a_project_email_carries_only_its_own_anchor(sent):
+    """The access-code merge, stated as the header rule that prevents it.
+
+    Hanz, 2026-08-13: "the treadwell access code should not be the same email thread, only the
+    projects." The OTP has had its own anchor since 2026-08-11 — the merge came from the other
+    side: project mail carried <treadwell-portal.<sha1(email)>@…> in References, which is the
+    Message-ID every code sent before that date went out on, so Gmail filed the project thread in
+    with the old codes."""
+    email_sender.send_portal_link(CUSTOMER, "Dana Reed", _url(), PROJECT, token=TOKEN)
+    refs = sent[0]["headers"]["References"].split()
+    assert refs == [email_sender.proposal_anchor(TOKEN)], refs
+    assert "treadwell-portal." not in sent[0]["headers"]["References"]
+    assert "treadwell-otp." not in sent[0]["headers"]["References"]
 
 
 # ── the staff side ───────────────────────────────────────────────────────────

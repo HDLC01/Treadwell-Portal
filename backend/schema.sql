@@ -365,6 +365,9 @@ alter table public.portal_proposals add column if not exists last_viewed_at time
 -- columns let the board say "the email got through" without claiming anybody read the bid.
 alter table public.portal_proposals add column if not exists link_clicked_at timestamptz;
 alter table public.portal_proposals add column if not exists last_link_clicked_at timestamptz;
+-- When the LATEST send went out. created_at records the first one and never moves, so without
+-- this a re-sent proposal re-enters the board's Sent column still showing the original date.
+alter table public.portal_proposals add column if not exists last_sent_at timestamptz;
 alter table public.portal_proposals add column if not exists deposit_submitted_at timestamptz;
 alter table public.portal_proposals add column if not exists deposit_received_at timestamptz;
 alter table public.portal_proposals add column if not exists contacts_received_at timestamptz;

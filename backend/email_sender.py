@@ -135,21 +135,34 @@ def project_thread_headers(token: str | None) -> dict[str, str] | None:
 def _thread_headers(email: str, token: str | None = None) -> dict[str, str]:
     """Group portal email into inbox threads AND carry the proposal identity.
 
-    Two anchors, both echoed back on reply:
-    - a per-recipient anchor, so the login code lands in the same conversation as
-      the proposal link (and is never shown on a web page);
-    - a per-proposal anchor (when `token` is given), which is what the inbound
-      webhook reads to route a reply to the right project.
+    WITH A TOKEN: the proposal anchor and nothing else, so a project's mail forms exactly one
+    conversation containing only that project.
 
-    In-Reply-To gets the proposal anchor when we have one, so a customer with
-    several projects gets a thread per project rather than one merged pile."""
+    Hanz, 2026-08-13: "the treadwell access code should not be the same email thread, only the
+    projects." The access code was never the problem — it got its own anchor (`_otp_headers`) on
+    2026-08-11. The problem was here: this function still prefixed a PER-RECIPIENT anchor,
+    `<treadwell-portal.<sha1(email)>@…>`, to References, and that is the exact Message-ID every
+    access code sent BEFORE 2026-08-11 went out on. Gmail threads on References-graph
+    connectivity, so a project email sharing that node gets filed into the conversation already
+    holding those old codes. The codes were not joining the project thread; the project thread was
+    joining the codes. The per-recipient anchor's only documented job was to make the login code
+    land beside the proposal link — the opposite of what is wanted now — so it goes.
+
+    It was also a latent cross-project merge: two proposals to the same customer shared that node,
+    and only In-Reply-To and the subject kept them apart.
+
+    WITHOUT A TOKEN: no proposal to anchor to, so fall back to the per-recipient mid. Nothing
+    reaches this branch today (every customer sender passes a token) — it is the safe default for
+    a future caller rather than live behaviour.
+
+    Gmail never un-merges an existing conversation: this stops NEW mail from joining a merged
+    thread; threads already merged stay merged."""
     recipient = hashlib.sha1((email or "").strip().lower().encode()).hexdigest()[:24]
     mid = f"<treadwell-portal.{recipient}@wetreadwell.com>"
     if not token:
         return {"References": mid, "In-Reply-To": mid}
     anchor = proposal_anchor(token)
-    # RFC 5322: References is a space-separated list, oldest first.
-    return {"References": f"{mid} {anchor}", "In-Reply-To": anchor}
+    return {"References": anchor, "In-Reply-To": anchor}
 
 
 def _send(to: list[str], subject: str, html: str, headers: dict[str, str] | None = None,
