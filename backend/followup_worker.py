@@ -274,6 +274,56 @@ def _send_staff(p: dict, due) -> bool:
         return False
 
 
+# What each reminder says once it is in the conversation, written for the person who RECEIVED it.
+#
+# Hanz, 2026-08-19: "For the Email follow ups, can it appear in the ChatBox and a history of the
+# follow ups." Until now a customer who reads the portal instead of their inbox watched the thread
+# go silent while six emails went out — and staff had no shared record of what had been chased.
+#
+# The internal vocabulary stays internal. "Nudge", "second nudge", "chase", "cadence" and the rule
+# keys are how we talk about this to each other; `not_viewed` rendered on a customer's own screen as
+# "Not opened yet" reads like being told off. Each line below says what we did and why, in the words
+# we would use to their face.
+_ECHO = {
+    "not_viewed": "Reminder sent — we emailed you a link to the proposal in case it got buried.",
+    "next_steps": "Reminder sent — we emailed you about the next steps on this proposal.",
+    "second_nudge": "Reminder sent — we emailed you again about this proposal.",
+    "checkin": "Checking in — we emailed you to see where this stands.",
+    "deposit_nudge": "Reminder sent — we emailed you about the deposit for this project.",
+}
+
+
+def _echo_to_thread(pid: str, due) -> None:
+    """Put a sent reminder into the project's conversation, so both sides can see it happened.
+
+    CUSTOMER SENDS ONLY, and that gate is the whole safeguard. Every staff template in
+    `_send_staff` is written for us and not for them — "A quick call often beats another email",
+    "this one is ours to chase", "Dates aren't held until the deposit is in" — plus the customer's
+    own address, the amount owed and a CRM link. The thread has no per-message visibility flag: the
+    customer endpoint returns every row. So an internal note posted here is an internal note the
+    customer reads.
+
+    `msg_type="system"` because both screens already render that as a card (app.js in the portal,
+    portal.js in the staff drawer) and it sits inside the existing CHECK constraint — no new message
+    type, so no migration. `meta.followup` marks these as machine-sent, which is what keeps them out
+    of the customer's notification bell: being emailed and then pinged about having been emailed is
+    one event, not two.
+
+    Called only after a send actually succeeded, so a released reservation leaves no claim that we
+    wrote to somebody we did not. Best-effort: the email has gone, and nothing here is worth undoing
+    it over."""
+    if getattr(due, "audience", "") != "customer":
+        return
+    body = _ECHO.get(getattr(due, "template", ""))
+    if not body:
+        return                              # an unmapped template says nothing rather than guessing
+    try:
+        db.add_message(pid, "staff", None, body, msg_type="system",
+                       meta={"followup": True, "template": due.template})
+    except Exception as exc:  # noqa: BLE001 — the email is away; the record is a courtesy
+        log.warning("[followup] could not echo %s to %s's thread: %s", due.template, pid, exc)
+
+
 def _tick(now: datetime | None = None) -> None:
     if not _enabled():
         return
@@ -314,5 +364,6 @@ def _tick(now: datetime | None = None) -> None:
                              pid, due.rule_key)
                 else:
                     log.info("[followup] %s %s -> %s", pid, due.rule_key, due.audience)
+                    _echo_to_thread(pid, due)
         except Exception as exc:  # noqa: BLE001 — never let one row end the sweep
             log.warning("[followup] skipped %s: %s", pid, exc)

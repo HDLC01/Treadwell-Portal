@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 
@@ -45,7 +47,8 @@ def _shipped_email_wording(request, monkeypatch):
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "realdb: keep the real db view/recipient helpers instead of the autouse stubs below")
+        "realdb: keep the real db view/recipient/notify-roster helpers instead of the autouse "
+        "stubs below")
     config.addinivalue_line(
         "markers",
         "realwording: keep the real email-wording readers instead of the autouse stubs above")
@@ -72,3 +75,82 @@ def _no_view_records(request, monkeypatch):
     # publish fixtures a connection-pool timeout each — slow, not red, which is the worse of the
     # two for exactly the reason above.
     monkeypatch.setattr(db, "mark_last_sent", lambda pid: None, raising=False)
+
+
+# ── the notification roster, read TWICE on every staff email ─────────────────
+# `email_sender._resolve_notify` reads portal_notify_recipients and then this project's
+# portal_notify_overrides, so every team notification makes two guarded reads. Both are correct
+# with no database and both waited out the connection pool's full 30s timeout first, and this was
+# by far the most expensive thing in the suite: 44 of the 52 stalls a whole-suite run made, which
+# is 22 of its 26 minutes. A publish ends in a send-confirmation notify_team, so the two files
+# that publish paid it per test — test_revisions.py 662s and test_creator_gets_notified.py 602s,
+# the latter with one test that publishes four times in a loop and therefore stalled eight times.
+#
+# `[]` rather than raising because for this caller the two are already indistinguishable:
+# resolve_notify_recipients() is handed configured=False either way and falls back to
+# config.NOTIFY_EMAILS / DEPOSIT_NOTIFY_EMAILS, and for the overrides an exception and an empty
+# list both leave adds/mutes empty. `staff_emails()` reads the same two and falls through to the
+# same env lists on either. So this does not pick a different branch from the one the suite was
+# already taking — it stops the suite paying a minute per send to arrive at it. Verified: with
+# these reads failing instantly instead of slowly, all 816 tests still pass.
+#
+# Patched at the two db functions, for the reason this file keeps repeating. The files that own
+# this behaviour install their own roster and therefore override these — test_inbound.py's
+# staff_emails pair, test_chat_reaches_the_estimator.py (a FakeDB in sys.modules),
+# test_notify_pick_applied.py, test_staff_reply_by_email.py — because a function-scoped autouse
+# fixture runs before the test body. Nothing reads either function UNGUARDED under test:
+# /api/admin/notify-recipients and /api/admin/proposal/{id}/notify-overrides are staging-smoke
+# territory, per the convention stated at the top of test_customer_auth.py.
+@pytest.fixture(autouse=True)
+def _no_notify_roster(request, monkeypatch):
+    if "realdb" in request.keywords:
+        return
+    import db
+    monkeypatch.setattr(db, "list_notify_recipients", lambda: [], raising=False)
+    monkeypatch.setattr(db, "list_notify_overrides", lambda pid: [], raising=False)
+
+
+# ── the backstop: an unstubbed call costs a second, not thirty ────────────────
+# Everything above is the actual fix, and each entry is at a named function and says why. This is
+# only the net underneath it, for the NEXT call somebody forgets: psycopg_pool's default `timeout`
+# is 30 seconds, so ONE unguarded-but-guarded read is 30 seconds per call, and the symptom is a
+# slow suite rather than a red one. Nobody investigates slow — which is how each of the entries
+# above cost minutes for weeks before anyone measured.
+#
+# It shortens the WAIT and nothing else. The call still runs, still reaches psycopg, still fails,
+# and still fails the same way: `getconn` reads `self.timeout` per acquisition and raises
+# PoolTimeout either way, so a guarded caller takes exactly the fallback it takes today and an
+# unguarded one still 500s. db.get_settings in particular still raises SettingsUnreadable for a
+# connection failure and still returns None for a missing table, which is what
+# test_any_other_read_failure_is_reported_not_swallowed and its neighbour pin (they patch db.q1
+# and never reach the pool at all).
+#
+# NOT a substitute for a stub, and deliberately not sized like one: a second times a few hundred
+# calls is still minutes. --durations=25 in pytest.ini is how the next one gets spotted.
+#
+# One read legitimately relies on this rather than on a stub, and it is named here so the next
+# person does not "tidy" it into the fixtures above: portal_page's db.get_proposal_by_token, hit
+# once by test_invoice_delivery.py::test_assets_and_shell_always_revalidate. That test asks
+# GET /p/{token} whether it carries a no-cache header; the landing page's click-recording read is
+# incidental to it, and get_proposal_by_token is a primary lookup that a blanket autouse stub
+# would quietly answer "not found" for on every future customer route. One second is the right
+# price for it.
+@pytest.fixture(autouse=True, scope="session")
+def _pool_gives_up_quickly():
+    import db
+
+    real_pool = db.pool
+
+    def impatient_pool():
+        p = real_pool()
+        p.timeout = 1.0
+        return p
+
+    db.pool = impatient_pool
+    # Belt and braces for an environment where DATABASE_URL points somewhere routable but silent:
+    # the pool deadline above caps how long a CALLER waits, while this caps how long the pool's
+    # own background worker sits on a TCP handshake. Inert on the default localhost URL, where the
+    # connection is refused immediately.
+    os.environ.setdefault("PGCONNECT_TIMEOUT", "1")
+    yield
+    db.pool = real_pool

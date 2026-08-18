@@ -421,7 +421,12 @@ def list_customer_events(email: str, limit: int = 30) -> list[dict[str, Any]]:
     approvals, deposits received and scheduling.
 
     Scoped by the same primary-OR-recipient union as list_proposals_by_email, so
-    one customer can never see another's activity."""
+    one customer can never see another's activity.
+
+    An automated follow-up echo is excluded. Those rows record an email the customer has just
+    RECEIVED (followup_worker._echo_to_thread), so ringing the bell about it makes one event look
+    like two — the reminder lands in their inbox and again as unread activity in the portal. It
+    still appears in the thread, where it belongs as a record of what we sent."""
     return qall(
         "select q.id, q.proposal_id, q.msg_type, q.body, q.created_at, "
         "       p.project_name, p.token "
@@ -429,6 +434,7 @@ def list_customer_events(email: str, limit: int = 30) -> list[dict[str, Any]]:
         "join public.portal_proposals p on p.proposal_id = q.proposal_id "
         "where q.author_kind = 'staff' "
         "  and q.msg_type in ('text','deposit_request','system') "
+        "  and coalesce((q.meta->>'followup')::boolean, false) = false "
         "  and q.proposal_id in ("
         "    select proposal_id from public.portal_proposals where lower(customer_email) = lower(%s)"
         "    union"
@@ -932,7 +938,13 @@ def add_followup(proposal_id: str, kind: str, detail: Optional[dict] = None,
               (proposal_id, kind, Jsonb(detail or {}), created_by))
 
 
-def list_followups(proposal_id: str, limit: int = 20) -> list[dict[str, Any]]:
+def list_followups(proposal_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    """One project's follow-up history, newest first.
+
+    The cap was 20, which is fewer than a long chase produces: the automated cadence writes a row
+    per reminder, staff calls and notes write their own, and the earliest sends — the ones that
+    answer "how long have we been at this?" — were the first to fall off the end. 100 is still a
+    bound, and this is one project's rows behind an index on (proposal_id, created_at desc)."""
     return qall("select id, kind, detail, created_by, created_at from public.portal_followups "
                 "where proposal_id=%s order by created_at desc limit %s",
                 (proposal_id, limit))

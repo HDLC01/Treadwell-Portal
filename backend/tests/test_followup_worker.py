@@ -29,7 +29,11 @@ def _proposal(**over):
 
 def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
           send_ok=True, staff_ok=True, enabled="true"):
-    calls = {"reserved": [], "deleted": [], "customer": [], "staff": [], "candidates": 0}
+    calls = {"reserved": [], "deleted": [], "customer": [], "staff": [], "candidates": 0,
+             # What the worker echoed into the project's conversation. Stubbed like every other
+             # database call here: unstubbed it is a real connection, and this one runs on the
+             # success path of every test in the file.
+             "thread": []}
     p = proposal if proposal is not None else _proposal()
 
     monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", enabled)
@@ -60,6 +64,10 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
 
     monkeypatch.setattr(fw.db, "reserve_followup", _reserve)
     monkeypatch.setattr(fw.db, "delete_followup", lambda rid: calls["deleted"].append(rid))
+    monkeypatch.setattr(
+        fw.db, "add_message",
+        lambda pid, kind, who, body, **k: calls["thread"].append(
+            {"body": body, "msg_type": k.get("msg_type"), "meta": k.get("meta")}) or {"id": 1})
     monkeypatch.setattr(fw.email_sender, "proposal_reply_to", lambda t: "proposals@notify.x")
     monkeypatch.setattr(fw.email_sender, "_resolve_notify", lambda kind, pid=None: ["bids@x.com"])
     monkeypatch.setattr(
@@ -284,3 +292,88 @@ def test_anything_that_is_not_an_explicit_yes_leaves_automation_off(monkeypatch)
     for junk in ("", "of", "truee", "maybe", "disabled", "off", "0", "no"):
         monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", junk)
         assert fw._enabled() is False, junk
+
+
+# ── the reminder appears in the conversation ──────────────────────────────────
+# Hanz, 2026-08-19: "For the Email follow ups, can it appear in the ChatBox and a history of the
+# follow ups." A customer who reads the portal rather than their inbox used to watch the thread go
+# silent while six emails went out, and staff had no shared record of what had been chased.
+def test_a_sent_reminder_appears_in_the_thread(monkeypatch):
+    calls = _wire(monkeypatch)
+    fw._tick(NOW)
+    assert len(calls["thread"]) == 1, calls["thread"]
+    echo = calls["thread"][0]
+    # `system` because both screens already render that as a card — the customer's app.js and the
+    # staff drawer's portal.js — and because it sits inside the existing msg_type CHECK constraint,
+    # so this needed no migration.
+    assert echo["msg_type"] == "system"
+    assert echo["meta"]["followup"] is True, "not marked machine-sent, so it will ring the bell"
+    # Written as "Heading — detail": both renderers split on the dash for the card's title.
+    assert " — " in echo["body"], echo["body"]
+
+
+def test_the_wording_is_what_we_would_say_to_the_customers_face(monkeypatch):
+    """The customer sees this row in their own thread. Our internal vocabulary for the cadence —
+    "nudge", "chase", "second nudge", the rule keys, the template names — reads as being told off
+    when it is pointed at the person it describes.
+
+    Mutation: echo `due.template` or `due.rule_key` instead of a sentence."""
+    calls = _wire(monkeypatch)
+    fw._tick(NOW)
+    body = calls["thread"][0]["body"].lower()
+    for word in ("nudge", "chase", "cadence", "not_viewed", "rule", "template"):
+        assert word not in body, "internal wording reached the customer: %r" % body
+    assert "we emailed you" in body, body
+
+
+def test_nothing_is_written_when_the_email_did_not_go(monkeypatch):
+    """The reservation is released and retried, so a row here would claim we wrote to somebody we
+    never reached — and the retry would then write a second one."""
+    calls = _wire(monkeypatch, send_ok=False)
+    fw._tick(NOW)
+    assert calls["customer"], "the test needs a send attempt to have happened"
+    assert calls["thread"] == []
+
+
+def test_an_internal_note_to_the_team_never_reaches_the_customers_thread(monkeypatch):
+    """THE safeguard, and the reason the echo is gated on audience rather than filtered later.
+
+    Every staff template is written for us: "A quick call often beats another email", "this one is
+    ours to chase", "Dates aren't held until the deposit is in". They also carry the customer's own
+    address, the amount owed and a CRM link. The thread has no per-message visibility flag — the
+    customer endpoint returns every row — so anything posted here is something the customer reads.
+
+    Mutation: drop the `audience == "customer"` guard in _echo_to_thread."""
+    # Driven straight at the guard rather than through the cadence: whether a staff-only reminder
+    # happens to be due on a given fixture is a scheduling question, and this is a confidentiality
+    # one. Every staff template is asserted, so adding a new one without deciding this again shows
+    # up here.
+    calls = _wire(monkeypatch)
+    written = []
+    monkeypatch.setattr(fw.db, "add_message",
+                        lambda *a, **k: written.append(a) or {"id": 1})
+
+    class _Due:
+        def __init__(self, audience, template):
+            self.audience, self.template = audience, template
+            self.rule_key = template
+
+    for template in ("staff_not_viewed", "staff_pause_expired",
+                     "staff_personal_followup", "staff_deposit_outstanding"):
+        fw._echo_to_thread("p1", _Due("staff", template))
+    assert written == [], (
+        "an internal note was posted into the customer's conversation: %r" % written)
+
+    # THE AUDIENCE GUARD, ON ITS OWN. The four names above are also absent from the wording map, so
+    # they would be refused by that lookup even with the guard gone — asserting only those passes
+    # whether or not the guard exists, which is a test proving nothing. This case carries a template
+    # the map DOES know with a staff audience, so the guard is the single thing standing between an
+    # internal reminder and the customer's screen.
+    fw._echo_to_thread("p1", _Due("staff", "not_viewed"))
+    assert written == [], (
+        "a staff-audience reminder was echoed to the customer because the audience guard is gone")
+
+    # …and the same call with a customer audience DOES write, so the assertion above is the guard
+    # working rather than the echo being broken.
+    fw._echo_to_thread("p1", _Due("customer", "not_viewed"))
+    assert len(written) == 1, "the customer echo stopped working, so the test above proves nothing"

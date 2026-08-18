@@ -15,6 +15,12 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: pip install -r requirements-dev.txt
+      # --dist loadfile, not the default load: this suite has module-scoped fixtures that shell
+      # out to node once per file (test_pdf_url_revision, test_portal_pricing_labels,
+      # test_view_signal_js), and `load` hands individual tests to whichever worker is free —
+      # which would re-run each of those harnesses once per worker. loadfile keeps a file whole
+      # on one worker, so intra-file ordering and per-file setup both behave as they do serially.
+      # --durations and testpaths come from backend/pytest.ini.
       - name: Run tests
         working-directory: backend
-        run: python -m pytest -q
+        run: python -m pytest -q -n auto --dist loadfile
