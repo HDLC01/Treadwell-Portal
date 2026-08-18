@@ -1888,18 +1888,35 @@ async def admin_publish(request: Request) -> JSONResponse:
                                                  reply_to=rt, note=note, token=token,
                                                  revised=revised)]
 
-    # When this send went out, so a re-sent card shows the re-send date rather than the original.
-    # Stamped for every publish, including one that emailed nobody — same rule as created_at and
-    # the enrolment below, which also record the SEND rather than its delivery.
+    # When this publish happened, so a re-sent card shows the re-send date rather than the
+    # original. Stamped even when nothing was delivered: somebody pressed send, and the card
+    # showing that attempt is how they find out it needs doing again.
     db.mark_last_sent(draft_id)
 
     # Enrol (or re-enrol) in follow-up automation. Stamped AFTER the emails go out so
     # the cadence clock starts from the send the customer actually received, and last
     # so a failure here can never stop a proposal from being delivered.
+    #
+    # ONLY IF SOMETHING ACTUALLY REACHED SOMEBODY. Hanz, 2026-08-19: "auto follow ups shoulnd
+    # trigger if a project was not sent". This used to enrol on every publish, so a send where
+    # every address bounced still started the cadence — and three days later the worker mailed
+    # that same dead address "just following up on the proposal we sent you", about a proposal it
+    # had never received. The confirmation email one block down already knows the difference and
+    # says "Proposal did NOT send"; the automation has to know it too.
+    #
+    # Skipping is also the right thing for a FAILED RE-SEND, and for the same reason enrolment is
+    # a re-anchor: revision 1 is out with the customer and being chased on its own clock. Moving
+    # that anchor to a revision-2 send that never landed would restart the cadence from a date
+    # nothing happened on, and (via cycle_key) discard the cycle's send history with it. Leaving
+    # the row untouched keeps chasing what the customer actually has.
     try:
         if assigned:
-            db.set_assigned_estimator(draft_id, assigned)
-        db.enroll_followup(draft_id)
+            db.set_assigned_estimator(draft_id, assigned)   # assignment is not a send
+        if emailed:
+            db.enroll_followup(draft_id)
+        else:
+            log.warning("not enrolling %s in follow-ups: the send reached nobody (%d attempted)",
+                        draft_id, len(send_list))
     except Exception as exc:  # noqa: BLE001 — the proposal is sent; automation is secondary
         log.warning("could not enrol %s in follow-ups: %s", draft_id, exc)
 
