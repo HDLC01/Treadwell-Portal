@@ -805,7 +805,16 @@ def test_the_pipeline_reads_the_new_columns_so_a_pre_DDL_prod_survives():
 def test_the_board_dates_come_from_the_saved_cadence_not_the_shipped_one(monkeypatch):
     """From the audit. The worker used the saved cadence and this column used the constants, so
     the moment anybody edited "every 3 days" every date on the board was wrong — and with a raised
-    max_recurring it reads "Nothing scheduled" while emails keep going out."""
+    max_recurring it reads "Nothing scheduled" while emails keep going out.
+
+    THE CLOCK IS FROZEN ON BOTH SIDES, and it has to be. This test anchored the row at the fixed
+    NOW above but let the endpoint call the real `_now_utc()`, so `elapsed` grew by 24h a day and on
+    2026-08-19 it walked into an arithmetic collision: at ~745h elapsed the shipped cadence gives
+    72 + 72×10 = 792h and a 240h cadence gives 72 + 240×3 = 792h, the same date, and a real
+    regression would have looked identical. It failed on main with nothing changed but the date.
+
+    So the assertion is no longer "these two differ" — it is the exact date each cadence produces,
+    computed from the rules rather than hardcoded, which cannot collide and cannot rot."""
     enrolled = NOW - timedelta(hours=400)
     viewed = NOW - timedelta(hours=400)
     row = {"proposal_id": "p1", "token": "t", "customer_email": "c@x.com",
@@ -813,6 +822,7 @@ def test_the_board_dates_come_from_the_saved_cadence_not_the_shipped_one(monkeyp
            "followup_enrolled_at": enrolled, "cycle_viewed_at": viewed, "created_at": enrolled}
     monkeypatch.setattr(portal_main.db, "unread_counts", lambda: {})
     monkeypatch.setattr(portal_main.db, "list_all_portal_proposals", lambda: [row])
+    monkeypatch.setattr(portal_main, "_now_utc", lambda: NOW)
 
     monkeypatch.setattr(portal_main.db, "get_settings", lambda k: None)
     shipped = client.get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
@@ -820,9 +830,19 @@ def test_the_board_dates_come_from_the_saved_cadence_not_the_shipped_one(monkeyp
     monkeypatch.setattr(portal_main.db, "get_settings", lambda k: {"recurring_hours": 240})
     saved = client.get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
 
-    assert shipped and saved, "the board stopped reporting a next reminder entirely"
-    assert shipped != saved, (
-        "changing the cadence did not move the board's date, so it is still using the constants")
+    # anchor + second_nudge + recurring × (n+1), the same expression due_now indexes on. Derived
+    # from followup_rules so an intentional change to the cadence maths updates both at once.
+    want_shipped = R.next_due_at(row, NOW, fs.defaults())
+    want_saved = R.next_due_at(
+        row, NOW, fs.merge({"recurring_hours": 240}))
+    assert want_shipped != want_saved, (
+        "the fixture no longer distinguishes the two cadences — pick a different recurring_hours")
+
+    assert shipped == want_shipped.isoformat(), (
+        "the board reports %s for the shipped cadence, the rules say %s" % (shipped, want_shipped))
+    assert saved == want_saved.isoformat(), (
+        "the board reports %s after the cadence was edited, the rules say %s — it is still using "
+        "the constants" % (saved, want_saved))
 
 
 def test_an_unreadable_cadence_does_not_take_the_whole_board_down(monkeypatch):
