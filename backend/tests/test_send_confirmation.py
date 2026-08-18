@@ -26,7 +26,7 @@ client = TestClient(main.app)
 def publish(monkeypatch):
     """A publish that touches no database and no mail server, recording every notify_team call
     and letting a test choose which customer emails 'deliver'."""
-    calls = {"notify": [], "emails": []}
+    calls = {"notify": [], "emails": [], "enrol": [], "assigned": []}
     state = {"send_ok": lambda to: True}
     proposal = {"token": "tok-1", "customer_email": "cust@acme.com", "proposal_status": "sent",
                 "assigned_estimator": "stored-est@wetreadwell.com"}
@@ -43,8 +43,9 @@ def publish(monkeypatch):
     monkeypatch.setattr(main.db, "add_recipient", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "remove_recipient", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: ["cust@acme.com"])
-    monkeypatch.setattr(main.db, "set_assigned_estimator", lambda *a, **k: None)
-    monkeypatch.setattr(main.db, "enroll_followup", lambda pid: None)
+    monkeypatch.setattr(main.db, "set_assigned_estimator",
+                        lambda pid, e: calls["assigned"].append(e))
+    monkeypatch.setattr(main.db, "enroll_followup", lambda pid: calls["enrol"].append(pid))
     monkeypatch.setattr(main.db, "mark_last_sent", lambda pid: None)
     monkeypatch.setattr(main.db, "add_notify_override_if_absent", lambda *a, **k: None)
     monkeypatch.setattr(main, "_pdf_cache_drop", lambda pid: None)
@@ -141,3 +142,59 @@ def test_a_later_revision_says_which_revision_went_out(publish):
     n = calls["notify"][0]
     assert "revision 3" in n["body"].lower(), (
         "a revision send reads identically to a first send")
+
+
+# ── the cadence needs a send that actually happened ──────────────────────────
+# Hanz, 2026-08-19: "auto follow ups shoulnd trigger if a project was not sent".
+#
+# Same fact as the confirmation above — did anything reach anybody — asked of the automation
+# instead of the email. The route used to enrol on every publish, so a send where every address
+# bounced still started the cadence, and the worker went on to mail that dead address "just
+# following up on the proposal we sent you" about a proposal it had never received.
+def test_a_send_that_reached_nobody_starts_no_cadence(publish):
+    go, calls, state = publish
+    state["send_ok"] = lambda to: False
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["emails"], "the test proved nothing: no send was even attempted"
+    assert calls["enrol"] == [], (
+        "the proposal was enrolled in follow-ups after reaching nobody — the customer gets chased "
+        "about a proposal they never received")
+
+
+def test_a_send_that_reached_somebody_does_start_one(publish):
+    """The other half, or the fix above is indistinguishable from deleting the feature."""
+    go, calls, _ = publish
+    go()
+    assert calls["enrol"] == ["d-1"], "a delivered proposal is no longer chased at all"
+
+
+def test_one_delivery_out_of_two_is_still_a_send(publish):
+    """The guard is "reached nobody", not "reached everybody". A second contact with a typo'd
+    address must not stop the customer who did get it from being followed up."""
+    go, calls, state = publish
+    state["send_ok"] = lambda to: to != "second@acme.com"
+    go(emails=["second@acme.com"])
+    assert calls["enrol"] == ["d-1"]
+
+
+def test_a_failed_resend_leaves_the_live_cadence_alone(publish):
+    """enroll_followup RE-anchors: it moves followup_enrolled_at to now and clears
+    cycle_viewed_at, and every rule key is scoped to that timestamp (followup_rules.cycle_key).
+    Calling it for a revision that never left the building would restart the clock from a date
+    nothing happened on and discard the cycle's send history, so revision 1 — which the customer
+    does have — gets chased from scratch. Not calling it is what leaves that alone."""
+    go, calls, state = publish
+    state["send_ok"] = lambda to: False
+    go(revision_no=2)
+    assert calls["enrol"] == [], "a failed re-send re-anchored the cadence"
+
+
+def test_the_estimator_is_still_recorded_when_the_send_fails(publish):
+    """Assignment is not a send. Whoever owns the job still owns it, and the confirmation email
+    that says the send failed is addressed to them — dropping the write with the enrolment would
+    lose the one person who has to act on it."""
+    go, calls, state = publish
+    state["send_ok"] = lambda to: False
+    go(assigned_estimator="kyle@wetreadwell.com")
+    assert calls["assigned"] == ["kyle@wetreadwell.com"]
