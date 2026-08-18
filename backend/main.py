@@ -1811,6 +1811,58 @@ async def admin_publish(request: Request) -> JSONResponse:
             log.warning("could not add the creator %s to %s's notifications: %s",
                         creator, draft_id, exc)
 
+    # WHO HEARS ABOUT *THIS* SEND, chosen on the Files screen before pressing Send.
+    #
+    # Hanz, 2026-08-19: "we need that notifcation sending selection in the Files. so we can select
+    # who receives it first."
+    #
+    # It has to arrive in the publish body rather than as a separate call the browser makes first,
+    # and that is not a style choice. `portal_notify_overrides.proposal_id` is a foreign key onto
+    # `portal_proposals`, and on a FIRST send that row does not exist until create_portal_proposal
+    # runs a few lines above — so a pre-publish write is refused by the 404 guard on
+    # /api/admin/proposal/{id}/notify-overrides and by the FK underneath it. The send Hanz cares
+    # most about is exactly the one a client-side sequence could not have configured.
+    #
+    # So it lands HERE: after the row exists, before notify_team resolves the recipients a few
+    # lines below. Anything written after that resolution would only affect the NEXT notification.
+    #
+    # `adds` and `mutes` are the complete set of deviations from the global roster, so an address in
+    # neither list is returned to whatever the roster says — that is what makes the screen's chips
+    # mean what they show. Upsert rather than insert-if-absent, because unlike the creator rule this
+    # is somebody deliberately clicking a person. A mute still beats an add in
+    # resolve_notify_recipients, so muting the assigned estimator here does stick despite the
+    # automatic add they get for owning the job.
+    #
+    # Best-effort as a whole: the customer's proposal has more claim on this request than the
+    # roster does.
+    def _addrs(key: str) -> list[str]:
+        out = []
+        for raw in (body.get(key) or [])[:_MAX_NOTIFY_RECIPIENTS]:
+            addr = (parseaddr(str(raw or ""))[1] or "").strip().lower()
+            if addr and len(addr) <= 254 and _EMAIL_RE.match(addr):
+                out.append(addr)
+        return out
+
+    notify_add, notify_mute = _addrs("notify_add"), _addrs("notify_mute")
+    if notify_add or notify_mute:
+        try:
+            muted = set(notify_mute)
+            for addr in notify_add:
+                if addr not in muted:            # an address in both is a client bug; mute wins
+                    db.set_notify_override(draft_id, addr, "add")
+            for addr in muted:
+                db.set_notify_override(draft_id, addr, "mute")
+            # Everyone the screen showed as simply following the roster: drop any stale override so
+            # the chip and the behaviour agree. Scoped to rows that exist, so this cannot invent
+            # anything, and it is what lets un-ticking on Files undo a mute set in the CRM drawer.
+            chosen = set(notify_add) | muted
+            for row in db.list_notify_overrides(draft_id):
+                addr = (row.get("email") or "").strip().lower()
+                if addr and addr not in chosen and addr != creator:
+                    db.clear_notify_override(draft_id, addr)
+        except Exception as exc:  # noqa: BLE001 — the proposal matters more than the roster
+            log.warning("could not apply the chosen notifications on %s: %s", draft_id, exc)
+
     # Reconcile the recipient set.
     if recipients is None:                      # legacy call — preserve exact old semantics
         if existing:
