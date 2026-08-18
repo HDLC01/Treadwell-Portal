@@ -146,10 +146,22 @@ def test_recipients_are_ordered_the_same_way_everywhere():
 
 
 # ── what the drawer shows ────────────────────────────────────────────────────
+# _recipient_activity makes FOUR guarded reads, and the tests below stubbed three of them. The
+# fourth, get_followup_recipients, was left real: this file is `realdb`, so conftest's stubs do not
+# cover it, and with no database it failed — correctly, after waiting out the connection pool's
+# full 30-second timeout. The tests passed on that failure, which is why nobody noticed the file
+# taking 211 seconds for 23 tests.
+#
+# It is now stubbed in each test, like the other three. The value matches what the failure produced
+# so the assertions are unchanged: the except branch treats an unreadable followups flag as
+# "everybody is opted in", which is also what a database that has not had the column added answers
+# (the query reads it through to_jsonb and `is not false` counts null as in). So each stub returns
+# that test's own recipient list.
 def test_recipient_activity_reports_each_contact_separately(monkeypatch):
     import datetime
     when = datetime.datetime(2026, 8, 11, 9, 30)
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: [A, B])
+    monkeypatch.setattr(main.db, "get_followup_recipients", lambda pid: [A, B])
     monkeypatch.setattr(main.db, "list_views", lambda pid: [
         # UPPERCASE on purpose: the match has to be case-insensitive here too, not only in SQL.
         {"email": A.upper(), "first_viewed_at": when, "last_viewed_at": when, "view_count": 3}])
@@ -171,6 +183,7 @@ def test_a_staff_message_does_not_mark_a_contact_as_having_replied(monkeypatch):
     moment Treadwell answers, and the column stops meaning anything."""
     import datetime
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: [A])
+    monkeypatch.setattr(main.db, "get_followup_recipients", lambda pid: [A])
     monkeypatch.setattr(main.db, "list_views", lambda pid: [])
     monkeypatch.setattr(main.db, "list_deposits", lambda pid: [])
     monkeypatch.setattr(main.db, "list_messages", lambda pid, after=0: [
@@ -180,10 +193,16 @@ def test_a_staff_message_does_not_mark_a_contact_as_having_replied(monkeypatch):
 
 
 def test_recipient_activity_survives_every_read_failing(monkeypatch):
-    """Four separate reads decorate a drawer that has to open. Each one guarded."""
+    """Four separate reads decorate a drawer that has to open. Each one guarded.
+
+    It said four and broke three. get_followup_recipients was failing for real against a database
+    that is not there, so the fourth guard was exercised by accident and at the cost of 30 seconds
+    — and would have stopped being exercised at all the day somebody ran the suite with a database
+    to hand."""
     def boom(*a, **k):
         raise RuntimeError("down")
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: [A, B])
+    monkeypatch.setattr(main.db, "get_followup_recipients", boom)
     monkeypatch.setattr(main.db, "list_views", boom)
     monkeypatch.setattr(main.db, "list_messages", boom)
     monkeypatch.setattr(main.db, "list_deposits", boom)
@@ -200,6 +219,7 @@ def test_no_recipients_means_no_rows(monkeypatch):
 def test_an_absent_approval_marks_nobody_as_the_approver(monkeypatch):
     """`approver_email` missing must not make the first contact read as having signed."""
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: [A, B])
+    monkeypatch.setattr(main.db, "get_followup_recipients", lambda pid: [A, B])
     monkeypatch.setattr(main.db, "list_views", lambda pid: [])
     monkeypatch.setattr(main.db, "list_messages", lambda pid, after=0: [])
     monkeypatch.setattr(main.db, "list_deposits", lambda pid: [])
