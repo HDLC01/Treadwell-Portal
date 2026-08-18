@@ -1851,6 +1851,53 @@ async def admin_publish(request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001 — the proposal is sent; automation is secondary
         log.warning("could not enrol %s in follow-ups: %s", draft_id, exc)
 
+    # Staff hear that the send actually happened — and, louder, when it did not.
+    #
+    # Hanz, 2026-08-19: "When a proposal has been sent it does not email the estimator and the
+    # people in notification sending. To confirm that the email has been sent." Until now the only
+    # record that a proposal went out was the response the sender's own browser showed for a few
+    # seconds. The estimator who owns the job and the roster on the Notification Sending page
+    # found out when the customer replied — or never.
+    #
+    # Routed through notify_team so every existing rule applies unchanged: the enabled roster,
+    # this project's per-project adds (which now include the creator, written above), the assigned
+    # estimator folded in as an add, and mutes winning over all of it. Threaded into the project's
+    # staff conversation like every other update about the job.
+    #
+    # A delivery failure is the version of this email that matters MOST — the sender's browser is
+    # the only other place that knows, and it has navigated away — so it always sends and names
+    # the addresses that failed rather than going quiet on the bad day.
+    try:
+        failed = [e for e in send_list if e not in emailed]
+        doc = ("Revision %d" % rev_no) if (rev_no and rev_no > 1) else "The proposal"
+        if not emailed:
+            heading = f"Proposal did NOT send — {project}"
+        elif failed:
+            heading = f"Proposal sent, with failures — {project}"
+        else:
+            heading = f"Proposal sent — {project}"
+        opener = (f"<p><strong>{html.escape(by)}</strong> sent {html.escape(doc.lower())} for "
+                  if by else f"<p>{html.escape(doc)} for ")
+        parts = [opener + f"<strong>{html.escape(project)}</strong>"]
+        if emailed:
+            parts.append(" to " + ", ".join(f"<strong>{html.escape(e)}</strong>" for e in emailed)
+                         + ".</p>")
+        else:
+            parts.append(", and <strong>no email was delivered</strong>.</p>")
+        if failed:
+            parts.append("<p><strong>Delivery failed for "
+                         + ", ".join(html.escape(e) for e in failed) + ".</strong> "
+                         + ("They have" if len(failed) > 1 else "That customer has")
+                         + " not received the proposal — open the project and send it again.</p>")
+        email_sender.notify_team(
+            heading, "".join(parts),
+            reply_link=_staff_link(draft_id), proposal_id=draft_id,
+            reply_to=rt, token=token, project=project,
+            assigned_estimator=assigned or (existing or {}).get("assigned_estimator"),
+        )
+    except Exception as exc:  # noqa: BLE001 — the proposal is sent; the confirmation is secondary
+        log.warning("send-confirmation email failed for %s: %s", draft_id, exc)
+
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
                   "recipients": send_list, "emailed": emailed,
                   "revision_no": rev_no, "revised": revised,
