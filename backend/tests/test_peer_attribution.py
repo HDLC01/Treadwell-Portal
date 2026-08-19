@@ -257,8 +257,14 @@ def test_every_customer_facing_path_uses_the_customer_serializer():
     # _customer_msg( and _recent_msg( do not match.
     bare = [code[:m.start()].count("\n") + 1
             for m in re.finditer(r"(?<!def )(?<![_\w])_msg\(", code)]
-    admin_line = code[:code.index('"messages": [_msg(m) for m in db.list_messages(proposal_id)]')
-                      ].count("\n") + 1
+    # Located by PATTERN, not by the exact call text. This used to index on the literal
+    # `[_msg(m) for m in db.list_messages(proposal_id)]`, and adding the `include_internal=True`
+    # argument to that same call (2026-08-19, so the staff drawer keeps seeing internal cards)
+    # broke it with a bare ValueError — a test that fails on an argument it has no opinion about.
+    _admin = re.search(r'"messages": \[_msg\(m\) for m in db\.list_messages\(', code)
+    assert _admin, ("the staff drawer no longer builds its thread with _msg() — rewrite this test "
+                    "rather than deleting it; the claim below is what it protects")
+    admin_line = code[:_admin.start()].count("\n") + 1
     assert bare == [admin_line], (
         "_msg() is used at line(s) %s; the only customer-visible payload it may build is the "
         "staff drawer's at %s" % (bare, admin_line))

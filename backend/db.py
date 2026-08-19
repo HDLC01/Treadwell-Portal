@@ -1149,12 +1149,34 @@ def list_questions(proposal_id: str) -> list[dict[str, Any]]:
     )
 
 
-def list_messages(proposal_id: str, after_id: int = 0) -> list[dict[str, Any]]:
-    """The full chat thread (all msg_types) for the chat-first UI + polling.
-    `after_id` > 0 returns only newer rows (monotonic id) for incremental polls."""
+def list_messages(proposal_id: str, after_id: int = 0,
+                  include_internal: bool = False) -> list[dict[str, Any]]:
+    """The chat thread (all msg_types) for the chat-first UI + polling.
+    `after_id` > 0 returns only newer rows (monotonic id) for incremental polls.
+
+    `meta.internal` ROWS ARE EXCLUDED BY DEFAULT, and the default is the point. This thread is
+    SHARED: the same rows render in the customer's portal (main.py's customer view and its poll)
+    and in the staff drawer. Some cards are written for the estimator and would be strange or
+    harmful in front of the customer — "Kevin opened the proposal", and later the CRM's own
+    "closed lost — another contractor". Marking those `internal` and filtering here is what makes
+    them staff-only without a schema change.
+
+    Defaulting to EXCLUDE rather than include is deliberate. A new caller is far more likely to be
+    customer-facing than not, and the two failure modes are not comparable: forgetting the flag on
+    a staff reader costs an estimator a card they can find elsewhere, while forgetting it on a
+    customer reader shows a customer an internal note. The wrong default is the one that cannot be
+    taken back.
+
+    NOT the same filter as `list_customer_events`. That one hides the follow-up echo from the
+    customer's BELL while leaving it in their thread, because the echo records an email they
+    genuinely received and should be able to see. `internal` is stronger: those rows are not theirs
+    at all."""
+    where = "proposal_id=%s and id > %s"
+    if not include_internal:
+        where += " and coalesce((meta->>'internal')::boolean, false) = false"
     return qall(
         "select id, author_kind, author_email, body, msg_type, meta, created_at "
-        "from public.portal_questions where proposal_id=%s and id > %s order by created_at asc, id asc",
+        "from public.portal_questions where " + where + " order by created_at asc, id asc",
         (proposal_id, int(after_id or 0)),
     )
 

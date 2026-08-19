@@ -876,8 +876,12 @@ def _alert_first_view(p: dict, who: Optional[str]) -> None:
         # msg_type="system" renders as a card in both frontends already (app.js, portal.js) and
         # sits inside the existing CHECK constraint, so this needs no migration. `meta.view` is
         # what keeps it out of the customer's notification bell — see db.list_customer_events.
+        # `internal` is what keeps this out of the CUSTOMER's copy of the shared thread — see
+        # db.list_messages, which excludes it by default and is opted out of only by the two staff
+        # readers. `view` stays alongside it so list_customer_events keeps its own bell rule and so
+        # the row is still identifiable as a view rather than as any internal card.
         db.add_message(p["proposal_id"], "staff", None, f"{name} opened the proposal.",
-                       msg_type="system", meta={"view": True})
+                       msg_type="system", meta={"view": True, "internal": True})
     except Exception as exc:  # noqa: BLE001
         log.warning("could not post the view card for %s: %s", p["proposal_id"], exc)
     try:
@@ -2315,7 +2319,9 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
         # notifications tell the other CONTACT, this tells the estimator.
         "recipient_activity": _recipient_activity(proposal_id, p, appr),
         "questions": [_q(q) for q in db.list_questions(proposal_id)],   # text-only (legacy drawer)
-        "messages": [_msg(m) for m in db.list_messages(proposal_id)],   # full thread (revamped drawer)
+        # include_internal: this is the STAFF drawer, and the internal cards (a customer opening
+        # the proposal, and the CRM's own actions) are written for whoever is reading here.
+        "messages": [_msg(m) for m in db.list_messages(proposal_id, include_internal=True)],
         "deposit_ref": proposals.deposit_ref(proposal_id),
         "deposits": [{
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
