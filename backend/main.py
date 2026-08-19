@@ -1036,6 +1036,19 @@ _LOST_REASON_LABELS = {
 }
 
 
+def _delay_window(months: int) -> str:
+    """How long a pause is, in words: "2 months", or "4+ months" at the top of the range.
+
+    The picker offers 1-4 and its 4 means "four or more", so that one has to read open-ended or it
+    promises a date nobody chose.
+
+    Shared by the customer's own delay card (api_project_status) and the staff-side one
+    (admin_set_status) rather than written out twice. Both land in the SAME thread, so two copies
+    of this expression would eventually describe one pause two different ways in front of the same
+    reader — and the "4+" special case is exactly the kind of detail a second copy loses."""
+    return "4+ months" if months == 4 else "%d month%s" % (months, "s" if months > 1 else "")
+
+
 @app.post("/api/portal/{token}/project-status")
 async def api_project_status(token: str, request: Request) -> JSONResponse:
     """The customer tells us where the project actually stands.
@@ -1077,7 +1090,7 @@ async def api_project_status(token: str, request: Request) -> JSONResponse:
             return _json({"ok": True, "project_status": {"paused_until": until.isoformat(),
                                                          "closed": False}})
         db.pause_followups(pid, until)
-        window = "4+ months" if months == 4 else f"{months} month{'s' if months > 1 else ''}"
+        window = _delay_window(months)
         db.add_message(pid, "customer", who,
                        f"Project delayed — revisiting in about {window}.",
                        msg_type="status_update",
@@ -2343,6 +2356,10 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
 # server only — letting staff post them would corrupt both the dedupe and the
 # digest's "has anyone actually chased this?" signal.
 _STAFF_FOLLOWUP_KINDS = ("staff_call", "staff_email", "staff_text", "staff_note")
+# The same four as an English noun phrase, for the thread card. Keyed off the stored kind rather
+# than the short form the drawer sends, because that one is normalised away before we get here.
+_FOLLOWUP_NOUNS = {"staff_call": "a call", "staff_email": "an email",
+                   "staff_text": "a text", "staff_note": "a note"}
 _LOST_REASONS = ("price", "another_contractor", "canceled", "scope_changed", "timing", "other")
 _PAUSE_MONTHS = (1, 2, 3, 4)
 
@@ -2473,19 +2490,99 @@ async def admin_preview_followup_settings(request: Request) -> JSONResponse:
                                for k in followup_settings.ALL_TEMPLATE_KEYS}})
 
 
+# ── staff actions in the project's thread (STAFF-ONLY cards) ──────────────────
+# Hanz: "every actiion of customer and staff should appear in the chatbox whether it be email,
+# messages etc". Nearly all of it already did — the send, each revision, questions and replies in
+# both directions and by email, the approval, the invoice, the deposit, the follow-up emails, the
+# customer's own delayed/not-going-ahead/ready-again, the customer opening it. What the thread
+# could not tell you was what STAFF had done to the project: who it was handed to, that somebody
+# rang the customer, that it had been filed as lost, that the chasing had been switched off. A
+# reader opening a quiet project could not tell "nobody has touched this" from "Kyle called them
+# on Tuesday and they asked for a fortnight".
+#
+# These four are the CRM's own bookkeeping and several of them are things a customer must never
+# read — "Closed–Lost. Reason: Selected another contractor", "reassigned from Kyle to RJ". So every
+# card carries meta.internal, which db.list_messages excludes by default and only the staff drawer
+# opts out of, and which db.list_customer_events now excludes from the customer's notification bell
+# as well. Same mechanism as the view card, no schema change: msg_type="system" is already in the
+# CHECK constraint and already renders as a card in both frontends.
+def _actor_name(by: Optional[str]) -> str:
+    """A person's name for a card, from whatever the staff tool stamped into `by`.
+
+    It sends an address today ("kyle@wetreadwell.com"), which reads badly mid-sentence, so an
+    address is shortened to a name. A value with no "@" is passed straight through rather than run
+    through _estimator_name as well: that helper capitalises each word, so a typed "Kyle Smith"
+    came back "Kyle smith" — mangling a real name to normalise an address we were not given.
+
+    "" when there is nothing, so a caller can choose a sentence with no subject instead of naming
+    the card after None."""
+    v = (by or "").strip()
+    if not v:
+        return ""
+    if "@" not in v:
+        return v
+    return _estimator_name(v) or v
+
+
+def _crm_card(proposal_id: str, body: str, what: str) -> None:
+    """Record a staff action in the project's thread, for staff eyes only.
+
+    GUARDED, ALWAYS, and the guard is the point rather than defensiveness. Every caller has
+    already made the state change the estimator pressed the button for — the estimator is
+    assigned, the deposit chase is off, the job is filed as lost. An unguarded write means a
+    database blip on a courtesy row returns a 500 from an endpoint that ALREADY did the work: the
+    drawer says "couldn't save", the rep believes it, and they either give up or do it twice. Same
+    posture and the same reason as the contacts prompts at admin_deposit_received and api_approve.
+    A missing card costs a reader one line of history; undoing the action costs them the action.
+
+    author_kind is "staff" — NOT "customer", which would be a quiet corruption rather than a
+    cosmetic slip: db.list_all_portal_proposals reads the newest customer-authored row as
+    `customer_replied_at`, so a mislabelled card would tell the board and the digest that the
+    customer had answered when nobody had.
+
+    `crm` names WHICH action alongside `internal`, the way the view card carries `view`: internal
+    is what enforces the visibility, and a bare flag would leave four different rows
+    indistinguishable to anything that later wants to render or count one kind of them."""
+    try:
+        db.add_message(proposal_id, "staff", None, body,
+                       msg_type="system", meta={"crm": what, "internal": True})
+    except Exception as exc:  # noqa: BLE001 — the action is done; do not undo it over a card
+        log.warning("could not post the %s card for %s: %s", what, proposal_id, exc)
+
+
 @app.post("/api/admin/proposal/{proposal_id}/assign")
 async def admin_assign(proposal_id: str, request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    if not db.get_proposal(proposal_id):
+    # The row is KEPT now (this was `if not db.get_proposal(...)`, which threw it away) because a
+    # handover is the thing a reader needs to see and the outgoing estimator exists nowhere else:
+    # one line later set_assigned_estimator has overwritten them.
+    p = db.get_proposal(proposal_id)
+    if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     body = await _body(request)
     email = (parseaddr(str(body.get("estimator_email") or ""))[1] or "").strip().lower()
     if not email:
         return _json({"ok": False, "error": "invalid_estimator"}, 400)
     by = _cap(body.get("by"), 120) or None
+    previous = (p.get("assigned_estimator") or "").strip().lower()
     db.set_assigned_estimator(proposal_id, email)
     db.add_followup(proposal_id, "staff_note", {"action": "reassigned", "to": email}, by)
+    # NO CARD WHEN NOBODY CHANGED. The drawer's picker posts the whole form, so re-saving a
+    # project — or picking the estimator it already has — arrives here as a real request. A thread
+    # carrying "reassigned from Kyle to Kyle" is worse than a thread carrying nothing: it is one
+    # more line to read past, and it pushes the entries that do mean something off the screen.
+    if previous != email:
+        who = _actor_name(by)
+        new_name = _estimator_name(email) or email
+        if previous:
+            old_name = _estimator_name(previous) or previous
+            text = ("%s reassigned this from %s to %s." % (who, old_name, new_name) if who
+                    else "Reassigned from %s to %s." % (old_name, new_name))
+        else:
+            text = ("%s assigned %s as the estimator." % (who, new_name) if who
+                    else "%s assigned as the estimator." % new_name)
+        _crm_card(proposal_id, text, "assign")
     return _json({"ok": True, "assigned_estimator": email})
 
 
@@ -2503,9 +2600,27 @@ async def admin_followup_automation(proposal_id: str, request: Request) -> JSONR
     body = await _body(request)
     enabled = bool(body.get("enabled"))
     by = _cap(body.get("by"), 120) or None
+    # Read through _followup_state, which is what the drawer's switch is DRAWN from, so the card
+    # and the switch can never disagree about what "on" meant a moment ago.
+    was = _followup_state(p)["enabled"]
     db.set_followup_enabled(proposal_id, enabled)
     db.add_followup(proposal_id, "staff_note",
                     {"action": "automation_on" if enabled else "automation_off"}, by)
+    # NO CARD WHEN THE SWITCH DID NOT MOVE — a second tab, a double click, or a drawer re-save all
+    # post the state the project already has.
+    #
+    # One deliberate silence: switching a never-enrolled legacy proposal OFF does write a
+    # followup_disabled_at, but nothing is chasing a proposal with no followup_enrolled_at, so the
+    # switch already read off and there is no news in a line confirming it.
+    if enabled != was:
+        who = _actor_name(by)
+        if enabled:
+            text = ("%s turned follow-up automation back on." % who if who
+                    else "Follow-up automation was turned back on.")
+        else:
+            text = ("%s turned follow-up automation off." % who if who
+                    else "Follow-up automation was turned off.")
+        _crm_card(proposal_id, text, "automation")
     return _json({"ok": True, "followup_state": _followup_state(db.get_proposal(proposal_id) or p)})
 
 
@@ -2526,7 +2641,25 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
     if kind not in _STAFF_FOLLOWUP_KINDS:
         return _json({"ok": False, "error": "invalid_kind"}, 400)
     note = _cap(body.get("note"), 2000) or None
-    row = db.add_followup(proposal_id, kind, {"note": note}, _cap(body.get("by"), 120) or None)
+    by = _cap(body.get("by"), 120) or None
+    row = db.add_followup(proposal_id, kind, {"note": note}, by)
+    # THE MOST VALUABLE OF THESE CARDS, because until now a phone call left no mark anywhere a
+    # person reads. portal_followups recorded it — the digest queries it and stops recommending a
+    # chase — but nothing rendered it, so the estimator who rang on Tuesday and the estimator who
+    # forgot looked identical in the thread, and the next person rang the customer again.
+    #
+    # No no-op case to check, and there is nothing to compare against if there were: every call
+    # logs a NEW event, and logging a second call after the first is the normal way to use this.
+    who = _actor_name(by)
+    # .get, not [kind] — the sentence is built OUTSIDE _crm_card's guard, so a fifth kind added to
+    # _STAFF_FOLLOWUP_KINDS without a noun here would KeyError after add_followup had already
+    # succeeded, which is the exact failure the guard exists to prevent. A vaguer card is the
+    # cheaper wrong answer.
+    noun = _FOLLOWUP_NOUNS.get(kind) or "a follow-up"
+    text = ("%s logged %s" % (who, noun)) if who else ("%s was logged" % noun.capitalize())
+    # The note is what makes the card worth reading — "they're waiting on the GC's schedule" is
+    # the whole content of the call. Quoted so it stays distinguishable from our own sentence.
+    _crm_card(proposal_id, text + (' — "%s"' % note if note else "."), "followup")
     return _json({"ok": True, "followup": {
         "kind": row["kind"], "detail": row.get("detail") or {},
         "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})
@@ -2556,6 +2689,8 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
     status = str(body.get("status") or "").strip().lower()
     by = _cap(body.get("by"), 120) or None
 
+    who = _actor_name(by)
+
     if status == "delayed":
         try:
             months = int(body.get("months") or 0)
@@ -2564,9 +2699,23 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
         if months not in _PAUSE_MONTHS:
             return _json({"ok": False, "error": "invalid_months"}, 400)
         until = followup_rules.add_months(followup_rules.business_today(_now_utc()), months)
+        # Read BEFORE the write, or the comparison below is against what we just stored.
+        already = followup_rules.as_date(p.get("followup_paused_until")) == until
         db.pause_followups(proposal_id, until)
         db.add_followup(proposal_id, "staff_note",
                         {"action": "paused", "months": months, "until": until.isoformat()}, by)
+        # Same no-op the CUSTOMER path guards, and for the same reason: pausing to the date it is
+        # already paused to has changed nothing, so it is not worth a line. Only the card is
+        # skipped — that path returns early, and matching it here would change what this endpoint
+        # does to its caller.
+        if not already:
+            window = _delay_window(months)
+            _crm_card(proposal_id,
+                      ("%s marked this delayed by about %s — follow-ups paused until %s."
+                       % (who, window, until.isoformat())) if who
+                      else ("Marked delayed by about %s — follow-ups paused until %s."
+                            % (window, until.isoformat())),
+                      "status_delayed")
     elif status == "closed_lost":
         reason = str(body.get("reason") or "").strip().lower() or None
         if reason and reason not in _LOST_REASONS:
@@ -2578,15 +2727,34 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
         # so the old "a stray click must not clobber a win" objection is covered without
         # blocking the move. The only failure left is the row disappearing between the
         # get_proposal above and this write.
+        was_closed = (p.get("proposal_status") or "") == "closed_lost"
         if not db.close_lost(proposal_id, reason):
             return _json({"ok": False, "error": "not_found"}, 404)
         db.add_followup(proposal_id, "staff_note",
                         {"action": "closed_lost", "reason": reason}, by)
+        # A closed job closed again with the SAME reason is a re-click, not news. A different
+        # reason is: "we lost on price" and "they went with somebody else" are different stories
+        # about the same job and the correction belongs in the thread.
+        if not (was_closed and (p.get("closed_lost_reason") or None) == reason):
+            label = _LOST_REASON_LABELS.get(reason or "", "")
+            _crm_card(proposal_id,
+                      ("%s marked this Closed–Lost." % who if who else "Marked Closed–Lost.")
+                      + (" Reason: %s." % label if label else ""),
+                      "status_closed_lost")
     elif status == "active":
+        # Both facts read before either write, for the reason the delayed branch gives.
+        was_closed = p.get("proposal_status") == "closed_lost"
+        was_paused = bool(p.get("followup_paused_until"))
         db.resume_followups(proposal_id)
-        if p.get("proposal_status") == "closed_lost":
+        if was_closed:
             db.reopen_if_closed(proposal_id)
         db.add_followup(proposal_id, "staff_note", {"action": "reactivated"}, by)
+        # Nothing to announce when the project was already active and unpaused: this is the
+        # button's resting state, so the board re-saving a live project must not narrate it.
+        if was_closed or was_paused:
+            _crm_card(proposal_id,
+                      "%s moved this back to Active." % who if who else "Moved back to Active.",
+                      "status_active")
     else:
         return _json({"ok": False, "error": "invalid_status"}, 400)
 
