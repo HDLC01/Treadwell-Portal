@@ -825,14 +825,77 @@ async def api_portal_viewed(token: str, request: Request) -> JSONResponse:
     try:
         # NOT self-guarded, unlike record_view — and it used to run inside the customer's main GET,
         # where a database blip took the whole proposal page down with it.
-        db.mark_viewed(p["proposal_id"])
+        #
+        # The return value is the sent -> viewed TRANSITION, which is what makes the alerting below
+        # an event instead of a stream: this endpoint fires on a hash change and a left-open tab
+        # repeats it, and `last_viewed_at` moves every time.
+        first_view = db.mark_viewed(p["proposal_id"])
     except Exception as exc:  # noqa: BLE001
         log.warning("mark_viewed failed for %s: %s", p["proposal_id"], exc)
         return _json({"ok": True, "marked": False})
     # WHICH recipient opened it — the staff-side question, separate from the shared status. The
     # session decides, never the body: the email is what the drawer prints beside "Viewed".
-    db.record_view(p["proposal_id"], _session_email(request))
+    who = _session_email(request)
+    db.record_view(p["proposal_id"], who)
+    if first_view:
+        _alert_first_view(p, who)
     return _json({"ok": True, "marked": True})
+
+
+def _alert_first_view(p: dict, who: Optional[str]) -> None:
+    """Tell staff, once per send, that the customer has opened the proposal.
+
+    Hanz wanted the opening to reach people rather than only sit on the board. The notification
+    bell already reports it; this adds the two places staff actually live — the project's thread
+    and their inbox.
+
+    CALLED ONLY ON THE TRANSITION, which is the whole design. A customer reading a proposal
+    properly opens it, scrolls, switches tabs and comes back, and the endpoint fires each time;
+    without the guard the estimator's inbox gets one email per poll and learns to filter the
+    lot. "They have opened it" is news exactly once per send — and a RE-send makes it news again,
+    because reset_for_revision puts the row back to 'sent' and the transition is available a
+    second time. That is correct rather than incidental: whether the customer looked at the
+    revision is a different question from whether they looked at what it replaced.
+
+    BOTH SIDES ARE BEST-EFFORT, and that is not defensiveness — it is the same rule the
+    mark_viewed call above already follows. This runs inside the customer's own request; a
+    Resend outage or a missing table must cost an estimator a notification, never cost the
+    customer the page they are trying to read. Each is guarded separately so a broken thread
+    write cannot swallow the email as well."""
+    project = p.get("project_name") or "your proposal"
+    # First name where the address gives us one, then the address, then a neutral noun. The card
+    # goes in the SHARED thread, so the fallback has to be a sentence we would be happy for the
+    # customer to read too — "opened the proposal" with nobody named beats "None opened".
+    #
+    # Stripped BEFORE _first_name_of, not after: that helper capitalises the first character of
+    # whatever it is handed, so a whitespace-only session email came back as whitespace, which is
+    # truthy, and the card was named after a space.
+    who_clean = (who or "").strip()
+    name = _first_name_of(who_clean) or who_clean or "The customer"
+    try:
+        # msg_type="system" renders as a card in both frontends already (app.js, portal.js) and
+        # sits inside the existing CHECK constraint, so this needs no migration. `meta.view` is
+        # what keeps it out of the customer's notification bell — see db.list_customer_events.
+        db.add_message(p["proposal_id"], "staff", None, f"{name} opened the proposal.",
+                       msg_type="system", meta={"view": True})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not post the view card for %s: %s", p["proposal_id"], exc)
+    try:
+        # The SAME kwargs the send confirmation passes, so this inherits the whole resolution
+        # rather than growing a second opinion about who hears from a project: the enabled
+        # roster, this project's adds and mutes, the assigned estimator folded in, mutes winning.
+        # Naming no address in the body, for the reason recorded on the send confirmation.
+        email_sender.notify_team(
+            f"Proposal opened — {project}",
+            f"<p><strong>{html.escape(name)}</strong> opened the proposal for "
+            f"<strong>{html.escape(project)}</strong>.</p>",
+            reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+            reply_to=email_sender.proposal_reply_to(p.get("token")),
+            token=p.get("token"), project=p.get("project_name"),
+            assigned_estimator=p.get("assigned_estimator"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("view notification failed for %s: %s", p["proposal_id"], exc)
 
 
 @app.post("/api/portal/{token}/approve")

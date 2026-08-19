@@ -64,9 +64,16 @@ def test_a_click_does_not_bump_updated_at(monkeypatch):
 
 
 def test_mark_viewed_still_does_all_of_its_own_work(monkeypatch):
-    """The complement: the real view path must be unchanged by any of this."""
-    sql, _ = _sql_of(monkeypatch, db.mark_viewed, "prop-1")
-    for expected in ("viewed_at = coalesce(viewed_at, now())", "last_viewed_at = now()",
+    """The complement: the real view path must be unchanged by any of this.
+
+    Reads through `q1`, not `execute`, since mark_viewed grew a `returning` clause to report the
+    sent -> viewed transition to its caller. Only the helper it goes through changed; every column
+    below is still written, which is what this test is actually about."""
+    seen = {}
+    monkeypatch.setattr(db, "q1", lambda sql, params=(): seen.update(sql=sql, params=params))
+    db.mark_viewed("prop-1")
+    sql = " ".join(seen["sql"].split())
+    for expected in ("viewed_at = coalesce(p.viewed_at, now())", "last_viewed_at = now()",
                      "cycle_viewed_at", "proposal_status"):
         assert expected in sql
 

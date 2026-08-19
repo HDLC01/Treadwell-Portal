@@ -67,11 +67,20 @@ def _route(name):
 def test_the_view_is_recorded_against_the_SESSION():
     """The whole value is that it says who was signed in when the page was fetched. Anything
     client-supplied would make it a claim rather than a record — the endpoint takes a body now,
-    so a caller could otherwise nominate somebody else as the reader."""
+    so a caller could otherwise nominate somebody else as the reader.
+
+    The session email is now BOUND first, because the view card and the "opened it" email name the
+    same reader and must not be able to disagree with the row. So this asserts the binding and the
+    call rather than requiring `_session_email(request)` to sit literally inside record_view's
+    parentheses — which is the spelling, not the guarantee. The guarantee is also enforced from the
+    outside, where it belongs: test_viewed_signal.py posts a body naming somebody else and asserts
+    the session wins."""
     body = _route("api_portal_viewed")
-    assert "db.record_view(" in body, "the view is not recorded at all"
-    assert "_session_email(request)" in body[body.index("db.record_view"):], (
-        "record_view is not passed the SESSION email")
+    assert "who = _session_email(request)" in body, "the reader is not taken from the session"
+    assert 'db.record_view(p["proposal_id"], who)' in body, (
+        "record_view is not passed the session reader")
+    assert body.index("who = _session_email(request)") < body.index("db.record_view"), (
+        "record_view is called before the session is read")
 
 
 def test_the_shared_status_is_left_alone():
