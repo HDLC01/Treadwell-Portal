@@ -13,6 +13,11 @@ notifications applies to this one unchanged: the enabled roster, the per-project
 the creator, written on this same route), the assigned estimator folded in as an add, and mutes
 winning over everything. These tests therefore assert on WHAT is handed to notify_team, not on a
 re-implementation of its resolution — that resolution has its own tests.
+
+WHOSE ADDRESSES APPEAR IN IT, added 2026-08-19 after Hanz read one: none, unless a delivery FAILED.
+"Proposal sent" says who sent it and which project and stops; the failure branch still names every
+address that bounced, because that email is a work order and the address is the thing to fix. The
+tests below pin both halves, in both directions, so neither drifts into the other.
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -66,14 +71,26 @@ def publish(monkeypatch):
 
 
 def test_a_send_emails_the_team_that_it_went_out(publish):
+    """It says WHO sent it and WHICH project, and — since 2026-08-19 — not one recipient address.
+
+    The success email used to recite the whole `to` list. Hanz, on receiving one: "Remove this whats
+    this?? Jsut say Treadwell has sent you a proposal" / "DONT pout the email address in the email
+    sent just the generic one we had". Who it went to is already on the project behind the
+    Reply-in-Portal button, so listing it copies customer contact details into every staff inbox on
+    the roster to support a decision none of them makes from this email.
+
+    Inverted rather than deleted, because "no addresses" is the requirement — a test that merely
+    stops looking for them would pass again the moment somebody put them back. The failure branch
+    is the deliberate exception and keeps its own assertions below."""
     go, calls, _ = publish
     r = go(assigned_estimator="kyle@wetreadwell.com")
     assert r.status_code == 200, r.text
     assert len(calls["notify"]) == 1, "the send confirmation did not go out exactly once"
     n = calls["notify"][0]
     assert n["heading"] == "Proposal sent — Oak Grove"
-    assert "cust@acme.com" in n["body"], "the confirmation does not say who received it"
+    assert "cust@acme.com" not in n["body"], "the customer's address is back in the sent email"
     assert "sender@wetreadwell.com" in n["body"], "the confirmation does not say who sent it"
+    assert "Oak Grove" in n["body"], "the confirmation does not say which project went out"
 
 
 def test_the_confirmation_carries_every_hook_the_roster_rules_need(publish):
@@ -115,13 +132,22 @@ def test_a_failed_delivery_is_the_loudest_version_not_a_missing_one(publish):
 
 
 def test_a_partial_failure_names_the_address_that_missed(publish):
+    """Only the BROKEN address, now. The DELIVERED one used to appear here as well, but it came
+    from the success clause rather than from the failure branch, so dropping the recipient list
+    dropped it from this email too — and that is the right outcome, not a casualty. The failure
+    branch is an exception to "no addresses" because it is a work order: the one thing the reader
+    has to act on is the address that bounced, and an address nobody can see cannot be corrected
+    and re-sent to. The address that WORKED is not part of that job, and naming it is the same
+    "who did this go to" recital Hanz asked us to stop mailing the roster."""
     go, calls, state = publish
     state["send_ok"] = lambda to: to != "second@acme.com"
     go(emails=["second@acme.com"])
     n = calls["notify"][0]
     assert "with failures" in n["heading"], n["heading"]
     assert "second@acme.com" in n["body"], "the failed address is not named"
-    assert "cust@acme.com" in n["body"], "the delivered address disappeared from the story"
+    assert "cust@acme.com" not in n["body"], (
+        "the address that DID deliver is back in the body — the recipient recital returned "
+        "through the partial-failure path")
 
 
 def test_a_broken_confirmation_can_never_stop_a_proposal(publish, monkeypatch):

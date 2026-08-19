@@ -1936,6 +1936,14 @@ async def admin_publish(request: Request) -> JSONResponse:
     # A delivery failure is the version of this email that matters MOST — the sender's browser is
     # the only other place that knows, and it has navigated away — so it always sends and names
     # the addresses that failed rather than going quiet on the bad day.
+    #
+    # THE SUCCESS LINE NAMES NOBODY, and the asymmetry with the failure branch is the point.
+    # Hanz, 2026-08-19, on receiving one: "Remove this whats this?? Jsut say Treadwell has sent you
+    # a proposal" / "DONT pout the email address in the email sent just the generic one we had".
+    # Who it went to is already on the project, one tap away behind the Reply-in-Portal button, so
+    # reciting it back to the roster copies customer contact details into a dozen staff inboxes to
+    # support no decision anybody makes from the email. The alternative — keeping the list and only
+    # shortening it ("to 2 recipients") — was rejected as still answering a question nobody asked.
     try:
         failed = [e for e in send_list if e not in emailed]
         doc = ("Revision %d" % rev_no) if (rev_no and rev_no > 1) else "The proposal"
@@ -1949,10 +1957,13 @@ async def admin_publish(request: Request) -> JSONResponse:
                   if by else f"<p>{html.escape(doc)} for ")
         parts = [opener + f"<strong>{html.escape(project)}</strong>"]
         if emailed:
-            parts.append(" to " + ", ".join(f"<strong>{html.escape(e)}</strong>" for e in emailed)
-                         + ".</p>")
+            parts.append(".</p>")
         else:
             parts.append(", and <strong>no email was delivered</strong>.</p>")
+        # THIS branch keeps the addresses, and a tidy-up that strips them for consistency with the
+        # line above breaks the email. Its whole purpose is "this one did not arrive, go fix it",
+        # and an address nobody can see is not an address anybody can correct and re-send to. The
+        # instruction above was scoped to the email that says it SENT.
         if failed:
             parts.append("<p><strong>Delivery failed for "
                          + ", ".join(html.escape(e) for e in failed) + ".</strong> "
