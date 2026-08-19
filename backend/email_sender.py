@@ -112,10 +112,12 @@ def staff_thread_subject(project_name: str | None) -> str:
 def project_thread_headers(token: str | None) -> dict[str, str] | None:
     """Threading headers for a STAFF email about one project. None without a token.
 
-    The proposal anchor and nothing else, because a team email has no single
-    recipient to anchor per-person (`_thread_headers` hashes one address, and
-    notify_team sends to the whole roster in one call). Every staff member
-    therefore gets one conversation per project, which is how they read it anyway.
+    The proposal anchor and nothing else, keyed on the PROJECT with nothing
+    recipient-specific in it — unlike `_thread_headers`, the customer equivalent, which
+    hashes one address. That property is what lets notify_team mail each person on the
+    roster separately (see the loop there) without splitting the conversation: every
+    copy carries the same References, so every staff member still gets one thread per
+    project, which is how they read it anyway.
 
     Hanz, 2026-08-11: "When a Treadwell employee replies through email it doesn't
     get captured by the Proposal CRM and doesn't get sent out to the customer."
@@ -860,15 +862,26 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
                 recipients: list[str] | None = None, reply_link: str | None = None,
                 proposal_id: str | None = None, reply_to: str | None = None,
                 token: str | None = None, project: str | None = None,
-                assigned_estimator: str | None = None) -> bool:
-    """Email the internal team. `recipients` (explicit) wins; otherwise resolve by
-    `kind` from the UI-managed roster, applying this proposal's per-project overrides
-    (`proposal_id`). `reply_link` appends a "Reply in Portal" button that deep-links
-    staff to the proposal in the staff tool. `reply_to` (the proposal's inbound
-    address) makes a plain reply from a staff inbox land in the thread too, so the
-    button is the convenient path rather than the only one — but ONLY together with
-    `token`, which carries the project in the threading headers. Reply-To alone gets
-    the reply to our inbox; the token is what tells us which project it belongs to."""
+                assigned_estimator: str | None = None) -> list[str]:
+    """Email the internal team, ONE MESSAGE PER PERSON. `recipients` (explicit) wins;
+    otherwise resolve by `kind` from the UI-managed roster, applying this proposal's
+    per-project overrides (`proposal_id`). `reply_link` appends a "Reply in Portal"
+    button that deep-links staff to the proposal in the staff tool. `reply_to` (the
+    proposal's inbound address) makes a plain reply from a staff inbox land in the
+    thread too, so the button is the convenient path rather than the only one — but
+    ONLY together with `token`, which carries the project in the threading headers.
+    Reply-To alone gets the reply to our inbox; the token is what tells us which
+    project it belongs to.
+
+    Returns the addresses that were DELIVERED, in roster order — `[]` when nothing
+    landed. This used to be a single bool, and the one caller that BRANCHES on it is
+    unaffected: followup_worker._send_staff wraps the call in `bool()`, and an empty
+    list is falsy for the same reason a False was — nothing went out, so the cadence
+    reservation is released and the next tick retries. Returning the list rather than
+    that bool is the point of the loop below: per-address delivery status is the whole
+    reason this is not BCC, and discarding it here would leave a future "the roster
+    copy to Kyle bounced" with nothing to read. The nine other call sites (main.py)
+    ignore the return entirely."""
     # The call site passes the EVENT ("Proposal APPROVED — Nearman Creek"). That stays the
     # heading inside the email; the outgoing subject becomes the project, so every update
     # about one job lands in one conversation. Without a project there is no thread to join.
@@ -890,5 +903,47 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
     if reply_to and token:
         body_html += ('<p style="color:#64748b;font-size:13px;margin-top:12px">Replying to this email '
                       'posts your message to the customer\'s portal thread and notifies them.</p>')
-    return _send(to, subject, _wrap(heading, body_html), reply_to=reply_to,
-                 headers=project_thread_headers(token))
+
+    # ONE SEND PER RECIPIENT, not one send addressed to the whole roster.
+    #
+    # Hanz, 2026-08-19: "for sending out multiple emails to the staff and customers can it be BCC
+    # so we dont see the cross talk of the emails of the receivers". This was the only path with
+    # that problem: the roster was resolved into a list and handed to _send once, and _send puts
+    # the list straight into Resend's "to" — so every staff notification published every
+    # colleague's address, plus whoever a per-project add or an assignment had folded in, in a To
+    # header they could all read. The two customer paths already loop (admin_publish over
+    # send_portal_link, admin_reply over send_reply_notification).
+    #
+    # BCC was what he asked for and is REJECTED. It needs something in To, and an empty or
+    # self-addressed To reads as machine mail and costs deliverability; and a BCC send comes back
+    # as ONE pass/fail for the batch, so a dead address is indistinguishable from a working one.
+    # Per-recipient keeps a verdict per address — which is exactly what makes admin_publish's
+    # "Proposal sent, with failures" email possible on the customer side — and it leaves one rule
+    # for all outbound mail instead of two.
+    #
+    # THREADING SURVIVES, which is the thing worth checking before believing any of the above:
+    # project_thread_headers takes only `token` and derives the anchor from the PROJECT, with
+    # nothing recipient-specific in it (unlike _thread_headers, which hashes an address). So all N
+    # copies carry identical References/In-Reply-To and each person's client files them into the
+    # one conversation for that job, exactly as before. Built ONCE, out here, so a later edit
+    # cannot quietly make the anchor per-recipient — and so can the body, which must be byte-equal
+    # in every copy.
+    headers = project_thread_headers(token)
+    wrapped = _wrap(heading, body_html)
+    delivered: list[str] = []
+    for addr in to:
+        # One dead address must never silence the rest of the team, so each send is its own
+        # attempt. _send already swallows transport errors and returns False; the try is for the
+        # failure it cannot swallow, because five of the main.py call sites are NOT wrapped and a
+        # raise here would 500 a customer's route over a staff email.
+        try:
+            if _send([addr], subject, wrapped, reply_to=reply_to, headers=headers):
+                delivered.append(addr)
+        except Exception as exc:  # noqa: BLE001
+            log.error("notify: sending %r to %s raised: %s", subject, addr, exc)
+    if len(delivered) < len(to):
+        # The per-address status the loop exists to produce, said out loud. Nothing else surfaces
+        # WHICH colleague missed a notification — the batch used to report one verdict for all.
+        log.warning("notify: %r reached %d of %d (missed: %s)", subject, len(delivered), len(to),
+                    ", ".join(a for a in to if a not in delivered))
+    return delivered

@@ -156,16 +156,23 @@ def test_notify_team_FORWARDS_the_estimator_to_the_resolver(roster, monkeypatch)
     """The wiring between the two halves. Every route test stubs `notify_team` itself, so they
     prove the kwarg is PASSED and nothing about whether notify_team does anything with it — a
     mutation dropping it from the `_resolve_notify` call survived until this existed. Spied at
-    `_send`, the last hop before Resend, so this is who would really be emailed."""
+    `_send`, the last hop before Resend, so this is who would really be emailed.
+
+    EVERY send, not just the first. It used to record one call, because there was one: notify_team
+    handed the whole resolved roster to a single `_send`. Since 2026-08-19 it mails the roster one
+    person at a time so nobody reads a colleague's address in their To
+    (test_one_email_per_staff.py), which makes the estimator the third of three calls rather than a
+    third address in one. The claim is unchanged — Kyle would really be emailed — and it is still
+    asserted on what reaches `_send` rather than on the resolver in isolation."""
     roster()
-    seen = {}
+    addressed = []
     monkeypatch.setattr(email_sender, "_send",
                         lambda to, subject, html, headers=None, **kw:
-                        seen.setdefault("to", list(to)) is None or True)
+                        addressed.extend(to) is None or True)
     email_sender.notify_team("New proposal question — Nearman Creek", "<p>hi</p>",
                              proposal_id="p1", assigned_estimator="kyle@wetreadwell.com")
-    assert "kyle@wetreadwell.com" in seen.get("to", []), (
-        "notify_team resolved recipients without the assigned estimator: %s" % seen)
+    assert "kyle@wetreadwell.com" in addressed, (
+        "notify_team resolved recipients without the assigned estimator: %s" % addressed)
 
 
 # ── the routes: both directions, which nothing covered before ────────────────

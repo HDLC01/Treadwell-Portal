@@ -266,6 +266,10 @@ def _send_staff(p: dict, due) -> bool:
                 f"</ul>"
                 f"<p>Automated reminders continue, but this one is worth a call.</p>")
     try:
+        # notify_team returns the addresses it DELIVERED to (one send per person), so `bool()`
+        # asks the only question the caller has: did anything land? Falsy means the sweep releases
+        # the reservation and retries next tick, which is what a False meant before the loop —
+        # same branch, same meaning. `_send_customer` above answers it the same way.
         return bool(email_sender.notify_team(
             subject, body, recipients=to, reply_link=crm_url, proposal_id=pid,
             reply_to=email_sender.proposal_reply_to(token)))
