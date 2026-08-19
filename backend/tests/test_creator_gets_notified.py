@@ -155,12 +155,13 @@ def test_a_creator_who_is_already_on_the_roster_is_not_emailed_twice():
 
 
 def test_the_creator_hears_about_a_deposit_as_well():
-    """Deposit alerts resolve from their own bucket. The person who priced the job is exactly who
-    wants to know the money arrived, so the add has to apply to both kinds."""
+    """A deposit alert goes to the general roster PLUS the deposit bucket (see
+    test_notify_recipients.py). The person who priced the job is exactly who wants to know the
+    money arrived, so the add has to apply to both kinds."""
     out = email_sender.resolve_notify_recipients(
         ["hanz@wetreadwell.com"], ["money@wetreadwell.com"], "deposit", [], [],
         adds=["rj@wetreadwell.com"], mutes=[], configured=True)
-    assert out == ["money@wetreadwell.com", "rj@wetreadwell.com"]
+    assert out == ["hanz@wetreadwell.com", "money@wetreadwell.com", "rj@wetreadwell.com"]
 
 
 def test_the_insert_is_an_add_that_does_nothing_on_conflict(monkeypatch):

@@ -736,10 +736,10 @@ def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env
                               adds=(), mutes=(), configured=None) -> list[str]:
     """Pure recipient resolution for team notifications, fully driven by the
     UI-managed roster (not hardcoded env). Base list: when the roster is CONFIGURED
-    (any rows exist), a 'deposit' alert prefers deposit-kind rows then general rows,
-    a 'general' alert uses general rows. Then per-project overrides apply: union
-    `adds`, subtract `mutes` (mute wins over add) — case-insensitive, order-preserving,
-    deduped.
+    (any rows exist), a 'deposit' alert takes the general rows PLUS the deposit-kind
+    rows, a 'general' alert uses general rows only. Then per-project overrides apply:
+    union `adds`, subtract `mutes` (mute wins over add) — case-insensitive,
+    order-preserving, deduped.
 
     `configured` tells apart two empty states: an UNCONFIGURED roster (no rows at all,
     e.g. fresh install) falls back to the env list, but a CONFIGURED roster whose
@@ -749,8 +749,19 @@ def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env
     if configured is None:
         configured = bool(general_rows or deposit_rows)
     if kind == "deposit":
-        base = list(deposit_rows or general_rows) if configured else list(env_deposit)
+        # ADDITIVE, not a swap. This read `list(deposit_rows or general_rows)`, which let the
+        # deposit bucket REPLACE the general roster — so the first deposit-kind row anybody added
+        # would have silently stopped every general recipient hearing about deposits. A deposit
+        # alert is MORE people than a general one, not DIFFERENT people: whoever handles the money
+        # joins the people already told, so the general roster is the floor and deposit rows extend
+        # it. Rejected alternative: keep the replace semantics and auto-add the money person as a
+        # per-project override instead — that hardcodes a named human into the codebase and writes
+        # a row per project. Nobody sits on the deposit list today, and general_rows alone still
+        # resolves a deposit alert when it is empty, so this changes no current behaviour.
+        base = (list(general_rows) + list(deposit_rows)) if configured else list(env_deposit)
     else:
+        # Deliberately NOT additive in the other direction: somebody is on the deposit list for the
+        # money, so a general alert must not start reaching them.
         base = list(general_rows) if configured else list(env_general)
     mute_set = {m.strip().lower() for m in (mutes or []) if m}
     out, seen = [], set()
