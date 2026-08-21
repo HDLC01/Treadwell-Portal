@@ -373,6 +373,72 @@ def test_a_failed_automation_card_still_flips_the_switch(crm):
         "the automation toggle was undone by a failed thread write")
 
 
+# ── 3b. turning automation on also LIFTS A PAUSE ──────────────────────────────
+# Added 2026-08-21. This route called set_followup_enabled and nothing else, and on a paused project
+# that made the switch a lie: followup_disabled_at and followup_paused_until BOTH suppress a send, so
+# clearing one of two stops is not the "Start the follow-up cadence from today" the drawer's own
+# button title promises. It also mattered more than it looks, because this is the control an
+# estimator reaches for when they cannot find a way out of a hold — which is the state every held
+# SENT bid was in until the drawer grew a bring-back on the same day. The workaround failed as
+# silently as the missing button.
+def test_turning_automation_on_lifts_the_pause_as_well_as_the_flag(crm):
+    """The flag and the date are two separate stops. Asserted as resume_followups being CALLED
+    rather than as a response field, because that call is the whole of the fix: the endpoint could
+    return a perfectly correct-looking followup_state (it re-reads the row) while nothing had
+    unpaused."""
+    crm.row["followup_disabled_at"] = dt.datetime(2026, 8, 10, 9, 0)
+    crm.row["followup_paused_until"] = "2026-12-21"
+    r = _automation(crm, True)
+    assert r.status_code == 200, r.text
+    assert crm.calls["automation"] == [("pid-1", True)]
+    assert crm.calls["resumed"] == ["pid-1"], (
+        "automation was switched on and the pause was left in place, so the button says the "
+        "cadence is running and nothing is sent")
+
+
+def test_the_lifted_pause_gets_its_own_line_in_the_thread(crm):
+    """Two changes, two sentences. The switch moving is a workflow decision; the pause coming off
+    changes what the CUSTOMER receives, and "why did they get a reminder in September?" is answered
+    by this line and by nothing else."""
+    crm.row["followup_disabled_at"] = dt.datetime(2026, 8, 10, 9, 0)
+    crm.row["followup_paused_until"] = "2026-12-21"
+    _automation(crm, True)
+    bodies = [c["body"] for c in crm.calls["cards"]]
+    assert len(bodies) == 2, bodies
+    assert bodies[0] == "Hanz turned follow-up automation back on."
+    assert bodies[1] == "Hanz lifted the follow-up pause, so the reminders start again."
+    assert crm.calls["cards"][1]["meta"] == {"crm": "automation_resumed", "internal": True}, (
+        "the pause card is not staff-only, so the customer reads our own bookkeeping")
+
+
+def test_the_pause_lift_is_recorded_even_when_the_switch_did_not_move(crm):
+    """Outside the switch-moved guard on purpose. A project that is enrolled, enabled AND paused —
+    which is exactly what a hold leaves behind — reports "on" already, so the no-op rule would
+    swallow the one part of this request that changed anything."""
+    crm.row["followup_paused_until"] = "2026-12-21"
+    _automation(crm, True)
+    assert crm.calls["resumed"] == ["pid-1"]
+    c = _one(crm)
+    assert c["body"] == "Hanz lifted the follow-up pause, so the reminders start again."
+
+
+def test_turning_automation_off_leaves_the_pause_exactly_where_it_is(crm):
+    """Only on the way ON. A paused project that somebody also takes off automation carries two
+    separate decisions, and resuming while switching off would be this route inventing a third."""
+    crm.row["followup_paused_until"] = "2026-12-21"
+    _automation(crm, False)
+    assert crm.calls["resumed"] == [], "switching automation off unpaused the project"
+
+
+def test_turning_it_on_when_nothing_is_paused_resumes_nothing(crm):
+    """A pointless write is not harmless here: resume_followups stamps updated_at, and the board
+    dates and sorts on the row."""
+    crm.row["followup_disabled_at"] = dt.datetime(2026, 8, 10, 9, 0)
+    _automation(crm, True)
+    assert crm.calls["resumed"] == []
+    assert _one(crm)["body"] == "Hanz turned follow-up automation back on."
+
+
 # ── 4. staff moved the project's status ───────────────────────────────────────
 def test_staff_marking_it_delayed_is_written_with_the_window_and_the_date(crm):
     """The CUSTOMER saying this already posted a card; staff saying it posted nothing, so a project
@@ -410,34 +476,73 @@ def test_pausing_to_the_date_it_is_already_paused_to_writes_no_card(crm):
     assert crm.calls["paused"], "the pause itself stopped happening"
 
 
+#: The comment staff have had to write since 2026-08-20. One sentence, which is all it asks for.
+NOTE = "12% over Wilson on the pour."
+
+
 def test_staff_closing_it_lost_is_written_with_the_reason(crm):
     """The reason is the card. "Closed" tells the next reader nothing they can act on; "selected
-    another contractor" is what they need before they ring the customer about the next job."""
-    _status(crm, status="closed_lost", reason="another_contractor")
+    another contractor" is what they need before they ring the customer about the next job.
+
+    AND THE COMMENT, since 2026-08-20 (Hanz). A reason alone is eight identical cards by the end of
+    a quarter; the sentence is the part the sales meeting is actually held to read. It has no column
+    and does not need one — this card and portal_followups.detail are both jsonb, which is why the
+    whole feature needed no DDL."""
+    _status(crm, status="closed_lost", reason="another_contractor", note=NOTE)
     c = _one(crm)
-    assert c["body"] == "Hanz marked this Closed–Lost. Reason: Selected another contractor."
+    assert c["body"] == ('Hanz marked this Closed–Lost. Reason: Selected another contractor. "%s"'
+                         % NOTE)
     assert c["msg_type"] == "system" and c["kind"] == "staff" and c["author"] is None
 
 
 def test_the_closed_lost_card_is_staff_only(crm):
-    """THE SHARPEST CASE IN THIS FILE. Unfiltered, the customer reads "Closed–Lost. Reason:
-    Selected another contractor" in their own conversation — our internal verdict on their project,
-    in front of them, in a thread they can reply to."""
-    _status(crm, status="closed_lost", reason="another_contractor")
+    """THE SHARPEST CASE IN THIS FILE, and sharper since the comment went on it. Unfiltered, the
+    customer reads "Closed–Lost. Reason: Selected another contractor" AND whatever the estimator
+    wrote about why we lost, in their own conversation, in a thread they can reply to."""
+    _status(crm, status="closed_lost", reason="another_contractor", note=NOTE)
     assert _one(crm)["meta"] == {"crm": "status_closed_lost", "internal": True}
 
 
-def test_closing_it_without_a_reason_still_records_the_close(crm):
-    _status(crm, status="closed_lost")
-    assert _one(crm)["body"] == "Hanz marked this Closed–Lost."
+def test_closing_it_without_a_reason_or_a_comment_is_refused(crm):
+    """WHO AND WHEN: Hanz, 2026-08-20. This test was
+    `test_closing_it_without_a_reason_still_records_the_close` and pinned the opposite: a bare close
+    wrote "Hanz marked this Closed–Lost." and saved. That was the looser of two ends of the same
+    act — the proposal tool's own draft route 422s a missing reason and a missing comment for a bid
+    nobody has sent — so the same decision, made from two drawers, filed one bid under a reason and
+    the other under "Not recorded".
+
+    The CUSTOMER's own form (api_project_status) stays lenient and must: it asks "if you don't mind
+    saying", and a customer who does mind still has to be able to tell us they are out."""
+    for fields in ({}, {"reason": "another_contractor"}, {"note": NOTE},
+                   {"reason": "vibes", "note": NOTE},
+                   {"reason": "another_contractor", "note": "   "},
+                   {"reason": "another_contractor", "note": "\n\t"}):
+        crm.calls["cards"].clear()
+        crm.calls["closed"].clear()
+        r = _status(crm, status="closed_lost", **fields)
+        assert r.status_code == 400, "%r got through" % fields
+        assert crm.calls["closed"] == [], "%r closed the job anyway" % fields
+        assert crm.calls["cards"] == []
 
 
-def test_closing_a_job_that_is_already_closed_for_that_reason_writes_no_card(crm):
-    """THE NO-OP. The board's Lost tab can be dragged onto the same column twice."""
+def test_closing_a_job_that_is_already_closed_for_that_reason_still_records_the_comment(crm):
+    """WHO AND WHEN: Hanz, 2026-08-20. This was the NO-OP — "the board's Lost tab can be dragged
+    onto the same column twice" — and it stops being one now that a comment is required, because the
+    comment is always news. Two people can close the same bid under "Not Low Bid" and only one of
+    them wrote down that we were 12% over Wilson; dropping the second card because the reason matched
+    would drop the only part worth reading.
+
+    So the card CHANGES rather than disappearing: it says a note was added on the close, not that the
+    job was closed again. The reason-changed rule below is untouched, and still covers the bare
+    re-click it was written for."""
     crm.row["proposal_status"] = "closed_lost"
     crm.row["closed_lost_reason"] = "another_contractor"
-    _status(crm, status="closed_lost", reason="another_contractor")
-    assert crm.calls["cards"] == []
+    _status(crm, status="closed_lost", reason="another_contractor", note=NOTE)
+    c = _one(crm)
+    assert c["body"] == 'Hanz added a note on the close: "%s"' % NOTE
+    assert c["meta"] == {"crm": "status_closed_lost", "internal": True}
+    assert "Closed–Lost" not in c["body"], (
+        "it narrates the close a second time, so the thread reads as though the job died twice")
     assert crm.calls["closed"], "the close itself stopped happening"
 
 
@@ -447,8 +552,51 @@ def test_correcting_the_close_reason_IS_news(crm):
     have swallowed it."""
     crm.row["proposal_status"] = "closed_lost"
     crm.row["closed_lost_reason"] = "price"
-    _status(crm, status="closed_lost", reason="another_contractor")
-    assert _one(crm)["body"] == "Hanz marked this Closed–Lost. Reason: Selected another contractor."
+    _status(crm, status="closed_lost", reason="another_contractor", note=NOTE)
+    assert _one(crm)["body"] == (
+        'Hanz marked this Closed–Lost. Reason: Selected another contractor. "%s"' % NOTE)
+
+
+# ── the two answers that pause a bid instead of killing it ────────────────────
+def test_a_hold_pauses_the_chase_and_says_why_in_the_thread(crm):
+    """Hanz, 2026-08-20: "Project on Hold" and "Small Bid <$25k - Pending" leave the card on the
+    Active board with the reminders paused. Routed through THIS status rather than a mechanism of
+    their own, so one bid cannot carry two pause dates able to disagree — and the reason and comment
+    ride along, or the pause reads as an unexplained gap in the chasing."""
+    r = _status(crm, status="delayed", months=4, reason="on_hold", note="GC has gone quiet.")
+    assert r.status_code == 200, r.text
+    assert crm.calls["paused"], "the pause itself did not happen"
+    bodies = [c["body"] for c in crm.calls["cards"]]
+    assert len(bodies) == 2, bodies
+    assert "delayed by about 4+ months" in bodies[0]
+    assert bodies[1] == 'On hold: Project on Hold — "GC has gone quiet."'
+    assert crm.calls["cards"][1]["meta"] == {"crm": "status_on_hold", "internal": True}
+
+
+def test_a_hold_gets_its_card_even_when_the_pause_date_is_unchanged(crm):
+    """The no-op rule above was about a pause carrying nothing but a date, where a second press says
+    nothing new. A hold carries somebody's sentence about why, and that sentence is the whole content
+    of the act — swallowing it because a colleague paused to the same day last week would lose the
+    only part anyone reads."""
+    crm.row["followup_paused_until"] = _until(4).isoformat()
+    _status(crm, status="delayed", months=4, reason="on_hold", note="Still quiet.")
+    bodies = [c["body"] for c in crm.calls["cards"]]
+    assert any('Still quiet.' in b for b in bodies), bodies
+
+
+def test_a_hold_is_refused_without_a_comment_or_with_a_lost_reason(crm):
+    """The same strictness as the close, and for the same reason: a hold with no sentence on it is a
+    bid that has gone quiet for reasons nobody wrote down. A close-lost reason arriving here would
+    pause a bid somebody meant to kill."""
+    for fields in ({"reason": "on_hold"}, {"reason": "on_hold", "note": "  "},
+                   {"reason": "another_contractor", "note": NOTE},
+                   {"reason": "vibes", "note": NOTE}):
+        crm.calls["cards"].clear()
+        crm.calls["paused"].clear()
+        r = _status(crm, status="delayed", months=4, **fields)
+        assert r.status_code == 400, "%r got through" % fields
+        assert crm.calls["paused"] == [], "%r paused the chase anyway" % fields
+        assert crm.calls["cards"] == []
 
 
 def test_reopening_a_lost_job_is_written_to_the_thread(crm):
@@ -464,6 +612,24 @@ def test_unpausing_a_delayed_job_is_written_too(crm):
     is about to start hearing from us again."""
     crm.row["followup_paused_until"] = "2026-10-19"
     _status(crm, status="active")
+    assert _one(crm)["body"] == "Hanz moved this back to Active."
+
+
+def test_bringing_back_a_HELD_bid_clears_the_pause_and_closes_nothing(crm):
+    """THE WAY OUT OF A HOLD, on a project the customer has. The drawer's bring-back posts
+    `bring_back` to the proposal tool, which clears its own marks and forwards `active` here — and
+    `active` is where resume_followups lives, so this call is the whole of "the hold is off".
+
+    Asserted as the CALL, not as a status: a hold never set proposal_status (that is the point of
+    routing it through `delayed`), so a held bid is still 'sent' and nothing about the response body
+    would change whether or not the pause came off. reopen_if_closed must NOT run either — there is
+    nothing closed to reopen, and calling it would rewrite the status of a live bid."""
+    crm.row["followup_paused_until"] = "2026-12-21"
+    r = _status(crm, status="active")
+    assert r.status_code == 200, r.text
+    assert crm.calls["resumed"] == ["pid-1"], "the hold survived the bring-back"
+    assert crm.calls["reopened"] == [], (
+        "a bid nobody closed was put through reopen_if_closed, which rewrites its status")
     assert _one(crm)["body"] == "Hanz moved this back to Active."
 
 
@@ -488,7 +654,7 @@ def test_a_failed_status_card_still_closes_the_job(crm):
     def boom(*a, **k):
         raise RuntimeError("relation missing")
     crm.monkeypatch.setattr(main.db, "add_message", boom)
-    r = _status(crm, status="closed_lost", reason="price")
+    r = _status(crm, status="closed_lost", reason="price", note=NOTE)
     assert r.status_code == 200
     j = r.json()
     assert j["ok"] is True and "proposal_status" in j and "followup_state" in j
