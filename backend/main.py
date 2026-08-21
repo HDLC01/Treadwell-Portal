@@ -1029,10 +1029,51 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
+# ── why a bid died, and whether it died at all ────────────────────────────────
+# THE CANONICAL MAP. Key to label for every reason a job can be closed LOST under, and the only
+# spelling any staff screen renders.
+#
+# Kyle's own list, verbatim off his screenshot, adopted 2026-08-20 — it replaced a six-answer
+# vocabulary that had been invented for the CUSTOMER's "not moving forward" form, which is a
+# different question asked of a different person. A customer says "price"; a GC bid dies because we
+# were not low. His answers are the ones the sales meeting says out loud.
+#
+# The last four are the ones ONLY the customer's own form can produce (frontend/index.html). They
+# are not offered to staff, but a customer can still close a job under any of them, so they stay
+# here or the Lost tab would file their bid under "Not recorded" and read as though nobody said.
+#
+# TWO OF KYLE'S EIGHT ARE NOT IN THIS MAP AT ALL: "Project on Hold" and "Small Bid <$25k - Pending"
+# put a bid on hold rather than closing it (see _HOLD_REASON_LABELS). A hold is not a loss and has
+# no business being a Lost column.
+#
+# "canceled" is the one key Kyle's list SHARES with the customer's form. His screenshot spells it
+# "Cancelled" and the customer's radio says "canceled"; one reason must not become two columns over
+# an l, so the key is the old one and this label is his spelling. The customer's radio copy is
+# theirs and is left alone — it is prose written for them, not a vocabulary.
+#
+# THIS MAP AND crm-core.js's LOST_REASON ARE COMPARED BY A TEST, in both repos, since 2026-08-20.
+# Nothing compared them before, which is how this side said "Selected another contractor" and the
+# tool said "Another contractor" for weeks about the same key.
 _LOST_REASON_LABELS = {
-    "price": "Price", "another_contractor": "Selected another contractor",
-    "canceled": "Project canceled", "scope_changed": "Scope changed",
-    "timing": "Timing", "other": "Other",
+    "not_low_bid": "Not Low Bid",
+    "no_response": "No Response",
+    "to_rebid": "Project to Rebid",
+    "different_gc": "Went to Different GC",
+    "gc_schedule": "Unable to meet GC schedule",
+    "canceled": "Project Cancelled",
+    "other": "Other",
+    "price": "Price",
+    "another_contractor": "Selected another contractor",
+    "scope_changed": "Scope changed",
+    "timing": "Timing",
+}
+
+# The two answers that PAUSE a bid instead of killing it. Hanz, 2026-08-20: the card stays on the
+# Active board and the reminder emails pause. They route through the `delayed` status this file
+# already has rather than a mechanism of their own — see admin_set_status.
+_HOLD_REASON_LABELS = {
+    "on_hold": "Project on Hold",
+    "small_bid_pending": "Small Bid <$25k - Pending",
 }
 
 
@@ -2360,8 +2401,18 @@ _STAFF_FOLLOWUP_KINDS = ("staff_call", "staff_email", "staff_text", "staff_note"
 # than the short form the drawer sends, because that one is normalised away before we get here.
 _FOLLOWUP_NOUNS = {"staff_call": "a call", "staff_email": "an email",
                    "staff_text": "a text", "staff_note": "a note"}
-_LOST_REASONS = ("price", "another_contractor", "canceled", "scope_changed", "timing", "other")
+# DERIVED, not typed out again. This was a second literal tuple 1300 lines below the label map it
+# is supposed to agree with, and the two had already drifted once. A reason that is accepted but has
+# no label renders as a bare "Marked Closed-Lost." with the reason silently dropped.
+_LOST_REASONS = tuple(_LOST_REASON_LABELS)
+_HOLD_REASONS = tuple(_HOLD_REASON_LABELS)
 _PAUSE_MONTHS = (1, 2, 3, 4)
+# Why the comment is required. Hanz, 2026-08-20. A reason alone does not tell the next person
+# anything — "Not Low Bid" is eight identical cards by the end of a quarter, and "we were 12% over
+# Wilson on the pour" is the sentence the sales meeting is actually held to read. Refused empty on
+# the STAFF paths only: the customer's own form asks "if you don't mind saying" and must keep
+# taking no for an answer.
+_NOTE_MAX = 2000
 
 
 # ── the follow-up cadence, as settings ────────────────────────────────────────
@@ -2591,7 +2642,20 @@ async def admin_followup_automation(proposal_id: str, request: Request) -> JSONR
     """Take a proposal off automation, or put it back on.
 
     This is the spec's "estimator manually removes the proposal from automation" —
-    the deliberate human override, so it is sticky across re-publishes."""
+    the deliberate human override, so it is sticky across re-publishes.
+
+    TURNING IT ON ALSO LIFTS A PAUSE, since 2026-08-21, and until then it did not: this route
+    called set_followup_enabled and nothing else, so on a paused project the switch flipped a flag
+    and the cadence stayed stopped. Two things were wrong with that. The button's own title in the
+    drawer is "Start the follow-up cadence from today", which it then did not do — followup_disabled_at
+    and followup_paused_until both suppress a send, and clearing one of two stops is not a start.
+    And it is the control an estimator reaches for when they cannot find a way out of a hold, which
+    is the state every held SENT bid was in until today, so the one obvious workaround failed
+    silently too.
+
+    Only on the way ON, and only when there is a pause to lift. Turning automation OFF must not
+    touch the date: a paused project that somebody also takes off automation has two separate
+    decisions on it, and resuming while switching off would be this route inventing a third."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     p = db.get_proposal(proposal_id)
@@ -2603,7 +2667,12 @@ async def admin_followup_automation(proposal_id: str, request: Request) -> JSONR
     # Read through _followup_state, which is what the drawer's switch is DRAWN from, so the card
     # and the switch can never disagree about what "on" meant a moment ago.
     was = _followup_state(p)["enabled"]
+    # Read BEFORE the writes, for the reason admin_set_status gives: after them the comparison is
+    # against what this request just stored.
+    was_paused = bool(p.get("followup_paused_until"))
     db.set_followup_enabled(proposal_id, enabled)
+    if enabled and was_paused:
+        db.resume_followups(proposal_id)
     db.add_followup(proposal_id, "staff_note",
                     {"action": "automation_on" if enabled else "automation_off"}, by)
     # NO CARD WHEN THE SWITCH DID NOT MOVE — a second tab, a double click, or a drawer re-save all
@@ -2621,6 +2690,17 @@ async def admin_followup_automation(proposal_id: str, request: Request) -> JSONR
             text = ("%s turned follow-up automation off." % who if who
                     else "Follow-up automation was turned off.")
         _crm_card(proposal_id, text, "automation")
+    # THE PAUSE GETS ITS OWN LINE, and it is outside the switch-moved guard on purpose. Lifting a
+    # pause is a change to what the CUSTOMER receives, not to a flag: a project paused until
+    # December starts being emailed again today. That has to be readable even in the case where the
+    # switch itself did not move (a re-save, or a project enrolled-and-enabled but held), because
+    # "why did they get a reminder in September?" is answered by this line and by nothing else.
+    if enabled and was_paused:
+        who = _actor_name(by)
+        _crm_card(proposal_id,
+                  ("%s lifted the follow-up pause, so the reminders start again." % who if who
+                   else "The follow-up pause was lifted, so the reminders start again."),
+                  "automation_resumed")
     return _json({"ok": True, "followup_state": _followup_state(db.get_proposal(proposal_id) or p)})
 
 
@@ -2679,7 +2759,25 @@ def admin_list_followups(proposal_id: str, request: Request) -> JSONResponse:
 async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
     """Staff-side equivalent of the customer's project-status card: pause the chase,
     close the opportunity, or put it back in play. Same db helpers, so the two paths
-    can never diverge."""
+    can never diverge.
+
+    THE STAFF PATH IS STRICTER THAN THE CUSTOMER PATH, deliberately, since 2026-08-20. It used to
+    be looser: `reason` was validated only `if reason`, so a sent project could be closed lost with
+    no reason at all, or with a made-up one, while the tool's own draft route 422s both for a bid
+    nobody has sent. The Lost tab has no column for a reason nobody recognises, so the same act
+    from two drawers filed one bid under a reason and the other under "Not recorded". Both ends now
+    refuse, and a comment saying WHY is required too.
+
+    The customer's own form (api_project_status) stays lenient on both counts and must: it asks "if
+    you don't mind saying", and a customer who does mind still has to be able to tell us they are
+    out.
+
+    A `delayed` WITH A REASON is one of Kyle's two hold answers — "Project on Hold" and "Small Bid
+    <$25k - Pending" — arriving from the close-out dialog. Hanz's instruction was to route those
+    through this status rather than build a mechanism: the card stays on the Active board and the
+    cadence pauses, which is what this branch already does. A `delayed` with NO reason is the older
+    "Mark delayed" control, which asks for a number of months and nothing else, and keeps working
+    exactly as it did."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     p = db.get_proposal(proposal_id)
@@ -2688,6 +2786,10 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
     body = await _body(request)
     status = str(body.get("status") or "").strip().lower()
     by = _cap(body.get("by"), 120) or None
+    # Read once for both branches. Capped and stripped here so "   " is the same as "" — an
+    # estimator hitting space to get past a required field has said nothing, and a required field
+    # that accepts a space is decoration.
+    note = _cap(str(body.get("note") or "").strip(), _NOTE_MAX) or None
 
     who = _actor_name(by)
 
@@ -2698,28 +2800,53 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
             months = 0
         if months not in _PAUSE_MONTHS:
             return _json({"ok": False, "error": "invalid_months"}, 400)
+        hold = str(body.get("reason") or "").strip().lower() or None
+        if hold is not None:
+            if hold not in _HOLD_REASONS:
+                return _json({"ok": False, "error": "invalid_reason"}, 400)
+            if not note:
+                return _json({"ok": False, "error": "note_required"}, 400)
         until = followup_rules.add_months(followup_rules.business_today(_now_utc()), months)
         # Read BEFORE the write, or the comparison below is against what we just stored.
         already = followup_rules.as_date(p.get("followup_paused_until")) == until
         db.pause_followups(proposal_id, until)
-        db.add_followup(proposal_id, "staff_note",
-                        {"action": "paused", "months": months, "until": until.isoformat()}, by)
+        # The reason and the comment ride in the SAME jsonb detail the note has always used
+        # (portal_followups.detail), which is why this needed no DDL. Only when there is one:
+        # nulls on every older pause would make "was a reason given" a truthiness test on a key
+        # that is always present.
+        detail = {"action": "paused", "months": months, "until": until.isoformat()}
+        if hold:
+            detail["reason"] = hold
+            detail["note"] = note
+        db.add_followup(proposal_id, "staff_note", detail, by)
         # Same no-op the CUSTOMER path guards, and for the same reason: pausing to the date it is
         # already paused to has changed nothing, so it is not worth a line. Only the card is
         # skipped — that path returns early, and matching it here would change what this endpoint
         # does to its caller.
-        if not already:
+        #
+        # A HOLD ALWAYS GETS ITS CARD, even when the date is unchanged. The old rule was about a
+        # pause carrying nothing but a date, where a second press said nothing new. A hold carries
+        # a reason and somebody's sentence about why, and that sentence is the whole content of the
+        # act — swallowing it because a colleague happened to pause to the same day last week would
+        # lose the only part anyone reads.
+        if not already or hold:
             window = _delay_window(months)
+            label = _HOLD_REASON_LABELS.get(hold or "", "")
             _crm_card(proposal_id,
                       ("%s marked this delayed by about %s — follow-ups paused until %s."
                        % (who, window, until.isoformat())) if who
                       else ("Marked delayed by about %s — follow-ups paused until %s."
                             % (window, until.isoformat())),
                       "status_delayed")
+            if label:
+                _crm_card(proposal_id, 'On hold: %s — "%s"' % (label, note),
+                          "status_on_hold")
     elif status == "closed_lost":
         reason = str(body.get("reason") or "").strip().lower() or None
-        if reason and reason not in _LOST_REASONS:
+        if reason not in _LOST_REASONS:
             return _json({"ok": False, "error": "invalid_reason"}, 400)
+        if not note:
+            return _json({"ok": False, "error": "note_required"}, 400)
         # An approved proposal is closeable from here as of 2026-08-10, per Hanz: a customer
         # can sign and the job still die, so staff need a way to file it as lost. The approval
         # is kept rather than erased (close_lost leaves the approved_* columns and the
@@ -2730,16 +2857,31 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
         was_closed = (p.get("proposal_status") or "") == "closed_lost"
         if not db.close_lost(proposal_id, reason):
             return _json({"ok": False, "error": "not_found"}, 404)
+        # THE COMMENT HAS NO COLUMN AND DOES NOT NEED ONE. portal_proposals carries the reason and
+        # the timestamp; this is the jsonb precedent the CUSTOMER's own note has used since the
+        # follow-up system shipped — portal_followups.detail, plus the message meta below. No DDL,
+        # and the thread is where a sentence about a job belongs anyway.
         db.add_followup(proposal_id, "staff_note",
-                        {"action": "closed_lost", "reason": reason}, by)
+                        {"action": "closed_lost", "reason": reason, "note": note}, by)
         # A closed job closed again with the SAME reason is a re-click, not news. A different
         # reason is: "we lost on price" and "they went with somebody else" are different stories
         # about the same job and the correction belongs in the thread.
+        #
+        # THE COMMENT IS ALWAYS NEWS, though, which is why it is ORed in. Two people can close the
+        # same bid under "Not Low Bid" and only one of them wrote down that we were 12% over
+        # Wilson; dropping the second card because the reason matched would drop the only part
+        # worth reading. The reason-changed rule stays for the bare re-click it was written for.
         if not (was_closed and (p.get("closed_lost_reason") or None) == reason):
             label = _LOST_REASON_LABELS.get(reason or "", "")
             _crm_card(proposal_id,
                       ("%s marked this Closed–Lost." % who if who else "Marked Closed–Lost.")
-                      + (" Reason: %s." % label if label else ""),
+                      + (" Reason: %s." % label if label else "")
+                      + ' "%s"' % note,
+                      "status_closed_lost")
+        else:
+            _crm_card(proposal_id,
+                      ("%s added a note on the close: " % who if who else "Note on the close: ")
+                      + '"%s"' % note,
                       "status_closed_lost")
     elif status == "active":
         # Both facts read before either write, for the reason the delayed branch gives.
