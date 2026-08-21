@@ -564,6 +564,7 @@ async def me_feedback(request: Request) -> JSONResponse:
             f"<p><strong>{html.escape(se)}</strong> sent {html.escape(label.lower())} about the "
             f"customer portal:</p><blockquote>{html.escape(text)}</blockquote>"
             + (f"<p class=\"muted\">While viewing project {html.escape(pid)}.</p>" if pid else ""),
+            kind="feedback",
         )
     except Exception as exc:  # noqa: BLE001 — saved already; a send failure is not the customer's
         log.warning("feedback notify failed for %s: %s", se, exc)
@@ -743,6 +744,7 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         f"<p><strong>{html.escape(who or '')}</strong> asked a question on "
         f"<strong>{html.escape(p.get('project_name') or '')}</strong>:</p>"
         f"<blockquote>{html.escape(text)}</blockquote>",
+        kind="question",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
@@ -893,6 +895,7 @@ def _alert_first_view(p: dict, who: Optional[str]) -> None:
             f"Proposal opened — {project}",
             f"<p><strong>{html.escape(name)}</strong> opened the proposal for "
             f"<strong>{html.escape(project)}</strong>.</p>",
+            kind="viewed",
             reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
             reply_to=email_sender.proposal_reply_to(p.get("token")),
             token=p.get("token"), project=p.get("project_name"),
@@ -982,6 +985,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
            else "<p>No deposit required for this project — the customer has been asked for "
                 "their project contacts.</p>")
         + f"<p>Project: {html.escape(project_name)}.</p>",
+        kind="approved",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
@@ -1200,7 +1204,7 @@ def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:
         # muted estimator was dragged back in — an explicit "don't email me about this job"
         # silently overruled. Both rules now live in one place (_resolve_notify), so chat
         # messages and status updates cannot disagree about who hears from a project.
-        email_sender.notify_team(subject, body_html,
+        email_sender.notify_team(subject, body_html, kind="status_change",
                                  reply_link=_staff_link(pid), proposal_id=pid,
                                  reply_to=email_sender.proposal_reply_to(p.get("token")),
                                  token=p.get("token"), project=p.get("project_name"),
@@ -1293,7 +1297,8 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         subject = f"Deposit by check — {project_name} ({ref})"
     email_sender.notify_team(
         subject, f"<p>{lead}</p>" + detail + f"<p>{closing}</p>",
-        kind="deposit", reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
+        kind="deposit_submitted",
+        reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
     )
@@ -1398,6 +1403,7 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
     email_sender.notify_team(
         f"Project contacts submitted — {project}",
         f"<p>Contacts for <strong>{html.escape(project)}</strong>:</p><ul>{rows}</ul>",
+        kind="contacts",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
@@ -2091,7 +2097,7 @@ async def admin_publish(request: Request) -> JSONResponse:
                          + ("They have" if len(failed) > 1 else "That customer has")
                          + " not received the proposal — open the project and send it again.</p>")
         email_sender.notify_team(
-            heading, "".join(parts),
+            heading, "".join(parts), kind="sent",
             reply_link=_staff_link(draft_id), proposal_id=draft_id,
             reply_to=rt, token=token, project=project,
             assigned_estimator=assigned or (existing or {}).get("assigned_estimator"),
@@ -3047,7 +3053,8 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
         f"Deposit RECEIVED — {project}",
         f"<p>The deposit for <strong>{html.escape(project)}</strong> is marked received. "
         f"The customer has been asked for their project contacts.</p>",
-        kind="deposit", reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
+        kind="deposit_received",
+        reply_link=_staff_link(proposal_id), proposal_id=proposal_id,
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
     )
@@ -3127,17 +3134,90 @@ async def admin_deposit_request(proposal_id: str, request: Request) -> JSONRespo
 
 
 # ── admin: configurable team-notification recipients (roster) ─────────────────
+# DISTINCT PEOPLE, not rows. See db.count_notify_people.
 _MAX_NOTIFY_RECIPIENTS = 40
+
+# Everything the `kind` column may hold: the floor, the nine CRM steps, and the legacy value the
+# two money steps shared before 2026-08-21. Sourced from email_sender so the API, the resolver and
+# the CHECK constraint cannot disagree about the vocabulary.
+# Kinds the ADD FIELD may create. The floor plus the legacy deposit kind - deliberately NOT
+# the steps; see admin_notify_add for why a disabled step row is not the same thing as a new
+# colleague. `_NOTIFY_KINDS` below stays the full set, because reads and the resolver must
+# still recognise every value the column can legally hold.
+_NOTIFY_ADDABLE_KINDS = frozenset((email_sender.GENERAL_KIND, email_sender.LEGACY_DEPOSIT_KIND))
+_NOTIFY_KINDS = frozenset((email_sender.GENERAL_KIND, email_sender.LEGACY_DEPOSIT_KIND)
+                          + email_sender.NOTIFY_STEP_IDS)
+_NOTIFY_STEP_STATES = ("on", "off", "inherit")
+
+
+def _notify_people(rows: list[dict] | None = None) -> set[str]:
+    """The DISTINCT addresses on the roster, which is what the cap is about.
+
+    The cap counted ROWS, and that was fine while a person had one. With a row per (person, step)
+    a 13-person roster holds up to 130 of them, so a row cap would refuse the fourteenth
+    colleague because the first thirteen had used their toggles — reported as "too many
+    recipients", which would be true of nothing anybody could see.
+
+    Derived from the rows we already fetch rather than a second count(distinct) query: one round
+    trip, and no chance of the cap and the list disagreeing about who is on it.
+
+    `rows` lets a caller that has already loaded the roster reuse it, so the step endpoint can
+    check the cap AND the unsilenceable-step guard off ONE read. Two reads could straddle another
+    admin's write and answer the two questions about two different rosters."""
+    return {(r.get("email") or "").strip().lower()
+            for r in (db.list_notify_recipients() if rows is None else rows) if r.get("email")}
+
+
+def _silences_step(rows: list[dict], email: str, step: str, state: str) -> bool:
+    """Would this one write take `step` from reaching somebody to reaching nobody?
+
+    ONE HELPER BECAUSE THERE ARE THREE WRITE PATHS, and the first version of this guard lived
+    inside only one of them. Its own comment claimed a server-side refusal "holds for a stale page,
+    a second tab and a curl alike" - and that was not true, because POST and PATCH on the same
+    resource create suppression rows without passing through it. Review executed both: two POSTs
+    of {kind: "sent"} returned 200 and took the reach from ['hanz','will'] to [], and a PATCH of
+    {enabled: false} on two `sent` rows did the same. A guard that one of three doors respects is
+    a guard nobody can rely on, so the check moved here and every door calls it.
+
+    Only steps in UNSILENCEABLE_STEPS are guarded, and only in the somebody -> nobody direction.
+    """
+    if step not in email_sender.UNSILENCEABLE_STEPS:
+        return False
+    before = email_sender.step_reach(rows, step)
+    if not before:
+        return False
+    return not email_sender.step_reach(_notify_rows_after(rows, email, step, state), step)
+
+
+def _notify_rows_after(rows: list[dict], email: str, step: str, state: str) -> list[dict]:
+    """The roster as it would stand AFTER this one cell write, without writing it.
+
+    Mirrors db.set_notify_step (an upsert on (kind, lower(email))) and db.clear_notify_step (a
+    delete on the same key), so a guard computed from this is answering the question the write
+    actually poses. A legacy 'deposit' row is deliberately untouched: neither DB call can reach
+    one, because both key on the step id."""
+    out = [r for r in rows
+           if not ((r.get("kind") or "") == step
+                   and (r.get("email") or "").strip().lower() == email)]
+    if state != "inherit":
+        out.append({"email": email, "kind": step, "enabled": state == "on"})
+    return out
 
 
 @app.get("/api/admin/notify-recipients")
 def admin_notify_list(request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    return _json({"ok": True, "recipients": [
-        {"id": r["id"], "email": r["email"], "kind": r["kind"],
-         "enabled": bool(r.get("enabled", True)), "added_by": r.get("added_by")}
-        for r in db.list_notify_recipients()]})
+    # `steps` rides along with the rows so the Notification Sending page renders its columns
+    # from the vocabulary the RESOLVER uses, and keeps no list of its own. The page lives in the
+    # other repo; a hardcoded copy over there is a copy that drifts, and a column the resolver
+    # does not recognise is a toggle that silently does nothing.
+    return _json({"ok": True,
+                  "steps": email_sender.steps_payload(),
+                  "recipients": [
+                      {"id": r["id"], "email": r["email"], "kind": r["kind"],
+                       "enabled": bool(r.get("enabled", True)), "added_by": r.get("added_by")}
+                      for r in db.list_notify_recipients()]})
 
 
 @app.post("/api/admin/notify-recipients")
@@ -3147,11 +3227,23 @@ async def admin_notify_add(request: Request) -> JSONResponse:
     body = await _body(request)
     email = (body.get("email") or "").strip().lower()
     kind = (body.get("kind") or "general").strip().lower()
-    if kind not in ("general", "deposit"):
+    # THE ADD FIELD ADDS PEOPLE TO THE TEAM, and it creates the row switched OFF. Under the old
+    # two-value vocabulary that meant only "on the roster, not emailed yet". Under the step
+    # vocabulary a disabled STEP row means "suppress", so accepting a step kind here mints exactly
+    # what the unsilenceable-step guard exists to prevent - review executed it: two POSTs of
+    # {kind: "sent"} returned 200 and took that alert's reach to nobody.
+    #
+    # So this route accepts the floor and the legacy deposit kind only, which is what it accepted
+    # before the matrix existed. Nothing sends anything else: the tool's own proxy allows the same
+    # two, and the page's add field has a single kind. Step rows are written through
+    # PUT .../step, which is guarded. This removes capability rather than adding a check.
+    if kind not in _NOTIFY_ADDABLE_KINDS:
         return _json({"ok": False, "error": "invalid_kind"}, 400)
     if len(email) > 254 or not _EMAIL_RE.match(email):
         return _json({"ok": False, "error": "invalid_email"}, 400)
-    if len(db.list_notify_recipients()) >= _MAX_NOTIFY_RECIPIENTS:
+    # PEOPLE, not rows: a person now holds up to one row per step, so counting rows would refuse
+    # the fourteenth colleague because the first thirteen had used their toggles.
+    if len(_notify_people()) >= _MAX_NOTIFY_RECIPIENTS:
         return _json({"ok": False, "error": "too_many"}, 400)
     # New recipients start OFF (gray) — added to the roster but not emailed until an
     # admin toggles them green. Adding someone must never silently start sending.
@@ -3164,7 +3256,19 @@ async def admin_notify_toggle(rid: int, request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
-    db.set_notify_recipient_enabled(rid, bool(body.get("enabled")))
+    enabled = bool(body.get("enabled"))
+    # PATCH TAKES AN id, NOT AN (email, step) PAIR, which is why it slipped the guard: nothing in
+    # the request says which step is being silenced. Look the row up and ask the same question the
+    # PUT asks. Review reached this from the tool's proxy, which forwards any rid on an admin
+    # session alone, with the roster GET handing step-row ids to the browser.
+    if not enabled:
+        rows = db.list_notify_recipients()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(rid)), None)
+        if row is not None:
+            kind = (row.get("kind") or "").strip().lower()
+            if _silences_step(rows, (row.get("email") or "").strip().lower(), kind, "off"):
+                return _json({"ok": False, "error": "would_silence_step", "step": kind}, 400)
+    db.set_notify_recipient_enabled(rid, enabled)
     return _json({"ok": True})
 
 
@@ -3173,6 +3277,71 @@ def admin_notify_delete(rid: int, request: Request) -> JSONResponse:
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     db.delete_notify_recipient(rid)
+    return _json({"ok": True})
+
+
+@app.put("/api/admin/notify-recipients/step")
+async def admin_notify_step_set(request: Request) -> JSONResponse:
+    """Set ONE cell of the person x step matrix.
+
+    `state` is the three things a cell can actually be, and they are three because two would be a
+    lie:
+      * "on"      — an explicit row, enabled. This person hears about this step.
+      * "off"     — an explicit row, disabled. This person does NOT, even though the general floor
+                    would otherwise have reached them. A suppression, and the only way to take one
+                    moment off somebody without taking them off the team entirely.
+      * "inherit" — no row. The floor decides, which is what an untouched cell has always meant.
+
+    ONE request per click, rather than the POST-then-PATCH pair the chips use. That pair would
+    create the row disabled and then enable it, so a half-failed click would leave a cell reading
+    off that nobody chose — and it would have to fight the roster cap on the way in.
+
+    Deliberately a step-only route: `general` is the floor and is set by the person's own on/off
+    chip, not by a matrix cell. Accepting it here would give one state two controls."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    email = (body.get("email") or "").strip().lower()
+    step = (body.get("step") or "").strip().lower()
+    state = (body.get("state") or "").strip().lower()
+    if len(email) > 254 or not _EMAIL_RE.match(email):
+        return _json({"ok": False, "error": "invalid_email"}, 400)
+    if step not in email_sender.NOTIFY_STEP_IDS:
+        return _json({"ok": False, "error": "invalid_step"}, 400)
+    if state not in _NOTIFY_STEP_STATES:
+        return _json({"ok": False, "error": "invalid_state"}, 400)
+    rows = db.list_notify_recipients()
+    # ONE STEP MAY NOT BE EMPTIED, AND THE WRITE IS REFUSED RATHER THAN FLAGGED.
+    #
+    # `sent` is the only step whose email is also a WARNING: admin_publish sends it on a delivery
+    # FAILURE too, saying "That customer has not received the proposal". Every other step reports
+    # something that happened; this one also reports something that did not, and it fires exactly
+    # when nobody is watching the project. Suppressing the last person on it would be a silent
+    # failure hidden behind a click that looked like it worked, which is the worst thing the new
+    # suppression power can do.
+    #
+    # REFUSING beats warning harder. A column badge is a report, and it only appears AFTER the
+    # last person is gone; a refusal is enforced here, so it holds for a stale page, a second tab
+    # and a curl alike, which is where UI-only copy fails. And it is narrow: one step, one
+    # direction (somebody -> nobody). Undo, every other step, and moving the alert from one person
+    # to another (turn the new one on first) all keep working.
+    #
+    # OUT OF SCOPE, deliberately: switching the whole team off from the roster card also empties
+    # this step. That path is not new, it silences all nine steps rather than hiding one, and the
+    # card it happens on shows the whole roster going grey. This guard is a brake on the power
+    # this change ADDS, not a new invariant over the roster as a whole.
+    if _silences_step(rows, email, step, state):
+        return _json({"ok": False, "error": "would_silence_step", "step": step}, 400)
+    if state == "inherit":
+        db.clear_notify_step(email, step)
+        return _json({"ok": True})
+    # A cell for somebody who is not on the roster at all is how a deposit-only person is added
+    # (kylene@ is exactly that), so it must be allowed — but it is also the one path that can grow
+    # the roster, so it answers to the same cap as the add field.
+    known = _notify_people(rows)
+    if email not in known and len(known) >= _MAX_NOTIFY_RECIPIENTS:
+        return _json({"ok": False, "error": "too_many"}, 400)
+    db.set_notify_step(email, step, state == "on", _cap(body.get("by"), 120) or None)
     return _json({"ok": True})
 
 

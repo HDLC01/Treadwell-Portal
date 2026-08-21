@@ -158,6 +158,85 @@ select v.email, 'general'
 from (values ('hanz@wetreadwell.com'), ('will@wetreadwell.com')) as v(email)
 where not exists (select 1 from public.portal_notify_recipients);
 
+-- 2026-08-21: `kind` widens from ('general','deposit') to the NINE CRM STEPS, so the roster can
+-- say who hears about each moment instead of only "everything" or "the money". The column was
+-- already text — the only structural change is the CHECK constraint, and it is purely additive.
+--
+-- Hanz asked whether Kylene is toggled on for approval. She is not: she sits on the deposit
+-- bucket, and approval only LOOKS connected because it leads to a deposit request. Seven of the
+-- nine notify_team() call sites named no kind at all, so every other moment shared one list.
+--
+-- 'general' STAYS, and is not a step. It is the FLOOR every step resolves on top of, so a step
+-- nobody has configured still reaches the team. A step row that is switched OFF suppresses that
+-- one moment for that one person and beats the floor — see email_sender.resolve_notify_recipients.
+--
+-- 'deposit' stays LEGAL as a legacy value: kylene@ is live as one of these rows, and the resolver
+-- fans it out to both money steps so nothing stops reaching her whichever order code and schema
+-- land in. The migration below converts the ENABLED ones and leaves the dormant ones inert,
+-- and nothing writes the value afterwards either way.
+--
+-- WRITTEN AS PLAIN STATEMENTS, not a `do $$ ... $$` block, for the reason spelled out further
+-- down this file (see the deposit_status / msg_type re-adds): run_script() strips `--` comments
+-- and SPLITS THIS FILE ON ';', so a dollar-quoted body is torn into fragments and the first of
+-- them ('do $$ declare c record') is a syntax error. psycopg rolls the transaction back on it, so
+-- NOTHING in schema.sql applies -- not the widened CHECK, not cleanup_expired, and not a single
+-- table on a fresh local DB -- and main.py's startup swallows the whole thing as one log line.
+-- APPLY_SCHEMA_ON_BOOT defaults true for every non-production ENVIRONMENT and
+-- docker-compose.staging.yml sets ENVIRONMENT=staging, so that is the next staging deploy.
+--
+-- THE CONSTRAINT NAME. Postgres auto-names a column-level check `<table>_<column>_check`, so the
+-- inline `check (kind in ('general','deposit'))` declared with the table above is
+-- portal_notify_recipients_kind_check. Not assumed -- confirmed by precedent on THIS database:
+-- portal_proposals.deposit_status and portal_questions.msg_type are inline column checks of
+-- exactly the same shape, are dropped below by that same auto-name, and both re-adds are live
+-- (prod accepts deposit_status 'submitted' and 'received', which the original narrow check
+-- rejected, so the drop found its target). Postgres only deviates from the convention when the
+-- name is already taken, and this table has one check constraint and one column that could
+-- produce it. A miss would leave the old constraint standing and reject every step row -- which
+-- is why the delete further down is guarded on the copy having landed rather than on this.
+alter table public.portal_notify_recipients
+  drop constraint if exists portal_notify_recipients_kind_check;
+alter table public.portal_notify_recipients
+  add constraint portal_notify_recipients_kind_check
+  check (kind in ('general','deposit','sent','viewed','question','status_change','approved',
+                  'deposit_submitted','deposit_received','contacts','feedback'));
+
+-- Convert each legacy 'deposit' row into the two money-step rows it always meant, then retire it.
+--
+-- ONLY THE ENABLED ONES. Adding a recipient has ALWAYS created the row switched OFF, so a
+-- disabled legacy row means "an address somebody typed into the Deposit-alerts card and never
+-- turned green" -- merely not on the deposit list. Under the new vocabulary an OFF step row means
+-- something that did not exist when these rows were written: suppress this person from this
+-- moment, beating the general floor. Copying `enabled` verbatim would therefore bake one dormant
+-- row into two permanent suppressions. Measured on rows [hanz general on, will general on, hanz
+-- kind='deposit' enabled=false]: HEAD resolved deposit to ['hanz','will'], and with the step code
+-- deposit_submitted and deposit_received both resolved to ['will'] alone. Hanz, silently dropped
+-- from both deposit emails with nobody touching anything.
+-- email_sender._resolve_notify skips a disabled legacy row for the same reason, so the two halves
+-- agree whichever order code and schema land in. The dormant row is left standing rather than
+-- deleted: it is inert (nothing resolves it, and the grid does not draw it), and inert is
+-- reversible where deleted is not.
+insert into public.portal_notify_recipients (email, kind, enabled, added_by)
+select r.email, s.step, r.enabled, r.added_by
+  from public.portal_notify_recipients r
+ cross join (values ('deposit_submitted'), ('deposit_received')) as s(step)
+ where r.kind = 'deposit' and r.enabled
+on conflict (kind, lower(email)) do nothing;
+-- THE DELETE IS GUARDED ON THE COPY HAVING LANDED, per address, rather than run unconditionally.
+-- Inside run_script the whole file is one transaction, so a failure would roll the delete back
+-- with everything else -- but the PRODUCTION path is out of band (portal_app has no DDL rights;
+-- an owner applies this by hand), and psql without ON_ERROR_STOP carries on past a failed
+-- statement. So if the widening above failed for any reason, the insert would fail the old narrow
+-- CHECK and an unguarded delete would still run, destroying the only record of who was on the
+-- deposit list with nothing left to rebuild it from. Idempotent: on a second run the enabled rows
+-- are already gone and the disabled ones never match the guard.
+delete from public.portal_notify_recipients d
+ where d.kind = 'deposit'
+   and exists (select 1 from public.portal_notify_recipients s
+                where s.kind = 'deposit_submitted' and lower(s.email) = lower(d.email))
+   and exists (select 1 from public.portal_notify_recipients v
+                where v.kind = 'deposit_received' and lower(v.email) = lower(d.email));
+
 -- Per-project notification overrides: assign an extra person to ONE project's
 -- notifications ('add'), or let someone opt OUT of one project ('mute'). Applied
 -- on top of the enabled roster at send time (mute wins over add). Mirrors
