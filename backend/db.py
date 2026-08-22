@@ -1253,6 +1253,35 @@ def add_notify_recipient(email: str, kind: str, added_by: Optional[str] = None,
     )
 
 
+def set_notify_step(email: str, kind: str, enabled: bool,
+                    added_by: Optional[str] = None) -> None:
+    """Write ONE cell of the person x step matrix: an explicit on or an explicit off.
+
+    UPSERTS, unlike add_notify_recipient's do-nothing. That is the difference between adding
+    somebody to a list (where a second click must not silently flip their state) and setting a
+    switch, where the whole point is that the last press wins. The unique key is
+    (kind, lower(email)), so one row per person per step and no way to accumulate duplicates.
+
+    An explicit OFF is a ROW, not the absence of one: it has to outrank the general floor, and
+    "no row" already means "inherit the floor". Deleting instead of storing false would make an
+    off cell indistinguishable from one nobody has touched — which is the misreading this whole
+    feature carries the most risk of."""
+    execute(
+        "insert into public.portal_notify_recipients (email, kind, enabled, added_by) "
+        "values (%s,%s,%s,%s) "
+        "on conflict (kind, lower(email)) do update set enabled = excluded.enabled",
+        (email.strip().lower(), kind, enabled, added_by),
+    )
+
+
+def clear_notify_step(email: str, kind: str) -> None:
+    """Drop a cell back to inheriting the floor. Deliberately not the same as setting it off."""
+    execute(
+        "delete from public.portal_notify_recipients where kind=%s and lower(email)=lower(%s)",
+        (kind, email),
+    )
+
+
 def set_notify_recipient_enabled(rid: int, enabled: bool) -> None:
     execute("update public.portal_notify_recipients set enabled=%s where id=%s", (enabled, rid))
 

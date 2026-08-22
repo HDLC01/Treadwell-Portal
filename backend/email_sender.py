@@ -732,38 +732,223 @@ def send_deposit_request(email: str, url: str, project_name: str, amount: float 
                  _thread_headers(email, token), reply_to=reply_to, attachments=atts)
 
 
-def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env_deposit,
-                              adds=(), mutes=(), configured=None) -> list[str]:
-    """Pure recipient resolution for team notifications, fully driven by the
-    UI-managed roster (not hardcoded env). Base list: when the roster is CONFIGURED
-    (any rows exist), a 'deposit' alert takes the general rows PLUS the deposit-kind
-    rows, a 'general' alert uses general rows only. Then per-project overrides apply:
-    union `adds`, subtract `mutes` (mute wins over add) — case-insensitive,
-    order-preserving, deduped.
+# CRM steps a notification can belong to.
+#
+# DERIVED FROM THE CALL SITES, not invented. Every notify_team() in main.py names one of these,
+# and each id is named after what actually happened to the project. Nothing here fires from
+# nowhere: the mapping is pinned by test_notify_step_coverage.py, which walks main.py's syntax
+# tree and fails if a call passes a step this tuple does not contain, or passes none at all.
+#
+# `general` is NOT a step. It is the FLOOR: the list every step resolves on top of (see
+# resolve_notify_recipients). Somebody on the general list hears about everything unless a step
+# row of their own says otherwise for that one step.
+#
+# ORDER IS THE PROJECT'S ORDER, because it becomes the column order of the matrix on the
+# Notification Sending page, and a grid whose columns run in the order the work happens can be
+# read without hunting.
+NOTIFY_STEPS: tuple[tuple[str, str, str], ...] = (
+    ("sent", "Proposal sent",
+     "The proposal was emailed to the customer, including when a delivery failed."),
+    ("viewed", "Proposal opened", "The customer opened the proposal."),
+    ("question", "Customer question", "The customer asked a question in the project thread."),
+    ("status_change", "Customer status",
+     "The customer said the project is delayed, not moving forward, or back on."),
+    ("approved", "Proposal approved", "The customer approved and signed."),
+    ("deposit_submitted", "Deposit sent",
+     "The customer sent ACH details, or told us a check is on the way."),
+    ("deposit_received", "Deposit received", "Staff marked the deposit received."),
+    ("contacts", "Project contacts", "The customer submitted their project contacts."),
+    ("feedback", "Portal feedback", "Somebody sent feedback about the customer portal itself."),
+)
+NOTIFY_STEP_IDS: tuple[str, ...] = tuple(s for s, _, _ in NOTIFY_STEPS)
 
-    `configured` tells apart two empty states: an UNCONFIGURED roster (no rows at all,
-    e.g. fresh install) falls back to the env list, but a CONFIGURED roster whose
-    enabled bucket is empty (everyone toggled off) sends to NOBODY — it must NOT
-    resurrect the env default inbox. `configured=None` infers from the rows passed
-    (back-compat for callers that pass only the 5 base args)."""
+# The floor's own id. Stored in the same `kind` column as a step, which is what lets one table
+# hold both "who is on the team" and "who is an exception on one step".
+GENERAL_KIND = "general"
+
+# The two steps that are about money. They inherit the DEPOSIT env fallback rather than the
+# general one, which is what the single old 'deposit' kind did.
+DEPOSIT_STEPS: frozenset[str] = frozenset({"deposit_submitted", "deposit_received"})
+
+# What those two steps were BOTH called before 2026-08-21, when the column held exactly
+# ('general','deposit'). A surviving row fans out to both deposit steps rather than being
+# ignored: kylene@ is one of these on prod, and a widening that silently stopped emailing her
+# would be the same class of bug as the swap fixed here on 2026-08-20. The schema change migrates
+# these into two step rows; this covers the window before it is applied, and any row a human
+# writes by hand afterwards.
+LEGACY_DEPOSIT_KIND = "deposit"
+
+
+def steps_payload() -> list[dict[str, object]]:
+    """The step vocabulary, for the UI. Served from here so the Notification Sending page's
+    columns cannot drift from what the resolver recognises: the page renders whatever this
+    returns and keeps no list of its own.
+
+    `required` marks a step that may not be left reaching nobody (UNSILENCEABLE_STEPS). It rides
+    along so the column can SAY so before somebody tries, rather than only reporting a refusal
+    afterwards. The refusal itself is enforced server-side in main.admin_notify_step_set; this
+    flag is the explanation, never the check."""
+    return [{"id": s, "label": label, "hint": hint, "required": s in UNSILENCEABLE_STEPS}
+            for s, label, hint in NOTIFY_STEPS]
+
+
+def steps_for_kind(kind: str) -> tuple[str, ...]:
+    """Which step buckets a stored row belongs to. One, normally; BOTH deposit steps for a legacy
+    'deposit' row; none at all for the floor, which is not a step."""
+    if kind == LEGACY_DEPOSIT_KIND:
+        return ("deposit_submitted", "deposit_received")
+    return (kind,) if kind in NOTIFY_STEP_IDS else ()
+
+
+def bucket_notify_rows(rows, step) -> tuple[list[str], list[str], list[str]]:
+    """Split the roster rows into the three buckets ONE step resolves from:
+    (the floor, this step's opt-ins, this step's suppressions).
+
+    Extracted so `_resolve_notify` and `step_reach` cannot form two opinions about which row means
+    what. A grid, a guard and a send that each bucket the rows themselves is three chances to
+    disagree about who is emailed.
+
+      * the FLOOR - enabled rows whose kind is 'general'. Everybody on the team.
+      * OPT-INS   - enabled rows whose kind is this step. Somebody who is not on the team but
+                    should hear about this one moment (kylene@ and the deposit).
+      * SUPPRESSIONS - rows whose kind is this step and which are switched OFF. Somebody on the
+                    team who does not want this one moment. It beats the floor.
+
+    A DISABLED LEGACY 'deposit' ROW IS NEITHER, and is skipped entirely. Under the old vocabulary
+    the column held exactly ('general','deposit') and there was no such thing as a suppression, so
+    an off row could only ever have meant "an address somebody typed into the Deposit-alerts card
+    and never turned green" - merely not on the deposit list. Reading it as a suppression now would
+    invent an instruction nobody gave, and because the legacy kind fans out to BOTH money steps it
+    would invent it twice. Measured on rows [hanz general on, will general on, hanz kind='deposit'
+    enabled=false]: before the widening `deposit` resolved to ['hanz','will']; treating that row as
+    a suppression resolved deposit_submitted AND deposit_received to ['will'] alone. Hanz dropped
+    from both deposit emails with nobody touching anything, on the deploy. And it was reachable by
+    every address ever added to that card and left grey, because adding has always created the row
+    off. schema.sql migrates only `where kind='deposit' and enabled` for the same reason.
+
+    An ENABLED step row that is switched off is still a suppression - that is the whole feature.
+    The exemption is only for the legacy kind, whose off state predates the concept.
+
+    A row whose kind is neither the floor nor a step anything recognises is IGNORED here (the
+    caller still counts it as `configured`, so a value from the future cannot drop the whole roster
+    back to the env inbox)."""
+    general: list[str] = []
+    opt_ins: list[str] = []
+    suppressed: list[str] = []
+    for r in rows or ():
+        row_kind = r.get("kind") or GENERAL_KIND
+        enabled = r.get("enabled", True)
+        if row_kind == GENERAL_KIND:
+            if enabled:                      # gray toggle -> not on the floor
+                general.append(r["email"])
+            continue
+        # A step row. `steps_for_kind` is what makes a legacy 'deposit' row count for BOTH money
+        # steps instead of matching nothing once the column widened.
+        if step not in steps_for_kind(row_kind):
+            continue
+        if not enabled and row_kind == LEGACY_DEPOSIT_KIND:
+            continue                         # see above: it cannot have meant "suppress"
+        (opt_ins if enabled else suppressed).append(r["email"])
+    return general, opt_ins, suppressed
+
+
+# Steps that must never be left reaching nobody. See `step_reach`.
+#
+# 'sent' carries the DELIVERY-FAILURE alert as well as the good news: admin_publish sends it with
+# "That customer has not received the proposal - open the project and send it again." Every other
+# step reports something that happened; this one is also the only warning that something did not,
+# and it fires precisely when nobody is watching the project. A suppression that emptied it would
+# be a silent failure hidden behind a successful-looking click, so the write is REFUSED rather
+# than merely flagged - see main.py's admin_notify_step_set.
+UNSILENCEABLE_STEPS: frozenset[str] = frozenset({"sent"})
+
+
+def step_reach(rows, step) -> list[str]:
+    """Who this step reaches ORG-WIDE: the floor plus its opt-ins, minus its suppressions.
+
+    Deliberately no per-project adds or mutes, and no env fallback: this answers "is this step
+    configured to reach somebody", which is a question about the roster, not about one job. A step
+    that only reaches somebody because one project happens to carry an override is still a step
+    nobody set up."""
+    general, opt_ins, suppressed = bucket_notify_rows(rows, step)
+    off = {e.strip().lower() for e in suppressed if e}
+    out, seen = [], set()
+    for e in general + opt_ins:
+        key = (e or "").strip().lower()
+        if not key or key in off or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def resolve_notify_recipients(general_rows, step_rows, step, env_general, env_deposit,
+                              adds=(), mutes=(), configured=None, suppressed=()) -> list[str]:
+    """Pure recipient resolution for team notifications, fully driven by the UI-managed roster
+    (not hardcoded env).
+
+    THE FLOOR. Every step resolves to the enabled GENERAL rows PLUS that step's own enabled rows.
+    A step nobody has configured therefore still reaches the team, because an alert that reaches
+    nobody is worse than one that reaches too many. That was already true of deposits (the
+    2026-08-20 note below) and it is now true of all nine steps.
+
+    THE EXCEPTION. `suppressed` is the addresses whose row FOR THIS STEP is switched off, and it
+    beats the floor. Without it, the only way to stop somebody hearing about one moment would be
+    to take them off the team entirely, which stops the other eight as well: a cliff, not a knob.
+    It is also what keeps the screen honest, because on the matrix every green cell receives and
+    every grey cell does not, one rule, readable straight off the grid. What the floor still
+    guarantees is the case it exists for: nothing has been SAID about this person and this step.
+
+    A suppression is a STEP row that is off. A GENERAL row that is off is not a suppression: it is
+    simply not on the floor, and says nothing about any individual step.
+
+    Then per-project overrides apply: union `adds`, subtract `mutes` (mute wins over add),
+    case-insensitive, order-preserving, deduped. A per-project mute outranks everything here,
+    step opt-ins included, because it is the narrowest and most deliberate thing anybody can say:
+    not me, not this job.
+
+    `configured` tells apart two empty states: an UNCONFIGURED roster (no rows at all, e.g. a
+    fresh install) falls back to the env list, but a CONFIGURED roster whose enabled buckets are
+    empty (everyone toggled off) sends to NOBODY and must not resurrect the env default inbox.
+    `configured=None` infers from the rows passed, for back-compat with callers that pass only the
+    five base args.
+
+    `step` is 'general' (or anything unrecognised) for a caller that names no step, and resolves
+    to the floor alone, which is exactly where the seven un-named call sites used to land.
+    """
     if configured is None:
-        configured = bool(general_rows or deposit_rows)
-    if kind == "deposit":
-        # ADDITIVE, not a swap. This read `list(deposit_rows or general_rows)`, which let the
-        # deposit bucket REPLACE the general roster — so the first deposit-kind row anybody added
-        # would have silently stopped every general recipient hearing about deposits. A deposit
-        # alert is MORE people than a general one, not DIFFERENT people: whoever handles the money
-        # joins the people already told, so the general roster is the floor and deposit rows extend
-        # it. Rejected alternative: keep the replace semantics and auto-add the money person as a
-        # per-project override instead — that hardcodes a named human into the codebase and writes
-        # a row per project. Nobody sits on the deposit list today, and general_rows alone still
-        # resolves a deposit alert when it is empty, so this changes no current behaviour.
-        base = (list(general_rows) + list(deposit_rows)) if configured else list(env_deposit)
+        configured = bool(general_rows or step_rows)
+    if not configured:
+        # Fresh install: the env lists are all there is. The two money steps inherit the deposit
+        # env list, which is what the single old 'deposit' kind did.
+        base = list(env_deposit if step in DEPOSIT_STEPS or step == LEGACY_DEPOSIT_KIND
+                    else env_general)
+    elif step in NOTIFY_STEP_IDS or step == LEGACY_DEPOSIT_KIND:
+        # ADDITIVE, not a swap. This once read `list(deposit_rows or general_rows)`, which let the
+        # deposit bucket REPLACE the general roster, so the first deposit-kind row anybody added
+        # would have silently stopped every general recipient hearing about deposits. A step alert
+        # is MORE people than the floor, not DIFFERENT people: whoever is added for one moment
+        # joins the people already told. Rejected alternative: keep the replace semantics and
+        # auto-add the money person as a per-project override instead, which hardcodes a named
+        # human into the codebase and writes a row per project.
+        base = list(general_rows) + list(step_rows)
     else:
-        # Deliberately NOT additive in the other direction: somebody is on the deposit list for the
-        # money, so a general alert must not start reaching them.
-        base = list(general_rows) if configured else list(env_general)
+        # No step named, or one nothing recognises: the floor, and only the floor. Deliberately
+        # NOT additive in the other direction, so somebody added for the deposit alone does not
+        # start receiving approvals and questions because of it.
+        base = list(general_rows)
     mute_set = {m.strip().lower() for m in (mutes or []) if m}
+    # PRECEDENCE, widest to narrowest, later winning: the floor, then this step's opt-ins and
+    # suppressions (org-wide, about one moment), then this project's adds, then its mutes.
+    #
+    # So a step suppression is subtracted from the BASE and a per-project add can still bring
+    # somebody back. That is not a loophole, it is the rule that already governed everybody: being
+    # the assigned estimator has always reached somebody who is not on the roster at all, and a
+    # step row saying "not this moment" is a weaker statement than being absent altogether. The
+    # narrow way to stop a specific job reaching you is the per-project mute, which is exactly
+    # what it is for and still outranks every line above it.
+    step_off = {m.strip().lower() for m in (suppressed or []) if m}
+    base = [e for e in base if (e or "").strip().lower() not in step_off]
     out, seen = [], set()
     for e in list(base) + list(adds or []):
         if not e:
@@ -778,31 +963,45 @@ def resolve_notify_recipients(general_rows, deposit_rows, kind, env_general, env
 
 def _resolve_notify(kind: str, proposal_id: str | None = None,
                     assigned_estimator: str | None = None) -> list[str]:
-    """Resolve recipients from the roster (enabled rows only) plus this proposal's
-    per-project overrides. On DB failure, fall back to env (don't go silent just
-    because the table was momentarily unreachable).
+    """Resolve recipients for ONE CRM step from the roster plus this proposal's per-project
+    overrides. On DB failure, fall back to env (don't go silent just because the table was
+    momentarily unreachable).
 
-    `assigned_estimator` is folded in as a per-project ADD, which is exactly what it is:
-    the person who owns THIS job hears about it whether or not they sit on the org-wide
-    roster. Hanz, 2026-08-13, asking for chat messages to reach "whoever is set for the
-    notification sending of that project" — and on 2026-08-13 the enabled roster was
-    hanz@ + will@ only, so a job assigned to Kyle emailed neither Kyle nor anybody who
-    knew about it.
+    `kind` is a step id from NOTIFY_STEPS. The parameter keeps its old name because it is the
+    keyword nine call sites and every test already pass, and because it is still literally the
+    row's `kind` column; what widened is the vocabulary, from ('general','deposit') to the nine
+    moments the CRM actually emails about.
 
-    Routed through `adds` rather than prepended by the caller so that a per-project MUTE
-    still wins: somebody who explicitly silenced one job does not get dragged back in by
-    being its estimator. That also collapses two rules into one — the status-update path
-    used to prepend the estimator itself, unconditionally, and therefore ignored mutes."""
-    general, deposit, adds, mutes = [], [], [], []
+    THREE BUCKETS come out of one table, keyed on that column — the floor, this step's opt-ins,
+    this step's suppressions. `bucket_notify_rows` does the splitting and documents each one,
+    including the row shape that is deliberately NONE of them: a DISABLED LEGACY 'deposit' row,
+    which predates the concept of a suppression and so cannot have meant one.
+
+    A row whose kind is neither the floor nor a step it recognises is IGNORED for resolution but
+    still counted as `configured`, so a value from the future cannot silently drop the whole
+    roster back to the env inbox.
+
+    `assigned_estimator` is folded in as a per-project ADD, which is exactly what it is: the
+    person who owns THIS job hears about it whether or not they sit on the org-wide roster. Hanz,
+    2026-08-13, asking for chat messages to reach "whoever is set for the notification sending of
+    that project" — and on that date the enabled roster was hanz@ + will@ only, so a job assigned
+    to Kyle emailed neither Kyle nor anybody who knew about it.
+
+    Routed through `adds` rather than prepended by the caller so that a per-project MUTE still
+    wins: somebody who explicitly silenced one job does not get dragged back in by being its
+    estimator. That also collapses two rules into one — the status-update path used to prepend the
+    estimator itself, unconditionally, and therefore ignored mutes."""
+    general: list[str] = []
+    step_rows: list[str] = []
+    suppressed: list[str] = []
+    adds: list[str] = []
+    mutes: list[str] = []
     configured = False
     try:
         import db  # local import: avoid a hard DB dependency at module import time
         rows = db.list_notify_recipients()
         configured = bool(rows)
-        for r in rows:
-            if not r.get("enabled", True):   # gray toggle → excluded
-                continue
-            (deposit if r.get("kind") == "deposit" else general).append(r["email"])
+        general, step_rows, suppressed = bucket_notify_rows(rows, kind)
     except Exception as exc:  # noqa: BLE001 — DB down / table missing → env fallback
         log.warning("notify-recipient lookup failed (%s); using env fallback", exc)
         configured = False
@@ -818,9 +1017,9 @@ def _resolve_notify(kind: str, proposal_id: str | None = None,
     est = (assigned_estimator or "").strip()
     if est:
         adds = list(adds) + [est]
-    return resolve_notify_recipients(general, deposit, kind, config.NOTIFY_EMAILS,
+    return resolve_notify_recipients(general, step_rows, kind, config.NOTIFY_EMAILS,
                                      config.DEPOSIT_NOTIFY_EMAILS, adds=adds, mutes=mutes,
-                                     configured=configured)
+                                     configured=configured, suppressed=suppressed)
 
 
 def staff_emails(proposal_id: str | None = None) -> set[str]:
@@ -875,8 +1074,11 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
                 token: str | None = None, project: str | None = None,
                 assigned_estimator: str | None = None) -> list[str]:
     """Email the internal team, ONE MESSAGE PER PERSON. `recipients` (explicit) wins;
-    otherwise resolve by `kind` from the UI-managed roster, applying this proposal's
-    per-project overrides (`proposal_id`). `reply_link` appends a "Reply in Portal"
+    otherwise resolve by `kind` — a CRM STEP id from NOTIFY_STEPS, naming which moment this is —
+    from the UI-managed roster, applying this proposal's per-project overrides (`proposal_id`).
+    EVERY call site names its step. Seven of them used to default to `general`, which is why the
+    only knob anybody had was "everything or nothing"; test_notify_step_coverage.py walks the
+    syntax tree and fails the next call that forgets. `reply_link` appends a "Reply in Portal"
     button that deep-links staff to the proposal in the staff tool. `reply_to` (the
     proposal's inbound address) makes a plain reply from a staff inbox land in the
     thread too, so the button is the convenient path rather than the only one — but
@@ -899,6 +1101,16 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
     heading = subject
     if project and token:
         subject = staff_thread_subject(project)
+    # A step nobody recognises resolves to the FLOOR and says so in the log. Said out loud
+    # because that is the failure this whole feature exists to end: seven of these call sites
+    # spent months defaulting to `general` with nothing anywhere reporting it, so the roster
+    # could not be configured per moment and nobody could tell. A typo now leaves a line in the
+    # log rather than a silent, wider send. `recipients` given explicitly means the caller has
+    # already decided (followup_worker passes its own list), so no step is expected there.
+    if (recipients is None and kind != GENERAL_KIND
+            and kind not in NOTIFY_STEP_IDS and kind != LEGACY_DEPOSIT_KIND):
+        log.warning("notify: %r names step %r, which is not in NOTIFY_STEPS — resolving to the "
+                    "general floor", heading, kind)
     to = (recipients if recipients is not None
           else _resolve_notify(kind, proposal_id, assigned_estimator))
     if not to:
