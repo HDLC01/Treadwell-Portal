@@ -338,8 +338,22 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "coalesce(p.assigned_estimator, d.owner_email, p.published_by) as estimator_email, "
         # Two "last touched" facts the digest and the board both need: when the
         # customer last did anything, and when THIS estimator last chased them.
+        # INTERNAL ROWS ARE EXCLUDED, and this predicate is load-bearing rather than tidy.
+        # `last_message_at` feeds _last_activity, which the 6am digest scores customer SILENCE
+        # from, and the digest's silence weight is 20 points against a cutoff of 40. When staff
+        # follow-up reminders started echoing into the thread (2026-08-24), each one moved this
+        # timestamp to today - so a reminder saying "nobody has opened this yet" counted as
+        # movement on the job and could push that same proposal off the estimator's morning
+        # email. Measured on one row: score 70 with the fact "no movement for 20 days", 50 and
+        # no such fact afterwards. The reminder would have hidden the thing it was reminding
+        # about.
+        #
+        # The CUSTOMER echo still counts, deliberately: the customer really was contacted, and
+        # that is activity. A note written to ourselves is not.
         "(select max(q.created_at) from public.portal_questions q "
-        "   where q.proposal_id = p.proposal_id) as last_message_at, "
+        "   where q.proposal_id = p.proposal_id "
+        "     and coalesce((q.meta ->> 'internal')::boolean, false) is not true) "
+        "  as last_message_at, "
         # Has the CUSTOMER ever come back to us, and when last.
         #
         # `last_message_at` above cannot answer this: it is the newest message from either side,
