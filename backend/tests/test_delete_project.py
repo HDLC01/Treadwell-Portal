@@ -80,8 +80,9 @@ def test_the_cadence_query_skips_a_deleted_project(monkeypatch):
     chasing from the trash."""
     sql, _ = _sql(monkeypatch, main.db.list_followup_candidates)
     # to_jsonb of the TABLE NAME rather than an alias: aliasing this query would mean qualifying
-    # every other column in it, and test_followup_deposit_stage.py reads three of them out of this
-    # source text to prove the approved-with-a-deposit-outstanding stage can run at all.
+    # every other column in it for no gain. This line is the only thing pinning that choice --
+    # test_followup_deposit_stage.py used to read three columns out of the source text and now
+    # executes the clause instead, which is alias-agnostic by design.
     assert "where (to_jsonb(portal_proposals) ->> 'deleted_at') is null" in sql
     # And the enrolment clause is still there: this must NARROW the candidate set, not replace it.
     assert "followup_enrolled_at is not null and followup_disabled_at is null" in sql

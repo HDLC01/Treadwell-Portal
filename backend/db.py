@@ -1136,9 +1136,13 @@ def list_followup_candidates() -> list[dict[str, Any]]:
         # to_jsonb for the reason spelled out in list_all_portal_proposals: prod gets the code
         # before it gets the ALTER, and the worker must not start raising UndefinedColumn on
         # every tick over one unapplied statement. The argument is the TABLE NAME, not an alias,
-        # deliberately -- aliasing this query as `p` would have meant qualifying every other
-        # column in it, and test_followup_deposit_stage.py reads three of them out of this
-        # source text to prove the approved-with-a-deposit-outstanding stage can run at all.
+        # deliberately -- aliasing this query as `p` would mean qualifying every other column in
+        # it for no gain, and test_delete_project.py pins that form.
+        #
+        # Nothing reads this SOURCE TEXT any more. test_followup_deposit_stage.py used to grep
+        # it for three substrings; it now EXECUTES this clause over a synthetic corpus and diffs
+        # the rows it admits against followup_rules.in_scope, so rewording the predicate without
+        # changing what it means is free, and changing what it means fails.
         "where (to_jsonb(portal_proposals) ->> 'deleted_at') is null "
         "  and followup_enrolled_at is not null and followup_disabled_at is null "
         "  and (proposal_status in ('sent','viewed') "
