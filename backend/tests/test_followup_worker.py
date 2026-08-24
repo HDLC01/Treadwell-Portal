@@ -7,10 +7,19 @@ sent first and crashed before recording, every restart would re-nag them, which 
 not recoverable. So: reserve, then send, and release the reservation only when
 nothing went out at all.
 """
+import re
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+import db
 import followup_rules as rules
 import followup_worker as fw
+
+# The real writer, captured before any test stubs it. _wire replaces db.add_message with a
+# recorder, and `db` here is the same module object the worker holds, so a test that wants the
+# genuine INSERT back has to have kept a reference to it from before that happened.
+_REAL_ADD_MESSAGE = db.add_message
 
 NOW = datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc)     # 10am Chicago
 ENROLLED = NOW - timedelta(hours=30)                       # first nudge is due
@@ -301,8 +310,12 @@ def test_anything_that_is_not_an_explicit_yes_leaves_automation_off(monkeypatch)
 def test_a_sent_reminder_appears_in_the_thread(monkeypatch):
     calls = _wire(monkeypatch)
     fw._tick(NOW)
-    assert len(calls["thread"]) == 1, calls["thread"]
-    echo = calls["thread"][0]
+    # TWO rows on this step, because it sends twice: the customer's reminder and the
+    # estimator's. The customer's is the one WITHOUT meta.internal, and it is picked by that
+    # flag rather than by position so this keeps asserting the customer's card if the order
+    # the cadence returns its dues ever changes.
+    assert len(calls["thread"]) == 2, calls["thread"]
+    echo = next(m for m in calls["thread"] if not (m["meta"] or {}).get("internal"))
     # `system` because both screens already render that as a card — the customer's app.js and the
     # staff drawer's portal.js — and because it sits inside the existing msg_type CHECK constraint,
     # so this needed no migration.
@@ -320,7 +333,8 @@ def test_the_wording_is_what_we_would_say_to_the_customers_face(monkeypatch):
     Mutation: echo `due.template` or `due.rule_key` instead of a sentence."""
     calls = _wire(monkeypatch)
     fw._tick(NOW)
-    body = calls["thread"][0]["body"].lower()
+    body = next(m for m in calls["thread"]
+                if not (m["meta"] or {}).get("internal"))["body"].lower()
     for word in ("nudge", "chase", "cadence", "not_viewed", "rule", "template"):
         assert word not in body, "internal wording reached the customer: %r" % body
     assert "we emailed you" in body, body
@@ -328,52 +342,219 @@ def test_the_wording_is_what_we_would_say_to_the_customers_face(monkeypatch):
 
 def test_nothing_is_written_when_the_email_did_not_go(monkeypatch):
     """The reservation is released and retried, so a row here would claim we wrote to somebody we
-    never reached — and the retry would then write a second one."""
-    calls = _wire(monkeypatch, send_ok=False)
+    never reached — and the retry would then write a second one.
+
+    BOTH halves of the step fail here, because both halves now write. With only the customer
+    send failing, the estimator's email still went out and its own row is legitimate — which
+    is what the pair of assertions below pins: an attempt was made on each side, and neither
+    left a record."""
+    calls = _wire(monkeypatch, send_ok=False, staff_ok=False)
     fw._tick(NOW)
     assert calls["customer"], "the test needs a send attempt to have happened"
+    assert calls["staff"], "the estimator's half was never attempted either"
     assert calls["thread"] == []
 
 
-def test_an_internal_note_to_the_team_never_reaches_the_customers_thread(monkeypatch):
-    """THE safeguard, and the reason the echo is gated on audience rather than filtered later.
+# ── the STAFF reminders are in the thread too, and only staff can read them ─────
+# Hanz, 2026-08-24: "make sure all follow up emails are shown in the Chat box and in the Follow Ups
+# section." Four of the reminders go to the ESTIMATOR and nobody else, and until now the Chat box
+# showed none of them: the echo returned early on anything that was not a customer send, so a
+# project could have been chased four times with a thread that looked untouched.
+#
+# They are echoed as `meta.internal` rows. That flag did not exist when the early return was
+# written; it does now, `db.list_messages` excludes it by DEFAULT, and the staff drawer is the one
+# reader that opts out (main.py, include_internal=True). So wording written for an estimator
+# reaches the estimator and stops there.
+_STAFF_TEMPLATES = ("staff_not_viewed", "staff_personal_followup",
+                    "staff_deposit_outstanding", "staff_pause_expired")
 
-    Every staff template is written for us: "A quick call often beats another email", "this one is
-    ours to chase", "Dates aren't held until the deposit is in". They also carry the customer's own
-    address, the amount owed and a CRM link. The thread has no per-message visibility flag — the
-    customer endpoint returns every row — so anything posted here is something the customer reads.
 
-    Mutation: drop the `audience == "customer"` guard in _echo_to_thread."""
-    # Driven straight at the guard rather than through the cadence: whether a staff-only reminder
-    # happens to be due on a given fixture is a scheduling question, and this is a confidentiality
-    # one. Every staff template is asserted, so adding a new one without deciding this again shows
-    # up here.
-    calls = _wire(monkeypatch)
-    written = []
-    monkeypatch.setattr(fw.db, "add_message",
-                        lambda *a, **k: written.append(a) or {"id": 1})
+class _Due:
+    """What rules.Due presents to the echo: an audience, a template, a rule key."""
 
-    class _Due:
-        def __init__(self, audience, template):
-            self.audience, self.template = audience, template
-            self.rule_key = template
+    def __init__(self, audience, template):
+        self.audience, self.template = audience, template
+        self.rule_key = template
 
-    for template in ("staff_not_viewed", "staff_pause_expired",
-                     "staff_personal_followup", "staff_deposit_outstanding"):
-        fw._echo_to_thread("p1", _Due("staff", template))
-    assert written == [], (
-        "an internal note was posted into the customer's conversation: %r" % written)
 
-    # THE AUDIENCE GUARD, ON ITS OWN. The four names above are also absent from the wording map, so
-    # they would be refused by that lookup even with the guard gone — asserting only those passes
-    # whether or not the guard exists, which is a test proving nothing. This case carries a template
-    # the map DOES know with a staff audience, so the guard is the single thing standing between an
-    # internal reminder and the customer's screen.
-    fw._echo_to_thread("p1", _Due("staff", "not_viewed"))
-    assert written == [], (
-        "a staff-audience reminder was echoed to the customer because the audience guard is gone")
+class _Thread:
+    """portal_questions, driven by the REAL db functions with only the connection replaced.
 
-    # …and the same call with a customer audience DOES write, so the assertion above is the guard
-    # working rather than the echo being broken.
+    A row goes in through db.add_message's own INSERT and comes back out through
+    db.list_messages' own SELECT, so what these tests assert is the visibility those two
+    statements actually carry rather than a restatement of it here. The internal predicate is
+    read OFF the SQL: if list_messages stops emitting it, this store stops filtering, exactly as
+    Postgres would, and the customer-side assertions go red.
+
+    Only the two statements this file exercises are accepted — anything else asserts, so a future
+    caller that reaches the database through here fails loudly instead of getting an empty list.
+    """
+
+    _HIDES_INTERNAL = "coalesce((meta->>'internal')::boolean, false) = false"
+
+    def __init__(self):
+        self.rows = []
+
+    def q1(self, sql, params=()):
+        assert "insert into public.portal_questions" in sql, sql
+        # Column names off the statement, not hard-coded: a reordered INSERT would otherwise file
+        # the body under msg_type here and pass anyway.
+        cols = [c.strip() for c in re.search(r"\(([^)]*)\)", sql).group(1).split(",")]
+        # psycopg wraps a jsonb parameter in Jsonb(...); `.obj` is the dict the caller passed.
+        row = dict(zip(cols, [getattr(v, "obj", v) for v in params]))
+        row["id"] = len(self.rows) + 1
+        row["created_at"] = NOW
+        self.rows.append(row)
+        return dict(row)
+
+    def qall(self, sql, params=()):
+        assert "from public.portal_questions" in sql, sql
+        flat = " ".join(sql.split())
+        pid, after = params[0], int(params[1] or 0)
+        rows = [r for r in self.rows if r["proposal_id"] == pid and r["id"] > after]
+        if self._HIDES_INTERNAL in flat:
+            rows = [r for r in rows if not (r.get("meta") or {}).get("internal")]
+        return [dict(r) for r in rows]
+
+
+@pytest.fixture()
+def thread(monkeypatch):
+    t = _Thread()
+    monkeypatch.setattr(db, "q1", t.q1)
+    monkeypatch.setattr(db, "qall", t.qall)
+    return t
+
+
+def test_every_staff_reminder_is_recorded_in_the_thread(thread):
+    """One row per reminder, so the drawer shows what has been chased and when.
+
+    Driven at the echo rather than through the cadence: which of the four happens to be due on a
+    given fixture is a scheduling question, and this is a record-keeping one. Every staff template
+    is named, so adding a fifth without deciding its wording shows up here.
+
+    Mutation: drop one entry from _ECHO_STAFF."""
+    for t in _STAFF_TEMPLATES:
+        fw._echo_to_thread("p1", _Due("staff", t))
+    rows = db.list_messages("p1", include_internal=True)
+    assert [r["meta"]["template"] for r in rows] == list(_STAFF_TEMPLATES)
+    for r in rows:
+        assert r["msg_type"] == "system", "a new msg_type renders nowhere and needs a migration"
+        assert r["author_kind"] == "staff" and r["author_email"] is None
+        assert r["meta"]["followup"] is True, "not marked machine-sent"
+        # "Heading — detail". Both renderers split the card title off the first dash and give
+        # up past 60 characters (splitSystem in portal.js), and a line that misses the window
+        # renders under the generic title "Update" with the whole sentence in the body.
+        assert 0 < r["body"].find(" — ") <= 60, r["body"]
+
+
+def test_a_staff_reminder_is_invisible_to_the_customer(thread):
+    """THE safeguard. Every staff template is written for us — "a call usually beats another
+    email", "dates are not held until it is in" — and the emails behind them carry the customer's
+    own address, the amount outstanding and a CRM link.
+
+    Asserted through the CUSTOMER's read: db.list_messages with the DEFAULT argument, which is
+    what the portal's view and its poll call. Inspecting the meta we wrote would only prove we set
+    a flag; this proves the flag is the one that query filters on.
+
+    Mutation: drop "internal": True from the staff meta in _echo_to_thread."""
+    for t in _STAFF_TEMPLATES:
+        fw._echo_to_thread("p1", _Due("staff", t))
+    assert db.list_messages("p1", include_internal=True), (
+        "nothing was written at all, so this proves nothing")
+    assert db.list_messages("p1") == [], (
+        "an internal reminder is in the customer's copy of the thread: %r"
+        % db.list_messages("p1"))
+
+
+def test_the_customer_echo_is_still_exactly_the_row_it_has_always_been(thread):
+    """LIVE IN PRODUCTION, with rows already in real threads. The customer half must post the same
+    visible card it posts today: same wording, same meta, and NO internal flag — marking it would
+    hide from the customer the record of an email they actually received.
+
+    Mutation: add "internal": True to the customer branch's meta."""
     fw._echo_to_thread("p1", _Due("customer", "not_viewed"))
-    assert len(written) == 1, "the customer echo stopped working, so the test above proves nothing"
+    visible = db.list_messages("p1")
+    assert len(visible) == 1, visible
+    assert visible[0]["meta"] == {"followup": True, "template": "not_viewed"}
+    assert visible[0]["body"] == (
+        "Reminder sent — we emailed you a link to the proposal in case it got buried.")
+
+
+def test_the_staff_wording_is_written_for_an_estimator(thread):
+    """"Reminder sent — we emailed you" is the customer's line and would be false here: on these
+    four steps nothing went to the customer at all. Each line says which fact triggered the email
+    the estimator just received, in the terms that email uses.
+
+    Mutation: point _ECHO_STAFF at the customer wording, or echo due.template."""
+    for t in _STAFF_TEMPLATES:
+        fw._echo_to_thread("p1", _Due("staff", t))
+    rows = db.list_messages("p1", include_internal=True)
+    by = {r["meta"]["template"]: r["body"].lower() for r in rows}
+    for template, body in by.items():
+        assert "we emailed you" not in body, template
+        assert "reminder sent" not in body, template
+        for word in ("nudge", "cadence", "staff_", "template", "rule_key"):
+            assert word not in body, (template, word)
+    # The trigger, per template: these are four different phone calls, and one shared line saying
+    # "a follow-up was sent" would be the version of this that tells the estimator nothing.
+    assert "opened" in by["staff_not_viewed"]
+    assert "read" in by["staff_personal_followup"]
+    assert "deposit" in by["staff_deposit_outstanding"]
+    assert "delay" in by["staff_pause_expired"]
+    assert len(set(by.values())) == len(_STAFF_TEMPLATES), "two reminders say the same thing"
+
+
+def test_an_unmapped_template_still_says_nothing(thread):
+    """Kept from the original: a template with no wording posts nothing rather than guessing, so a
+    fifth reminder added without a line here is silent instead of showing an estimator
+    "staff_whatever_we_called_it".
+
+    The last two cases are the maps not leaking across audiences. A customer-audience send must
+    never pick up staff wording (it would post a note ABOUT the customer TO the customer), and a
+    staff-audience send must never pick up the customer's (it would post a non-internal "we
+    emailed you" for an email the customer never got).
+
+    Mutation: fall back to the other map, or to `due.template`, when a lookup misses."""
+    fw._echo_to_thread("p1", _Due("staff", "staff_invented_tomorrow"))
+    fw._echo_to_thread("p1", _Due("customer", "invented_tomorrow"))
+    fw._echo_to_thread("p1", _Due("", "staff_not_viewed"))
+    fw._echo_to_thread("p1", _Due("staff", "not_viewed"))
+    fw._echo_to_thread("p1", _Due("customer", "staff_not_viewed"))
+    assert db.list_messages("p1", include_internal=True) == []
+
+
+def test_the_tick_records_both_halves_of_the_same_step(monkeypatch, thread):
+    """End to end through the cadence rather than at the helper. The not-viewed step sends twice —
+    the customer's reminder and the estimator's — and the Chat box has to show both, with only one
+    of them visible to the customer.
+
+    Mutation: restore the `if due.audience != "customer": return` early return."""
+    calls = _wire(monkeypatch)
+    # Un-stub the writer: this test wants the real INSERT, into the fake thread above.
+    monkeypatch.setattr(fw.db, "add_message", _REAL_ADD_MESSAGE)
+    fw._tick(NOW)
+    assert [c["template"] for c in calls["customer"]] == ["not_viewed", "not_viewed"]
+    assert calls["staff"], "the estimator's half of the step never sent"
+    both = db.list_messages("p1", include_internal=True)
+    assert [r["meta"]["template"] for r in both] == ["not_viewed", "staff_not_viewed"]
+    assert [r["meta"]["template"] for r in db.list_messages("p1")] == ["not_viewed"]
+
+
+def test_a_staff_reminder_cannot_reach_the_customers_notification_bell(monkeypatch):
+    """list_customer_events is a SECOND, INDEPENDENT customer surface with its own filter — its
+    docstring says so — and it selects exactly the shape these rows have: author_kind 'staff',
+    msg_type 'system'. Two of its predicates cover them and both are asserted, because the row
+    carries both flags and neither is redundant: `internal` says the row is not the customer's at
+    all, `followup` says a machine sent it.
+
+    Asserted on the statement because that is where the exclusion lives; a row that reaches this
+    SELECT reaches the customer's bell."""
+    seen = {}
+    monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    db.list_customer_events("c@x.com")
+    sql = " ".join(seen["sql"].split())
+    assert "coalesce((q.meta->>'internal')::boolean, false) = false" in sql, (
+        "the customer's bell does not exclude internal rows — an estimator's reminder about the "
+        "customer would ring the customer's own bell")
+    assert "coalesce((q.meta->>'followup')::boolean, false) = false" in sql, (
+        "the follow-up echo exclusion went with it")

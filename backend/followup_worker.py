@@ -207,7 +207,16 @@ def _send_staff(p: dict, due) -> bool:
     pid = p["proposal_id"]
     project = p.get("project_name") or "this project"
     token = p.get("token")
-    portal_url = f"{config.PUBLIC_BASE_URL}/p/{token}"
+    # NO CUSTOMER LINK IN A STAFF EMAIL. Hanz, 2026-08-24: "can we remove the Proposal link in
+    # the email for the treadwell staff". It read as clutter and it was worse than that: that
+    # URL is the customer's own magic link, and /p/{token} is the whole credential. A staff
+    # reminder lands in several inboxes, gets forwarded, and quoted in replies, so every copy was
+    # another way into a customer's proposal by anyone who saw it. Staff never needed it either:
+    # `reply_link=crm_url` below is the button they actually press, and it lands on the CRM card
+    # where the same proposal is reachable behind a login.
+    #
+    # `token` is still read above because the CUSTOMER emails need it. If you are adding a link
+    # to a staff email, link the CRM, not the portal.
     crm_url = f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={pid}"
     who = p.get("customer_name") or p.get("customer_email") or "the customer"
     # For a deposit chase the figure that matters is the DEPOSIT, not the whole job — the estimator
@@ -247,7 +256,6 @@ def _send_staff(p: dict, due) -> bool:
                 + f"<li>Customer: {email_sender._esc(who)}</li>"
                 + f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
                 + f"<li>Amount: {amount_txt}</li>"
-                + f"<li>Proposal: <a href=\"{portal_url}\">{portal_url}</a></li>"
                 + f"</ul>"
                 + ("<p>Their own reminders have stopped — they've told us it's on the way, so "
                    "this one is ours to chase. Mark it received in the CRM when it lands.</p>"
@@ -262,7 +270,6 @@ def _send_staff(p: dict, due) -> bool:
                 f"<li>Customer: {email_sender._esc(who)}</li>"
                 f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
                 f"<li>Amount: {amount_txt}</li>"
-                f"<li>Proposal: <a href=\"{portal_url}\">{portal_url}</a></li>"
                 f"</ul>"
                 f"<p>Automated reminders continue, but this one is worth a call.</p>")
     try:
@@ -287,7 +294,8 @@ def _send_staff(p: dict, due) -> bool:
 # The internal vocabulary stays internal. "Nudge", "second nudge", "chase", "cadence" and the rule
 # keys are how we talk about this to each other; `not_viewed` rendered on a customer's own screen as
 # "Not opened yet" reads like being told off. Each line below says what we did and why, in the words
-# we would use to their face.
+# we would use to their face. THE CUSTOMER MAP — the staff one is below, and the split is what
+# decides whether a row is internal.
 _ECHO = {
     "not_viewed": "Reminder sent — we emailed you a link to the proposal in case it got buried.",
     "next_steps": "Reminder sent — we emailed you about the next steps on this proposal.",
@@ -297,15 +305,45 @@ _ECHO = {
 }
 
 
+# The STAFF half of the same record. Four reminders go to the estimator and nobody else, and
+# until now they appeared in the conversation NOWHERE: the drawer showed a thread that went quiet
+# while the estimator's inbox filled up. These rows are marked `internal`, which is what keeps them
+# in the staff drawer and out of the customer's copy of the thread (db.list_messages).
+#
+# Written for an ESTIMATOR, so the wording is not the customer's. "Reminder sent" would be a lie
+# here — nothing was sent to the customer on these steps — and each line says which fact triggered
+# the email that just went out, in the same terms as that email.
+_ECHO_STAFF = {
+    "staff_not_viewed": ("Nobody has opened this yet — the proposal has gone unread since it "
+                         "was sent, and the estimator has been emailed. A call usually beats "
+                         "another email."),
+    "staff_personal_followup": ("Worth a call — the customer has read the proposal and not "
+                                "approved it, and the estimator has been emailed. The automated "
+                                "reminders carry on either way."),
+    "staff_deposit_outstanding": ("Deposit still outstanding — the job is approved and the "
+                                  "money has not arrived, and the estimator has been emailed. "
+                                  "Dates are not held until it is in."),
+    "staff_pause_expired": ("Delay window has ended — the wait the customer asked for is "
+                            "over and the automated follow-ups have resumed. The estimator has "
+                            "been emailed."),
+}
+
+
 def _echo_to_thread(pid: str, due) -> None:
     """Put a sent reminder into the project's conversation, so both sides can see it happened.
 
-    CUSTOMER SENDS ONLY, and that gate is the whole safeguard. Every staff template in
-    `_send_staff` is written for us and not for them — "A quick call often beats another email",
-    "this one is ours to chase", "Dates aren't held until the deposit is in" — plus the customer's
-    own address, the amount owed and a CRM link. The thread has no per-message visibility flag: the
-    customer endpoint returns every row. So an internal note posted here is an internal note the
-    customer reads.
+    BOTH AUDIENCES, on two different maps, because the two readerships are different people.
+    A customer reminder posts a plain row: they received that email and the row is the record of
+    it in the thread they read. A staff reminder posts an INTERNAL row — `meta.internal`, which
+    `db.list_messages` excludes by default (its docstring is the authority) and which only the
+    staff drawer opts out of with `include_internal=True`. That flag is what lets the estimator's
+    own reminders sit in the shared thread at all: "Dates are not held until it is in" and the
+    customer's outstanding balance are notes about them, not to them.
+
+    Which map a row comes from therefore decides its visibility, so the audience is read once here
+    and never re-derived. An unmapped template still says nothing rather than guessing, on either
+    side; adding a fifth staff reminder without deciding its wording posts nothing instead of
+    posting the internal template name.
 
     `msg_type="system"` because both screens already render that as a card (app.js in the portal,
     portal.js in the staff drawer) and it sits inside the existing CHECK constraint — no new message
@@ -316,16 +354,21 @@ def _echo_to_thread(pid: str, due) -> None:
     Called only after a send actually succeeded, so a released reservation leaves no claim that we
     wrote to somebody we did not. Best-effort: the email has gone, and nothing here is worth undoing
     it over."""
-    if getattr(due, "audience", "") != "customer":
+    audience = getattr(due, "audience", "")
+    template = getattr(due, "template", "")
+    if audience == "customer":
+        body, meta = _ECHO.get(template), {"followup": True, "template": template}
+    elif audience == "staff":
+        body, meta = _ECHO_STAFF.get(template), {"followup": True, "template": template,
+                                                 "internal": True}
+    else:
         return
-    body = _ECHO.get(getattr(due, "template", ""))
     if not body:
         return                              # an unmapped template says nothing rather than guessing
     try:
-        db.add_message(pid, "staff", None, body, msg_type="system",
-                       meta={"followup": True, "template": due.template})
+        db.add_message(pid, "staff", None, body, msg_type="system", meta=meta)
     except Exception as exc:  # noqa: BLE001 — the email is away; the record is a courtesy
-        log.warning("[followup] could not echo %s to %s's thread: %s", due.template, pid, exc)
+        log.warning("[followup] could not echo %s to %s's thread: %s", template, pid, exc)
 
 
 def _tick(now: datetime | None = None) -> None:
