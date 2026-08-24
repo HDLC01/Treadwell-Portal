@@ -2911,6 +2911,83 @@ async def admin_set_status(proposal_id: str, request: Request) -> JSONResponse:
                   "followup_state": _followup_state(fresh)})
 
 
+# ── deleting a project off the board, and putting it back ─────────────────────
+# Hanz, 2026-08-24: "In the proposals tab under the Active Projects create a 'delete project'
+# button", and "make sure there is a confirmation dialog". He had two sent test bids that no
+# control in either app could take off the Active Projects board.
+#
+# WHY THIS END HAD TO GROW A ROUTE. The staff tool's own Trash button calls DELETE /api/draft/{id},
+# which is one table — the draft. The board reads the PORTAL's rows
+# (db.list_all_portal_proposals), whose join deliberately does not filter the draft's deleted_at
+# because "trashing the draft does not retract the proposal the customer already has". So trashing
+# a SENT project removed it from the Proposals Database and left its card on the board for good,
+# and worse: the board's enrichment reads drafts.list_drafts(), which skips trashed rows, so the
+# card silently lost its is_test flag, its bid total and its won mark and could move itself from
+# the Test tab onto Active with nobody touching it. Hiding the portal row is what makes the card
+# leave; the two halves have to happen together, which is what the tool's route now guarantees.
+#
+# A SOFT HIDE, not a delete, and the reversibility is the requirement rather than caution. The
+# customer's link keeps working either way — it reads portal_proposals by TOKEN and renders the
+# pinned draft_revisions snapshot, neither of which is filtered — because deleting a project off
+# our board is not the same act as revoking what somebody was already sent.
+@app.post("/api/admin/proposal/{proposal_id}/delete")
+async def admin_delete_proposal(proposal_id: str, request: Request) -> JSONResponse:
+    """Take this proposal off the staff board and stop its follow-ups. Reversible."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        # The tool reads this as "there is no portal row", which is the normal answer for a bid
+        # nobody ever sent — so it must stay a 404 and must not be dressed up as an error.
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    if not db.delete_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    # Bookkeeping, so `action` is set: last_staff_followup_at counts only rows WITHOUT one, and
+    # deleting a project is not somebody chasing a customer.
+    db.add_followup(proposal_id, "staff_note", {"action": "deleted"}, by)
+    who = _actor_name(by)
+    # An internal card, so the record survives into the restore. It is `internal`, which is what
+    # keeps it out of the customer's copy of the thread (list_messages) and out of their
+    # notification bell (list_customer_events) — the customer is told nothing about this.
+    _crm_card(proposal_id,
+              ("%s deleted this project. It is off the board and the follow-ups have stopped; "
+               "the link the customer already has still works." % who) if who
+              else ("Project deleted. It is off the board and the follow-ups have stopped; "
+                    "the link the customer already has still works."),
+              "status_deleted")
+    return _json({"ok": True, "deleted": True})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/restore")
+async def admin_restore_proposal(proposal_id: str, request: Request) -> JSONResponse:
+    """Put a deleted proposal back on the board. THE CADENCE STAYS OFF — see db.restore_proposal."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    # Read BEFORE the write, or "was this actually deleted" is a question about what we just did.
+    # A restore of a live project is a no-op worth reporting rather than narrating: nothing moved,
+    # so nothing goes in the thread.
+    was_deleted = p.get("deleted_at") is not None
+    if not db.restore_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    if was_deleted:
+        db.add_followup(proposal_id, "staff_note", {"action": "restored"}, by)
+        who = _actor_name(by)
+        _crm_card(proposal_id,
+                  ("%s restored this project. The follow-up reminders stay off until somebody "
+                   "switches them back on." % who) if who
+                  else ("Project restored. The follow-up reminders stay off until somebody "
+                        "switches them back on."),
+                  "status_restored")
+    return _json({"ok": True, "restored": True, "was_deleted": was_deleted})
+
+
 @app.post("/api/admin/send-digest")
 async def admin_send_digest(request: Request) -> JSONResponse:
     """Render and send one estimator's morning follow-up list.

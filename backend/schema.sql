@@ -602,3 +602,34 @@ grant select, insert, update, delete on public.portal_feedback to portal_app;
 drop policy if exists portal_app_rw on public.portal_feedback;
 create policy portal_app_rw on public.portal_feedback
   for all to portal_app using (true) with check (true);
+
+-- ── deleting a project off the staff board ────────────────────────────────────
+-- Hanz, 2026-08-24: "In the proposals tab under the Active Projects create a 'delete project'
+-- button", and "make sure there is a confirmation dialog". Two sent test bids could not be taken
+-- off the Active Projects board by any control in either app: the Proposals Database's Trash
+-- button only trashes the DRAFT, and list_all_portal_proposals deliberately does not filter on
+-- that, so the card outlived the project it belonged to.
+--
+-- REVERSIBLE, which is why this is a timestamp and not a delete. The row keeps every column it
+-- had, so restoring is one update and the customer never notices either way: their link reads
+-- portal_proposals by TOKEN (get_proposal_by_token) and their document comes off the pinned
+-- draft_revisions snapshot, and neither of those is filtered here. Deleting takes a project off
+-- OUR board; it does not retract what the customer was sent.
+--
+-- A HARD delete was the other option and is worse on this table. portal_proposals.proposal_id has
+-- no foreign key onto drafts, so nothing cascades from the tool's side, while portal_questions,
+-- portal_deposits, portal_approvals, portal_followups and portal_proposal_recipients all cascade
+-- FROM here -- one wrong click would take the whole conversation, the approval and the deposit
+-- record with it, and none of that is recoverable.
+--
+-- Nullable with no default, so every existing row reads as live. The readers that must skip a
+-- deleted row (list_all_portal_proposals and list_followup_candidates) look this column up
+-- through to_jsonb for the reason documented at the top of the first one: prod cannot apply its
+-- own DDL, so the code arrives before the ALTER does, and a missing column named directly makes
+-- psycopg raise UndefinedColumn -- which would take the board AND the Follow-ups page down over
+-- one unapplied statement. An absent jsonb key reads as NULL, which is "not deleted".
+alter table public.portal_proposals add column if not exists deleted_at timestamptz;
+-- The board reads live rows only, newest first, on a 25s poll. Partial so it indexes exactly the
+-- rows that query wants and a deleted project costs it nothing.
+create index if not exists portal_proposals_live_idx
+  on public.portal_proposals (created_at desc) where deleted_at is null;
