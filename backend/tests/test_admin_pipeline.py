@@ -34,15 +34,25 @@ def test_pipeline_query_joins_the_estimator_off_the_draft(monkeypatch):
 
 def test_pipeline_query_keeps_proposals_whose_draft_was_trashed(monkeypatch):
     """Binning the draft does not retract the proposal the customer already has.
-    An inner join, or a `deleted_at is null` filter, would drop the estimator off
-    exactly those rows — or drop the rows entirely."""
+    An inner join, or a filter on the DRAFT's deleted_at, would drop the estimator off
+    exactly those rows — or drop the rows entirely.
+
+    This used to assert `"deleted_at" not in sql`, full stop, and that stopped being the right
+    claim on 2026-08-24 when the proposal row grew a deleted_at of its own (the drawer's Delete
+    project button). The two columns have the same NAME and opposite meanings here: OURS is
+    filtered, because a deleted project must leave the board; the DRAFT's is not, for the reason
+    above. So the assertion is now about which table's column appears, which is what it always
+    meant."""
     seen = {}
     monkeypatch.setattr(main.db, "qall",
                         lambda sql, params=(): seen.update(sql=sql) or [])
     main.db.list_all_portal_proposals()
     sql = " ".join(seen["sql"].split())
     assert "left join" in sql
-    assert "deleted_at" not in sql
+    assert "d.deleted_at" not in sql, "the draft's deleted_at is being filtered again"
+    # Not even spelled without the alias: `deleted_at is null` unqualified would be ambiguous
+    # across the join, and it is the shape somebody re-adding the old bug would write.
+    assert "'deleted_at') is null" in sql, "the PORTAL's own deleted_at must be filtered"
 
 
 def test_pipeline_query_selects_every_milestone_the_board_dates_by(monkeypatch):

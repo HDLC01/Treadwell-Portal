@@ -338,8 +338,22 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "coalesce(p.assigned_estimator, d.owner_email, p.published_by) as estimator_email, "
         # Two "last touched" facts the digest and the board both need: when the
         # customer last did anything, and when THIS estimator last chased them.
+        # INTERNAL ROWS ARE EXCLUDED, and this predicate is load-bearing rather than tidy.
+        # `last_message_at` feeds _last_activity, which the 6am digest scores customer SILENCE
+        # from, and the digest's silence weight is 20 points against a cutoff of 40. When staff
+        # follow-up reminders started echoing into the thread (2026-08-24), each one moved this
+        # timestamp to today - so a reminder saying "nobody has opened this yet" counted as
+        # movement on the job and could push that same proposal off the estimator's morning
+        # email. Measured on one row: score 70 with the fact "no movement for 20 days", 50 and
+        # no such fact afterwards. The reminder would have hidden the thing it was reminding
+        # about.
+        #
+        # The CUSTOMER echo still counts, deliberately: the customer really was contacted, and
+        # that is activity. A note written to ourselves is not.
         "(select max(q.created_at) from public.portal_questions q "
-        "   where q.proposal_id = p.proposal_id) as last_message_at, "
+        "   where q.proposal_id = p.proposal_id "
+        "     and coalesce((q.meta ->> 'internal')::boolean, false) is not true) "
+        "  as last_message_at, "
         # Has the CUSTOMER ever come back to us, and when last.
         #
         # `last_message_at` above cannot answer this: it is the newest message from either side,
@@ -368,6 +382,17 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "  as last_staff_followup_at "
         "from public.portal_proposals p "
         "left join public.drafts d on d.id = p.proposal_id "
+        # A DELETED project is off the board (2026-08-24). The ONE reader of
+        # portal_proposals that has to forget a row exists, together with
+        # list_followup_candidates below -- see delete_proposal.
+        #
+        # Read through to_jsonb for exactly the reason the click columns above are: this is
+        # the only pipeline query, prod applies its DDL by hand, and `p.deleted_at is null`
+        # against a database that has not had the ALTER yet raises UndefinedColumn and takes
+        # the board and the Follow-ups page down together. An absent key is NULL, and NULL
+        # here means live, so the board keeps working and starts filtering the moment the
+        # column lands.
+        "where (to_jsonb(p) ->> 'deleted_at') is null "
         "order by p.created_at desc"
     )
 
@@ -988,6 +1013,57 @@ def reopen_if_closed(proposal_id: str) -> bool:
     return bool(row)
 
 
+def delete_proposal(proposal_id: str) -> bool:
+    """Take a project off the staff board, reversibly. Returns whether a row exists.
+
+    Hanz, 2026-08-24: a "delete project" button in the drawer's Proposal tab, offered on sent
+    projects too, and REVERSIBLE — it goes to Trash and comes back.
+
+    TWO COLUMNS, ONE STATEMENT, and the second is not tidying. `deleted_at` is what takes the card
+    off the board; `followup_disabled_at` is what stops the automated chase, and the chase is the
+    half that reaches a customer. list_followup_candidates selects on `followup_enrolled_at is not
+    null and followup_disabled_at is null`, so a project deleted without this would keep emailing
+    the customer from the trash — the cadence went live on 2026-08-24, the same day the button was
+    asked for. Writing both here rather than in the route means no caller can do half of it.
+
+    coalesce, so a re-delete never moves a disable stamp that already exists: the follow-up log
+    dates "when did we stop chasing this" off it, and re-stamping would re-date a stop that
+    happened weeks ago.
+
+    NOT filtered on `deleted_at is null`. A second press is a no-op that reports success, which is
+    what a caller retrying a timed-out request needs; False means only that no such proposal_id
+    exists, exactly as close_lost's does.
+
+    Named directly rather than through to_jsonb, unlike the two readers. A WRITE to a column that
+    is not there must fail loudly — silently reporting a project deleted while it sat on the board
+    is the worse outcome by far, and prod's missing ALTER is then one 500 on one button rather than
+    a lie the estimator has no way to see."""
+    row = q1("update public.portal_proposals set deleted_at = now(), "
+             "    followup_disabled_at = coalesce(followup_disabled_at, now()), "
+             "    updated_at = now() "
+             "where proposal_id = %s "
+             "returning proposal_id", (proposal_id,))
+    return bool(row)
+
+
+def restore_proposal(proposal_id: str) -> bool:
+    """Put a deleted project back on the board. Returns whether a row exists.
+
+    THE CADENCE STAYS OFF, deliberately, and this is the whole reason restore is its own function
+    rather than `delete_proposal(..., on=False)`: `followup_disabled_at` is left exactly where
+    delete_proposal put it. Somebody restoring a project is looking for it, not asking us to start
+    emailing their customer again — and the reminders would resume against an anchor weeks old, so
+    the first tick after a restore would fire immediately. Turning the chase back on is the
+    follow-up panel's own switch, which says so on the button.
+
+    Named directly for the same reason delete_proposal is: a restore that silently did nothing is
+    worse than one that fails."""
+    row = q1("update public.portal_proposals set deleted_at = null, updated_at = now() "
+             "where proposal_id = %s "
+             "returning proposal_id", (proposal_id,))
+    return bool(row)
+
+
 def add_followup(proposal_id: str, kind: str, detail: Optional[dict] = None,
                  created_by: Optional[str] = None) -> dict[str, Any]:
     return q1("insert into public.portal_followups (proposal_id, kind, detail, created_by) "
@@ -1034,7 +1110,8 @@ def list_followup_candidates() -> list[dict[str, Any]]:
 
     Paused rows are deliberately INCLUDED: the rule engine needs them to notice a
     pause that has expired and remind the estimator. Closed-lost is excluded — there
-    is nothing left to chase.
+    is nothing left to chase. A DELETED project is excluded for a stronger reason: it
+    is off the board, so an email going out about it would be a chase nobody could see.
 
     APPROVED is included while its deposit is still outstanding. Hanz, 2026-08-12:
     "followups should be automated until a deposit has been received." It used to be
@@ -1050,7 +1127,20 @@ def list_followup_candidates() -> list[dict[str, Any]]:
     that money is due, which is money worth chasing."""
     return qall(
         "select * from public.portal_proposals "
-        "where followup_enrolled_at is not null and followup_disabled_at is null "
+        # A DELETED project is never chased. Deleting stamps followup_disabled_at too, so the
+        # next clause already catches it -- but resume_followups CLEARS that stamp, and the
+        # tool's "back to Active" button calls it, so a deleted row could be talked back into
+        # the cadence by a control that says nothing about deletion. This predicate is the one
+        # that cannot be undone by accident.
+        #
+        # to_jsonb for the reason spelled out in list_all_portal_proposals: prod gets the code
+        # before it gets the ALTER, and the worker must not start raising UndefinedColumn on
+        # every tick over one unapplied statement. The argument is the TABLE NAME, not an alias,
+        # deliberately -- aliasing this query as `p` would have meant qualifying every other
+        # column in it, and test_followup_deposit_stage.py reads three of them out of this
+        # source text to prove the approved-with-a-deposit-outstanding stage can run at all.
+        "where (to_jsonb(portal_proposals) ->> 'deleted_at') is null "
+        "  and followup_enrolled_at is not null and followup_disabled_at is null "
         "  and (proposal_status in ('sent','viewed') "
         "       or (proposal_status = 'approved' "
         "           and (coalesce(deposit_required, true) "
