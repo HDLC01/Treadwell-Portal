@@ -447,7 +447,13 @@ def auth_logout(request: Request) -> JSONResponse:
     return resp
 
 
-_EVENT_ICONS = {"text": "💬", "deposit_request": "🧾", "system": "🔔"}
+# NAMES, not glyphs. The bell row and the toast both escape whatever this returns
+# (shell.js `esc()`), so markup could never have travelled this way even if we wanted it to —
+# and Hanz asked for a real icon set rather than emoji. So the API names the icon and the client
+# resolves the name against its own ICONS map, falling back to a dot for anything it does not
+# know. Adding a kind here without adding the name there degrades to that dot; it cannot break
+# the row.
+_EVENT_ICONS = {"text": "message", "deposit_request": "receipt", "system": "bell"}
 
 
 def _event(row: dict, seen) -> dict:
@@ -467,7 +473,7 @@ def _event(row: dict, seen) -> dict:
     return {
         "id": f"ev:{row.get('id')}",
         "kind": kind,
-        "icon": _EVENT_ICONS.get(kind, "•"),
+        "icon": _EVENT_ICONS.get(kind, "dot"),
         "title": f"{head} · {row.get('project_name') or 'your project'}",
         "body": body[:240],
         "ts": ts.isoformat() if hasattr(ts, "isoformat") else ts,
