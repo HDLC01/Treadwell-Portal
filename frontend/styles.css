@@ -309,6 +309,58 @@ textarea { min-height: 96px; resize: vertical; }
 
 /* sticky composer */
 .composer { position: sticky; bottom: 0; background: var(--bg); padding-top: 6px; }
+/* ── chat attachments ─────────────────────────────────────────────────────── */
+/* A picture is SHOWN, not listed: the commonest attachment on a flooring bid is a photo of a
+   slab, and a column of filename chips makes the reader open every one to find it. Capped so a
+   tall phone photo cannot push the rest of the thread off the screen. */
+.att-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.att-img { display: block; line-height: 0; border-radius: 8px; overflow: hidden; }
+.att-img img { max-width: 220px; max-height: 220px; width: auto; height: auto; display: block; }
+.att-file {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-radius: 8px; text-decoration: none;
+  background: rgba(0, 0, 0, .06); color: inherit; font-size: 13px; max-width: 260px;
+}
+.att-file:hover { background: rgba(0, 0, 0, .11); }
+.att-file .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-file .att-size { opacity: .65; font-size: 12px; flex: none; }
+/* On the customer's own red bubbles the neutral wash disappears — lift it off the bubble
+   instead of tinting it. */
+.msg.customer .att-file { background: rgba(255, 255, 255, .2); }
+.msg.customer .att-file:hover { background: rgba(255, 255, 255, .3); }
+
+/* The queue above the composer, before anything is sent. */
+.att-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 2px; }
+.att-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 6px 4px 4px; border-radius: 8px; background: rgba(0, 0, 0, .06);
+  font-size: 12px; max-width: 240px;
+}
+.att-chip img { width: 26px; height: 26px; object-fit: cover; border-radius: 5px; display: block; }
+.att-chip .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-chip .att-size { opacity: .65; flex: none; }
+.att-chip.is-uploading { opacity: .7; }
+/* A failed upload keeps its chip and says why, ON the file it happened to — a banner could not
+   say which of three photos was the problem. */
+.att-chip.is-error { background: rgba(200, 16, 46, .12); }
+.att-chip.is-error .att-size { color: #9e001f; opacity: 1; }
+.att-x {
+  border: 0; background: none; cursor: pointer; font-size: 15px; line-height: 1;
+  padding: 0 2px; opacity: .55; color: inherit;
+}
+.att-x:hover { opacity: 1; }
+
+/* The paperclip. Sized to the Send button's height so the row does not shift when the textarea
+   grows, and given a real hit area rather than the 20px glyph. */
+.icon-btn {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 38px; height: 38px; padding: 0; border: 0; border-radius: 8px;
+  background: none; color: inherit; opacity: .6; cursor: pointer;
+}
+.icon-btn:hover { opacity: 1; background: rgba(0, 0, 0, .06); }
+/* Dragging a file anywhere over the composer. */
+.composer.drop-on { outline: 2px dashed rgba(200, 16, 46, .5); outline-offset: 3px; border-radius: 10px; }
+
 .composer-row { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea {
   flex: 1; resize: none; min-height: 46px; max-height: 140px; margin: 0; line-height: 1.4;

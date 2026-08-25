@@ -310,7 +310,8 @@ def proposal_reply_to(token: str) -> str | None:
 
 def send_portal_link(email: str, name: str, url: str, project_name: str,
                      reply_to: str | None = None, note: str | None = None,
-                     token: str | None = None, revised: bool = False) -> bool:
+                     token: str | None = None, revised: bool = False,
+                     attachments: list[tuple[str, bytes]] | None = None) -> bool:
     """`revised` marks a re-send that carries genuinely different numbers, so the
     customer isn't left wondering whether this is the same proposal again. It also
     tells them the earlier version no longer stands — the portal has reopened it for
@@ -363,7 +364,8 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
                 html_blocks.append(note_html)
             return _send([email], customer_thread_subject(project_name),
                          _wrap(rendered["title"], "".join(html_blocks)),
-                         _thread_headers(email, token), reply_to=reply_to)
+                         _thread_headers(email, token), reply_to=reply_to,
+                         attachments=attachments)
 
     lead = ("A revised proposal for <strong>%s</strong> is ready to review. It replaces the "
             "version we sent previously." % _esc(project_name)) if revised else \
@@ -379,7 +381,7 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
     )
     return _send([email], customer_thread_subject(project_name),
                  _wrap("Your revised proposal is ready" if revised else "Your proposal is ready", body),
-                 _thread_headers(email, token), reply_to=reply_to)
+                 _thread_headers(email, token), reply_to=reply_to, attachments=attachments)
 
 
 _SENT_TPL_TTL = 60.0

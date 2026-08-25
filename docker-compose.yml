@@ -25,6 +25,11 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8898:8898"
+    # Chat attachments live here. A NAMED VOLUME, not a bind mount and not the image:
+    # without it every photo a customer or an estimator attached would be deleted by the
+    # next deploy, leaving a thread full of message cards pointing at files that are gone.
+    volumes:
+      - portaluploads:/app/data
     environment:
       DATABASE_URL: postgresql://portal:portal@db:5432/portal
       PUBLIC_BASE_URL: http://localhost:8898
@@ -35,4 +40,5 @@ services:
         condition: service_healthy
 
 volumes:
+  portaluploads:
   pgdata:

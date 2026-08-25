@@ -36,6 +36,7 @@ import inbound
 import invoice
 import proposals
 import ratelimit
+import uploads
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("portal")
@@ -721,10 +722,70 @@ def _customer_msg(row: dict, viewer_email: Optional[str]) -> dict:
         "msg_type": row.get("msg_type") or "text",
         "mine": customer and (not author or author == me),
         "author_first_name": _first_name_of(row.get("author_email")) if customer else "",
+        # `attachments` joins the whitelist because a customer has to be able to SEE the photo
+        # they or the estimator attached. It is safe to pass through for the reason the whitelist
+        # exists at all: unlike `meta.from`, every field in an attachment record was rebuilt by
+        # uploads.sanitize when the message was written, never taken from the sender.
         "meta": {k: meta[k] for k in ("source", "revision_no", "superseded", "superseded_by",
-                                     "amount", "invoice_no", "reference") if k in meta},
+                                     "amount", "invoice_no", "reference", "attachments")
+                 if k in meta},
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
     }
+
+
+async def _store_upload(request: Request, proposal_id: str) -> JSONResponse:
+    """The body of both upload routes. Identical for customer and staff on purpose: the same caps,
+    the same allow-list and the same refusal wording, so the two sides cannot drift apart."""
+    blob = await request.body()
+    if len(blob) > uploads.MAX_BYTES:
+        return _json({"ok": False, "error": "that file is larger than 15 MB"}, 413)
+    name = request.query_params.get("name")
+    mime = (request.headers.get("content-type") or "").split(";")[0].strip()
+    try:
+        rec = uploads.store(proposal_id, name, mime, blob)
+    except ValueError as e:
+        return _json({"ok": False, "error": str(e)}, 400)
+    except OSError:
+        log.exception("attachment write failed for %s", proposal_id)
+        return _json({"ok": False, "error": "could not save that file"}, 500)
+    return _json({"ok": True, "file": {k: rec[k] for k in ("id", "name", "mime", "size", "image")}})
+
+
+def _serve_upload(proposal_id: str, file_id: str, internal: bool = False):
+    """Serve one attachment.
+
+    THE THREAD IS THE ACCESS LIST. A file is served only when it appears in `meta.attachments` on a
+    message of this proposal, and the name and content type come from THAT record rather than from
+    the request or from the path on disk. So an id that was uploaded and never sent is not
+    fetchable, and a caller cannot choose what a file claims to be on its way out.
+
+    THE CALLER SAYS WHETHER STAFF-ONLY MESSAGES COUNT, and the two sides answer differently.
+    This served both from one list that opted into `internal`, which would have let a customer
+    fetch a file hanging off a staff-only card — "Kevin opened the proposal", the CRM's own closed
+    -lost note — on nothing but a uuid. Guessing one is not realistic, and that is not the point:
+    the rule about who may read an internal row should be the same rule everywhere, not relaxed in
+    the one place that happens to be about bytes.
+
+    (test_only_the_staff_reader_opts_in is what found it. It counts the opted-in readers in this
+    file and insists there is exactly one — the staff drawer — which is precisely the guard a
+    second reader should have to argue with.)
+    """
+    rec = None
+    for m in db.list_messages(proposal_id, include_internal=internal):
+        rec = uploads.pick(m.get("meta"), file_id)
+        if rec:
+            break
+    if not rec:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    path = uploads.path_of(proposal_id, file_id)
+    if not path:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    # `inline` for a picture so it opens in the tab; `attachment` for everything else so a .docx
+    # downloads under its real name instead of being rendered as gibberish.
+    disp = "inline" if uploads.is_image(rec.get("mime")) else "attachment"
+    return FileResponse(path, media_type=rec.get("mime") or "application/octet-stream",
+                        filename=rec.get("name") or "attachment",
+                        content_disposition_type=disp)
 
 
 def _require(request: Request, token: str):
@@ -740,11 +801,16 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
     p = _require(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    text = _cap((await _body(request)).get("body"), 4000)
-    if not text:
+    body = await _body(request)
+    text = _cap(body.get("body"), 4000)
+    atts = uploads.sanitize(body.get("attachments"))
+    # A MESSAGE MAY BE JUST A PHOTO. Requiring text as well would mean a customer who wants to
+    # send a picture of the slab has to invent a sentence to go with it.
+    if not text and not atts:
         return _json({"ok": False, "error": "empty"}, 400)
     who = _session_email(request)
-    row = db.add_message(p["proposal_id"], "customer", who, text, msg_type="text")
+    row = db.add_message(p["proposal_id"], "customer", who, text, msg_type="text",
+                         meta={"attachments": atts} if atts else None)
     email_sender.notify_team(
         f"New proposal question — {p.get('project_name')}",
         f"<p><strong>{html.escape(who or '')}</strong> asked a question on "
@@ -797,6 +863,35 @@ def api_messages(token: str, request: Request) -> JSONResponse:
         # when STAFF pause or close it from the drawer.
         "paused_until": _iso(p.get("followup_paused_until")),
         "closed": (p.get("proposal_status") or "") == "closed_lost"}})
+
+
+@app.post("/api/portal/{token}/upload")
+async def api_portal_upload(token: str, request: Request) -> JSONResponse:
+    """One file, raw in the body, filename in `?name=`.
+
+    Raw rather than multipart because the portal does not ship `python-multipart` and this needs
+    no parser: the browser sends `fetch(url, {method:"POST", body:file})` and the File object
+    supplies its own Content-Type. See uploads.py for why that was preferred to a new dependency.
+
+    The upload is not visible to anybody until it is ATTACHED to a message — the fetch route below
+    only serves ids that appear in this proposal's thread. So an abandoned upload is inert.
+    """
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP,
+                              config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "too_many"}, 429)
+    return _store_upload(request, p["proposal_id"])
+
+
+@app.get("/api/portal/{token}/file/{file_id}")
+async def api_portal_file(token: str, file_id: str, request: Request):
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    # Customer side: staff-only messages are not theirs, and neither are the files on them.
+    return _serve_upload(p["proposal_id"], file_id)
 
 
 @app.post("/api/portal/{token}/viewed")
@@ -1811,6 +1906,43 @@ def _admin_ok(request: Request) -> bool:
     return bool(config.SERVICE_TOKEN and hmac.compare_digest(presented, config.SERVICE_TOKEN))
 
 
+# Resend accepts 40 MB per message, but a proposal email that big is a bounce waiting to happen
+# on the customer's own mail server. A tighter total, said out loud on the page before they press
+# Send, beats a delivery failure they find out about from the customer.
+_PUBLISH_ATT_TOTAL = 10 * 1024 * 1024
+
+
+def _decode_publish_attachments(items) -> list[tuple[str, str, bytes]]:
+    """`[{name, mime, b64}]` -> `[(name, mime, bytes)]`, or ValueError with a sentence to show.
+
+    Base64 rather than a separate upload for the reason at the top of this change: on a first send
+    there is no proposal row for an upload to belong to. The cost is a bigger request body, which
+    is why the total is capped here as well as per file.
+    """
+    import base64
+
+    out: list[tuple[str, str, bytes]] = []
+    total = 0
+    for a in (items or [])[:uploads.MAX_PER_MESSAGE]:
+        if not isinstance(a, dict):
+            continue
+        mime = str(a.get("mime") or "").split(";")[0].strip().lower()
+        if mime not in uploads.ALLOWED:
+            raise ValueError("%s cannot be attached to an email" % uploads.clean_name(a.get("name")))
+        try:
+            blob = base64.b64decode(str(a.get("b64") or ""), validate=True)
+        except (ValueError, TypeError):
+            raise ValueError("%s could not be read" % uploads.clean_name(a.get("name")))
+        if not blob:
+            continue
+        total += len(blob)
+        if len(blob) > uploads.MAX_BYTES or total > _PUBLISH_ATT_TOTAL:
+            raise ValueError("those files come to more than 10 MB together — "
+                             "send the large ones in the chat instead")
+        out.append((uploads.clean_name(a.get("name")), mime, blob))
+    return out
+
+
 @app.post("/api/admin/publish")
 async def admin_publish(request: Request) -> JSONResponse:
     """Publish a proposal to the portal: read the draft (shared DB), mint a token
@@ -1872,6 +2004,15 @@ async def admin_publish(request: Request) -> JSONResponse:
     if body.get("assigned_estimator") and not assigned:
         return _json({"ok": False, "error": "invalid_estimator"}, 400)
 
+    # THE FILES, decoded and checked BEFORE the proposal row is touched. A publish that has
+    # already created a row and posted a card, and only then discovers it cannot read one of the
+    # attachments, would leave the customer a proposal whose email is missing half of what the
+    # estimator meant to send -- with nothing on screen to say so.
+    try:
+        pub_atts = _decode_publish_attachments(body.get("attachments"))
+    except ValueError as e:
+        return _json({"ok": False, "error": str(e)}, 400)
+
     existing = db.get_proposal(draft_id)
     revised = False
     if existing:
@@ -1915,6 +2056,22 @@ async def admin_publish(request: Request) -> JSONResponse:
         db.add_message(draft_id, "staff", None, "Your proposal is ready to review.",
                        msg_type="proposal_card",
                        meta={"revision_no": rev_no} if rev_no else None)
+
+    # On disk now that there is a proposal to scope them to, and recorded on the newest proposal
+    # card so the customer can find them in the thread a week later rather than hunting an inbox.
+    mail_atts: list[tuple[str, bytes]] = []
+    if pub_atts:
+        stored = []
+        for name_, mime_, blob_ in pub_atts:
+            try:
+                stored.append(uploads.store(draft_id, name_, mime_, blob_))
+                mail_atts.append((uploads.clean_name(name_), blob_))
+            except (ValueError, OSError):
+                # One unreadable file does not cost the customer their proposal. It is dropped
+                # from both the email and the card, and the publish carries on.
+                log.warning("publish attachment refused for %s: %r", draft_id, name_)
+        if stored:
+            db.attach_to_latest_card(draft_id, uploads.sanitize(stored))
 
     # Whoever BUILT this estimate hears about the project, roster or no roster.
     #
@@ -2018,6 +2175,7 @@ async def admin_publish(request: Request) -> JSONResponse:
     rt = email_sender.proposal_reply_to(token)
     emailed = [e for e in send_list
                if email_sender.send_portal_link(e, name if e == primary else "", link, project,
+                                                attachments=mail_atts or None,
                                                  reply_to=rt, note=note, token=token,
                                                  revised=revised)]
 
@@ -3044,9 +3202,12 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "not_found"}, 404)
     body = await _body(request)
     text = _cap(body.get("body"), 4000)
-    if not text:
+    atts = uploads.sanitize(body.get("attachments"))
+    # Same rule as the customer side: a photo on its own is a message.
+    if not text and not atts:
         return _json({"ok": False, "error": "empty"}, 400)
-    db.add_question(proposal_id, "staff", _cap(body.get("by"), 120) or "Treadwell", text)
+    db.add_message(proposal_id, "staff", _cap(body.get("by"), 120) or "Treadwell", text,
+                   msg_type="text", meta={"attachments": atts} if atts else None)
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     project = p.get("project_name") or "your proposal"
     rt = email_sender.proposal_reply_to(p["token"])
@@ -3054,6 +3215,22 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
         email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text,
                                              token=p["token"])
     return _json({"ok": True})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/upload")
+async def admin_upload(proposal_id: str, request: Request) -> JSONResponse:
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not db.get_proposal(proposal_id):
+        return _json({"ok": False, "error": "not_found"}, 404)
+    return await _store_upload(request, proposal_id)
+
+
+@app.get("/api/admin/proposal/{proposal_id}/file/{file_id}")
+async def admin_file(proposal_id: str, file_id: str, request: Request):
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    return _serve_upload(proposal_id, file_id, internal=True)
 
 
 @app.post("/api/admin/proposal/{proposal_id}/followup-recipient")
