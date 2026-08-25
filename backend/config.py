@@ -137,6 +137,13 @@ GOOGLE_AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
 # ── Dropbox (folder creation on approval — optional/graceful) ─────────────────
 DROPBOX_ENABLED = bool(_env("DROPBOX_REFRESH_TOKEN") or _env("DROPBOX_ACCESS_TOKEN"))
 
+# ── Attachments ───────────────────────────────────────────────────────────────
+# Where files people attach to a chat message are written. A DOCKER VOLUME in every
+# deployed environment (see docker-compose*.yml): without one, every photo a customer
+# sent would be deleted by the next deploy, silently, leaving a thread full of message
+# cards pointing at files that no longer exist.
+UPLOAD_DIR = _env("PORTAL_UPLOAD_DIR", "/app/data/uploads")
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 ENVIRONMENT = _env("ENVIRONMENT", "development")
 IS_PROD = ENVIRONMENT == "production"

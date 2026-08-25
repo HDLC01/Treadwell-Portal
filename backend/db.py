@@ -901,6 +901,28 @@ def supersede_proposal_cards(proposal_id: str, replaced_by_rev: int) -> None:
     )
 
 
+def attach_to_latest_card(proposal_id: str, attachments: list[dict[str, Any]]) -> None:
+    """Hang the files sent with a publish on that publish's own proposal card.
+
+    THE NEWEST CARD, not all of them: a revision posts a new card and supersedes the old one, and
+    an estimator who attaches a photo to revision 3 is not saying anything about revision 1. The
+    `order by id desc limit 1` is what keeps a re-send from rewriting history.
+
+    Merged into `meta` rather than replacing it, because the card already carries `revision_no`
+    and `superseded` and dropping either would retire the wrong card on screen.
+    """
+    if not attachments:
+        return
+    execute(
+        "update public.portal_questions "
+        "set meta = coalesce(meta, '{}'::jsonb) || jsonb_build_object('attachments', %s::jsonb) "
+        "where id = (select id from public.portal_questions "
+        "            where proposal_id = %s and msg_type = 'proposal_card' "
+        "            order by id desc limit 1)",
+        (Jsonb(attachments), proposal_id),
+    )
+
+
 # ── Follow-up automation ──────────────────────────────────────────────────────
 # A sent proposal is chased on a cadence until it is approved, the customer says
 # they are delayed or out, or an estimator takes it off automation. See

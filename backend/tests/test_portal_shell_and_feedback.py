@@ -368,3 +368,120 @@ def test_the_table_is_declared_and_survives_a_deleted_proposal():
     assert "references" not in block, (
         "portal_feedback cascades from portal_proposals, so closing a job deletes its feedback")
     assert "check (category in ('question','request','problem','other'))" in block
+
+# ── the bell panel opens UNDER the bell ──────────────────────────────────────
+@needs_node
+def test_the_notifications_panel_opens_under_the_bell():
+    """Hanz, 2026-08-25: "when you click the bell Icon, it is far from the icon".
+
+    The panel was `position:fixed; top:58px; right:16px` — the viewport's top-right — while the
+    bell is inserted BEFORE the `.tag` element, i.e. before the `margin-left:auto` divider, which
+    puts it at the LEFT of the header. The rule had been copied from the staff tool, where it only
+    looks correct because that bell genuinely sits top-right.
+
+    EXECUTED, because the claim is a coordinate. A source assertion that `placePanel` exists, or
+    that the CSS no longer says `right:16px`, cannot tell you the panel ends up near the bell —
+    which is the entire complaint. So this runs the real `mount()`, gives the bell a known
+    rectangle, fires the real click handler, and reads the inline `left`/`top` the code wrote.
+
+    The stub is richer than the one above on purpose: elements record their listeners (so a click
+    can actually be dispatched) and the bell answers `getBoundingClientRect`. Without either, the
+    positioning code is unreachable."""
+    script = r"""
+    const fs = require("fs");
+    const all = [];
+    const mk = () => {
+      const n = { id:"", innerHTML:"", textContent:"", style:{}, dataset:{}, hidden:false,
+        value:"", _on:{}, offsetWidth:360,
+        classList:{add(){},remove(){},toggle(){}}, setAttribute(){},
+        appendChild(c){ all.push(c); }, insertBefore(c){ all.push(c); },
+        addEventListener(t,f){ (this._on[t] = this._on[t] || []).push(f); },
+        querySelector:()=>null, querySelectorAll:()=>[], remove(){}, focus(){},
+        getBoundingClientRect: () => n._rect || { left:0, right:0, top:0, bottom:0 } };
+      return n;
+    };
+    const byId = (id) => all.find((n) => n.id === id)
+      || (all.some((n) => (n.innerHTML || "").includes('id="' + id + '"')) ? mk() : null);
+    const header = mk();
+    const doc = { getElementById: byId, createElement: mk, addEventListener(){},
+      querySelector: (s) => (s === ".site-header" ? header : null),
+      documentElement:{classList:{toggle(){},add(){},remove(){}}},
+      body:{ appendChild(n){ all.push(n); }, firstChild:null, insertBefore(n){ all.push(n); } },
+      head:{ appendChild(){} }, readyState:"complete" };
+    const win = { addEventListener(){}, location:{ pathname:"/p/tok123", href:"x" },
+      innerWidth: 1440, setInterval(){}, setTimeout(){},
+      fetch: () => Promise.resolve({ json: async () => ({}) }),
+      localStorage:{ getItem:()=>null, setItem(){} } };
+    const src = fs.readFileSync(process.argv[1], "utf8");
+    new Function("window","document","localStorage","fetch","setInterval","setTimeout","location",src)(
+      win, doc, win.localStorage, win.fetch, win.setInterval, win.setTimeout, win.location);
+    win.TWShell.mount();
+
+    const bell = all.find((n) => n.id === "bell");
+    const panel = all.find((n) => n.id === "bell-panel");
+    // The bell as it really sits on his screen: left of centre, just under a 60px header.
+    bell._rect = { left: 176, right: 205, top: 16, bottom: 44 };
+    (bell._on.click || []).forEach((f) => f({ stopPropagation(){} }));
+    const near = { left: parseInt(panel.style.left, 10), top: parseInt(panel.style.top, 10) };
+
+    // …and a bell close to the right edge must pull the panel back inside the viewport rather
+    // than letting 360px hang off the screen.
+    (bell._on.click || []).forEach((f) => f({ stopPropagation(){} }));   // close
+    bell._rect = { left: 1400, right: 1428, top: 16, bottom: 44 };
+    (bell._on.click || []).forEach((f) => f({ stopPropagation(){} }));   // open again
+    const clamped = { left: parseInt(panel.style.left, 10) };
+
+    console.log(JSON.stringify({
+      near, clamped, bellFound: !!bell, panelFound: !!panel,
+      openedAtAll: panel.hidden === false,
+    }));
+    """
+    proc = subprocess.run(["node", "-e", script, "--", str(FRONTEND / "shell.js")],
+                          capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert got["bellFound"] and got["panelFound"], "the shell built no bell or no panel"
+    assert got["openedAtAll"], "the click did not open the panel"
+    # Under the bell, not across the page from it. The bell's left edge is 176; the old code put
+    # the panel at `right:16px`, i.e. left ~1064 on a 1440 viewport.
+    assert got["near"]["left"] == 176, (
+        "the panel opened at x=%s for a bell at x=176 — it is not anchored to the bell"
+        % got["near"]["left"])
+    assert got["near"]["top"] == 52, (
+        "the panel should sit just below the bell's bottom edge (44 + 8), got %s"
+        % got["near"]["top"])
+    # 1440 - 360 - 8 = 1072. Anchoring naively to a bell at 1400 would overflow by 328px.
+    assert got["clamped"]["left"] == 1072, (
+        "a bell near the right edge should pull the panel back inside the viewport, got %s"
+        % got["clamped"]["left"])
+
+
+# ── icons are SVG, not emoji ─────────────────────────────────────────────────
+def test_the_portal_chrome_uses_an_icon_set_rather_than_emoji():
+    """Hanz, 2026-08-25: "we need to use a proper Icon set for our icons please dont use emojis".
+
+    Asserted as an ABSENCE over the whole file rather than site by site, because the failure mode
+    is somebody adding the fourteenth control with an emoji in it — a per-site list would pass
+    while the file drifted. The bar is any codepoint above U+2500: that catches the emoji planes
+    and the dingbat glyphs (✎ ⏻ ☰ ✕) this file used to lean on, while leaving ordinary
+    punctuation, box-drawing comment rules and the em dashes in the prose alone."""
+    stray = sorted({ch for ch in SHELL if ord(ch) > 0x2500})
+    assert not stray, (
+        "shell.js still carries glyph icons: %s — use the ICONS map instead"
+        % " ".join("U+%04X" % ord(c) for c in stray))
+    assert "const ICONS = {" in SHELL, "the icon set is gone"
+    assert 'stroke="currentColor"' in SHELL, (
+        "the icons do not inherit their control's colour, so hover states will not work")
+
+
+def test_the_api_names_an_icon_rather_than_sending_one():
+    """The bell row and the toast both pass the server's `icon` through `esc()`, so markup could
+    never have travelled that way. The API therefore sends a NAME and the client resolves it
+    against its own map — which also means adding an event kind without adding an icon degrades to
+    a dot instead of printing a raw tag."""
+    assert main._EVENT_ICONS == {"text": "message", "deposit_request": "receipt",
+                                 "system": "bell"}, (
+        "the event icon map is not sending names: %r" % (main._EVENT_ICONS,))
+    for name in ("message", "receipt", "bell", "dot"):
+        assert ("    %s:" % name) in SHELL or ("\n    %s:" % name) in SHELL, (
+            "the client cannot resolve the icon name %r that the API can send" % name)

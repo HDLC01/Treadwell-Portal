@@ -223,7 +223,9 @@ def test_a_staff_chat_emails_the_customer(monkeypatch):
     sent = []
     monkeypatch.setattr(main, "_admin_ok", lambda request: True)
     monkeypatch.setattr(main.db, "get_proposal", lambda pid: p)
-    monkeypatch.setattr(main.db, "add_question", lambda *a, **k: {"id": 2})
+    # add_message, not add_question. A staff reply may carry attachments, which live in the
+    # message's `meta` — and add_question is the no-meta wrapper, so the route stopped using it.
+    monkeypatch.setattr(main.db, "add_message", lambda *a, **k: {"id": 2})
     monkeypatch.setattr(main, "_q", lambda row: {"id": 2})
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: ["c@x.com", "ap@acme.com"])
     monkeypatch.setattr(main.email_sender, "send_reply_notification",

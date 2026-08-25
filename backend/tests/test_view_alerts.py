@@ -176,9 +176,20 @@ def test_only_the_staff_reader_opts_in(monkeypatch):
     src = inspect.getsource(main)
     calls = re.findall(r"db\.list_messages\([^)]*\)", src)
     assert calls, "list_messages is no longer called from main.py — rewrite this test"
-    internal = [c for c in calls if "include_internal" in c]
-    assert len(internal) == 1, (
-        "expected exactly one opted-in reader (the staff drawer); found %d: %r" % (len(internal), internal))
+    # HARD-CODED opt-ins, which is the dangerous kind: a reader that always sees internal cards,
+    # whoever is asking. There is exactly one, and it is the staff drawer.
+    always = [c for c in calls if "include_internal=True" in c]
+    assert len(always) == 1, (
+        "expected exactly one opted-in reader (the staff drawer); found %d: %r" % (len(always), always))
+    # A reader may instead let its CALLER decide — the attachment fetch does, because the same
+    # function serves the customer and the staff sides and they do not get the same answer. That
+    # is only safe while the default is closed, so the default is what this pins. Getting it
+    # backwards would hand a customer the files on a staff-only card.
+    assert "def _serve_upload(proposal_id: str, file_id: str, internal: bool = False)" in src, (
+        "the attachment fetch no longer defaults to hiding staff-only messages")
+    for c in calls:
+        assert "include_internal" not in c or "include_internal=True" in c or "=internal" in c, (
+            "a reader opts into internal cards by some third route: %r" % c)
     # And the customer-facing readers are the ones shaping rows with _customer_msg.
     for m in re.finditer(r"_customer_msg\(m[^)]*\)\s*\n?\s*for m in db\.list_messages\(([^)]*)\)", src):
         assert "include_internal" not in m.group(1), (

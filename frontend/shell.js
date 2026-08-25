@@ -81,11 +81,26 @@ textarea.fb-in{resize:vertical}
 .bell-badge{position:absolute;top:-1px;right:-1px;min-width:25px;height:16px;padding:0 3px;border-radius:8px;
  background:var(--primary);color:#fff;font:700 9px/16px system-ui;text-align:center;box-sizing:border-box}
 #bell-back{position:fixed;inset:0;z-index:949;background:transparent}
-#bell-panel{position:fixed;top:58px;right:16px;width:min(360px,calc(100vw - 28px));max-height:70vh;
+/* ANCHORED TO THE BELL, and left/top are written by placePanel() at open time.
+   Hanz, 2026-08-25: "when you click the bell Icon, it is far from the icon". It was pinned to the
+   viewport's top-right while the bell sits at the LEFT of the header — the rule was copied from the
+   staff tool, where it only looks right because that bell genuinely is top-right.
+
+   STILL fixed, positioned from the bell's rect, rather than absolute inside the header the way
+   .switcher-menu does it. That pattern is the nicer one and it is right there two elements to the
+   left — but an absolute panel is trapped in the header's stacking context (z-index:50), so it
+   would need the header raised into the 900s, and that would put the header above the sidebar
+   (800) and the feedback dialog (870), both of which are meant to cover it. Positioning from the
+   rect keeps every existing layer exactly where it is. */
+#bell-panel{position:fixed;top:58px;left:16px;width:min(360px,calc(100vw - 28px));max-height:70vh;
  overflow-y:auto;background:var(--bg);border:1px solid var(--outline);border-radius:12px;
  box-shadow:0 16px 44px rgba(0,0,0,.22);z-index:950;font-size:.82rem}
 .bell-h{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;font-weight:800;
  border-bottom:1px solid var(--surface-highest);position:sticky;top:0;background:var(--bg)}
+/* The icon slots. flex:none stops the SVG being squashed by a long title, and the muted colour
+   keeps the row's own text the thing you read first. */
+.bell-ico{flex:none;display:inline-flex;color:var(--secondary)}
+.shell-ico svg,.bell-ico svg{display:block}
 .bell-list{padding:6px}
 .bell-empty{padding:24px 14px;text-align:center;color:var(--secondary)}
 .bell-item{display:flex;gap:10px;align-items:flex-start;padding:10px;border-radius:9px;
@@ -122,15 +137,15 @@ textarea.fb-in{resize:vertical}
       `<div class="shell-brand"><img class="shell-bison" src="/static/img/treadwell-bison.svg" alt="" width="28" height="18">TREADWELL<button class="shell-x" id="shell-close" title="Hide menu">‹</button></div>
        <div class="shell-sec">Your account</div>
        <a class="shell-item${onChat ? " active" : ""}" href="${onChat ? `/p/${encodeURIComponent(TOKEN)}` : "/"}">
-         <span class="shell-ico">💬</span><span>Chat</span></a>
-       <a class="shell-item" href="/"><span class="shell-ico">▤</span><span>My projects</span></a>
+         <span class="shell-ico">${icon("message")}</span><span>Chat</span></a>
+       <a class="shell-item" href="/"><span class="shell-ico">${icon("projects")}</span><span>My projects</span></a>
        <div class="shell-sec" id="shell-steps-h" hidden>This project</div>
        <div id="shell-steps"></div>
        <div class="shell-sec">Help us improve</div>
        <button class="shell-item" id="shell-fb" type="button">
-         <span class="shell-ico">✎</span><span>Send feedback</span></button>
+         <span class="shell-ico">${icon("pencil")}</span><span>Send feedback</span></button>
        <div class="shell-foot"><span id="shell-email"></span>
-         <button id="shell-out" title="Sign out">⏻</button></div>`;
+         <button id="shell-out" title="Sign out" aria-label="Sign out">${icon("power")}</button></div>`;
     document.body.appendChild(side);
     const back = document.createElement("div");
     back.id = "shell-back";
@@ -158,13 +173,15 @@ textarea.fb-in{resize:vertical}
     const header = document.querySelector(".site-header");
     if (header) {
       const burger = document.createElement("button");
-      burger.id = "shell-burger"; burger.title = "Menu"; burger.textContent = "☰";
+      burger.id = "shell-burger"; burger.title = "Menu";
+      burger.setAttribute("aria-label", "Menu");
+      burger.innerHTML = icon("menu", 20);
       burger.addEventListener("click", () => setOpen(true));
       header.insertBefore(burger, header.firstChild);
       const bell = document.createElement("button");
       bell.className = "bell"; bell.id = "bell"; bell.title = "Notifications";
       bell.setAttribute("aria-label", "Notifications");
-      bell.innerHTML = '🔔<span class="bell-badge" id="bell-badge" hidden></span>';
+      bell.innerHTML = icon("bell", 19) + '<span class="bell-badge" id="bell-badge" hidden></span>';
       const tag = header.querySelector(".tag");
       if (tag) header.insertBefore(bell, tag); else header.appendChild(bell);
     }
@@ -193,10 +210,10 @@ textarea.fb-in{resize:vertical}
     if (!box) return;
     const showDeposit = window.TW_DEPOSIT_APPLIES !== false;
     box.innerHTML = [
-      ["proposal", "📄", "Proposal"], ["deposit", "💳", "Deposit"],
-      ["contacts", "👤", "Contact info"], ["schedule", "📅", "Schedule"],
+      ["proposal", "file", "Proposal"], ["deposit", "card", "Deposit"],
+      ["contacts", "user", "Contact info"], ["schedule", "calendar", "Schedule"],
     ].filter(([k]) => k !== "deposit" || showDeposit).map(([k, i, l]) =>
-      `<button class="shell-item" data-step="${k}"><span class="shell-ico">${i}</span><span>${l}</span></button>`
+      `<button class="shell-item" data-step="${k}"><span class="shell-ico">${icon(i)}</span><span>${l}</span></button>`
     ).join("");
   }
   window.TW_refreshShellSteps = renderSteps;
@@ -220,12 +237,55 @@ textarea.fb-in{resize:vertical}
     return Math.floor(h / 24) + "d ago";
   };
 
+  /** The portal's icon set: name -> inline SVG.
+   *
+   *  Hanz, 2026-08-25: "we need to use a proper Icon set for our icons please dont use emojis".
+   *
+   *  INLINE AND HAND-PICKED, not a library. Both repos are deliberately self-contained — no CDN,
+   *  no build step — and the portal already draws its chevrons, padlock and tick this way, so this
+   *  is an extraction of a pattern that was already here rather than a new dependency. The style
+   *  is the one those existing icons use: 24x24 viewBox, no fill, currentColor stroke, width 2,
+   *  round caps and joins. currentColor is the whole point: every icon inherits the colour of
+   *  the control it sits in, so hover and active states keep working with no per-icon CSS.
+   *
+   *  WHY A MAP RATHER THAN LITERALS AT EACH SITE. Two of these are chosen by the SERVER
+   *  (notification rows and toasts pick by event kind), and the row renderer escapes what it is
+   *  given — so the API cannot send markup and must send a NAME that this map resolves. Having
+   *  one lookup for both the hand-written chrome and the server-driven rows keeps a single
+   *  vocabulary; icon() falling back to dot is what makes an unknown name harmless. */
+  const ICONS = {
+    bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+    message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    receipt: '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1V2l-2 1-2-1-2 1-2-1-2 1-2-1z"/><path d="M8 7h8M8 11h8M8 15h5"/>',
+    projects: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 14h18"/>',
+    pencil: '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/>',
+    power: '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><path d="M12 2v10"/>',
+    menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+    file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
+    card: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
+    user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+    close: '<path d="M18 6 6 18M6 6l12 12"/>',
+    chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+    dot: '<circle cx="12" cy="12" r="9"/>',
+  };
+
+  /** One icon as markup. `size` is a px number; the caller's colour is inherited. */
+  function icon(name, size) {
+    const body = ICONS[name] || ICONS.dot;
+    const px = size || 18;
+    return '<svg class="ico" width="' + px + '" height="' + px + '" viewBox="0 0 24 24" fill="none"'
+      + ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
+      + ' aria-hidden="true">' + body + '</svg>';
+  }
+
   function buildBell() {
     if ($("bell-panel")) return;
     const panel = document.createElement("div");
     panel.id = "bell-panel"; panel.hidden = true;
     panel.innerHTML = '<div class="bell-h"><span>Notifications</span>' +
-      '<button class="shell-x" id="bell-close" title="Close">×</button></div>' +
+      '<button class="shell-x" id="bell-close" title="Close" aria-label="Close">'
+      + icon("close", 16) + '</button></div>' +
       '<div class="bell-list" id="bell-list"><div class="bell-empty">Loading…</div></div>';
     document.body.appendChild(panel);
     const back = document.createElement("div");
@@ -235,14 +295,36 @@ textarea.fb-in{resize:vertical}
     toasts.id = "shell-toasts";
     document.body.appendChild(toasts);
 
+    /** Put the panel under the bell, clamped inside the viewport.
+     *
+     *  Measured at OPEN time rather than once at build time: the header is sticky and its contents
+     *  shift with the viewport (the padlock tag hides its text under 480px, and the project
+     *  switcher's width follows the project name), so a position captured at boot is wrong by the
+     *  first resize. Re-measured on resize while open for the same reason. */
+    const placePanel = () => {
+      const b = $("bell");
+      if (!b) return;
+      const r = b.getBoundingClientRect();
+      const gap = 8, margin = 8;
+      panel.style.top = Math.round(r.bottom + gap) + "px";
+      // Left-aligned to the bell, then pulled back if that would run off the right edge. Reading
+      // offsetWidth after the panel is visible is what makes the clamp honest; while it is
+      // hidden the width is 0 and every panel would sit flush left.
+      const w = panel.offsetWidth || 360;
+      const max = Math.max(margin, window.innerWidth - w - margin);
+      panel.style.left = Math.round(Math.min(Math.max(margin, r.left), max)) + "px";
+    };
+
     const close = () => { OPEN = false; panel.hidden = true; back.hidden = true; };
     $("bell").addEventListener("click", (e) => {
       e.stopPropagation();
       if (OPEN) return close();
       OPEN = true; panel.hidden = false; back.hidden = false;
+      placePanel();                     // after hidden is cleared, so offsetWidth is real
       render();
       markSeen();
     });
+    window.addEventListener("resize", () => { if (OPEN) placePanel(); });
     $("bell-close").addEventListener("click", close);
     back.addEventListener("click", close);
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && OPEN) close(); });
@@ -254,7 +336,7 @@ textarea.fb-in{resize:vertical}
     list.innerHTML = ITEMS.length
       ? ITEMS.map((n) =>
           `<a class="bell-item${n.unread ? " unread" : ""}" href="${esc(n.link || "#")}">
-             <span>${esc(n.icon || "•")}</span>
+             <span class="bell-ico">${icon(n.icon)}</span>
              <span class="bell-main"><span class="bell-title">${esc(n.title || "")}</span>
              <span class="bell-body">${esc(n.body || "")}</span></span>
              <span class="bell-time">${esc(relTime(n.ts))}</span></a>`).join("")
@@ -272,7 +354,7 @@ textarea.fb-in{resize:vertical}
     if (!wrap) return;
     const el = document.createElement("div");
     el.className = "shell-toast";
-    el.innerHTML = `<span>${esc(n.icon || "🔔")}</span>
+    el.innerHTML = `<span class="bell-ico">${icon(n.icon || "bell")}</span>
       <span class="bell-main"><span class="t">${esc(n.title || "")}</span>
       <span class="b">${esc(n.body || "")}</span></span>
       <button class="x" title="Dismiss">×</button>`;
@@ -329,7 +411,7 @@ textarea.fb-in{resize:vertical}
     back.innerHTML =
       `<div class="fb-card" role="dialog" aria-modal="true" aria-labelledby="fb-h">
          <div class="fb-head"><strong id="fb-h">Send feedback</strong>
-           <button class="shell-x" id="fb-x" title="Close">✕</button></div>
+           <button class="shell-x" id="fb-x" title="Close" aria-label="Close">${icon("close", 16)}</button></div>
          <p class="fb-lede">What would you like from this portal? A question about how something
             works, something you wish it did, or something that looks wrong — it all reaches the
             Treadwell team.</p>
@@ -378,7 +460,7 @@ textarea.fb-in{resize:vertical}
         if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
         back.querySelector(".fb-card").innerHTML =
           `<div class="fb-head"><strong>Thank you</strong>
-             <button class="shell-x" id="fb-x2" title="Close">✕</button></div>
+             <button class="shell-x" id="fb-x2" title="Close" aria-label="Close">${icon("close", 16)}</button></div>
            <p class="fb-lede">That has reached the Treadwell team. If it needs a reply, somebody
               will come back to you by email.</p>
            <div class="fb-foot"><button class="btn btn-primary" id="fb-done" type="button">Close</button></div>`;
