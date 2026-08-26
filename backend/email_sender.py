@@ -660,6 +660,7 @@ def _digest_headers(email: str) -> dict:
 
 
 def send_reply_notification(email: str, url: str, project_name: str,
+                            attachments: list[tuple[str, bytes]] | None = None,
                             reply_to: str | None = None, message: str | None = None,
                             token: str | None = None) -> bool:
     # Hanz, 2026-08-12: 'Change it o jUST "View proposal here"'. It replaced two sentences
@@ -685,7 +686,7 @@ def send_reply_notification(email: str, url: str, project_name: str,
         f'<p style="color:#64748b;font-size:13px">{nudge}</p>'
     )
     return _send([email], customer_thread_subject(project_name), _wrap("You have a new reply", body),
-                 _thread_headers(email, token), reply_to=reply_to)
+                 _thread_headers(email, token), reply_to=reply_to, attachments=attachments)
 
 
 def send_customer_update(email: str, url: str, project_name: str, heading: str,

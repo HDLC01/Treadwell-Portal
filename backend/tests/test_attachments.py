@@ -412,3 +412,93 @@ def test_what_is_not_covered_is_written_down():
     place, and this test is here to make deleting them a failing change rather than a tidy-up."""
     assert "NO MALWARE SCANNING" in uploads.__doc__
     assert "EXIF" in uploads.__doc__
+
+
+# ── 8. the file has to reach the EMAIL, not just the thread ──────────────────
+#
+# Hanz, 2026-08-26: "When I attach an image and resend in the customer portal, the image or files
+# does not appear in the email". Storing the attachment on the message put it in the customer's
+# thread, which is what made the feature look finished — and the notification email is a separate
+# step on the very same request, which was left exactly as it was.
+#
+# These are source-level assertions on purpose. The bug was not a wrong value anywhere; it was an
+# argument that was never passed, and the only way to see that is to look at the call.
+
+def test_the_reply_email_carries_the_files_the_reply_attached():
+    import inspect
+
+    import main
+    src = inspect.getsource(main.admin_reply)
+    assert "_mail_files(proposal_id, atts)" in src, (
+        "the reply route does not read its attachments back off disk")
+    assert "attachments=files or None" in src, (
+        "the reply stores the attachment and emails without it — the exact bug reported")
+
+
+def test_every_customer_facing_send_that_can_carry_files_does():
+    """The check that would have caught it. Two senders reach a customer with something an
+    estimator attached — the proposal email and the reply notification — and both must pass the
+    files along. `/api/notify` and `/api/inbound/resend` are excluded by name and with reasons:
+    the first is a status handoff with no attachment concept, the second is a CUSTOMER message
+    arriving by webhook, and customers cannot attach."""
+    import inspect
+
+    import main
+    src = inspect.getsource(main)
+    # The publish loop and the newly-added-recipient send.
+    assert src.count("attachments=mail_atts or None") == 1
+    assert src.count("attachments=_proposal_card_files(proposal_id) or None") == 1
+    # The chat reply.
+    assert src.count("attachments=files or None") == 1
+
+
+def test_the_reply_notification_hands_them_to_the_mailer():
+    """A parameter added and then dropped on the floor inside the function is the same bug one
+    level down, and it looks just as finished from the route."""
+    import inspect
+
+    import email_sender
+    sig = inspect.signature(email_sender.send_reply_notification)
+    assert "attachments" in sig.parameters
+    assert "attachments=attachments" in inspect.getsource(email_sender.send_reply_notification)
+
+
+def test_a_recipient_added_after_the_send_gets_what_the_others_got(store, monkeypatch):
+    """Read off the newest proposal CARD rather than remembered, because the card is the record of
+    what was sent — and a revision posts a new card, so this follows the current version without
+    knowing anything about revisions."""
+    import main
+
+    rec = uploads.store("pid", "slab.png", "image/png", PNG)
+    saved = uploads.sanitize([rec])
+    monkeypatch.setattr(main.db, "list_messages", lambda pid, include_internal=False: [
+        {"msg_type": "text", "meta": None},
+        {"msg_type": "proposal_card", "meta": {"attachments": saved}},
+    ])
+    got = main._proposal_card_files("pid")
+    assert [n for n, _ in got] == ["slab.png"]
+    assert got[0][1] == PNG
+
+
+def test_a_missing_file_is_skipped_not_fatal(store, monkeypatch):
+    """An id whose bytes are gone must not take the whole email — or the whole reply — with it.
+    The thread still shows the card either way, and the log says which one went missing."""
+    import main
+    monkeypatch.setattr(main.db, "list_messages", lambda pid, include_internal=False: [])
+    assert main._mail_files("pid", [{"id": "0" * 32, "name": "gone.png"}]) == []
+    assert main._mail_files("pid", None) == []
+
+
+def test_the_email_total_is_capped_even_when_the_thread_is_not(store):
+    """Ten 2 MB photos are fine in a thread and not fine in one email. The cap is the publish
+    cap, so the two paths cannot disagree about what a mail server will take."""
+    import main
+
+    big = b"\x89PNG\r\n\x1a\n" + b"0" * (3 * 1024 * 1024)
+    atts = []
+    for i in range(5):
+        r = uploads.store("pid", "p%d.png" % i, "image/png", big)
+        atts.extend(uploads.sanitize([r]))
+    got = main._mail_files("pid", atts)
+    assert 0 < len(got) < 5, "the email total was not enforced: %d files" % len(got)
+    assert sum(len(b) for _, b in got) <= main._PUBLISH_ATT_TOTAL
