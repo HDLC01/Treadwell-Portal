@@ -311,23 +311,114 @@ textarea { min-height: 96px; resize: vertical; }
 .composer { position: sticky; bottom: 0; background: var(--bg); padding-top: 6px; }
 /* ── chat attachments ─────────────────────────────────────────────────────── */
 /* A picture is SHOWN, not listed: the commonest attachment on a flooring bid is a photo of a
-   slab, and a column of filename chips makes the reader open every one to find it. Capped so a
-   tall phone photo cannot push the rest of the thread off the screen. */
+   slab, and a column of filename chips makes the reader open every one to find it.
+   AND THE NAME IS SHOWN TOO. It used to live only on the anchor's `title`, which on a phone —
+   where this side of the conversation is mostly read — cannot be reached at all. So every
+   attachment carries a visible caption, picture or not, and both kinds use the same
+   .att-name/.att-size pair. Kept deliberately identical to the staff drawer's version of this
+   block: it is one conversation seen from two ends, and the two have drifted before. */
 .att-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.att-img { display: block; line-height: 0; border-radius: 8px; overflow: hidden; }
-.att-img img { max-width: 220px; max-height: 220px; width: auto; height: auto; display: block; }
+
+/* THE TILE: ONE SURFACE, with a fixed-height well for the picture and the caption on the rest of
+   it. Every dimension is known at first paint, so a photo arriving late cannot change the bubble's
+   height — renderChat scrolls the thread to the newest message, so a reflow mid-read yanks the
+   view, and on a phone a full-height photo pushed everything else off the screen.
+   `color: inherit` and `text-decoration: none` are load-bearing rather than tidy: an anchor
+   whose text is not given a colour is drawn in the user agent's link blue with the user agent's
+   underline, which on the customer's own dark red bubble is illegible.
+   The surface is set PER BUBBLE further down, for the reason the chip discovered first: a neutral
+   wash vanishes on #9E001F. Measured in a browser, rgba(0,0,0,.06) over it is 1.08:1 against the
+   bubble — the same colour, to the eye — so the caption floated with nothing holding it to its
+   picture, while the identical rule read correctly on the grey one. */
+.att-img {
+  display: block; width: 176px; border-radius: 8px; overflow: hidden;
+  color: inherit; text-decoration: none;
+}
+.att-well { display: block; position: relative; height: 132px; line-height: 0; }
+.att-well img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* THE CAPTION, UNDER the picture rather than over it. Text laid over a photograph is legible or
+   not depending on the photograph, and the commonest attachment here is a near-white concrete
+   slab; a scrim thick enough to guarantee 4.5:1 over arbitrary pixels would cover a fifth of the
+   thumbnail it is captioning. Under it, the caption sits on the tile's own surface — a colour we
+   chose — so the contrast is a measurement rather than a hope.
+   No background of its own: the tile is one surface and the caption is the part of it the
+   photograph does not cover. One value to get right per bubble instead of two. */
+.att-cap { display: block; padding: 5px 8px 6px; font-size: 13px; line-height: 1.25; }
+.att-cap .att-name { display: block; font-weight: 600; }
+/* min-height so the second line's box exists even when the size is unknown, or tiles in one row
+   come out different heights. */
+.att-cap .att-size { display: block; min-height: 15px; }
+
+/* A file that did not load says so, and the TILE KEEPS ITS SHAPE while saying it: swapping in a
+   small chip shrinks the bubble, which is a reflow on the error path — in the feature whose whole
+   point is not reflowing. A class reveals the image-off glyph that shipped with the markup.
+   display:none rather than opacity/visibility, because an invisible element still takes clicks. */
+.att-broke { display: none; position: absolute; inset: 0; margin: auto; opacity: .55; }
+.att-img.is-failed .att-broke { display: block; }
+.att-img.is-failed, .att-file.is-failed { cursor: default; }
+/* AND THE BROKEN <img> ITSELF HAS TO GO. Found in a browser and by nothing else: the element is
+   still in the flow after it fails, so Chromium draws its own torn-page mark in the corner of the
+   well — the exact glyph this state exists to replace, sitting next to the replacement. The staff
+   drawer needs no equivalent rule because over there the <img> is only ever created once the bytes
+   are in hand, so a failed tile has never had one. */
+.att-img.is-failed img { display: none; }
+
+/* The chip, for anything without a useful preview. Its surface is set with the tile's, below —
+   ONE place owns "what colour is an attachment on this bubble". */
 .att-file {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 6px 10px; border-radius: 8px; text-decoration: none;
-  background: rgba(0, 0, 0, .06); color: inherit; font-size: 13px; max-width: 260px;
+  color: inherit; font-size: 13px; max-width: 260px;
 }
-.att-file:hover { background: rgba(0, 0, 0, .11); }
-.att-file .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.att-file .att-size { opacity: .65; font-size: 12px; flex: none; }
-/* On the customer's own red bubbles the neutral wash disappears — lift it off the bubble
-   instead of tinting it. */
-.msg.customer .att-file { background: rgba(255, 255, 255, .2); }
-.msg.customer .att-file:hover { background: rgba(255, 255, 255, .3); }
+/* TRUNCATE, never wrap. Three lines of filename inside a chat bubble is worse than an ellipsis,
+   and the untruncated name is on the anchor's title either way. */
+.att-file .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.att-cap .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── legible on BOTH bubbles ─────────────────────────────────────────────────
+   MEASURED, not eyeballed. `opacity` was the defect, and it was a defect on ONE side only, which
+   is how it survived: the size line at opacity .65 over #E9E8E7 is 4.6:1 and fine, and the same
+   rule inside the customer's own bubble is white at 65% over #9E001F, which is 3.4:1 — under the
+   4.5:1 floor for small text. Nobody had looked at it on the red one. The failure note was worse:
+   #9e001f on that same red is 1.4:1, i.e. invisible.
+   So each line takes a real colour per context. Contrast against the surface it lands on (the
+   per-bubble surfaces below, not the bubble itself):
+                   customer (red) bubble        staff #E9E8E7 / peer #F5F3F3
+     name          #fff             6.6:1       --fg         12.2 / 13.5
+     size          rgba(#fff,.86)   5.3:1       --secondary   4.6 / 5.1
+     did not load  --primary-tint   5.1:1       --primary     6.1 / 6.7
+   The neutral column is this app's own --secondary; the staff drawer's copy of this block uses
+   ITS own --ink-v, which is warmer and lands a shade higher. Same structure, same geometry, same
+   words, each app's own token — rather than one of them borrowing the other's hex.
+   The opacity is set back to 1 on the same rule that sets the colour, deliberately, rather than
+   left to a separate declaration that could tie with it on weight and be decided by whichever
+   ended up later in the file. Opacity MULTIPLIES: left at .65 it would take 4.6:1 down to 3.3:1
+   and undo the fix with the rule the fix replaced. */
+.att-cap .att-size, .att-file .att-size {
+  opacity: 1; color: var(--secondary); font-size: 12px; flex: none;
+}
+.att-img.is-failed .att-size, .att-file.is-failed .att-size { color: var(--primary); }
+.msg.customer .att-cap .att-size,
+.msg.customer .att-file .att-size { color: rgba(255, 255, 255, .86); }
+/* Four classes deliberately, so these out-WEIGH the three-class rules above rather than merely
+   following them in the file. Specificity beats source order. */
+.msg.customer .att-img.is-failed .att-size,
+.msg.customer .att-file.is-failed .att-size { color: var(--primary-tint); }
+
+/* ── the surface, per bubble ─────────────────────────────────────────────────
+   A NEUTRAL WASH DISAPPEARS ON THE RED BUBBLE, so it is recessed on the staff and peer ones and
+   lifted on the customer's own. The chip has always done this; the tile now does it too, because
+   it needed it for exactly the same reason. Visibility of the surface against the bubble it sits
+   on, and the text on top of it:
+                    surface                 vs bubble   name   size(.86)   did-not-load
+     staff / peer   rgba(0,0,0,.06)            1.14:1   12.2      4.6           6.1
+     customer       rgba(255,255,255,.16)      1.29:1    6.6      5.3           5.1  */
+.att-img, .att-file { background: rgba(0, 0, 0, .06); }
+.att-img:hover, .att-file:hover { background: rgba(0, 0, 0, .11); }
+.msg.customer .att-img, .msg.customer .att-file { background: rgba(255, 255, 255, .16); }
+.msg.customer .att-img:hover,
+.msg.customer .att-file:hover { background: rgba(255, 255, 255, .28); }
 
 /* The queue above the composer, before anything is sent. */
 .att-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 2px; }
