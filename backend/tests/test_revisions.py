@@ -82,13 +82,23 @@ def publish(monkeypatch):
     monkeypatch.setattr(main.db, "set_assigned_estimator",
                         lambda pid, e: calls.setdefault("assigned", []).append(e))
     monkeypatch.setattr(main.db, "reopen_if_closed", lambda pid: False)
+    # A publish that carries attachments writes them onto the newest proposal card. Left
+    # unstubbed it reaches for a real connection and burns the pool's full timeout -- and it is
+    # only reached when there ARE attachments, which is why every publish test written before
+    # them passed without it. Recorded, so a test can assert what landed on the card.
+    monkeypatch.setattr(main.db, "attach_to_latest_card",
+                        lambda pid, atts: calls.setdefault("carded", []).append(atts))
     monkeypatch.setattr(main.db, "mark_last_sent",
                         lambda pid: calls.setdefault("last_sent", []).append(pid))
     monkeypatch.setattr(main, "_pdf_cache_drop", lambda pid: None)
     monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda t: None)
+    # `attachments` is recorded as the FILENAMES that actually reached the mailer. Hanz asked
+    # directly whether a re-sent revision carries a newly attached photo, and the only honest
+    # answer is one that watches this seam rather than reading the call.
     monkeypatch.setattr(main.email_sender, "send_portal_link",
                         lambda e, n, url, proj, **k: calls["emails"].append(
-                            {"to": e, "revised": k.get("revised")}) or True)
+                            {"to": e, "revised": k.get("revised"),
+                             "attachments": [f for f, _ in (k.get("attachments") or [])]}) or True)
 
     def _run(existing, body, *, was_approved=False):
         monkeypatch.setattr(main.db, "get_proposal", lambda pid: existing)
@@ -188,3 +198,74 @@ def test_publish_without_revision_no_behaves_exactly_as_before(publish):
 def test_garbage_revision_no_is_ignored_not_crashed(publish):
     out, calls = publish(_EXISTING, {"draft_id": "p1", "revision_no": "not-a-number"})
     assert out["revision_no"] is None and calls["reset"] == []
+
+
+# ── a re-sent revision carries a newly attached photo ────────────────────────
+# Hanz, 2026-08-26, after the reply-email fix landed: "Also resent revisions when adding a photo
+# again does it reach also?" Reading the call says yes — the send loop is unconditional and passes
+# `attachments` beside `revised`. That is not the same as knowing, so this executes the route.
+
+def _png():
+    return b"\x89PNG\r\n\x1a\n" + b"0" * 64
+
+
+def _b64png():
+    import base64
+    return base64.b64encode(_png()).decode()
+
+
+def test_a_revision_send_carries_a_newly_attached_photo(publish, tmp_path, monkeypatch):
+    """The case asked about: a proposal already sent, re-sent as revision 2 with a photo attached
+    on the Files screen. The photo must reach the email, not only the thread."""
+    import config
+    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path), raising=False)
+
+    _out, calls = publish(
+        {"proposal_id": "p1", "token": "tok", "proposal_status": "sent",
+         "customer_email": "c@x.com", "customer_name": "Cust", "project_name": "Westport"},
+        {"draft_id": "p1", "revision_no": 2, "assigned_estimator": "kyle@wetreadwell.com",
+         "attachments": [{"name": "slab.png", "mime": "image/png", "b64": _b64png()}]},
+    )
+    assert calls["emails"], "nothing was emailed at all"
+    assert calls["emails"][0]["revised"] is True, "this was not treated as a revision"
+    assert calls["emails"][0]["attachments"] == ["slab.png"], (
+        "a re-sent revision dropped the newly attached photo from the email: %r"
+        % (calls["emails"][0],))
+
+
+def test_the_photo_lands_on_the_REVISION_card_not_the_superseded_one(publish, tmp_path, monkeypatch):
+    """Ordering, which is the part that could silently be wrong. The revision's own card is posted
+    first and the files attach to "the latest card" afterwards — get that backwards and the photo
+    hangs off the card the customer has just been told is superseded."""
+    import config
+    import main
+    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path), raising=False)
+    attached = []
+    monkeypatch.setattr(main.db, "attach_to_latest_card",
+                        lambda pid, atts: attached.append(atts))
+
+    _out, calls = publish(
+        {"proposal_id": "p1", "token": "tok", "proposal_status": "sent",
+         "customer_email": "c@x.com", "customer_name": "Cust", "project_name": "Westport"},
+        {"draft_id": "p1", "revision_no": 3, "assigned_estimator": "kyle@wetreadwell.com",
+         "attachments": [{"name": "slab.png", "mime": "image/png", "b64": _b64png()}]},
+    )
+    # The revision card was posted, and only then were the files attached.
+    cards = [m for m in calls["messages"] if m["type"] == "proposal_card"]
+    assert cards, "no revision card was posted"
+    assert attached and [a["name"] for a in attached[0]] == ["slab.png"]
+    assert calls["superseded"] == [3], "the earlier card was not retired"
+
+
+def test_a_revision_with_nothing_attached_emails_nothing_extra(publish, tmp_path, monkeypatch):
+    """The plain re-send still works, and carries no files — the estimator did not attach any this
+    time, and silently re-sending the previous revision's photos would be us deciding what the
+    customer receives."""
+    import config
+    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path), raising=False)
+    _out, calls = publish(
+        {"proposal_id": "p1", "token": "tok", "proposal_status": "sent",
+         "customer_email": "c@x.com", "customer_name": "Cust", "project_name": "Westport"},
+        {"draft_id": "p1", "revision_no": 2, "assigned_estimator": "kyle@wetreadwell.com"},
+    )
+    assert calls["emails"][0]["attachments"] == []

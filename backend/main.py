@@ -1984,15 +1984,22 @@ def _decode_publish_attachments(items) -> list[tuple[str, str, bytes]]:
     for a in (items or [])[:uploads.MAX_PER_MESSAGE]:
         if not isinstance(a, dict):
             continue
-        mime = str(a.get("mime") or "").split(";")[0].strip().lower()
-        if mime not in uploads.ALLOWED:
-            raise ValueError("%s cannot be attached to an email" % uploads.clean_name(a.get("name")))
         try:
             blob = base64.b64decode(str(a.get("b64") or ""), validate=True)
         except (ValueError, TypeError):
             raise ValueError("%s could not be read" % uploads.clean_name(a.get("name")))
         if not blob:
             continue
+        # THE CONTENT, checked here rather than left to the store. This used to test the CLAIMED
+        # type; a file whose bytes disagreed then got as far as the storage loop, was refused
+        # there, logged, and DROPPED -- while the publish carried on and returned 200. The
+        # estimator saw "Sent to customer portal" and the customer got an email with no
+        # attachment. A file we will not carry has to stop the send, by name, before the proposal
+        # row is touched.
+        mime = uploads.detect(blob)
+        if mime not in uploads.ALLOWED:
+            raise ValueError("%s cannot be attached — that file is not a kind we can send"
+                             % uploads.clean_name(a.get("name")))
         total += len(blob)
         if len(blob) > uploads.MAX_BYTES or total > _PUBLISH_ATT_TOTAL:
             raise ValueError("those files come to more than 10 MB together — "
@@ -2124,10 +2131,14 @@ async def admin_publish(request: Request) -> JSONResponse:
             try:
                 stored.append(uploads.store(draft_id, name_, mime_, blob_))
                 mail_atts.append((uploads.clean_name(name_), blob_))
-            except (ValueError, OSError):
-                # One unreadable file does not cost the customer their proposal. It is dropped
-                # from both the email and the card, and the publish carries on.
-                log.warning("publish attachment refused for %s: %r", draft_id, name_)
+            except (ValueError, OSError) as exc:
+                # Only a genuine WRITE failure can reach here now -- the content was already
+                # checked before the row was touched, so this is a disk problem, not a bad file.
+                # The publish carries on rather than costing the customer their proposal, and the
+                # reason is logged: "refused" with no reason is what made the last one take an
+                # SSH session to diagnose.
+                log.warning("publish attachment %r not stored for %s: %s: %s",
+                            name_, draft_id, type(exc).__name__, exc)
         if stored:
             db.attach_to_latest_card(draft_id, uploads.sanitize(stored))
 
