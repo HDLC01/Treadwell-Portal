@@ -714,6 +714,9 @@ function renderChat(msgs) {
   t.innerHTML = msgs.map(renderMsg).join("");
   t.querySelectorAll("[data-open-proposal]").forEach((el) => el.addEventListener("click", openProposal));
   t.querySelectorAll("[data-pay-deposit]").forEach((el) => el.addEventListener("click", openDeposit));
+  // Alongside the other two, and for the same reason: an event handler written into the markup is
+  // blocked by this app's CSP, so every listener in this thread has to be bound here.
+  attHydrate(t);
   if (atBottom) t.scrollTop = t.scrollHeight;   // keep pinned to newest unless the user scrolled up
 }
 
@@ -857,20 +860,80 @@ function attHtml(m) {
   if (!list.length) return "";
   const href = (a) => `/api/portal/${TOKEN}/file/${encodeURIComponent(a.id)}`;
   return `<div class="att-list">` + list.map((a) => (a.image
-    // `alt` is empty and the name lives on the anchor's title: as alt text a filename is read out
-    // in place of the picture, and while the image is still fetching the browser LAYS IT OUT --
-    // which on the staff side spilled the name over the message above. `onerror` swaps in a chip,
-    // because a photo that 404s should say so rather than draw a torn page.
-    ? `<a class="att-img" href="${href(a)}" target="_blank" rel="noopener" title="${esc(a.name)}"
-          aria-label="${esc(a.name)}"><img src="${href(a)}" alt="" loading="lazy"
-          onerror="this.parentNode.className='att-file is-failed';this.parentNode.removeAttribute('href');this.parentNode.textContent='';this.parentNode.appendChild(Object.assign(document.createElement('span'),{className:'att-name',textContent:${JSON.stringify(a.name || "attachment")}}));this.parentNode.appendChild(Object.assign(document.createElement('span'),{className:'att-size',textContent:'did not load'}))"></a>`
-    : `<a class="att-file" href="${href(a)}" target="_blank" rel="noopener">
+    // A TILE: the well on top, the filename under it. The name used to live only on the anchor's
+    // `title`, which on a phone -- where these are mostly opened -- is not reachable at all. The
+    // caption is the same `.att-name` / `.att-size` pair the chip below already had, so a photo
+    // and a document in the same message read as two of the same thing.
+    //
+    // `alt` is EMPTY on purpose: as alt text a filename is read out in place of the picture, the
+    // browser lays it out while the image is still fetching, and it would now be saying the same
+    // thing the caption says two lines down. No aria-label either -- it would override the
+    // visible text inside the anchor.
+    //
+    // No inline `onerror`: this app's CSP is `script-src 'self'` with NO 'unsafe-inline', so an
+    // event-handler attribute is refused by the browser and the failure state would never have
+    // appeared. attHydrate binds it after the paint instead.
+    ? `<a class="att-img" href="${href(a)}" target="_blank" rel="noopener" title="${esc(a.name)}">
+         <span class="att-well">
+           <img src="${href(a)}" alt="" loading="lazy">
+           <svg class="att-broke" viewBox="0 0 24 24" width="24" height="24" fill="none"
+                stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                stroke-linejoin="round" aria-hidden="true">
+             <line x1="2" x2="22" y1="2" y2="22" />
+             <path d="M10.41 10.41a2 2 0 1 1-2.83-2.83" />
+             <line x1="13.5" x2="6" y1="13.5" y2="21" />
+             <line x1="18" x2="21" y1="12" y2="15" />
+             <path d="M3.59 3.59A1.99 1.99 0 0 0 3 5v14a2 2 0 0 0 2 2h14c.55 0 1.05-.22 1.41-.59" />
+             <path d="M21 15V5a2 2 0 0 0-2-2H9" /></svg>
+         </span>
+         <span class="att-cap">
+           <span class="att-name">${esc(a.name)}</span>
+           <span class="att-size">${fileSize(a.size)}</span>
+         </span></a>`
+    : `<a class="att-file" href="${href(a)}" target="_blank" rel="noopener"
+          title="${esc(a.name)}">
          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
            <polyline points="14 2 14 8 20 8"/></svg>
          <span class="att-name">${esc(a.name)}</span>
          <span class="att-size">${fileSize(a.size)}</span></a>`)).join("") + `</div>`;
+}
+
+/** Arm the failure state on every image in a freshly painted thread.
+ *
+ *  IN JAVASCRIPT, NOT IN AN ATTRIBUTE. The portal sends
+ *  `script-src 'self' https://accounts.google.com https://www.gstatic.com` on every page, with no
+ *  'unsafe-inline' -- so an `onerror="..."` attribute is blocked outright and the version of this
+ *  that lived in the markup could never have run on the live site.
+ *
+ *  The already-broken case matters as much as the listener. An image that fails from cache can be
+ *  finished before this runs, and a listener bound afterwards never hears about it -- so a
+ *  complete image with no intrinsic width is treated as the failure it is. */
+function attHydrate(root) {
+  if (!root) return;
+  for (const img of root.querySelectorAll(".att-img img")) {
+    const tile = img.closest(".att-img");
+    if (!tile || tile.dataset.attArmed) continue;
+    tile.dataset.attArmed = "1";
+    img.addEventListener("error", () => attFailed(tile));
+    if (img.complete && !img.naturalWidth) attFailed(tile);
+  }
+}
+
+/** Say, on the attachment it happened to, that it did not load.
+ *
+ *  NOTHING IS REBUILT AND NOTHING CHANGES SIZE. Turning the tile into a small chip shrinks the
+ *  bubble, and the thread auto-scrolls to the newest message -- so a reflow pulls the view out
+ *  from under whoever is reading, which is the exact problem the fixed box exists to prevent. The
+ *  glyph is already in the markup and a class reveals it; the caption's second line stops being a
+ *  file size and starts being the reason. */
+function attFailed(el) {
+  if (!el) return;
+  el.classList.add("is-failed");
+  el.removeAttribute("href");
+  const note = el.querySelector(".att-size");
+  if (note) note.textContent = "did not load";
 }
 
 // ── chat ⇄ proposal view toggle (hash-driven) ─────────────────────────────────
