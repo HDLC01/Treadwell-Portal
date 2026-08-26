@@ -36,12 +36,53 @@ def store(tmp_path, monkeypatch):
 # ── 1. what is allowed in ────────────────────────────────────────────────────
 
 def test_only_the_listed_types_can_be_stored(store):
-    """The allow-list is the whole gate. An executable, a script, an unknown type: refused, and
-    refused with a sentence the UI can show as-is rather than a generic failure."""
-    for bad in ("application/x-msdownload", "text/html", "image/svg+xml", "", "application/zip"):
+    """The allow-list is the whole gate — and it is now about the file's CONTENT, not the type its
+    uploader claimed. Rewritten from the claim side to the content side: the old version passed a
+    real PNG under a series of forbidden labels and watched it get refused, which tested the label
+    check. What matters is the bytes, so these are bodies that are not any allowed type."""
+    bads = [
+        (b"MZ\x90\x00" + b"0" * 40, "a Windows executable"),
+        (b"\x7fELF" + b"0" * 40, "an ELF binary"),
+        (b"PK\x03\x04" + b"x" * 40, "a zip that is not an Office document"),
+        (b"<html><script>alert(1)</script></html>", "an HTML document"),
+        (b"<svg onload=alert(1)>", "an SVG"),
+        (b"", "nothing at all"),
+    ]
+    for blob, what in bads:
         with pytest.raises(ValueError) as e:
-            uploads.store("pid", "x", bad, PNG)
-        assert "cannot be attached" in str(e.value), bad
+            uploads.store("pid", "photo.png", "image/png", blob)
+        assert "cannot be attached" in str(e.value) or "empty" in str(e.value), what
+
+
+def test_a_misnamed_image_is_stored_as_what_it_really_is(store):
+    """THE CASE HANZ HIT. "attached an image to the proposal and sent another revision didnt go
+    through", and the prod log said: publish attachment refused for ...: 'Check-PNG-Image-File.png'.
+
+    A browser sets File.type from the file's EXTENSION, so a JPEG saved as .png arrives claiming
+    image/png. The old check compared the bytes to that claim, saw a mismatch, and refused a
+    perfectly good photograph — for a reason the estimator could neither see nor act on.
+
+    Now the content decides outright, and the file is stored under the extension it has earned."""
+    jpeg = b"\xff\xd8\xff\xe0" + b"0" * 40
+    rec = uploads.store("pid", "Check-PNG-Image-File.png", "image/png", jpeg)
+    assert rec["mime"] == "image/jpeg" and rec["ext"] == ".jpg"
+    assert rec["name"] == "Check-PNG-Image-File.png", (
+        "the name the customer sees should still be the one they were sent")
+    assert (store / "pid" / (rec["id"] + ".jpg")).is_file()
+
+
+def test_a_text_type_is_confirmed_and_never_invented(store):
+    """text/plain and text/csv have no signature, so they cannot be detected — only confirmed
+    against a claim. That asymmetry is load-bearing: if `detect` returned text/plain for "anything
+    that decodes as UTF-8", the allow-list would quietly widen to every non-binary file there is —
+    .html, .svg, .js, .py — and these are served from the origin the customer's session lives on."""
+    assert uploads.detect("just a note".encode()) is None, (
+        "detect volunteered a text type — that widens the allow-list to any non-binary file")
+    assert uploads.store("pid", "n.txt", "text/plain", b"cove base 240 LF")["ext"] == ".txt"
+    # …and a document dressed as a note is still refused, because real notes do not open with a tag.
+    for markup in (b"<html><body>hi</body></html>", b"  <svg onload=alert(1)>", b"<?xml version=\"1.0\"?>"):
+        with pytest.raises(ValueError):
+            uploads.store("pid", "n.txt", "text/plain", markup)
 
 
 def test_svg_is_refused_even_though_it_is_an_image(store):
@@ -229,10 +270,26 @@ def _b64(blob: bytes) -> str:
 
 
 def test_the_publish_decoder_returns_bytes_for_what_it_accepts():
+    """And the type it returns is the DETECTED one. The fixture here is a PNG, so it comes back as
+    image/png however it was labelled — which is the whole change."""
     import main
     out = main._decode_publish_attachments(
         [{"name": "slab.jpg", "mime": "image/jpeg", "b64": _b64(PNG)}])
-    assert out == [("slab.jpg", "image/jpeg", PNG)]
+    assert out == [("slab.jpg", "image/png", PNG)]
+
+
+def test_a_file_we_cannot_carry_stops_the_send_instead_of_vanishing():
+    """THE EXPENSIVE HALF OF THE BUG. The content check used to happen inside the storage loop,
+    after the proposal row had been written and the card posted — so a refusal was logged, dropped,
+    and the publish returned 200. The estimator read "Sent to customer portal" and the customer got
+    an email with no attachment. Nobody would know until the customer asked.
+
+    It is now checked in the decoder, which runs before the row is touched, and it names the file."""
+    import main
+    with pytest.raises(ValueError) as e:
+        main._decode_publish_attachments(
+            [{"name": "notes.exe", "mime": "image/png", "b64": _b64(b"MZ\x90\x00" + b"0" * 40)}])
+    assert "notes.exe" in str(e.value)
 
 
 def test_a_type_the_email_may_not_carry_names_the_file_it_refused():
@@ -261,7 +318,9 @@ def test_the_total_is_capped_below_what_resend_would_take():
     would find out from the customer — so the cap is ours, and it is a sentence that says what to
     do instead."""
     import main
-    half = b"0" * (6 * 1024 * 1024)
+    # REAL JPEG bytes. The content check runs before the size cap now, so filler that is not
+    # actually an image is refused for its type and never reaches the total at all.
+    half = b"\xff\xd8\xff\xe0" + b"0" * (6 * 1024 * 1024)
     with pytest.raises(ValueError) as e:
         main._decode_publish_attachments([
             {"name": "a.jpg", "mime": "image/jpeg", "b64": _b64(half)},
@@ -283,17 +342,24 @@ def test_the_files_are_decoded_before_the_proposal_row_is_touched():
         "half-way through a publish")
 
 
-def test_one_unreadable_file_does_not_cost_the_customer_their_proposal():
-    """`uploads.store` is inside a try in the publish loop: a disk error on one photo drops that
-    photo, not the send. The alternative is a 500 on the single action in this product that must
-    not fail after the estimator has pressed the button."""
+def test_a_disk_failure_is_contained_and_says_why():
+    """`uploads.store` is inside a try in the publish loop, so a disk error on one photo drops that
+    photo rather than the send — a 500 on the one action in this product that must not fail after
+    the button is pressed would be worse.
+
+    What can reach that handler is now ONLY a write failure: the content was already checked in
+    the decoder, before the row was touched. And it logs the exception, because "refused" with no
+    reason is what made the reported case take an SSH session and a container probe to diagnose."""
     import inspect
 
     import main
     src = inspect.getsource(main.admin_publish)
     i = src.index("uploads.store(draft_id")
-    assert "except (ValueError, OSError):" in src[i:i + 400], (
+    tail = src[i:i + 900]
+    assert "except (ValueError, OSError) as exc:" in tail, (
         "a failed attachment write is no longer contained — it will take the publish with it")
+    assert "type(exc).__name__" in tail, (
+        "the log still does not say WHY a file was not stored")
 
 
 def test_the_card_the_files_land_on_is_the_newest_one():
@@ -497,7 +563,7 @@ def test_the_email_total_is_capped_even_when_the_thread_is_not(store):
     big = b"\x89PNG\r\n\x1a\n" + b"0" * (3 * 1024 * 1024)
     atts = []
     for i in range(5):
-        r = uploads.store("pid", "p%d.png" % i, "image/png", big)
+        r = uploads.store("pid", "p%d.png" % i, "image/png", big)   # a real PNG, detected as one
         atts.extend(uploads.sanitize([r]))
     got = main._mail_files("pid", atts)
     assert 0 < len(got) < 5, "the email total was not enforced: %d files" % len(got)

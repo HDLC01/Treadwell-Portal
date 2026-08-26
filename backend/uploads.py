@@ -77,6 +77,18 @@ IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/heic
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
+# The two signature-less types. Only these may be established from what the uploader claimed.
+_TEXT_TYPES = ("text/plain", "text/csv")
+
+
+def _looks_like_markup(blob: bytes) -> bool:
+    """Is this a DOCUMENT dressed as a note? An .html, .svg or .xml decodes perfectly well as
+    text, so the not-binary test alone would wave all three through as text/plain -- and these
+    files are served from the origin the customer's session cookie lives on. Cheap and blunt on
+    purpose: real notes and CSVs do not open with a tag."""
+    head = (blob or b"")[:512].lstrip()[:64].lower()
+    return head.startswith(b"<")
+
 # What each allowed type must actually START with. The Content-Type header is a claim by the
 # uploader's client; this is the file speaking for itself.
 _MAGIC: dict[str, tuple[bytes, ...]] = {
@@ -92,6 +104,50 @@ _MAGIC: dict[str, tuple[bytes, ...]] = {
     "application/msword": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"PK\x03\x04"),
     "application/vnd.ms-excel": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"PK\x03\x04"),
 }
+
+
+def detect(blob: bytes) -> Optional[str]:
+    """The type this file ACTUALLY is, or None when it is not one we accept.
+
+    This replaces asking the uploader. A browser sets File.type from the file's EXTENSION, so a
+    JPEG saved as .png arrives claiming image/png -- and the signature check then refused a
+    perfectly good photograph for a reason the estimator could not see or act on. Deriving the
+    answer from the content is both friendlier and stricter: friendlier because a misnamed file
+    just works, stricter because the type can no longer be asserted by whoever sent it.
+
+    ORDER MATTERS for the two container formats. A .docx and an .xlsx are both zips, and an
+    OLE2 .doc and .xls are byte-identical at the front, so a bare signature cannot tell them
+    apart. The zip is looked INSIDE for the part name that says which it is, and OLE2 falls back
+    to Word -- the commoner of the two here, and the one whose viewer opens the other anyway.
+    """
+    b = blob or b""
+    if not b:
+        return None
+    for kind in ("image/jpeg", "image/png", "image/gif", "application/pdf"):
+        if any(b.startswith(m) for m in _MAGIC[kind]):
+            return kind
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    if b[4:8] == b"ftyp" and b[8:12] in (
+            b"heic", b"heix", b"hevc", b"heim", b"heis", b"hevm", b"mif1", b"msf1"):
+        return "image/heic"
+    if b.startswith(b"PK" + bytes([3, 4])):
+        # The zip's first entry names the format. Cheap and definite: no zipfile parse, just the
+        # part names OOXML always writes near the front of the archive.
+        head = b[:4096]
+        if b"word/" in head:
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if b"xl/" in head:
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        return None                    # a zip that is not an Office document is not on the list
+    if b.startswith(bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])):
+        return "application/msword"    # or .xls; indistinguishable at the header, see above
+    # NO TEXT FALLBACK HERE, deliberately. text/plain and text/csv have no signature, so they
+    # cannot be DETECTED -- only confirmed against a claim. Returning text/plain for "anything
+    # that decodes" would quietly widen the allow-list to every non-binary file there is: .html,
+    # .svg, .js, .py. `store` handles the text types separately, from the claim, which is the only
+    # place a claim is still allowed to matter.
+    return None
 
 
 def verify(kind: str, blob: bytes) -> bool:
@@ -170,19 +226,28 @@ def store(proposal_id: str, name: Optional[str], mime: Optional[str], blob: byte
     is a sentence the UI can show as-is, because "upload failed" tells a customer nothing about
     which of their three photos was the problem.
     """
-    kind = str(mime or "").split(";")[0].strip().lower()
-    ext = ALLOWED.get(kind)
-    if not ext:
-        raise ValueError("that kind of file cannot be attached")
     if not blob:
         raise ValueError("that file is empty")
     if len(blob) > MAX_BYTES:
         raise ValueError("that file is larger than 15 MB")
-    # THE BYTES MUST AGREE WITH THE CLAIM. Without this the allow-list is checking a header the
-    # uploader wrote, which is not a check at all -- an executable declaring image/jpeg would be
-    # stored under a .jpg it has no right to.
-    if not verify(kind, blob):
-        raise ValueError("that file is not really a %s" % ext.lstrip("."))
+    # THE CONTENT DECIDES, and the claim is not consulted at all. `mime` is kept in the signature
+    # because every caller has one to hand and it makes the refusal message specific, but it has
+    # no say in what gets stored. That is the whole point: a browser derives File.type from the
+    # file's EXTENSION, so a JPEG saved as .png claims image/png -- and a check that trusted the
+    # claim refused a real photograph for a reason nobody could see. Deriving it is friendlier
+    # AND stricter.
+    claimed = str(mime or "").split(";")[0].strip().lower()
+    kind = detect(blob)
+    if kind is None and claimed in _TEXT_TYPES and verify(claimed, blob) and not _looks_like_markup(blob):
+        # The one case where the claim still decides. A .txt or .csv has nothing to detect, so the
+        # most that can be established is that it is not binary and not a document pretending to
+        # be a note -- and that the person sending it said it was text.
+        kind = claimed
+    ext = ALLOWED.get(kind or "")
+    if not ext:
+        raise ValueError("that kind of file cannot be attached%s"
+                         % (" (it is not really a %s)" % ALLOWED[claimed].lstrip(".")
+                            if claimed in ALLOWED else ""))
     # The proposal id scopes the directory, so serving a file can require that the requester has
     # access to THAT proposal -- an id alone is never enough.
     fid = uuid.uuid4().hex
