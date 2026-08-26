@@ -20,14 +20,26 @@ THREE DECISIONS WORTH KNOWING ABOUT, because each one avoided a much larger chan
    read back on every thread poll, and the thread polls constantly.
 
 WHAT IS ALLOWED IN. Only types a customer or an estimator plausibly attaches to a flooring bid:
-photographs, PDFs, and the office documents Kyle already trades in. The extension is decided HERE
-from the sniffed content type rather than taken from the uploaded name, and the stored filename is
-a uuid -- so a name like `invoice.pdf.exe`, a path traversal, or a Windows reserved device name
-never reaches the filesystem. The original name is kept as data, for display only.
+photographs, PDFs, and the office documents Kyle already trades in. Macro-enabled Office formats
+(.docm, .xlsm) are deliberately absent from the list.
 
-WHAT IS DELIBERATELY NOT HERE. No virus scanning, and no image re-encoding to strip EXIF. Both are
-real, both are out of scope for a bid portal between a contractor and their customer, and saying so
-is better than implying a guarantee that is not being made.
+THE TYPE IS CHECKED AGAINST THE BYTES, not taken on trust. The Content-Type on the request is
+whatever the uploader's client chose to say, so on its own it decides nothing: `verify` reads the
+file's own signature and refuses a mismatch. The first version of this module trusted that header
+while its docstring claimed to be sniffing the content -- which is exactly the sort of gap that
+survives review, because the comment says the right thing.
+
+The stored filename is a uuid and the extension comes from the VERIFIED type, so a name like
+`invoice.pdf.exe`, a path traversal, or a Windows reserved device name never reaches the
+filesystem. The original name is kept as data, for display only.
+
+WHAT IS DELIBERATELY NOT HERE, said plainly rather than implied. NO MALWARE SCANNING. A file that
+genuinely is a valid PDF or .docx passes every check in this module, because it is one -- so the
+residual risk is an estimator opening a real document with a malicious payload inside it. Closing
+that needs either ClamAV (whose daemon wants about a gigabyte on a 2 GB VPS already running a dozen
+containers) or sending customer files to a third-party scanner, which is a privacy decision and not
+a technical one. Also no image re-encoding, so EXIF -- including GPS on a phone photo -- is passed
+through as the customer sent it.
 """
 from __future__ import annotations
 
@@ -64,6 +76,62 @@ ALLOWED: dict[str, str] = {
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "image/heif"}
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# What each allowed type must actually START with. The Content-Type header is a claim by the
+# uploader's client; this is the file speaking for itself.
+_MAGIC: dict[str, tuple[bytes, ...]] = {
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+    "application/pdf": (b"%PDF-",),
+    # Every modern Office format is a zip; the older ones are OLE2 compound files. Which of the
+    # two a given type may be is what the pairing below encodes -- a .docx claiming to be OLE2
+    # is a mismatch worth refusing even though both are "Office".
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": (b"PK\x03\x04",),
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": (b"PK\x03\x04",),
+    "application/msword": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"PK\x03\x04"),
+    "application/vnd.ms-excel": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"PK\x03\x04"),
+}
+
+
+def verify(kind: str, blob: bytes) -> bool:
+    """Does this file's content match the type its uploader claimed?
+
+    Four shapes, because four families of format say who they are differently:
+
+      fixed prefix   JPEG, PNG, GIF, PDF, and the zip / OLE2 Office containers -- see _MAGIC
+      RIFF/WEBP      a 12-byte header with the brand at offset 8
+      ISO-BMFF       HEIC/HEIF: an `ftyp` box at offset 4, the brand right after it
+      no signature   text/plain and text/csv have none, so the test is the opposite one -- it
+                     must not be BINARY. A NUL byte in the first 8 KB is the giveaway an
+                     executable cannot avoid, and bytes that will not decode as UTF-8 are not
+                     text a person typed.
+
+    Refusing on a type this function does not know is deliberate: a new entry in ALLOWED with
+    no way to check it should fail closed and make somebody come here, not sail through on the
+    uploader's word.
+    """
+    b = blob or b""
+    if kind in _MAGIC:
+        return any(b.startswith(m) for m in _MAGIC[kind])
+    if kind == "image/webp":
+        return b[:4] == b"RIFF" and b[8:12] == b"WEBP"
+    if kind in ("image/heic", "image/heif"):
+        return b[4:8] == b"ftyp" and b[8:12] in (
+            b"heic", b"heix", b"hevc", b"heim", b"heis", b"hevm", b"mif1", b"msf1")
+    if kind in ("text/plain", "text/csv"):
+        head = b[:8192]
+        if bytes([0]) in head:
+            return False
+        # errors="ignore" would accept anything. The window is trimmed back instead, so a
+        # multi-byte character sliced in half by the 8 KB boundary is not read as corruption.
+        probe = head if len(b) <= 8192 else head[:-4]
+        try:
+            probe.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return True
+    return False
 
 
 def root() -> Path:
@@ -110,6 +178,11 @@ def store(proposal_id: str, name: Optional[str], mime: Optional[str], blob: byte
         raise ValueError("that file is empty")
     if len(blob) > MAX_BYTES:
         raise ValueError("that file is larger than 15 MB")
+    # THE BYTES MUST AGREE WITH THE CLAIM. Without this the allow-list is checking a header the
+    # uploader wrote, which is not a check at all -- an executable declaring image/jpeg would be
+    # stored under a .jpg it has no right to.
+    if not verify(kind, blob):
+        raise ValueError("that file is not really a %s" % ext.lstrip("."))
     # The proposal id scopes the directory, so serving a file can require that the requester has
     # access to THAT proposal -- an id alone is never enough.
     fid = uuid.uuid4().hex

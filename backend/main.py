@@ -785,7 +785,21 @@ def _serve_upload(proposal_id: str, file_id: str, internal: bool = False):
     disp = "inline" if uploads.is_image(rec.get("mime")) else "attachment"
     return FileResponse(path, media_type=rec.get("mime") or "application/octet-stream",
                         filename=rec.get("name") or "attachment",
-                        content_disposition_type=disp)
+                        content_disposition_type=disp,
+                        # BELT AND BRACES, on a response whose body a customer supplied.
+                        #
+                        # nosniff: the media type here is the one uploads.verify proved, so no
+                        # browser should be second-guessing it. Content sniffing is precisely how
+                        # a file that is "only" a picture gets treated as something else.
+                        #
+                        # The CSP is what makes a mistake anywhere upstream survivable: even if
+                        # something did render, `default-src 'none'` plus `sandbox` leaves it no
+                        # script, no network, no form, and no same-origin privileges — and these
+                        # files are served from the origin the customer's session cookie lives on.
+                        headers={"X-Content-Type-Options": "nosniff",
+                                 "Content-Security-Policy":
+                                     "default-src 'none'; sandbox; frame-ancestors 'none'",
+                                 "Referrer-Policy": "no-referrer"})
 
 
 def _require(request: Request, token: str):
@@ -803,14 +817,15 @@ async def api_post_question(token: str, request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
     text = _cap(body.get("body"), 4000)
-    atts = uploads.sanitize(body.get("attachments"))
-    # A MESSAGE MAY BE JUST A PHOTO. Requiring text as well would mean a customer who wants to
-    # send a picture of the slab has to invent a sentence to go with it.
-    if not text and not atts:
+    # `attachments` IS IGNORED HERE, deliberately and permanently. There is no customer upload
+    # route (see the note above the fetch route), so any ids in this body name files this customer
+    # did not put there — either an estimator's, or nothing at all. Reading them would let a
+    # customer re-attach somebody else's file to their own message and, worse, would be the one
+    # place the "staff only" rule could be talked out of later.
+    if not text:
         return _json({"ok": False, "error": "empty"}, 400)
     who = _session_email(request)
-    row = db.add_message(p["proposal_id"], "customer", who, text, msg_type="text",
-                         meta={"attachments": atts} if atts else None)
+    row = db.add_message(p["proposal_id"], "customer", who, text, msg_type="text")
     email_sender.notify_team(
         f"New proposal question — {p.get('project_name')}",
         f"<p><strong>{html.escape(who or '')}</strong> asked a question on "
@@ -865,24 +880,17 @@ def api_messages(token: str, request: Request) -> JSONResponse:
         "closed": (p.get("proposal_status") or "") == "closed_lost"}})
 
 
-@app.post("/api/portal/{token}/upload")
-async def api_portal_upload(token: str, request: Request) -> JSONResponse:
-    """One file, raw in the body, filename in `?name=`.
-
-    Raw rather than multipart because the portal does not ship `python-multipart` and this needs
-    no parser: the browser sends `fetch(url, {method:"POST", body:file})` and the File object
-    supplies its own Content-Type. See uploads.py for why that was preferred to a new dependency.
-
-    The upload is not visible to anybody until it is ATTACHED to a message — the fetch route below
-    only serves ids that appear in this proposal's thread. So an abandoned upload is inert.
-    """
-    p = _require(request, token)
-    if not p:
-        return _json({"ok": False, "error": "unauthorized"}, 401)
-    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP,
-                              config.RATE_WINDOW_SEC):
-        return _json({"ok": False, "error": "too_many"}, 429)
-    return _store_upload(request, p["proposal_id"])
+# THERE IS NO CUSTOMER UPLOAD ROUTE, and its absence is the security answer rather than an
+# omission. Hanz, 2026-08-26: "I think we apply the sending of the file attachments only to the
+# treadwell side."
+#
+# Every defence in uploads.py reduces the risk of accepting a stranger's file; none of them
+# removes it, because a genuinely valid PDF carrying a malicious payload is still a genuinely
+# valid PDF and the only real answer to that is a scanner this VPS cannot host. Not letting an
+# unknown party write to our disk at all closes the question instead of narrowing it.
+#
+# The customer keeps the half that matters to them: they can read and download whatever the
+# estimator attached. Their own side of the thread is text.
 
 
 @app.get("/api/portal/{token}/file/{file_id}")

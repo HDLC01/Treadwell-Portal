@@ -1149,114 +1149,25 @@ $("pdf-close").addEventListener("click", closePdfModal);
 $("pdf-scrim").addEventListener("click", closePdfModal);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePdfModal(); });
 
-// Files chosen but not yet sent. Uploaded IMMEDIATELY on pick rather than on send, so a slow
-// upload happens while the customer is still typing instead of turning "Send" into a long wait
-// with no explanation. An upload nobody sends is inert: the fetch route only serves ids that
-// appear on a message in this proposal's thread.
-let PENDING_ATT = [];
-
-function drawPending() {
-  const strip = $("qa-atts");
-  strip.innerHTML = PENDING_ATT.map((a, i) => `
-    <span class="att-chip${a.pending ? " is-uploading" : ""}${a.error ? " is-error" : ""}">
-      ${a.image && a.preview ? `<img src="${a.preview}" alt="">` : ""}
-      <span class="att-name">${esc(a.name)}</span>
-      <span class="att-size">${a.error ? esc(a.error) : (a.pending ? "uploading…" : fileSize(a.size))}</span>
-      <button type="button" class="att-x" data-att-remove="${i}" aria-label="Remove ${esc(a.name)}">&times;</button>
-    </span>`).join("");
-  strip.hidden = !PENDING_ATT.length;
-}
-
-$("qa-atts").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-att-remove]");
-  if (!b) return;
-  const a = PENDING_ATT[Number(b.dataset.attRemove)];
-  if (a && a.preview) URL.revokeObjectURL(a.preview);
-  PENDING_ATT.splice(Number(b.dataset.attRemove), 1);
-  drawPending();
-});
-
-/** Send one file up, raw. Not the JSON `api` helper: the body IS the file. */
-async function uploadOne(entry, file) {
-  try {
-    const r = await fetch(`/api/portal/${TOKEN}/upload?name=${encodeURIComponent(file.name || "attachment")}`, {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": file.type || "application/octet-stream" },
-      body: file,
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.ok === false || !j.file) throw new Error(j.error || "could not upload that file");
-    Object.assign(entry, j.file, { pending: false });
-  } catch (err) {
-    // The chip STAYS and says what went wrong, next to the file it went wrong for. A toast would
-    // not say which of three photos failed, which is the only thing worth knowing.
-    entry.pending = false;
-    entry.error = String(err.message || "could not upload").slice(0, 60);
-  }
-  drawPending();
-}
-
-function addFiles(files) {
-  for (const f of Array.from(files || [])) {
-    if (PENDING_ATT.length >= 10) {
-      alertBox($("qa-alert"), "error", "Up to 10 files per message.");
-      break;
-    }
-    const image = /^image\//.test(f.type || "");
-    const entry = { name: f.name || "attachment", size: f.size, mime: f.type,
-                    image, pending: true,
-                    // The LOCAL file for the preview, so a thumbnail appears instantly and does
-                    // not wait on the round trip it is meant to be reassuring you about.
-                    preview: image ? URL.createObjectURL(f) : "" };
-    PENDING_ATT.push(entry);
-    uploadOne(entry, f);
-  }
-  drawPending();
-}
-
-$("qa-attach").addEventListener("click", () => $("qa-file").click());
-$("qa-file").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
-
-// Drag a photo onto the composer, or paste one straight out of a screenshot tool. Both are how
-// people actually move a picture into a chat; neither is discoverable, so the paperclip stays.
-const composer = $("qa-form");
-["dragenter", "dragover"].forEach((k) => composer.addEventListener(k, (e) => {
-  if (!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"))) return;
-  e.preventDefault(); composer.classList.add("drop-on");
-}));
-["dragleave", "drop"].forEach((k) => composer.addEventListener(k, (e) => {
-  if (k === "drop") { e.preventDefault(); addFiles(e.dataTransfer && e.dataTransfer.files); }
-  composer.classList.remove("drop-on");
-}));
-$("qa-body").addEventListener("paste", (e) => {
-  const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
-  if (files.length) { e.preventDefault(); addFiles(files); }
-});
+// NO UPLOAD ON THIS SIDE, on purpose. Hanz, 2026-08-26: "I think we apply the sending of the
+// file attachments only to the treadwell side."
+//
+// Attachments travel one way. The estimator attaches; the customer reads. renderMsg below
+// still draws whatever came down in a message's meta, which is the half of the feature that
+// matters here -- there is simply no route to point a paperclip at, and that is the answer to
+// "how do we know a customer's file is safe" rather than a narrowing of it.
 
 $("qa-form").addEventListener("submit", async (e) => {
   e.preventDefault(); clearAlert($("qa-alert"));
   const ta = $("qa-body");
   const body = ta.value.trim();
-  const ready = PENDING_ATT.filter((a) => a.id && !a.pending && !a.error);
-  // A PHOTO ON ITS OWN IS A MESSAGE. Requiring text as well would make somebody invent a
-  // sentence to go with a picture of their floor.
-  if (!body && !ready.length) return;
-  if (PENDING_ATT.some((a) => a.pending)) {
-    alertBox($("qa-alert"), "info", "One moment — still uploading.");
-    return;
-  }
+  if (!body) return;
   const btn = $("qa-btn"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  const res = await api("POST", "/questions", {
-    body,
-    attachments: ready.map((a) => ({ id: a.id, name: a.name, mime: a.mime, size: a.size })),
-  });
+  const res = await api("POST", "/questions", { body });
   btn.disabled = false; btn.textContent = "Send";
   if (handleExpired(res, $("qa-alert"))) return;
   const { ok, data } = res;
   if (!ok) { alertBox($("qa-alert"), "error", data.error || "Could not send. Try again."); return; }
-  PENDING_ATT.forEach((a) => { if (a.preview) URL.revokeObjectURL(a.preview); });
-  PENDING_ATT = [];
-  drawPending();
   ta.value = ""; ta.style.height = "";
   if (data.message) {   // dedup: a concurrent poll may have already appended this id
     const have = new Set((STATE.messages || []).map((m) => m.id));
