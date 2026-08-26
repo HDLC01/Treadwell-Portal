@@ -857,8 +857,13 @@ function attHtml(m) {
   if (!list.length) return "";
   const href = (a) => `/api/portal/${TOKEN}/file/${encodeURIComponent(a.id)}`;
   return `<div class="att-list">` + list.map((a) => (a.image
-    ? `<a class="att-img" href="${href(a)}" target="_blank" rel="noopener" title="${esc(a.name)}">
-         <img src="${href(a)}" alt="${esc(a.name)}" loading="lazy"></a>`
+    // `alt` is empty and the name lives on the anchor's title: as alt text a filename is read out
+    // in place of the picture, and while the image is still fetching the browser LAYS IT OUT --
+    // which on the staff side spilled the name over the message above. `onerror` swaps in a chip,
+    // because a photo that 404s should say so rather than draw a torn page.
+    ? `<a class="att-img" href="${href(a)}" target="_blank" rel="noopener" title="${esc(a.name)}"
+          aria-label="${esc(a.name)}"><img src="${href(a)}" alt="" loading="lazy"
+          onerror="this.parentNode.className='att-file is-failed';this.parentNode.removeAttribute('href');this.parentNode.textContent='';this.parentNode.appendChild(Object.assign(document.createElement('span'),{className:'att-name',textContent:${JSON.stringify(a.name || "attachment")}}));this.parentNode.appendChild(Object.assign(document.createElement('span'),{className:'att-size',textContent:'did not load'}))"></a>`
     : `<a class="att-file" href="${href(a)}" target="_blank" rel="noopener">
          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

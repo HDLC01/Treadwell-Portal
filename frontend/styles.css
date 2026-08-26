@@ -314,8 +314,17 @@ textarea { min-height: 96px; resize: vertical; }
    slab, and a column of filename chips makes the reader open every one to find it. Capped so a
    tall phone photo cannot push the rest of the thread off the screen. */
 .att-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.att-img { display: block; line-height: 0; border-radius: 8px; overflow: hidden; }
-.att-img img { max-width: 220px; max-height: 220px; width: auto; height: auto; display: block; }
+/* A FIXED BOX so a photo arriving late cannot change the bubble's height. The thread
+   auto-scrolls to the newest message, so a reflow mid-read yanks the view -- and on a phone,
+   where these are most often opened, a full-height photo pushed everything else off screen. */
+.att-img {
+  display: block; line-height: 0; border-radius: 8px; overflow: hidden;
+  width: 180px; height: 135px; background: rgba(0, 0, 0, .05);
+}
+.att-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* A file that did not load says so, rather than drawing a broken image. */
+.att-file.is-failed { background: rgba(0, 0, 0, .06); cursor: default; }
+.att-file.is-failed .att-size { color: #9e001f; opacity: 1; }
 .att-file {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 6px 10px; border-radius: 8px; text-decoration: none;
