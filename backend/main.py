@@ -1920,6 +1920,56 @@ def _admin_ok(request: Request) -> bool:
 _PUBLISH_ATT_TOTAL = 10 * 1024 * 1024
 
 
+def _proposal_card_files(proposal_id: str) -> list[tuple[str, bytes]]:
+    """Whatever went out attached to the newest proposal card, for a recipient added afterwards.
+
+    Read off the card rather than remembered, because the card IS the record of what was sent --
+    `attach_to_latest_card` put them there at publish time for exactly this reason, and a revision
+    posts a new card, so this follows the current version without needing to know about revisions
+    at all.
+    """
+    # NOT include_internal. A proposal card is never an internal row -- it is the customer's own
+    # "your proposal is ready" -- so opting in would widen the staff-only rule for nothing, and
+    # test_only_the_staff_reader_opts_in is right to refuse a third opted-in reader.
+    for m in reversed(db.list_messages(proposal_id)):
+        if (m.get("msg_type") or "") == "proposal_card":
+            return _mail_files(proposal_id, (m.get("meta") or {}).get("attachments"))
+    return []
+
+
+def _mail_files(proposal_id: str, atts) -> list[tuple[str, bytes]]:
+    """The stored files for a message's attachments, as `(name, bytes)` ready for an email.
+
+    The publish path has the bytes in hand already -- they arrive base64 in the request. A REPLY
+    only has ids, because the file was uploaded minutes earlier and lives on the volume, so the
+    bytes have to be read back. That asymmetry is exactly why the reply path was missed: it looked
+    like it had the same information available and it did not.
+
+    Capped at the same total as a publish, and a drop is LOGGED rather than silent: an estimator
+    who attached four photographs and sees three arrive should be findable in the log, and the
+    thread still holds all four either way.
+    """
+    out: list[tuple[str, bytes]] = []
+    total = 0
+    for a in atts or []:
+        path = uploads.path_of(proposal_id, str(a.get("id") or ""))
+        if not path:
+            log.warning("attachment %r has no file on disk for %s", a.get("id"), proposal_id)
+            continue
+        try:
+            blob = path.read_bytes()
+        except OSError:
+            log.exception("could not read attachment %r for %s", a.get("id"), proposal_id)
+            continue
+        if total + len(blob) > _PUBLISH_ATT_TOTAL:
+            log.warning("attachment %r left out of the email for %s: over the %d byte total",
+                        a.get("name"), proposal_id, _PUBLISH_ATT_TOTAL)
+            continue
+        total += len(blob)
+        out.append((uploads.clean_name(a.get("name")), blob))
+    return out
+
+
 def _decode_publish_attachments(items) -> list[tuple[str, str, bytes]]:
     """`[{name, mime, b64}]` -> `[(name, mime, bytes)]`, or ValueError with a sentence to show.
 
@@ -3219,9 +3269,14 @@ async def admin_reply(proposal_id: str, request: Request) -> JSONResponse:
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     project = p.get("project_name") or "your proposal"
     rt = email_sender.proposal_reply_to(p["token"])
+    # THE FILES GO WITH IT. Storing them on the message put them in the customer's thread, which
+    # is what made this look finished -- but the notification email is a separate step on the same
+    # request, and it was left as it was. Hanz: "When I attach an image and resend in the customer
+    # portal, the image or files does not appear in the email".
+    files = _mail_files(proposal_id, atts)
     for e in (db.get_recipients(proposal_id) or [p["customer_email"]]):
         email_sender.send_reply_notification(e, link, project, reply_to=rt, message=text,
-                                             token=p["token"])
+                                             token=p["token"], attachments=files or None)
     return _json({"ok": True})
 
 
@@ -3280,10 +3335,14 @@ async def admin_followup_recipient(proposal_id: str, request: Request) -> JSONRe
         # They cannot reach the portal without the link, so adding somebody and not sending it
         # would put a contact on the list who can never open the thing they are a contact for.
         try:
+            # WITH THE FILES THE OTHERS GOT. The same omission as the reply path, wearing a
+            # different hat: without this, a contact added after the send is the only recipient
+            # who has to ask what the photo was.
             email_sender.send_portal_link(
                 email, "", f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
                 p.get("project_name") or "your project",
-                reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"])
+                reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"],
+                attachments=_proposal_card_files(proposal_id) or None)
         except Exception as exc:  # noqa: BLE001 — they are on the list; the link can be re-sent
             log.error("could not send the portal link to a newly added contact: %s", exc)
     elif email not in existing:
