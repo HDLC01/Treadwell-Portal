@@ -21,13 +21,25 @@
     s.textContent = `
 :root{--shell-w:240px}
 body{transition:margin-left .2s ease}
+/* THE CLOSED DRAWER IS INERT, not merely off-screen. visibility:hidden takes the subtree out of
+   hit-testing AND out of the tab order, so a shut menu can neither take a tap meant for the
+   proposal behind it nor hand a keyboard six links nobody can see; pointer-events:none states the
+   first half again in a property a test can resolve without a browser. transform alone was never
+   the guarantee it looks like - it animates, and mid-slide the drawer is still over the page.
+   The 0s visibility transition is DELAYED by the slide on the way out and immediate on the way in,
+   so the drawer is visible for the whole animation both directions and inert the moment it has
+   finished leaving. */
 #shell-side{position:fixed;top:0;left:0;height:100vh;width:var(--shell-w);background:var(--bg);
  border-right:1px solid var(--surface-highest);display:flex;flex-direction:column;padding:18px 14px;
- z-index:800;transform:translateX(-100%);transition:transform .2s ease;box-sizing:border-box;
+ z-index:800;transform:translateX(-100%);visibility:hidden;pointer-events:none;
+ transition:transform .2s ease,visibility 0s linear .2s;box-sizing:border-box;
  font-size:.9rem;overflow-y:auto}
-html.shell-open #shell-side{transform:translateX(0)}
-#shell-back{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:790}
-html.shell-open #shell-back{display:block}
+html.shell-open #shell-side{transform:translateX(0);visibility:visible;pointer-events:auto;
+ transition:transform .2s ease,visibility 0s linear 0s}
+/* pointer-events as well as display: the scrim is the other half of the same guarantee, and a
+   stray display:block from anywhere would otherwise hand it every tap on the page. */
+#shell-back{display:none;pointer-events:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:790}
+html.shell-open #shell-back{display:block;pointer-events:auto}
 @media (min-width:900px){
   html.shell-open body{margin-left:var(--shell-w)}
   html.shell-open #shell-back{display:none}
@@ -124,7 +136,20 @@ textarea.fb-in{resize:vertical}
 .shell-toast .x{border:none;background:none;color:var(--secondary);font-size:16px;line-height:1;
  cursor:pointer;padding:0 3px;border-radius:6px;flex:none}
 /* Clear the sticky composer on small screens — it sits at bottom:0. */
-@media (max-width:767px){#shell-toasts{left:12px;right:12px;bottom:84px;width:auto}}`;
+@media (max-width:767px){#shell-toasts{left:12px;right:12px;bottom:84px;width:auto}}
+/* THE SHEET IS WIDER ON A PHONE, NOT NARROWER. 240px was picked against the desktop rail; on a
+   phone this is a modal sheet, and at 240 of 375 "Send feedback" and the email in the footer
+   truncate on the one screen where the label is all there is. min() keeps a strip of the page
+   showing at every width, so it still reads as something laid OVER the proposal.
+   Rows go to 48px (Material's floor for a full-width target) and the lone glyphs to 44 (Apple's).
+   The 54x34 burger was under both. Desktop sizes are untouched: a mouse does not need this. */
+@media (max-width:899px){
+  #shell-side{width:min(296px,86vw)}
+  .shell-item{min-height:48px}
+  #shell-burger{width:48px;height:44px}
+  .shell-x,.shell-foot button,.bell{min-width:44px;min-height:44px;display:inline-flex;
+   align-items:center;justify-content:center}
+}`;
     document.head.appendChild(s);
   }
 
@@ -151,17 +176,54 @@ textarea.fb-in{resize:vertical}
     back.id = "shell-back";
     document.body.appendChild(back);
 
+    // ── THE VIEWPORT OWNS THE OPEN STATE, NOT THE ACCOUNT ─────────────────────
+    // The remembered flag is read and written only at >=900px, where the drawer is a
+    // rail beside the reading column. Below that it is a modal sheet over the whole
+    // screen, so it starts shut on every load and every toggle lasts the visit.
+    //
+    // The staff tool had the same restore-at-any-width flag with an OPEN desktop
+    // default, and on a phone the 240px rail covered 64% of the screen and swallowed
+    // every tap; measured on staging at 375px. This side defaults closed so it could
+    // not go that wrong, but the leak is identical: a customer who opens the menu on
+    // a laptop hands their phone an open drawer over the proposal they came to read.
+    const mql = window.matchMedia("(min-width: 900px)");
+    const wide = () => mql.matches;
+    const isOpen = () => document.documentElement.classList.contains("shell-open");
     const setOpen = (open) => {
       document.documentElement.classList.toggle("shell-open", open);
-      try { localStorage.setItem("tw_portal_nav", open ? "1" : "0"); } catch {}
+      // The assistive tree agrees with the cascade, which hides the shut drawer from
+      // hit-testing and from the tab order.
+      side.setAttribute("aria-hidden", open ? "false" : "true");
+      const b = $("shell-burger");
+      if (b) b.setAttribute("aria-expanded", open ? "true" : "false");
+      if (wide()) { try { localStorage.setItem("tw_portal_nav", open ? "1" : "0"); } catch {} }
     };
     // Default CLOSED: customers are mobile-heavy and the reading column is only
     // 760px, so an open drawer squeezes it.
     let saved = null;
     try { saved = localStorage.getItem("tw_portal_nav"); } catch {}
-    setOpen(saved === "1");
-    back.addEventListener("click", () => setOpen(false));
-    $("shell-close").addEventListener("click", () => setOpen(false));
+    setOpen(wide() && saved === "1");
+    // Focus goes back to the burger, or the caret is left inside a subtree the CSS has
+    // just made invisible.
+    const closeNav = () => {
+      const wasNarrow = !wide();
+      setOpen(false);
+      const b = $("shell-burger");
+      if (wasNarrow && b) b.focus();
+    };
+    back.addEventListener("click", closeNav);
+    $("shell-close").addEventListener("click", closeNav);
+    // Escape only where the drawer is MODAL. At >=900px it is a rail, and closing it on
+    // Escape would fight the feedback dialog and the PDF popup layered above it.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !wide() && isOpen()) closeNav();
+    });
+    // Crossing DOWN over 900px shuts it, so a rotate cannot leave a rail across a phone.
+    // It writes nothing: setOpen only persists while wide() is true, and this fires after
+    // the query has already gone false.
+    const onWidthChange = () => { if (!wide()) setOpen(false); };
+    if (typeof mql.addEventListener === "function") mql.addEventListener("change", onWidthChange);
+    else if (typeof mql.addListener === "function") mql.addListener(onWidthChange);
     $("shell-out").addEventListener("click", async () => {
       try { await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }); } catch {}
       location.href = "/";
@@ -175,8 +237,15 @@ textarea.fb-in{resize:vertical}
       const burger = document.createElement("button");
       burger.id = "shell-burger"; burger.title = "Menu";
       burger.setAttribute("aria-label", "Menu");
+      burger.setAttribute("aria-controls", "shell-side");
+      // setOpen ran before this button existed (the drawer is built first), so the initial
+      // state is stamped here rather than left absent until the first toggle.
+      burger.setAttribute("aria-expanded", isOpen() ? "true" : "false");
       burger.innerHTML = icon("menu", 20);
-      burger.addEventListener("click", () => setOpen(true));
+      burger.addEventListener("click", () => {
+        setOpen(true);
+        if (!wide()) { const x = $("shell-close"); if (x) x.focus(); }
+      });
       header.insertBefore(burger, header.firstChild);
       const bell = document.createElement("button");
       bell.className = "bell"; bell.id = "bell"; bell.title = "Notifications";

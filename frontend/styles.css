@@ -308,7 +308,16 @@ textarea { min-height: 96px; resize: vertical; }
 .chat-card .btn { min-height: 40px; padding: 0 18px; }
 
 /* sticky composer */
-.composer { position: sticky; bottom: 0; background: var(--bg); padding-top: 6px; }
+/* The safe-area inset is the home-indicator strip on a gesture-navigation phone. The composer is
+   stuck to bottom:0, which is UNDER that strip: the send button and the last two rows of the
+   textarea sat in the swipe-up zone, so a tap there is as likely to background the browser as to
+   send the question. env() resolves to 0 everywhere it does not apply, so this costs nothing on a
+   desktop or a home-button phone. max() rather than a bare env() because 6px of breathing room
+   below the button is wanted either way. */
+.composer {
+  position: sticky; bottom: 0; background: var(--bg); padding-top: 6px;
+  padding-bottom: max(6px, env(safe-area-inset-bottom));
+}
 /* ── chat attachments ─────────────────────────────────────────────────────── */
 /* A picture is SHOWN, not listed: the commonest attachment on a flooring bid is a photo of a
    slab, and a column of filename chips makes the reader open every one to find it.

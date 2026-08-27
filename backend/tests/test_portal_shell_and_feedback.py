@@ -116,13 +116,20 @@ def test_the_shell_really_stays_empty_until_signalled():
     const header = el();                   // every portal page has the sticky .site-header
     const doc = { getElementById: byId, createElement: el, addEventListener(){},
       querySelector: (s) => (s === ".site-header" ? header : null),
-      documentElement:{classList:{toggle(){},add(){},remove(){}}},
+      // `contains` alongside toggle: the burger reads the drawer's state back out of the class
+      // to stamp its initial aria-expanded, because setOpen runs before the button exists.
+      documentElement:{classList:{toggle(){},add(){},remove(){},contains:()=>false}},
       body:{ appendChild(n){ body.push(n); all.push(n); },
              firstChild:null, insertBefore(n){ body.push(n); all.push(n); } },
       head:{ appendChild(){} }, readyState:"complete" };
     let fetched = [];
     const win = { addEventListener(){}, location:{ pathname:"/p/tok123", href:"x" },
       setInterval(){}, setTimeout(){},
+      // buildSidebar asks the viewport whether the drawer is a rail or a modal sheet, so the stub
+      // has to answer. `matches: true` is the desktop answer, which is what both scenarios below
+      // are about; a missing matchMedia threw and took the whole shell down. This is the stub
+      // catching up with a browser API the shell now uses, not a new behaviour to assert.
+      matchMedia: () => ({ matches: true, addEventListener(){}, addListener(){} }),
       fetch: (u) => { fetched.push(u); return Promise.resolve({ json: async () => ({}) }); },
       localStorage:{ getItem:()=>null, setItem(){} } };
     const src = fs.readFileSync(process.argv[1], "utf8");
@@ -405,11 +412,18 @@ def test_the_notifications_panel_opens_under_the_bell():
     const header = mk();
     const doc = { getElementById: byId, createElement: mk, addEventListener(){},
       querySelector: (s) => (s === ".site-header" ? header : null),
-      documentElement:{classList:{toggle(){},add(){},remove(){}}},
+      // `contains` alongside toggle: the burger reads the drawer's state back out of the class
+      // to stamp its initial aria-expanded, because setOpen runs before the button exists.
+      documentElement:{classList:{toggle(){},add(){},remove(){},contains:()=>false}},
       body:{ appendChild(n){ all.push(n); }, firstChild:null, insertBefore(n){ all.push(n); } },
       head:{ appendChild(){} }, readyState:"complete" };
     const win = { addEventListener(){}, location:{ pathname:"/p/tok123", href:"x" },
       innerWidth: 1440, setInterval(){}, setTimeout(){},
+      // buildSidebar asks the viewport whether the drawer is a rail or a modal sheet, so the stub
+      // has to answer. `matches: true` is the desktop answer, which is what both scenarios below
+      // are about; a missing matchMedia threw and took the whole shell down. This is the stub
+      // catching up with a browser API the shell now uses, not a new behaviour to assert.
+      matchMedia: () => ({ matches: true, addEventListener(){}, addListener(){} }),
       fetch: () => Promise.resolve({ json: async () => ({}) }),
       localStorage:{ getItem:()=>null, setItem(){} } };
     const src = fs.readFileSync(process.argv[1], "utf8");
