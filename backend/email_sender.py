@@ -267,15 +267,28 @@ _SIGNATURE_HTML = (
 )
 
 
-def _otp_headers(email: str) -> dict[str, str]:
-    """A thread anchor for login codes ONLY, separate from the proposal thread.
+def _otp_headers(email: str, code: str) -> dict[str, str]:
+    """A thread anchor for ONE login code: never the proposal's, and never another code's.
 
-    Access codes are transient noise: a customer may request several while reading
-    one proposal, and threading them in with the proposal, replies and invoice
-    buried the conversation under a pile of expired codes. Codes now thread with
-    each other (one tidy "access code" conversation per recipient) and never with
-    the proposal."""
-    anchor = hashlib.sha1((email or "").strip().lower().encode()).hexdigest()[:24]
+    Two separate things have to stay true here, and they were traded against each other once
+    already. Codes must not thread with the PROPOSAL -- a customer requesting three codes while
+    reading one job buried the proposal, its replies and its invoice under a pile of expired
+    numbers, which is what this function was written for on 2026-08-13.
+
+    They must also not thread with EACH OTHER, which is where the first version went wrong. It
+    keyed the anchor on the recipient alone, so every code that person ever received landed in one
+    growing conversation. Hanz, 2026-09-19, looking at that conversation in Gmail: "the access code
+    for one customer should be a different thread each time... So that the thread doesn't look as
+    long or it's hard to scroll down." A customer who needs the code they were just sent should not
+    have to scroll past every code they were ever sent to reach it.
+
+    THE CODE IS IN THE ANCHOR, so a different code is a different conversation. Deliberately not a
+    timestamp or a uuid: re-sending the SAME code is the same code, and grouping those two is
+    correct. The subject carries the code too -- both have to be unique or Gmail regroups them on
+    subject alone, which is how a References-only fix would have looked right and changed
+    nothing."""
+    seed = f"{(email or '').strip().lower()}|{code or ''}"
+    anchor = hashlib.sha1(seed.encode()).hexdigest()[:24]
     mid = f"<treadwell-otp.{anchor}@wetreadwell.com>"
     return {"References": mid, "In-Reply-To": mid}
 
@@ -286,8 +299,12 @@ def send_otp(email: str, code: str, project_name: str) -> bool:
         f'<p style="font-size:30px;font-weight:800;letter-spacing:6px;margin:16px 0">{code}</p>'
         f'<p style="color:#64748b">This code expires in {config.OTP_TTL_MINUTES} minutes.</p>'
     )
-    return _send([email], "Your Treadwell proposal access code", _wrap("Your access code", body),
-                 _otp_headers(email))
+    # THE CODE IS IN THE SUBJECT, for the threading reason in _otp_headers and for a plainer one:
+    # the customer can read it off the inbox list without opening anything. It leaks nothing the
+    # inbox did not already show -- Gmail's snippet renders the body's first line, which has
+    # always carried the code.
+    return _send([email], f"Your Treadwell access code: {code}",
+                 _wrap("Your access code", body), _otp_headers(email, code))
 
 
 def proposal_reply_to(token: str) -> str | None:

@@ -198,17 +198,20 @@ def test_outbound_without_a_token_is_unchanged():
 
 def test_otp_threads_separately_from_the_proposal():
     """Login codes are transient noise — several may be requested while reading one
-    proposal. They thread with each other, never into the proposal conversation."""
-    otp = email_sender._otp_headers("c@x.com")
+    proposal. Each gets its own conversation, and none of them joins the proposal's."""
+    otp = email_sender._otp_headers("c@x.com", "482913")
     proposal = email_sender._thread_headers("c@x.com", "SOMETOKEN_longenough")
     assert "treadwell-otp." in otp["References"]
     assert "treadwell-portal." not in otp["References"]
     assert "tw-proposal." not in otp["References"]
     assert otp["References"] != proposal["References"]
     assert otp["In-Reply-To"] != proposal["In-Reply-To"]
-    # Two codes to the same person share one thread; different people don't.
-    assert email_sender._otp_headers("c@x.com") == otp
-    assert email_sender._otp_headers("other@x.com") != otp
+    # A DIFFERENT CODE IS A DIFFERENT THREAD (2026-09-19). This pair used to assert the reverse:
+    # the anchor was keyed on the recipient alone, so one customer's codes piled into a single
+    # conversation that grew until the newest code was a scroll away.
+    assert email_sender._otp_headers("c@x.com", "482913") == otp     # same code, same thread
+    assert email_sender._otp_headers("c@x.com", "999999") != otp     # new code, new thread
+    assert email_sender._otp_headers("other@x.com", "482913") != otp  # and never another person's
     # An OTP anchor must never be mistaken for a proposal anchor on the way back in.
     assert inbound.find_thread_token({"references": [otp["References"]]}) is None
 
