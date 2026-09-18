@@ -197,7 +197,7 @@ def test_the_access_code_is_its_own_thread(sent):
     """"Except for the OTP. OTPs shold always be separate threads." Already true before he
     asked; asserted here so it stays true."""
     email_sender.send_otp(CUSTOMER, "482913", PROJECT)
-    assert sent[0]["subject"] == "Your Treadwell proposal access code"
+    assert sent[0]["subject"] == "Your Treadwell access code: 482913"
     assert email_sender.proposal_anchor(TOKEN) not in sent[0]["headers"]["In-Reply-To"]
     assert "tw-proposal" not in str(sent[0]["headers"]), (
         "a login code is threaded with the proposal, which buries the conversation under "
@@ -221,11 +221,32 @@ def test_a_login_code_and_a_project_email_to_the_SAME_person_do_not_thread(sent)
     assert sent[0]["subject"] != sent[1]["subject"]
 
 
-def test_several_access_codes_thread_with_EACH_OTHER(sent):
-    """Separate from the project, but not a new conversation per code — that is the other half
-    of what makes them tidy."""
+def test_each_access_code_is_a_NEW_conversation(sent):
+    """REVERSED on 2026-09-19, and the reversal is the point of the change. This test used to
+    assert the opposite -- that codes thread with each other, "one tidy access code conversation
+    per recipient". Tidy in the abstract; in a real inbox it grew without limit, and Hanz, looking
+    at his own: "the access code for one customer should be a different thread each time... So
+    that the thread doesn't look as long or it's hard to scroll down."
+
+    BOTH halves are asserted because either alone leaves Gmail free to regroup them: distinct
+    References anchors with one shared subject still collapse into a conversation.
+
+    Mutation: key `_otp_headers` on the email alone again, or drop the code from the subject."""
     email_sender.send_otp(CUSTOMER, "111111", PROJECT)
     email_sender.send_otp(CUSTOMER, "222222", PROJECT)
+    assert sent[0]["headers"]["In-Reply-To"] != sent[1]["headers"]["In-Reply-To"]
+    assert sent[0]["headers"]["References"] != sent[1]["headers"]["References"]
+    assert sent[0]["subject"] != sent[1]["subject"]
+
+
+def test_the_same_code_resent_is_the_same_conversation(sent):
+    """The one grouping that stays. A resend of the code somebody already has is not new mail
+    about a new thing, and splitting it would put two identical numbers in two places.
+
+    This is also what makes the anchor deterministic rather than a uuid, which would have
+    satisfied the test above while making a resend look like a second code."""
+    email_sender.send_otp(CUSTOMER, "333333", PROJECT)
+    email_sender.send_otp(CUSTOMER, "333333", PROJECT)
     assert sent[0]["headers"] == sent[1]["headers"]
     assert sent[0]["subject"] == sent[1]["subject"]
 
