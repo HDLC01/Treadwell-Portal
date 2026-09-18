@@ -212,17 +212,39 @@
         <div class="card" id="approve-card">
           <h2>Approve this proposal</h2>
           <div id="approve-alert" role="alert" aria-live="polite"></div>
+          <!-- Budget Pricing carries no Terms and Conditions, so it cannot be e-signed. The
+               server decides that and says why in prose (view.signing.blocked_reason); this
+               renders that sentence unchanged, so one refusal has exactly one wording. -->
+          <div id="signing-blocked" class="alert info hidden"></div>
           <form id="approve-form" class="stack" novalidate>
             <div class="field">
-              <label for="ap-name">Full name <span class="req">*</span></label>
+              <label for="ap-name">Signature &mdash; type your full legal name <span class="req">*</span></label>
               <input id="ap-name" type="text" autocomplete="name" required>
+              <!-- A rendering of what is in the input above, never a second value: what gets
+                   recorded, and what the certificate quotes, is #ap-name. aria-hidden so a
+                   screen reader is not read the same name twice. -->
+              <div class="sig-preview" id="sig-preview" aria-hidden="true">
+                <span class="sig-hint" id="sig-hint">Your signature appears here as you type</span><span class="sig-ink" id="sig-ink"></span>
+              </div>
             </div>
             <div class="field">
               <label for="ap-title">Title</label>
               <input id="ap-title" type="text" autocomplete="organization-title">
             </div>
-            <p class="small muted">By approving, you confirm acceptance of the option(s) selected above and their combined total. Date is recorded automatically.</p>
+            <!-- THE CONSENT SENTENCE IS NEVER WRITTEN IN THIS FILE. It is served by the API
+                 (view.signing.consent_text) and put here by app.js, because the signature
+                 certificate quotes that string verbatim: a second copy in the markup becomes a
+                 second sentence the first time either one is edited, and the legal record would
+                 then quote wording this customer never read. -->
+            <label class="consent hidden" id="consent-row">
+              <input type="checkbox" id="ap-consent">
+              <span class="consent-text" id="consent-text"></span>
+            </label>
+            <p class="small muted" id="approve-plain-note">By approving, you confirm acceptance of the option(s) selected above and their combined total. Date is recorded automatically.</p>
             <button class="btn btn-primary btn-block" type="submit" id="approve-btn">Approve proposal</button>
+            <!-- Why the button is not pressable yet. A disabled control with no reason beside it
+                 is how a customer decides the page is broken and calls instead. -->
+            <p class="help center hidden" id="ap-gate-hint" role="status"></p>
           </form>
         </div>
 

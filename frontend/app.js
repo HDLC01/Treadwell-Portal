@@ -124,6 +124,13 @@ function renderPortal(vm) {
   if (SHOWN_REVISION !== null && rev !== SHOWN_REVISION) {
     resetPdfMounts();
     SELECTED.clear();
+    // A signature is given against ONE document. The new-tab latch and the consent tick both
+    // belong to the revision that just went away, so they die with it: whoever signs the new
+    // proposal opens it and ticks the box again. Set here rather than inside resetPdfMounts,
+    // which backend/tests/js/pdf-url-harness.js lifts verbatim.
+    PDF_OPENED_IN_TAB = false;
+    const consent = $("ap-consent");
+    if (consent) consent.checked = false;
   }
   SHOWN_REVISION = rev;
 
@@ -157,6 +164,7 @@ function renderPortal(vm) {
 
   renderOptions(vm.options, vm.addons, approved);
   renderPdf(vm.has_pdf);
+  renderSigning();   // after renderOptions: it has the last word on the Approve button
   renderContacts(vm);
   renderChat(STATE.messages);
   setupDeposit();
@@ -594,6 +602,138 @@ function renderPdf(has) {
   $("pdf-modal-link").href = src;
   $("pdf-modal-title").textContent = (STATE && STATE.project_name) || "Your proposal";
   mountInlinePdf();   // website-style preview in the card; clicking it opens the full view
+}
+
+// -- the approval IS a signature ----------------------------------------------
+// Kyle wants approving a proposal to BE signing it, which the federal ESIGN Act and the Kansas
+// UETA allow with a typed name and a recorded act of assent. Two things turn this card from
+// browsewrap into clickwrap: the customer cannot sign until they have opened the document, and
+// the sentence they tick is SERVED by the API rather than written into this page.
+
+/** Set by the "open in a new tab" links, which mountPdf never sees. Cleared with the mounted
+ *  latch when a revision lands -- see renderPortal. */
+let PDF_OPENED_IN_TAB = false;
+
+/** Has this customer actually opened the proposal document?
+ *
+ *  PDF_MOUNTED is the honest signal: mountPdf() sets it when the full-size viewer is built and
+ *  resetPdfMounts() clears it when a revision lands, so a NEW document has to be opened again.
+ *  signalProposalViewed() cannot serve here -- it fires on navigating to the proposal step,
+ *  which is already true by the time this card is on screen, so gating on it would gate on
+ *  nothing.
+ *
+ *  `!has_pdf` IS THE CORRECT ANSWER, not a loophole. mountPdf early-returns without latching
+ *  when there is no document to mount, so gating on the latch alone would leave every customer
+ *  of a PDF-less proposal unable to approve at all. There is nothing to open.
+ *
+ *  The new-tab links count. They serve the same bytes from the same endpoint, and a customer
+ *  who read the proposal in a tab and came back to a dead button would be right to think the
+ *  page was broken. */
+function proposalWasOpened() {
+  if (!STATE || !STATE.has_pdf) return true;
+  return PDF_MOUNTED || PDF_OPENED_IN_TAB;
+}
+
+/** The server's ruling on signing this proposal: required, blocked, and the exact wording.
+ *  Null before the first view arrives, and on any payload without it -- in which case this card
+ *  behaves exactly as it did before signing existed. */
+function signingView() {
+  return (STATE && STATE.signing) || null;
+}
+
+/** Why the Approve button is not pressable yet, as a sentence for the customer, or null when it
+ *  is. ONE function decides, so the button and the line under it can never disagree. */
+function approveBlocker() {
+  const sign = signingView();
+  const required = !!(sign && sign.required);
+  if (required && !String(sign.consent_text || "").trim()) {
+    // No sentence, no signature. An approval recorded against wording nobody was shown is worse
+    // than an approval that did not happen, so this refuses rather than falling back to a copy.
+    return { error: true, msg: "Something's not right — please refresh and try again." };
+  }
+  if (!SELECTED.size) return { msg: "Select at least one option above to approve." };
+  if (required && !proposalWasOpened()) {
+    return { msg: "Please open the full proposal above before signing." };
+  }
+  const box = $("ap-consent");
+  if (required && !(box && box.checked)) return { msg: "Tick the box above to sign and approve." };
+  return null;
+}
+
+/** Enable or disable the Approve button, and say why.
+ *
+ *  RUNS AFTER updateSelectedTotal, never instead of it. That function also writes btn.disabled
+ *  (for an empty selection) and is lifted whole by backend/tests/js/portal-pricing-harness.js,
+ *  so it is left alone and this re-decides the same flag afterwards. Every path that can change
+ *  the answer ends here: renderPortal calls renderSigning, and a pricing checkbox change bubbles
+ *  to the delegated listener on #options, which fires after the per-box one. */
+function updateApproveGate() {
+  // The ticked look lives here rather than in the change listener, because a poll re-render and
+  // a click have to leave the row saying the same thing the checkbox says.
+  const row = $("consent-row");
+  const box = $("ap-consent");
+  if (row && box) row.classList.toggle("is-agreed", !!box.checked);
+  const btn = $("approve-btn");
+  if (!btn || btn.dataset.locked) return;   // mid-submit -- the submit path owns the button
+  const blocked = approveBlocker();
+  btn.disabled = !!blocked;
+  const hint = $("ap-gate-hint");
+  if (!hint) return;
+  hint.textContent = blocked ? blocked.msg : "";
+  hint.classList.toggle("is-error", !!(blocked && blocked.error));
+  hint.classList.toggle("hidden", !blocked);
+}
+
+/** Draw the typed name in a script face, so the field reads as a signature rather than as a
+ *  contact form. A rendering of #ap-name and nothing more: the name that is recorded, emailed
+ *  and printed on the certificate is the one in the input. */
+function renderSignaturePreview() {
+  const input = $("ap-name");
+  const val = ((input && input.value) || "").trim();
+  const ink = $("sig-ink");
+  const hint = $("sig-hint");
+  if (ink) ink.textContent = val;
+  if (hint) hint.classList.toggle("hidden", !!val);
+}
+
+/** The signing half of the approve card: the served consent sentence, the button's own words,
+ *  and -- for a proposal that cannot be signed -- the server's sentence saying why not. */
+function renderSigning() {
+  const sign = signingView();
+  const required = !!(sign && sign.required);
+  const row = $("consent-row");
+  const box = $("ap-consent");
+  if (row) row.classList.toggle("hidden", !required);
+  if (required) {
+    // RENDERED AS RECEIVED, via textContent. This string is quoted verbatim on a legal record;
+    // it is not a template, it is not rebuilt here, and it is not stored in this file.
+    const txt = $("consent-text");
+    if (txt) txt.textContent = sign.consent_text || "";
+  } else if (box) {
+    // Nothing to consent to. A tick left behind would put a consent flag on the next proposal
+    // this session renders.
+    box.checked = false;
+    if (row) row.classList.remove("is-agreed");
+  }
+  const reason = (sign && sign.blocked_reason) || "";
+  const blocked = $("signing-blocked");
+  if (blocked) {
+    blocked.textContent = reason;
+    blocked.classList.toggle("hidden", !reason);
+  }
+  // The generic "by approving you confirm..." line is the ONLY statement of what approval means
+  // on a proposal that cannot be signed. Where there is a consent sentence it is a weaker second
+  // version of it, and two accounts of what a customer just agreed to is one too many.
+  const note = $("approve-plain-note");
+  if (note) note.classList.toggle("hidden", required);
+  // "Sign" is a claim about the document. Budget Pricing has no Terms and Conditions attached,
+  // so the button must not make it there.
+  const btn = $("approve-btn");
+  if (btn && !btn.dataset.locked) {
+    btn.textContent = required ? "Sign and approve proposal" : "Approve proposal";
+  }
+  renderSignaturePreview();
+  updateApproveGate();
 }
 
 // ── project status: the customer's way out of the follow-up cadence ──────────
@@ -1185,22 +1325,61 @@ function setupDeposit() {
 }
 
 // ── actions (handlers attach once; elements exist in the hidden #portal) ──────────
-$("approve-form").addEventListener("submit", async (e) => {
-  e.preventDefault(); clearAlert($("approve-alert"));
+/** Send the approval.
+ *
+ *  A NAMED FUNCTION, not the listener body, because what it puts in the request is now a legal
+ *  artefact: `consent` is what the server refuses an unsigned approval on, and "does this page
+ *  actually send the boolean" has to be a question a test can execute rather than grep. */
+async function submitApproval() {
+  clearAlert($("approve-alert"));
   const name = $("ap-name").value.trim();
   if (!name) { alertBox($("approve-alert"), "error", "Please enter your full name."); $("ap-name").focus(); return; }
   const option_labels = [...SELECTED];
   if (!option_labels.length) { alertBox($("approve-alert"), "error", "Please select at least one option to approve."); return; }
-  const btn = $("approve-btn"); btn.dataset.locked = "1"; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
-  const res = await api("POST", "/approve", { name, title: $("ap-title").value.trim(), option_labels, date: new Date().toISOString().slice(0, 10) });
-  delete btn.dataset.locked; btn.disabled = false; btn.textContent = "Approve proposal";
+  const sign = signingView();
+  const required = !!(sign && sign.required);
+  const box = $("ap-consent");
+  if (required && !(box && box.checked)) {
+    // The gate normally makes this unreachable. It is here anyway because a form is one Enter
+    // key away from submitting, and an approval with no consent has to fail on this side rather
+    // than travel to the server to be refused.
+    alertBox($("approve-alert"), "error", "Please tick the box to sign and approve this proposal.");
+    return;
+  }
+  const btn = $("approve-btn");
+  const label = btn.textContent;   // "Sign and approve proposal", or "Approve proposal"
+  btn.dataset.locked = "1"; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Submitting…';
+  const body = { name, title: $("ap-title").value.trim(), option_labels, date: new Date().toISOString().slice(0, 10) };
+  // THE LITERAL BOOLEAN, and only where signing is required. api_approve tests
+  // `body.get("consent") is not True`, so "true" is refused on purpose: ESIGN turns on an
+  // affirmative act of assent, and a stringified one is not evidence of one. A Budget Pricing
+  // proposal sends no consent at all -- it has no Terms and Conditions to consent to.
+  if (required) body.consent = true;
+  const res = await api("POST", "/approve", body);
+  delete btn.dataset.locked; btn.disabled = false; btn.textContent = label;
   if (handleExpired(res, $("approve-alert"))) return;
   const { ok, data } = res;
-  if (!ok) { alertBox($("approve-alert"), "error", data.error || "Could not approve. Please try again."); return; }
+  if (!ok) {
+    alertBox($("approve-alert"), "error", data.error || "Could not approve. Please try again.");
+    updateApproveGate();   // the button was force-enabled above; hand it back to the gate
+    return;
+  }
   const fresh = await api("GET", "");
   renderPortal(fresh.data.view);
   window.scrollTo({ top: 0, behavior: "smooth" });
-});
+}
+$("approve-form").addEventListener("submit", (e) => { e.preventDefault(); submitApproval(); });
+
+// The signature preview follows the typing; nothing is validated here. A name is checked when it
+// is submitted, not while somebody is still in the middle of writing it.
+$("ap-name").addEventListener("input", renderSignaturePreview);
+$("ap-consent").addEventListener("change", updateApproveGate);
+// DELEGATED, and deliberately not a call inside renderOptions. renderOptions rebuilds the
+// pricing checkboxes on every render and its own per-box handler ends in updateSelectedTotal,
+// which writes btn.disabled -- a change event reaches this container afterwards, so the gate
+// gets the last word without either of those two functions being touched. Both are lifted
+// verbatim by backend/tests/js/portal-pricing-harness.js.
+$("options").addEventListener("change", updateApproveGate);
 
 $("back-to-chat").addEventListener("click", () => { location.hash = "chat"; });
 $("thankyou-pay").addEventListener("click", openDeposit);
@@ -1213,6 +1392,16 @@ $("tracker").addEventListener("click", (e) => {
 
 // PDF: click the inline preview to open the full-size popup; close via ×, scrim, or Esc.
 $("pdf-preview").addEventListener("click", openPdfModal);
+// Re-read the gate once the viewer has mounted. Wired here rather than inside mountPdf or
+// resetPdfMounts because pdf-url-harness.js lifts both of those verbatim into a scope that would
+// not carry this function, and a ReferenceError there takes the suite down.
+$("pdf-preview").addEventListener("click", updateApproveGate);
+// "Open in a new tab" is opening the document too, from the same endpoint. Not counting it would
+// leave a customer who read the whole proposal in a tab staring at a dead button.
+for (const id of ["pdf-link", "pdf-modal-link"]) {
+  const a = $(id);
+  if (a) a.addEventListener("click", () => { PDF_OPENED_IN_TAB = true; updateApproveGate(); });
+}
 $("pdf-close").addEventListener("click", closePdfModal);
 $("pdf-scrim").addEventListener("click", closePdfModal);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePdfModal(); });
