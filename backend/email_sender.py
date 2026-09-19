@@ -708,7 +708,8 @@ def send_reply_notification(email: str, url: str, project_name: str,
 
 def send_customer_update(email: str, url: str, project_name: str, heading: str,
                          body_html: str, reply_to: str | None = None,
-                         token: str | None = None) -> bool:
+                         token: str | None = None,
+                         attachments: list[tuple[str, bytes]] | None = None) -> bool:
     """Confirm a milestone to the CUSTOMER — approval, deposit, contacts, dates.
 
     Every one of these already posted a chat line and (mostly) emailed the team,
@@ -722,7 +723,7 @@ def send_customer_update(email: str, url: str, project_name: str, heading: str,
         f'View your project</a></p>'
     )
     return _send([email], customer_thread_subject(project_name), _wrap(heading, body),
-                 _thread_headers(email, token), reply_to=reply_to)
+                 _thread_headers(email, token), reply_to=reply_to, attachments=attachments)
 
 
 def send_deposit_request(email: str, url: str, project_name: str, amount: float | None = None,
@@ -1092,7 +1093,8 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
                 recipients: list[str] | None = None, reply_link: str | None = None,
                 proposal_id: str | None = None, reply_to: str | None = None,
                 token: str | None = None, project: str | None = None,
-                assigned_estimator: str | None = None) -> list[str]:
+                assigned_estimator: str | None = None,
+                attachments: list[tuple[str, bytes]] | None = None) -> list[str]:
     """Email the internal team, ONE MESSAGE PER PERSON. `recipients` (explicit) wins;
     otherwise resolve by `kind` — a CRM STEP id from NOTIFY_STEPS, naming which moment this is —
     from the UI-managed roster, applying this proposal's per-project overrides (`proposal_id`).
@@ -1180,7 +1182,11 @@ def notify_team(subject: str, body_html: str, kind: str = "general",
         # failure it cannot swallow, because five of the main.py call sites are NOT wrapped and a
         # raise here would 500 a customer's route over a staff email.
         try:
-            if _send([addr], subject, wrapped, reply_to=reply_to, headers=headers):
+            # attachments ride EVERY copy, for the same reason the body does: the roster is
+            # one notification sent N times, not N different notifications, and an estimator
+            # who got the one without the signed contract would have no way to know.
+            if _send([addr], subject, wrapped, reply_to=reply_to, headers=headers,
+                     attachments=attachments):
                 delivered.append(addr)
         except Exception as exc:  # noqa: BLE001
             log.error("notify: sending %r to %s raised: %s", subject, addr, exc)

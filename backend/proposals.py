@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import signing
+
 
 def _num(v) -> float | None:
     try:
@@ -170,4 +172,8 @@ def build_view_model(proposal_row: dict[str, Any], data: dict[str, Any]) -> dict
             "deposit_amount": _num(proposal_row.get("deposit_amount")),
         },
         "has_pdf": bool(proposal_row.get("pdf_path")),
+        # E-signature. The approve card is a signature block now, so the wording it must show,
+        # the version that wording is stored under, and whether this work type can be signed at
+        # all are decided here rather than in the browser. See signing.signing_block.
+        "signing": signing.signing_block(proposal_row, data),
     }
