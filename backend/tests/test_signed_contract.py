@@ -754,3 +754,69 @@ def test_a_refusal_says_why_and_not_merely_that_it_refused(monkeypatch):
     with pytest.raises(signing.ContractUnavailable) as exc:
         signing.render_signed_contract(PROPOSAL_PDF, {})
     assert "400" in str(exc.value) and "missing signer_name" in str(exc.value)
+
+
+# ── only the Direct form has somewhere to sign ──────────────────────────────────────
+# Hanz, 2026-09-19, after the signature moved onto the proposal's own ACCEPTANCE row:
+# "Direct only for now." Kyle's artwork paints that row and only the Direct artwork has it --
+# verified by hashing the page-1 image of all eight templates: Direct share one, the three GC
+# templates share another, Gyp has a third, and neither of the last two carries the row.
+#
+# GC IS AN AUDIENCE, gyp is a work type, and that is why the gate needs both halves. The same
+# polish job renders on the Direct form for a direct customer and the GC form for a general
+# contractor. Reading work_type alone would offer a GC customer a signature the tool refuses.
+def test_a_gc_proposal_cannot_be_signed():
+    assert signing.signing_blocked_reason("polish", "GC") is not None
+    assert signing.signing_blocked_reason("epoxy", "GC") is not None
+
+
+def test_a_gyp_proposal_cannot_be_signed_whatever_the_audience():
+    """gyp is audience-agnostic in TEMPLATE_PICKER -- one template, no acceptance row."""
+    assert signing.signing_blocked_reason("gyp", "Direct") is not None
+    assert signing.signing_blocked_reason("gyp", "GC") is not None
+
+
+def test_a_direct_proposal_can_still_be_signed():
+    """The case that must NOT regress: widening a refusal is one edit away from refusing
+    everything, and that failure is silent -- every customer simply stops being offered a
+    signature."""
+    for wt in ("epoxy", "polish", "combo"):
+        assert signing.signing_blocked_reason(wt, "Direct") is None
+    # Case and padding are what a real blob carries, not a normalised token.
+    assert signing.signing_blocked_reason("epoxy", " direct ") is None
+
+
+def test_a_missing_audience_reads_as_direct():
+    """The tool's own GenerateIn.audience defaults to Direct, so a blob that never stated one
+    DID render the Direct form. Treating absent as blocked would retro-unsign real proposals."""
+    assert signing.signing_blocked_reason("epoxy") is None
+    assert signing.signing_blocked_reason("epoxy", None) is None
+    assert signing.signing_blocked_reason("epoxy", "") is None
+
+
+def test_the_audience_is_read_from_the_payload_first():
+    """proposal_payload is what _generate actually picked the template from. Keying on the top
+    level instead would let the two disagree, and the portal would offer a signature for a form
+    the tool then refuses -- with the customer watching."""
+    assert signing.draft_audience({"audience": "GC",
+                                   "proposal_payload": {"audience": "Direct"}}) == "Direct"
+    assert signing.draft_audience({"audience": "GC", "proposal_payload": {}}) == "GC"
+    assert signing.draft_audience({"audience": "GC"}) == "GC"
+    assert signing.draft_audience({}) == "Direct"
+    assert signing.draft_audience(None) == "Direct"
+
+
+def test_the_view_blocks_a_gc_job_and_says_why():
+    """End of the chain: what the customer's page is actually handed."""
+    block = signing.signing_block({"project_name": "Nearman Creek"},
+                                  _draft(work_type="polish", audience="GC"))
+    assert block["required"] is False
+    assert block["blocked_reason"]
+    assert block["consent_text"] is None and block["consent_version"] is None
+
+
+def test_the_view_still_offers_a_direct_job_its_consent_wording():
+    block = signing.signing_block({"project_name": "Nearman Creek"},
+                                  _draft(work_type="polish", audience="Direct"))
+    assert block["required"] is True and block["blocked_reason"] is None
+    assert "Nearman Creek" in (block["consent_text"] or "")

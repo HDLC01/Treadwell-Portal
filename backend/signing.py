@@ -99,7 +99,25 @@ def consent_text(project_name: Optional[str], version: Optional[str] = None) -> 
 # ── who cannot sign ───────────────────────────────────────────────────────────
 # Keyed on the work type carried in the pinned draft blob (`data["work_type"]`), the
 # same value the proposal tool keys its TEMPLATE_PICKER on.
-UNSIGNABLE_WORK_TYPES = frozenset({"budget"})
+#
+# TWO DIFFERENT REASONS LIVE HERE, and they are not the same shape.
+#
+# `budget` has no Terms and Conditions section in its template, so a "signed contract" built
+# from it would be a signature attached to no terms -- worse than no signature at all.
+#
+# `gyp` is here for a different reason, added 2026-09-19: its form has nowhere to sign. Kyle's
+# proposal artwork paints the ACCEPTANCE row -- SIGNATURE / DATE / PRINTED NAME / TOTAL -- and
+# only the DIRECT artwork has it. Gyp has its own form and GC has a third, and neither carries
+# that row. The signature is written onto that row now (the tool's acceptance_signature.py), so
+# a template without one has no place to put it. Hanz, 2026-09-19, told which templates have the
+# block: "Direct only for now."
+UNSIGNABLE_WORK_TYPES = frozenset({"budget", "gyp"})
+
+# GC IS AN AUDIENCE, NOT A WORK TYPE, which is why it cannot join the set above. The same
+# `polish` job renders on the Direct form for a direct customer and on the GC form for a general
+# contractor; only the first has an acceptance row. So the audience has to be read as well, and
+# anything that is not Direct cannot be signed.
+SIGNABLE_AUDIENCE = "direct"
 
 # Written as a sentence the UI can show as-is. The portal HAS a way to reach the
 # estimator — the project thread every customer already uses — so it points there
@@ -111,12 +129,38 @@ BLOCKED_MESSAGE = (
 )
 
 
-def signing_blocked_reason(work_type: Any) -> Optional[str]:
+def draft_audience(data: Optional[dict[str, Any]]) -> str:
+    """Which proposal form this job renders on: "Direct", "GC", or whatever was saved.
+
+    `proposal_payload` FIRST, top level second. The payload is what `_generate` actually picked
+    the template from, so reading it here means this gate and the tool's own guard cannot
+    disagree about which form a job is on -- and disagreeing would mean the portal offering a
+    signature the tool then refuses, with the customer watching.
+
+    DEFAULTS TO Direct, which is not a guess: the tool's own `GenerateIn.audience` defaults to
+    "Direct", so a blob that never stated one did render the Direct form.
+    """
+    d = data if isinstance(data, dict) else {}
+    payload = d.get("proposal_payload")
+    if isinstance(payload, dict):
+        a = str(payload.get("audience") or "").strip()
+        if a:
+            return a
+    return str(d.get("audience") or "").strip() or "Direct"
+
+
+def signing_blocked_reason(work_type: Any, audience: Any = "Direct") -> Optional[str]:
     """Why this proposal cannot be e-signed, or None when it can.
 
     A SENTENCE, not a code, because both the page and an API error render it unchanged.
+
+    `audience` DEFAULTS TO Direct so an older caller that passes only a work type keeps its
+    current answer rather than silently blocking every proposal -- but every live call site
+    passes it, and the estimate path reads it through `draft_audience` above.
     """
     if str(work_type or "").strip().lower() in UNSIGNABLE_WORK_TYPES:
+        return BLOCKED_MESSAGE
+    if str(audience or "Direct").strip().lower() != SIGNABLE_AUDIENCE:
         return BLOCKED_MESSAGE
     return None
 
@@ -234,7 +278,7 @@ def signing_block(proposal_row: Optional[dict[str, Any]],
 
     `blocked_reason` is prose, not a code -- the UI shows it unchanged and so does the refusal
     from the download endpoints, so one refusal has exactly one sentence."""
-    reason = signing_blocked_reason((data or {}).get("work_type"))
+    reason = signing_blocked_reason((data or {}).get("work_type"), draft_audience(data))
     return {
         "work_type": str((data or {}).get("work_type") or "").strip().lower(),
         # Signing is REQUIRED for every work type that has Terms and Conditions to be bound by.

@@ -1814,9 +1814,14 @@ def _signed_contract_pdf(p: dict) -> tuple[Optional[bytes], Optional[str], int]:
     unchanged and the customer-facing one is read by a customer."""
     pid = p["proposal_id"]
     data = db.get_pinned_draft_data(p) or {}
-    blocked = signing.signing_blocked_reason(data.get("work_type"))
+    # THE AUDIENCE TRAVELS TOO, since 2026-09-19. The signature is written onto the proposal's
+    # own ACCEPTANCE row and only the Direct artwork has one, so "can this be signed" is a
+    # question about the FORM, which is (work_type, audience) -- not work type alone. Reading
+    # only the first half here would offer a GC customer a signature the tool then refuses.
+    blocked = signing.signing_blocked_reason(data.get("work_type"),
+                                             signing.draft_audience(data))
     if blocked:
-        # No T&Cs in this template, so no contract was ever signed and none can be produced.
+        # Nowhere on this form to sign, so no contract was ever signed and none can be produced.
         return None, blocked, 400
     try:
         row = db.get_signed_contract(pid)
@@ -2256,8 +2261,8 @@ def _proposal_card_files(proposal_id: str) -> list[tuple[str, bytes]]:
     posts a new card, so this follows the current version without needing to know about revisions
     at all.
     """
-    # NOT include_internal. A proposal card is never an internal row -- it is the customer's own
-    # "your proposal is ready" -- so opting in would widen the staff-only rule for nothing, and
+    # NOT include_internal. A proposal card is never an internal row -- it is the customer's own
+    # "your proposal is ready" -- so opting in would widen the staff-only rule for nothing, and
     # test_only_the_staff_reader_opts_in is right to refuse a third opted-in reader.
     for m in reversed(db.list_messages(proposal_id)):
         if (m.get("msg_type") or "") == "proposal_card":
