@@ -479,6 +479,31 @@ textarea { min-height: 96px; resize: vertical; }
 .msg.customer .att-img:hover,
 .msg.customer .att-file:hover { background: rgba(255, 255, 255, .28); }
 
+/* ── the chip's EDGE, because the wash alone cannot carry it ───────────────────
+   Hanz, 2026-09-21, on the signed contract now sitting in the thread: "can we make this
+   contrast though so its just more visible". The text was never the problem -- the name and size
+   lines are in the table above. The SURFACE is: 1.14:1 on the staff bubble, which is the one the
+   contract arrives on, so a chip that is nothing but a wash reads as words rather than a thing to
+   click. The customer's own bubble is barely better at 1.29:1.
+
+   RAISING THE WASH IS THE WRONG LEVER: on the red, white@.26 gets the surface to 1.59:1 and takes
+   the size line to 4.4:1, under the 4.5 floor for 12px. A border buys the edge without moving what
+   the text sits on, so every number in the table above still holds:
+                  border vs bubble
+     staff        rgba(0,0,0,.45)        3.2:1
+     customer     rgba(255,255,255,.55)  3.2:1
+   Both clear the 3:1 WCAG 1.4.11 floor for a control's boundary.
+
+   .att-file ONLY, not .att-img: a photo tile already has a defined edge -- its own image -- and
+   .att-well is sized in px, so a border there would shift a layout that is not broken.
+
+   KEPT IDENTICAL to the staff drawer's copy in the proposal tool's portal.html, like the rest of
+   this block. One document, two threads, and a customer comparing them should see one chip. */
+.att-file { border: 1px solid rgba(0, 0, 0, .45); }
+.att-file:hover { border-color: rgba(0, 0, 0, .62); }
+.msg.customer .att-file { border-color: rgba(255, 255, 255, .55); }
+.msg.customer .att-file:hover { border-color: rgba(255, 255, 255, .78); }
+
 /* The queue above the composer, before anything is sent. */
 .att-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 2px; }
 .att-chip {
