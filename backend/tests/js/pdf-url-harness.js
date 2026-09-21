@@ -173,6 +173,16 @@ function terms(opts) {
      ${fn("resetPdfMounts")}
      ${grabConst("TERMS_HASH")}
      ${fn("openPdfModal")}
+     // STUBBED HERE, AND ASSERTED IN THE OTHER HARNESS. openTermsInProposal calls
+     // updateApproveGate -- that call is the fix for "it doesnt allow me to sign", where the
+     // control satisfied proposalWasOpened and told the gate nothing. This harness is about the
+     // frame's src and has no approve card to gate, so a no-op keeps it honest about its own
+     // scope. The gate claim is driven for real in approve-signing-harness.js, which lifts this
+     // same function together with updateApproveGate and reads the button back
+     // (test_reading_the_terms_satisfies_the_open_the_proposal_gate). A stub in BOTH places
+     // would be the hole; a stub in the one that does not own the claim is the split this file
+     // already takes with the network.
+     let updateApproveGate = () => {};
      ${fn("openTermsInProposal")}
      renderPdf(STATE.has_pdf);
      openTermsInProposal();
