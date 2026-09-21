@@ -1161,6 +1161,19 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     staff_contract_html, customer_contract_html, contract_atts = _contract_email_parts(
         signing.signing_project_name(p, data), contract_pdf, contract_error,
         signing_required=sign["required"])
+    # THE SAME BYTES, UNDER THE SAME NAME, IN THE ONE PLACE BOTH SIDES ALREADY LOOK. Hanz,
+    # 2026-09-21: "show the pdf as an attachment in chat that we can download". The emails
+    # carry it and the portal has a download button, but an email gets deleted and a button
+    # lives on one screen; the thread is where the estimator and the customer both go back to.
+    #
+    # GUARDED ON contract_atts RATHER THAN ON contract_pdf, so the filename can only ever have
+    # ONE spelling: if the emails are carrying a document, the thread carries THAT document
+    # named identically, and a customer never sees two names for one file. It also folds the
+    # two cases that must post nothing into one condition -- a build that failed (both emails
+    # say so instead, and the download rebuilds it) and a Budget Pricing approval, which has no
+    # contract to attach because it has no Terms and Conditions to sign.
+    if contract_atts:
+        _post_contract_to_thread(p["proposal_id"], contract_atts[0][0], contract_atts[0][1])
 
     deposit_due = p.get("deposit_required") is not False
     email_sender.notify_team(
@@ -1780,6 +1793,50 @@ def _contract_email_parts(project_name: Optional[str], pdf: Optional[bytes],
                 '<p style="color:#64748b;font-size:13px">Document fingerprint (SHA-256): '
                 "<code>%s</code>.</p>" % short)
     return staff, customer, [(signing.contract_filename(project_name), pdf)]
+
+
+def _post_contract_to_thread(proposal_id: str, filename: str, pdf: bytes) -> None:
+    """Put the signed contract in the project's chat thread, carried in `meta.attachments`.
+
+    NO NEW STORE AND NO DDL. `portal_questions.meta` is jsonb and uploads.store already writes
+    the bytes to the upload volume and hands back exactly the record a message's attachment
+    list is made of -- the same two steps the publish path takes for an estimator's files.
+
+    msg_type IS "text", NOT "system", AND THAT IS NOT A STYLE CHOICE. Neither renderer draws
+    attachments on a system row: the customer portal's renderMsg returns a title/body card for
+    msg_type "system", and the staff drawer's msgHtml renders one as a single `p.note.sys`
+    line. Only the message bubble and the proposal card call attHtml. A system row here would
+    store the attachment perfectly and show NOBODY a download -- the feature would be invisible
+    on both sides with every test green. A bubble from Treadwell is also the honest reading of
+    what this is: us handing over a document, not the thread reporting an event. The event is
+    already recorded, by the "Approved by ..." system line written further up.
+
+    IT NEVER RAISES. Everything that matters is committed by the time this runs, the customer
+    has already been told their proposal is approved, and both emails are carrying the same
+    document. A full disk or a refused insert costs the chat copy and nothing else.
+
+    THE TWO HALVES ARE GUARDED SEPARATELY, like _store_signed_contract's are, so the log says
+    WHICH one failed -- a stored file with no message is an orphan on the volume, a failed
+    store is nothing at all, and they are diagnosed differently. Every line names the exception
+    type and its message: "refused" without a reason has cost an SSH session before now."""
+    try:
+        rec = uploads.store(proposal_id, filename, "application/pdf", pdf)
+    except Exception as exc:  # noqa: BLE001 -- an approval is never lost over a file write
+        log.error("signed contract not attached to the thread for %s: %s: %s",
+                  proposal_id, type(exc).__name__, exc)
+        return
+    try:
+        db.add_message(
+            proposal_id, "staff", None,
+            "Your signed contract is attached. This is your copy to keep, and you can "
+            "download it here any time.",
+            msg_type="text",
+            # sanitize rather than the raw record, matching the publish path: `meta` is read
+            # back into two web pages and an email, so the list is rebuilt field by field.
+            meta={"attachments": uploads.sanitize([rec])})
+    except Exception as exc:  # noqa: BLE001
+        log.error("signed contract stored as %s but not posted to the thread for %s: %s: %s",
+                  rec.get("id"), proposal_id, type(exc).__name__, exc)
 
 
 def _approval_signed_at(approval: dict) -> Optional[datetime]:

@@ -53,7 +53,7 @@ def _row(**over):
 
 
 @pytest.fixture
-def portal(monkeypatch):
+def portal(monkeypatch, tmp_path):
     """The real app with only the seams that leave the process replaced.
 
     The proposal PDF is seeded straight into main._PDF_CACHE rather than served over HTTP, which
@@ -69,6 +69,9 @@ def portal(monkeypatch):
 
     main._PDF_CACHE.clear()
     main._pdf_cache_put(PID, 2, PROPOSAL_PDF)
+    # The approval path WRITES the signed contract to the upload volume now. Pointed at the
+    # test's own directory, or every run of this module would drop a PDF in /app/data/uploads.
+    monkeypatch.setattr(main.config, "UPLOAD_DIR", str(tmp_path), raising=False)
 
     monkeypatch.setattr(main, "_require", lambda request, token: state["proposal"])
     monkeypatch.setattr(main, "_session_email", lambda request: "dana@acme.com")
@@ -81,8 +84,13 @@ def portal(monkeypatch):
     monkeypatch.setattr(main.db, "add_approval", _add_approval)
     monkeypatch.setattr(main.db, "set_approved",
                         lambda pid, total, *a, **k: calls["approved"].append(total))
+    # THE WHOLE ROW, not just the body. `meta.attachments` is where the signed contract rides
+    # into the thread and `msg_type` is what decides whether either renderer draws it, so a
+    # stub that kept only the text could not see the feature at all.
     monkeypatch.setattr(main.db, "add_message",
-                        lambda pid, kind, who, body, **k: calls["messages"].append(body))
+                        lambda pid, kind, who, body, **k: calls["messages"].append(
+                            {"pid": pid, "kind": kind, "who": who, "body": body,
+                             "type": k.get("msg_type"), "meta": k.get("meta")}))
 
     def _upsert(approval_id, proposal_id, **k):
         calls["contracts"].append(dict(approval_id=approval_id, proposal_id=proposal_id, **k))
@@ -419,6 +427,152 @@ def test_the_filename_survives_a_project_name_with_slashes_in_it(portal):
     assert "/" not in name and '"' not in name
 
 
+# ── the thread keeps a copy too ───────────────────────────────────────────────
+def _contract_msgs(client):
+    """Every thread message carrying an attachment.
+
+    Nothing else in this flow attaches anything, so this IS the feature's whole footprint in the
+    thread — which is what makes "exactly one" and "none at all" testable as counts rather than
+    as a search for particular wording."""
+    return [m for m in client.calls["messages"] if (m["meta"] or {}).get("attachments")]
+
+
+def test_an_approval_posts_the_signed_contract_into_the_chat_thread(portal):
+    """Hanz, 2026-09-21: "show the pdf as an attachment in chat that we can download".
+
+    Both emails already carry it and the portal has a download button, but an email gets deleted
+    and a button lives on one screen; the thread is the place both sides go back to. EXACTLY ONE
+    message, because two copies of a contract in one thread read as two contracts."""
+    assert _approve(portal).status_code == 200
+    msgs = _contract_msgs(portal)
+    assert len(msgs) == 1, "expected one contract message in the thread, got %d" % len(msgs)
+    atts = msgs[0]["meta"]["attachments"]
+    assert len(atts) == 1
+    assert atts[0]["mime"] == "application/pdf", (
+        "the type is derived from the BYTES; %r means detect() did not recognise the PDF"
+        % atts[0]["mime"])
+    assert atts[0]["size"] == len(SIGNED_PDF)
+    assert atts[0]["image"] is False, "a PDF flagged as an image renders as an empty grey tile"
+
+
+def test_the_thread_copy_is_named_exactly_what_the_emails_named_it(portal):
+    """ONE FILE, ONE NAME. The customer receives this document twice — attached to an email and
+    sitting in the thread — and two spellings of one name reads as two different documents. Taken
+    off the email attachment rather than rebuilt here, so a divergence cannot hide behind a
+    literal somebody remembered to update in both places."""
+    assert _approve(portal).status_code == 200
+    emailed = portal.calls["team"][0]["attachments"][0][0]
+    assert emailed == "Nearman Creek - Signed Contract.pdf"
+    assert _contract_msgs(portal)[0]["meta"]["attachments"][0]["name"] == emailed
+
+
+def test_the_bytes_in_the_thread_are_the_bytes_that_were_signed(portal):
+    """The record in `meta` is only a pointer. This follows it to the volume, because a message
+    naming a file that was never written is a download that 404s in front of a customer — and the
+    record on its own cannot tell the difference."""
+    assert _approve(portal).status_code == 200
+    fid = _contract_msgs(portal)[0]["meta"]["attachments"][0]["id"]
+    path = main.uploads.path_of(PID, fid)
+    assert path is not None, "the thread names an attachment that is not on disk"
+    assert path.read_bytes() == SIGNED_PDF
+
+
+def test_the_contract_message_is_a_shape_both_threads_draw_attachments_on(portal):
+    """msg_type "text", NOT "system", and that is load-bearing rather than cosmetic.
+
+    NEITHER UI DRAWS AN ATTACHMENT ON A SYSTEM ROW. The customer portal's renderMsg returns a
+    plain title/body card for msg_type "system", and the staff drawer's msgHtml renders one as a
+    single `p.note.sys` line; only the message bubble and the proposal card call attHtml. A system
+    row here would store the contract perfectly and show NOBODY a download — the feature would be
+    invisible on both sides with every other test in this file green.
+
+    It also reads correctly: this is Treadwell handing over a document, not the thread reporting
+    an event. The event already has its own line, written by the "Approved by ..." system row."""
+    assert _approve(portal).status_code == 200
+    msg = _contract_msgs(portal)[0]
+    assert msg["type"] == "text", (
+        "msg_type %r carries the attachment but neither thread renders one on it" % msg["type"])
+    assert msg["kind"] == "staff", "Treadwell hands this over; it is not the customer's own message"
+    assert "attached" in msg["body"].lower(), "a bubble with no words is an unexplained file"
+
+
+def test_a_failed_build_puts_nothing_in_the_thread(portal):
+    """There is no document, so there is no message — and nothing that pretends otherwise. Both
+    emails say the copy is being prepared and the download rebuilds it; a thread message with no
+    file on it would be worse than silence."""
+    def _refuse(pdf, cert, **k):
+        raise signing.ContractUnavailable("proposal tool returned 502: template missing")
+    portal.state["render"] = _refuse
+    assert _approve(portal).status_code == 200
+    assert _contract_msgs(portal) == []
+    assert portal.calls["approved"] == [13265.0], "the approval itself was lost"
+
+
+def test_a_refused_upload_never_costs_the_approval(portal):
+    """A full volume, or a directory that will not take a write. The customer pressed a button
+    meaning "yes, at this price" — that fact is theirs whatever the filesystem does. The emailed
+    copy has to survive too: those bytes are already in hand and must not be thrown away because
+    one of the two places we put them refused."""
+    portal.monkeypatch.setattr(
+        main.uploads, "store",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("No space left on device")))
+    r = _approve(portal)
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert portal.calls["approved"] == [13265.0]
+    assert _contract_msgs(portal) == []
+    assert portal.calls["team"][0]["attachments"], "the emailed copy went with the chat copy"
+
+
+def test_a_refused_thread_message_never_costs_the_approval(portal):
+    """The other half of the write, guarded separately on purpose. A stored file with no message
+    is an orphan on the volume; a failed store is nothing at all. They are diagnosed differently,
+    so they are caught separately — and neither may reach the customer as a failed approval."""
+    recorded = main.db.add_message
+
+    def _boom(pid, kind, who, body, **k):
+        if (k.get("meta") or {}).get("attachments"):
+            raise RuntimeError("deadlock detected")
+        return recorded(pid, kind, who, body, **k)
+    portal.monkeypatch.setattr(main.db, "add_message", _boom)
+    r = _approve(portal)
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert portal.calls["approved"] == [13265.0]
+    assert portal.calls["automations"] == ["Nearman Creek"], (
+        "the downstream automations were skipped")
+    assert portal.calls["team"][0]["attachments"], "the emailed copy went with the chat copy"
+
+
+def test_the_lazy_rebuild_writes_nothing_into_the_thread(portal):
+    """PINNED DELIBERATELY, because the opposite is tempting: an approval whose build failed has
+    no chat copy, and the download that later rebuilds it looks like the moment to add one.
+
+    Three reasons it is not. There is no reliable exactly-once guard on this path —
+    _store_signed_contract swallows a failed upsert by design, so a row that will not persist is
+    rebuilt on EVERY download and would post a message each time. This same function serves the
+    STAFF endpoint, so Kyle opening the PDF would publish a message into a customer's thread. And
+    a contract landing in the thread hours later, under whatever was said since, reads as a new
+    event rather than a copy of an old one. Nobody is left without it: both emails said the copy
+    was being prepared, and this download is the copy they were pointed at."""
+    portal.state["contract_row"] = _signed_row(None)
+    portal.state["approval_record"] = _approval_record()
+    assert portal.get("/api/portal/%s/signed-contract.pdf" % TOKEN).status_code == 200
+    assert portal.calls["contracts"][0]["pdf"] == SIGNED_PDF, "the rebuild never happened"
+    assert _contract_msgs(portal) == [], "a download wrote into the customer's thread"
+
+
+def test_a_staff_download_cannot_speak_in_the_customers_thread(portal):
+    """The concrete half of the rule above. Staff read the approval email before the customer
+    opens the portal, so the admin endpoint is usually the FIRST caller to trigger a rebuild —
+    and fetching a file must never be a way to post to a customer."""
+    portal.monkeypatch.setattr(main.config, "SERVICE_TOKEN", "s3cret")
+    portal.state["contract_row"] = _signed_row(None)
+    portal.state["approval_record"] = _approval_record()
+    r = portal.get("/api/admin/signed-contract.pdf?proposal_id=%s" % PID,
+                   headers={"X-Service-Token": "s3cret"})
+    assert r.status_code == 200 and r.content == SIGNED_PDF
+    assert _contract_msgs(portal) == []
+
+
 # ── Budget Pricing: no Terms and Conditions, so no signature ──────────────────
 def test_a_budget_proposal_is_approved_without_being_signed(portal):
     """The Budget Pricing template carries no Terms and Conditions section at all. A certificate
@@ -451,6 +605,16 @@ def test_a_budget_approval_creates_no_signed_contract_row(portal):
     portal.state["draft"] = _draft(work_type="budget")
     _approve(portal, consent=None)
     assert portal.calls["contracts"] == []
+
+
+def test_a_budget_approval_posts_no_contract_to_the_thread(portal):
+    """No Terms and Conditions means no signature and no contract, so there is nothing to attach
+    — the same silence the emails keep, for the same reason. A file in the thread would be the
+    loudest possible claim that a contract exists."""
+    portal.state["draft"] = _draft(work_type="budget")
+    assert _approve(portal, consent=None).status_code == 200
+    assert portal.calls["approved"] == [13265.0]
+    assert _contract_msgs(portal) == []
 
 
 def test_a_budget_approval_email_promises_no_contract(portal):
