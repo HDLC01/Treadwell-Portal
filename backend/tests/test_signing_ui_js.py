@@ -149,6 +149,45 @@ def test_an_unticked_box_sends_nothing_at_all(ran):
          "msg": "Please tick the box to sign and approve this proposal."}]
 
 
+# ── pressing it has to reach the gate, not just the popup ────────────────────
+@needs_node
+def test_reading_the_terms_satisfies_the_open_the_proposal_gate(ran):
+    """Hanz, 2026-09-22, having read the terms and scrolled to the bottom: "it doesnt allow me
+    to sign."
+
+    approveBlocker refuses while `required && !proposalWasOpened()`, and proposalWasOpened reads
+    PDF_MOUNTED — which openPdfModal sets. So pressing Read the Terms DOES satisfy that
+    condition; what it did not do was tell the gate. Nothing re-evaluated, so Approve stayed
+    disabled under a hint asking the customer to open the full proposal, which they had just
+    done. Every other control that can satisfy this calls updateApproveGate — #pdf-preview's
+    click listener and the new-tab link both do. This one was the exception.
+
+    DRIVEN THROUGH THE REAL HANDLER. The harness lifts openTermsInProposal, openPdfModal,
+    mountPdf and pdfUrl whole rather than setting PDF_MOUNTED by hand, because setting the latch
+    by hand is precisely what hides this class of bug: the latch was never the problem.
+
+    The assertion is that the hint MOVES ON to the next unmet condition. A test that only checked
+    `disabled` would pass against the broken version too, since the button is disabled either way
+    at this point — the tick is still off.
+
+    Mutation: delete the `updateApproveGate()` call from openTermsInProposal. `gateMovesOn` goes
+    red and nothing else does."""
+    g = ran["termsPressOpensTheGate"]
+    assert g["mounted"] is True, (
+        "pressing Read the Terms did not mount the document, so it cannot satisfy the gate at all")
+    assert g["shown"] == ["pdf-modal", "pdf-scrim"], (
+        "the popup did not open, so this walk is not the one a customer takes")
+    assert "open the full proposal" in g["before"]["hint"], (
+        "fixture is wrong: this walk is supposed to start with the document unopened")
+    assert "open the full proposal" not in g["afterPress"]["hint"], (
+        "after reading the terms the gate STILL asks the customer to open the proposal they just "
+        "opened — the control satisfies the condition and never tells the gate")
+    assert g["afterPress"]["hint"] == "Tick the box above to sign and approve.", (
+        "the gate did not move on to the next unmet condition: %r" % g["afterPress"]["hint"])
+    assert g["ticked"]["disabled"] is False and g["ticked"]["hint"] == "", (
+        "with the document read and the box ticked the customer still cannot sign")
+
+
 # ── the Terms are offered before they are confirmed ──────────────────────────
 @needs_node
 def test_the_read_the_terms_button_appears_with_the_tick(ran):

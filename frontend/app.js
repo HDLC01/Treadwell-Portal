@@ -1230,6 +1230,17 @@ function openTermsInProposal() {
   // that condition is a second place to forget it -- proven redundant rather than assumed:
   // deleting it left every test green, which is the only evidence that says so.
   openPdfModal();
+  // AND TELL THE GATE, or this control silently blocks the thing it exists to enable.
+  //
+  // approveBlocker refuses while `required && !proposalWasOpened()`, and proposalWasOpened reads
+  // PDF_MOUNTED -- which openPdfModal has just set. So pressing this DOES satisfy the gate, and
+  // without this line nothing re-evaluates it: the button stays disabled under a hint reading
+  // "Please open the full proposal above before signing" when the customer has just done exactly
+  // that. Hanz, 2026-09-22, having read the terms and scrolled down: "it doesnt allow me to sign".
+  //
+  // Every other control that can satisfy this condition already does this -- #pdf-preview's own
+  // click listener and the new-tab link both call it. This one was the exception.
+  updateApproveGate();
   // querySelectorAll()[0], matching mountPdf's own cleanup two functions down, rather than
   // querySelector -- one way of reaching this frame, so a stub or a change has one thing to follow.
   const wrap = $("pdf-frame-wrap");

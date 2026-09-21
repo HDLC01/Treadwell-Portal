@@ -44,6 +44,13 @@ function grabDecl(name) {
   return m[0];
 }
 
+/** Lift a top-level `const NAME = ...;` -- grabDecl above only matches `let`. */
+function grabConst(name) {
+  const m = new RegExp("\\nconst " + name + "\\s*=[^;]*;").exec(src);
+  if (!m) throw new Error(name + " is gone from app.js -- rewrite this harness");
+  return m[0];
+}
+
 /** The class attribute this element REALLY ships with in index.html.
  *
  *  Read from the markup instead of assumed, because "starts hidden" is half of each claim: a
@@ -58,13 +65,21 @@ function initialClasses(id) {
 
 const IDS = ["approve-btn", "ap-gate-hint", "consent-row", "ap-consent", "consent-text",
              "signing-blocked", "approve-plain-note", "sig-ink", "sig-hint", "ap-name",
-             "ap-title", "approve-alert", "read-terms"];
+             "ap-title", "approve-alert", "read-terms",
+             // The popup's own three, so the REAL openPdfModal + mountPdf chain can run in
+             // here rather than being stubbed -- see pressReadTerms below.
+             "pdf-frame-wrap", "pdf-modal", "pdf-scrim", "pdf-loading"];
 
 function makeNode(id) {
   const cls = new Set(initialClasses(id));
   const node = {
     id, textContent: "", innerHTML: "", value: "", checked: false, disabled: false,
     dataset: {}, focus() {},
+    // mountPdf appends an iframe into #pdf-frame-wrap and reads it back. Generic rather than
+    // special-cased so a node is a node; every other id simply never uses them.
+    _kids: [],
+    appendChild(f) { this._kids.push(f); return f; },
+    querySelectorAll() { return this._kids.filter((k) => !k.removed); },
     classList: {
       add: (c) => cls.add(c),
       remove: (c) => cls.delete(c),
@@ -94,7 +109,7 @@ function card(opts) {
 
   const scope = new Function(
     "STATE_IN", "SELECTED_IN", "$", "api", "alertBox", "clearAlert", "handleExpired",
-    "renderPortal", "window",
+    "renderPortal", "window", "TOKEN", "document", "show", "hide",
     `let STATE = STATE_IN;
      let SELECTED = SELECTED_IN;
      ${grabDecl("PDF_MOUNTED")}
@@ -106,6 +121,16 @@ function card(opts) {
      ${fn("renderSignaturePreview")}
      ${fn("renderSigning")}
      ${fn("submitApproval")}
+     // THE READ-THE-TERMS PATH, LIFTED WHOLE rather than simulated. openFullViewer below
+     // fakes the pdf-preview route by setting the latch and calling the gate, which is fine
+     // for what it covers -- but it is exactly the shape of the bug this pair exists to
+     // catch: a control that satisfies proposalWasOpened and never tells the gate. So this
+     // one runs the real chain, and nothing here re-implements the step that was missing.
+     ${fn("pdfUrl")}
+     ${fn("mountPdf")}
+     ${fn("openPdfModal")}
+     ${grabConst("TERMS_HASH")}
+     ${fn("openTermsInProposal")}
      return {
        render: renderSigning,
        gate: updateApproveGate,
@@ -115,18 +140,32 @@ function card(opts) {
        // in the page; the flags themselves are lifted from app.js above.
        openFullViewer: () => { PDF_MOUNTED = true; updateApproveGate(); },
        openInNewTab: () => { PDF_OPENED_IN_TAB = true; updateApproveGate(); },
+       // The real handler the #read-terms listener is bound to. No latch set by hand.
+       pressReadTerms: openTermsInProposal,
+       pdfMounted: () => PDF_MOUNTED,
        setState: (s) => { STATE = s; },
      };`);
 
   const alerts = [];
+  const frames = [];
+  const shownIds = [];
+  const hiddenIds = [];
+  const doc = { createElement: () => { const f = { className: "", title: "", src: "",
+    removed: false, setAttribute() {}, addEventListener() {}, remove() { this.removed = true; } };
+    frames.push(f); return f; }, body: { style: {} } };
   const handle = scope(
     o.state, new Set(o.selected === undefined ? ["Base Bid"] : o.selected), $, api,
     (el, kind, msg) => alerts.push({ id: el && el.id, kind, msg }),
     (el) => { if (el) el.textContent = ""; },
     () => false,
     () => {},
-    { scrollTo() {} });
+    { scrollTo() {} }, "tok-harness", doc,
+    // show/hide are the page's one-liners; stubbed so the popup opening is observable
+    // without a DOM, and recorded so a test can tell "opened" from "silently did nothing".
+    (x) => { if (x && x.id) shownIds.push(x.id); },
+    (x) => { if (x && x.id) hiddenIds.push(x.id); });
 
+  const readShown = () => shownIds.slice();
   const read = () => ({
     buttonText: nodes["approve-btn"].textContent,
     disabled: nodes["approve-btn"].disabled,
@@ -147,7 +186,7 @@ function card(opts) {
     signatureHintHidden: nodes["sig-hint"].classList.contains("hidden"),
   });
 
-  return { handle, nodes, read, calls, alerts };
+  return { handle, nodes, read, calls, alerts, shownIds, readShown };
 }
 
 const SIGNABLE = (consent) => ({
@@ -185,6 +224,24 @@ const flush = () => new Promise((r) => setImmediate(r));
     c.nodes["ap-consent"].checked = true;
     c.handle.gate();
     out.pdfGate = { closed, opened, ticked: c.read() };
+  }
+
+  // THE READ-THE-TERMS WALK, through the real handler. This is the pair that was missing when
+  // the button shipped: it satisfied proposalWasOpened (openPdfModal mounts the frame, which
+  // sets PDF_MOUNTED) and told the gate nothing, so Approve stayed disabled under a hint reading
+  // "Please open the full proposal above before signing" -- to a customer who had just done it.
+  // Hanz, 2026-09-22: "it doesnt allow me to sign".
+  {
+    const c = card({ state: SIGNABLE(CONSENT_A) });
+    c.handle.render();
+    const before = c.read();
+    c.handle.pressReadTerms();
+    const afterPress = c.read();
+    const mounted = c.handle.pdfMounted();
+    c.nodes["ap-consent"].checked = true;
+    c.handle.gate();
+    out.termsPressOpensTheGate = { before, afterPress, mounted, ticked: c.read(),
+                                   shown: c.readShown() };
   }
 
   // The same walk with the new-tab link instead of the popup. Same document, same endpoint.
