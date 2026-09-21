@@ -149,6 +149,56 @@ def test_an_unticked_box_sends_nothing_at_all(ran):
          "msg": "Please tick the box to sign and approve this proposal."}]
 
 
+# ── the Terms are offered before they are confirmed ──────────────────────────
+@needs_node
+def test_the_read_the_terms_button_appears_with_the_tick(ran):
+    """Hanz, 2026-09-22: "for the portal plase create a button I have read the terms and
+    conditions".
+
+    The consent sentence says the customer has reviewed the Terms and Conditions. Until this
+    button existed the portal never put them in front of anybody -- they are their own pages of
+    the proposal, reachable only by opening the PDF and scrolling past the pricing. Asking
+    somebody to confirm they have read something you never showed them is the half of a clickwrap
+    a dispute attacks first.
+
+    REVEALED FROM THE SAME `required` AS THE TICK, asserted as a pair rather than separately: a
+    button offering terms with nothing to agree to is noise, and a tick confirming terms nobody
+    was offered is the thing the button exists to fix. One condition, so they cannot disagree.
+
+    Read off the RENDERED node, not the markup -- index.html ships it with `hidden`, and a
+    regex over the file cannot tell a button that unhides from one that never does."""
+    r = ran["pdfGate"]["closed"]
+    assert r["consentRowHidden"] is False, "fixture is wrong: this one is supposed to be signable"
+    assert r["termsBtnHidden"] is False, (
+        "the consent tick is shown but the Terms are not offered, so the customer is asked to "
+        "confirm they have read a document the portal never put in front of them")
+
+
+@needs_node
+def test_no_document_means_no_terms_button_even_though_the_tick_stays(ran):
+    """THE SECOND HALF OF THE CONDITION, and the reason it is `required && has_pdf` rather than
+    `required` alone. A signable proposal whose PDF has not rendered yet still shows the tick --
+    that is deliberate, and noPdfIsNotALockout is the scenario that pins it -- but the Terms
+    button would open nothing, and a control that does nothing when pressed is worse than one
+    that is not offered."""
+    r = ran["noPdfIsNotALockout"]["beforeTick"]
+    assert r["consentRowHidden"] is False, "the tick is supposed to survive a missing document"
+    assert r["termsBtnHidden"] is True, (
+        "a Read-the-Terms button is offered with no document behind it; pressing it opens an "
+        "empty popup")
+
+
+@needs_node
+def test_a_proposal_with_nothing_to_sign_offers_no_terms_button(ran):
+    """Budget Pricing carries no Terms and Conditions -- which is why signing.py refuses to
+    certify one. A button opening terms that are not in the document would be the same false
+    claim, one layer up."""
+    r = ran["budget"]["rendered"]
+    assert r["consentRowHidden"] is True
+    assert r["termsBtnHidden"] is True, (
+        "a proposal that cannot be signed is offering Terms to read; that template has none")
+
+
 # ── Budget Pricing: exempt, not blocked ──────────────────────────────────────
 @needs_node
 def test_budget_pricing_shows_the_servers_own_sentence(ran):

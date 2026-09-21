@@ -236,6 +236,21 @@
                  certificate quotes that string verbatim: a second copy in the markup becomes a
                  second sentence the first time either one is edited, and the legal record would
                  then quote wording this customer never read. -->
+            <!-- READ IT BEFORE YOU CONFIRM IT. The consent sentence says the customer has
+                 reviewed the Terms and Conditions, and until this button existed the portal never
+                 put them in front of anybody: they are their own pages of the proposal document,
+                 reachable only by opening the PDF and scrolling past the pricing.
+
+                 Hanz, 2026-09-22: "for the portal plase create a button I have read the terms and
+                 conditions". Presenting the terms is also the half that makes a clickwrap consent
+                 hold up -- an unread statement is the first thing a dispute attacks -- so this is
+                 evidence, not decoration.
+
+                 IT OPENS THE PROPOSAL, not a second copy of the wording. The signed contract
+                 attaches those same pages, so a copy kept here would be a second source that
+                 drifts from the document the customer is bound by the first time either changes. -->
+            <button class="btn btn-secondary btn-block read-terms hidden" type="button"
+                    id="read-terms">Read the Terms and Conditions</button>
             <label class="consent hidden" id="consent-row">
               <input type="checkbox" id="ap-consent">
               <span class="consent-text" id="consent-text"></span>

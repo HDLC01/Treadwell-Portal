@@ -704,6 +704,12 @@ function renderSigning() {
   const row = $("consent-row");
   const box = $("ap-consent");
   if (row) row.classList.toggle("hidden", !required);
+  // SHOWN WITH THE TICK, from the same `required`, because the two are one control: a button
+  // offering terms with nothing to agree to is noise, and a tick confirming terms the customer
+  // was never offered is the thing this button exists to fix. One condition, so they cannot
+  // disagree. Also needs the document to exist -- a button opening nothing is worse than none.
+  const terms = $("read-terms");
+  if (terms) terms.classList.toggle("hidden", !(required && STATE && STATE.has_pdf));
   if (required) {
     // RENDERED AS RECEIVED, via textContent. This string is quoted verbatim on a legal record;
     // it is not a template, it is not rebuilt here, and it is not stored in this file.
@@ -1207,6 +1213,30 @@ function mountInlinePdf() {
   ifr.src = pdfUrl("#toolbar=0&navpanes=0&scrollbar=0&view=FitH");
   wrap.appendChild(ifr);
 }
+// WHERE THE TERMS START. They are their own pages of the proposal, after the pricing page, so
+// "read the Terms" is that document opened at them. A page number rather than a search: the
+// heading is baked into the template's page artwork, not text the viewer could find.
+const TERMS_HASH = "#page=2&view=FitH";
+
+/** Open the proposal at its Terms and Conditions.
+ *
+ *  RE-POINTS THE FRAME RATHER THAN REMOUNTING IT. mountPdf latches on PDF_MOUNTED and keeps one
+ *  iframe for the life of the page, which is deliberate -- the upstream render is a full docx +
+ *  LibreOffice pass. But a mounted frame also keeps its scroll position, so without this a second
+ *  press of this button would reopen wherever the customer last scrolled to and quietly not show
+ *  them the terms at all. */
+function openTermsInProposal() {
+  // NO has_pdf CHECK HERE. openPdfModal already refuses without a document, and a second copy of
+  // that condition is a second place to forget it -- proven redundant rather than assumed:
+  // deleting it left every test green, which is the only evidence that says so.
+  openPdfModal();
+  // querySelectorAll()[0], matching mountPdf's own cleanup two functions down, rather than
+  // querySelector -- one way of reaching this frame, so a stub or a change has one thing to follow.
+  const wrap = $("pdf-frame-wrap");
+  const ifr = wrap && wrap.querySelectorAll("iframe")[0];
+  if (ifr) ifr.src = pdfUrl(TERMS_HASH);
+}
+
 function openPdfModal() {
   if (!STATE || !STATE.has_pdf) return;
   show($("pdf-modal")); show($("pdf-scrim"));
@@ -1374,6 +1404,10 @@ $("approve-form").addEventListener("submit", (e) => { e.preventDefault(); submit
 // is submitted, not while somebody is still in the middle of writing it.
 $("ap-name").addEventListener("input", renderSignaturePreview);
 $("ap-consent").addEventListener("change", updateApproveGate);
+// NAMED HANDLER, not an inline arrow: this repo's harness can read a listener body and cannot run
+// one, and its own rule is that anything with a decision in it belongs in a function a test can
+// call. openTermsInProposal has two.
+$("read-terms").addEventListener("click", openTermsInProposal);
 // DELEGATED, and deliberately not a call inside renderOptions. renderOptions rebuilds the
 // pricing checkboxes on every render and its own per-box handler ends in updateSelectedTotal,
 // which writes btn.disabled -- a change event reaches this container afterwards, so the gate

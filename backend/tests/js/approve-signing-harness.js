@@ -58,7 +58,7 @@ function initialClasses(id) {
 
 const IDS = ["approve-btn", "ap-gate-hint", "consent-row", "ap-consent", "consent-text",
              "signing-blocked", "approve-plain-note", "sig-ink", "sig-hint", "ap-name",
-             "ap-title", "approve-alert"];
+             "ap-title", "approve-alert", "read-terms"];
 
 function makeNode(id) {
   const cls = new Set(initialClasses(id));
@@ -135,6 +135,10 @@ function card(opts) {
     hintIsError: nodes["ap-gate-hint"].classList.contains("is-error"),
     consentLabel: nodes["consent-text"].textContent,
     consentRowHidden: nodes["consent-row"].classList.contains("hidden"),
+    // The Read-the-Terms button, revealed from the SAME `required` the tick is. Read here rather
+    // than asserted in markup because a button that renders and never unhides is exactly what a
+    // regex over index.html cannot tell from one that works.
+    termsBtnHidden: nodes["read-terms"].classList.contains("hidden"),
     consentAgreed: nodes["consent-row"].classList.contains("is-agreed"),
     blockedText: nodes["signing-blocked"].textContent,
     blockedHidden: nodes["signing-blocked"].classList.contains("hidden"),
