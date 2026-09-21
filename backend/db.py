@@ -403,6 +403,13 @@ def unread_counts() -> dict[str, int]:
     author_kind='staff', are msg_type!='text' so they never count as a reply.
     One aggregate query for the whole board (no N+1).
 
+    THE ONE STAFF ROW THE SERVER WRITES ITSELF IS EXEMPT. The signed contract posted on
+    approval is author_kind='staff' AND msg_type='text', so it would break the invariant
+    above: a customer who asks a question and then approves would have it fall behind the
+    contract and lose its badge, and nobody would learn the question went unanswered. Those
+    rows carry meta.system_doc, and only this subquery reads it -- the row is an ordinary
+    bubble everywhere a human looks.
+
     Deliberately excludes 'deposit_submitted': nothing clears it (staff answer a
     deposit by marking it Received, not by typing a chat reply), so counting it
     would pin a badge on the card forever. It reaches staff via the bell feed
@@ -412,7 +419,8 @@ def unread_counts() -> dict[str, int]:
         "from public.portal_questions q "
         "where q.author_kind='customer' and q.msg_type='text' "
         "and q.id > coalesce((select max(s.id) from public.portal_questions s "
-        "  where s.proposal_id=q.proposal_id and s.author_kind='staff' and s.msg_type='text'), 0) "
+        "  where s.proposal_id=q.proposal_id and s.author_kind='staff' and s.msg_type='text' "
+        "    and coalesce(s.meta->>'system_doc', '') <> 'true'), 0) "
         "group by q.proposal_id"
     )
     return {r["pid"]: int(r["n"]) for r in rows}

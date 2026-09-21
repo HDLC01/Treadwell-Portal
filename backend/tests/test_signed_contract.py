@@ -496,6 +496,48 @@ def test_the_contract_message_is_a_shape_both_threads_draw_attachments_on(portal
     assert "attached" in msg["body"].lower(), "a bubble with no words is an unexplained file"
 
 
+def test_the_contract_message_is_marked_so_it_is_not_read_as_a_staff_reply(portal):
+    """`meta.system_doc`, and the staff board goes quietly wrong without it.
+
+    This is the FIRST staff `text` row the server writes by itself, and db.unread_counts counts
+    customer text newer than the last staff TEXT message -- an invariant its own docstring leans
+    on ("System/card rows, though author_kind='staff', are msg_type!='text'"). So a customer who
+    asks "can you start in October?" and then approves would have the question fall behind this
+    row: the board badge clears, the drawer's Chat count clears, and the drawer stops opening on
+    Chat. Kyle never sees the question and nothing anywhere says so.
+
+    Verified on Postgres 16 with the shipped predicate before this was written: with the marker
+    the question still counts, without it the row disappears from unread_counts entirely."""
+    assert _approve(portal).status_code == 200
+    meta = _contract_msgs(portal)[0]["meta"]
+    assert meta.get("system_doc") is True, (
+        "unmarked, this row silently clears the unread badge on any question asked before "
+        "the approval -- meta was %r" % meta)
+    assert meta.get("attachments"), "the marker must not have displaced the attachment"
+
+
+def test_the_unread_query_exempts_marked_rows_from_the_staff_side_only(monkeypatch):
+    """The other half of the pair above. The marker is inert unless the query reads it, and it
+    has to read it on the STAFF subquery: applied to the customer clause instead it would drop
+    customer messages from the count, which is the same bug pointed the other way.
+
+    Executes unread_counts with the connection captured rather than reading db.py's source, so
+    a query that no longer carries the clause cannot pass by having it in a comment."""
+    sql = {}
+
+    def _capture(q, *a, **k):
+        sql["q"] = q
+        return []
+
+    monkeypatch.setattr(main.db, "qall", _capture)
+    assert main.db.unread_counts() == {}
+    before, staff = sql["q"].split("author_kind='staff'", 1)
+    assert "system_doc" in staff, (
+        "the staff-reply subquery does not exempt the contract row: %s" % staff)
+    assert "system_doc" not in before, (
+        "the exemption landed on the customer clause, which would hide real questions")
+
+
 def test_a_failed_build_puts_nothing_in_the_thread(portal):
     """There is no document, so there is no message — and nothing that pretends otherwise. Both
     emails say the copy is being prepared and the download rebuilds it; a thread message with no

@@ -1818,7 +1818,16 @@ def _post_contract_to_thread(proposal_id: str, filename: str, pdf: bytes) -> Non
     THE TWO HALVES ARE GUARDED SEPARATELY, like _store_signed_contract's are, so the log says
     WHICH one failed -- a stored file with no message is an orphan on the volume, a failed
     store is nothing at all, and they are diagnosed differently. Every line names the exception
-    type and its message: "refused" without a reason has cost an SSH session before now."""
+    type and its message: "refused" without a reason has cost an SSH session before now.
+
+    IT CARRIES `system_doc`, AND WITHOUT IT THIS FEATURE HIDES CUSTOMER QUESTIONS. This is the
+    first staff `text` row the SERVER writes by itself, and `db.unread_counts` counts customer
+    text newer than the last staff TEXT message -- its own docstring leans on the invariant that
+    staff-authored rows are never `text`. So a customer who asks "can you start in October?" and
+    then approves would have their question fall behind this row: the board badge clears, the
+    drawer's Chat count clears, and the drawer stops opening on Chat. Kyle would never see the
+    question, and nothing anywhere would say so. The marker keeps the row out of that one
+    subquery while leaving it a normal bubble everywhere a human looks."""
     try:
         rec = uploads.store(proposal_id, filename, "application/pdf", pdf)
     except Exception as exc:  # noqa: BLE001 -- an approval is never lost over a file write
@@ -1833,7 +1842,11 @@ def _post_contract_to_thread(proposal_id: str, filename: str, pdf: bytes) -> Non
             msg_type="text",
             # sanitize rather than the raw record, matching the publish path: `meta` is read
             # back into two web pages and an email, so the list is rebuilt field by field.
-            meta={"attachments": uploads.sanitize([rec])})
+            #
+            # `system_doc` is read by db.unread_counts and by nothing else. A dedicated
+            # msg_type would be tidier but portal_questions.msg_type carries a CHECK
+            # constraint, so it would cost DDL on both databases for a flag one query reads.
+            meta={"attachments": uploads.sanitize([rec]), "system_doc": True})
     except Exception as exc:  # noqa: BLE001
         log.error("signed contract stored as %s but not posted to the thread for %s: %s: %s",
                   rec.get("id"), proposal_id, type(exc).__name__, exc)
