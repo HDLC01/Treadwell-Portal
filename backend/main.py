@@ -36,6 +36,7 @@ import inbound
 import invoice
 import proposals
 import ratelimit
+import signing
 import uploads
 
 logging.basicConfig(level=logging.INFO)
@@ -238,7 +239,8 @@ def _contact(row: dict) -> dict:
 def _notify_customer(p: dict, heading: str, body_html: str, *,
                      actor_email: Optional[str] = None,
                      peer_heading: Optional[str] = None,
-                     peer_body_html: Optional[str] = None) -> None:
+                     peer_body_html: Optional[str] = None,
+                     attachments: Optional[list[tuple[str, bytes]]] = None) -> None:
     """Email the milestone to EVERY recipient on the proposal.
 
     The third channel alongside the chat line and the team email. Best-effort:
@@ -271,13 +273,18 @@ def _notify_customer(p: dict, heading: str, body_html: str, *,
             # this function turns on: an unknown actor means NOBODY is the actor, so nobody
             # gets a receipt. A mutation removing it is correctly equivalent, not a gap.
             is_actor = bool(actor) and e.strip().lower() == actor
+            # The attachment goes to BOTH versions. A signed contract belongs to every
+            # contact on the project, not only to whoever happened to click the button --
+            # the peer copy differs in its wording, never in what it encloses.
             if peer_body_html and not is_actor:
                 email_sender.send_customer_update(e, link, project,
                                                   peer_heading or heading, peer_body_html,
-                                                  reply_to=rt, token=p["token"])
+                                                  reply_to=rt, token=p["token"],
+                                                  attachments=attachments)
             else:
                 email_sender.send_customer_update(e, link, project, heading, body_html,
-                                                  reply_to=rt, token=p["token"])
+                                                  reply_to=rt, token=p["token"],
+                                                  attachments=attachments)
     except Exception as exc:  # noqa: BLE001
         log.warning("customer update email failed for %s: %s", p.get("proposal_id"), exc)
 
@@ -1046,6 +1053,25 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     data = db.get_pinned_draft_data(p) or {}
     options = proposals.pricing_options(data)
 
+    # ── the approval IS the signature ────────────────────────────────────────
+    # CHECKED BEFORE ANYTHING IS WRITTEN, which is the whole placement. An approval is the
+    # moment a customer reads "approved" and believes a contract now exists, so every reason
+    # to refuse one has to be spent before the first insert. See signing.py.
+    #
+    # `is not True` rather than a truthiness test. ESIGN turns on an AFFIRMATIVE act of
+    # assent, and consent:"false", consent:0 and consent:"maybe" are not one -- only the
+    # boolean the checkbox emits is.
+    #
+    # A BUDGET PRICING PROPOSAL IS EXEMPT rather than blocked here. Its template carries no
+    # Terms and Conditions, so there is nothing to be bound by and no honest consent sentence
+    # to show; requiring one would lock those customers out of approving at all. The page
+    # steers them to talk to us instead (signing_block.blocked_reason), and no certificate is
+    # ever produced claiming T&Cs they were never shown.
+    sign = signing.signing_block(p, data)
+    if sign["required"] and body.get("consent") is not True:
+        return _json({"ok": False, "error":
+                      "Please tick the box to sign and approve this proposal."}, 400)
+
     # Multi-select (option_labels[]) is the V1 path; option_label (single string)
     # is the legacy body. A single-option proposal auto-selects its only option.
     raw = body.get("option_labels")
@@ -1070,8 +1096,32 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         approved_date = date.today()
 
     approver = _session_email(request)
-    db.add_approval(p["proposal_id"], name, title, approved_date, total, option_summary,
-                    _client_ip(request), approver, options=label_list)
+    signed_at = _now_utc()
+    revision_no = p.get("current_revision_no")
+    # WHAT WAS SIGNED, pinned by hash, and computed BEFORE the row is written so the row can
+    # carry them. A fingerprint taken afterwards is a fingerprint of whatever the document had
+    # become by then, which is the one thing a signature exists to rule out.
+    #
+    # Both are None for a Budget Pricing approval: hashes with no certificate attesting to
+    # them would read as evidence of a signature that was never taken.
+    revision_sha = signing.revision_sha256(data) if sign["required"] else None
+    # 30 seconds, not the viewer's 90. This runs inside the customer's own click, and a cold
+    # render that misses the deadline costs a NULL hash and a rebuild on first download --
+    # never a stalled approval.
+    proposal_pdf = _proposal_pdf_bytes(p, timeout=30.0) if sign["required"] else None
+    if sign["required"] and proposal_pdf is None:
+        log.warning("approval for %s has no proposal PDF to hash (upstream unavailable) -- "
+                    "the signed contract will be built on first download", p["proposal_id"])
+    approval_id = db.add_approval(
+        p["proposal_id"], name, title, approved_date, total, option_summary,
+        _client_ip(request), approver, options=label_list,
+        consent_version=(signing.CONSENT_VERSION if sign["required"] else None),
+        # Capped: a User-Agent is attacker-controlled free text on a legal record.
+        user_agent=_cap(request.headers.get("user-agent"), 500) or None,
+        revision_no=int(revision_no) if revision_no else None,
+        revision_sha256=revision_sha,
+        contract_sha256=signing.sha256_hex(proposal_pdf) if proposal_pdf else None,
+    )
     db.set_approved(p["proposal_id"], total, option_summary, name, title, approved_date,
                     options=label_list, deposit_amount=deposit)
 
@@ -1084,6 +1134,47 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     # Staff decided at send time whether this job collects a deposit. When it
     # doesn't, every mention of one has to go — promising an invoice that will
     # never arrive is worse than saying nothing.
+    # ── the signed contract ──────────────────────────────────────────────────
+    # BEST-EFFORT, AND EVERYTHING ABOVE IS ALREADY COMMITTED. This calls another container to
+    # assemble a PDF; letting that decide whether an approval happened is how a customer ends
+    # up pressing Approve three times because a LibreOffice pass was slow.
+    #
+    # A FAILURE IS NEVER SILENT. It costs the attachment and both emails SAY SO -- an
+    # estimator must not read "APPROVED" and assume the paperwork exists. That is the exact
+    # shape of the publish bug that sent a customer an email with nothing attached while the
+    # estimator read "Sent".
+    contract_pdf, contract_error = None, None
+    if sign["required"]:
+        certificate = signing.build_certificate(
+            project_name=signing.signing_project_name(p, data),
+            proposal_id=p["proposal_id"], revision_no=revision_no,
+            signer_name=name, signer_title=title, signer_email=approver,
+            signed_at=signed_at, ip_address=_client_ip(request),
+            user_agent=_cap(request.headers.get("user-agent"), 500),
+            options_summary=option_summary, total=total,
+            deposit_amount=(deposit if p.get("deposit_required") is not False else None),
+            proposal_pdf_sha256=signing.sha256_hex(proposal_pdf) if proposal_pdf else "",
+            revision_sha=revision_sha or "",
+            consent_version=signing.CONSENT_VERSION)
+        contract_pdf, contract_error = _store_signed_contract(
+            p["proposal_id"], approval_id, certificate, proposal_pdf)
+    staff_contract_html, customer_contract_html, contract_atts = _contract_email_parts(
+        signing.signing_project_name(p, data), contract_pdf, contract_error,
+        signing_required=sign["required"])
+    # THE SAME BYTES, UNDER THE SAME NAME, IN THE ONE PLACE BOTH SIDES ALREADY LOOK. Hanz,
+    # 2026-09-21: "show the pdf as an attachment in chat that we can download". The emails
+    # carry it and the portal has a download button, but an email gets deleted and a button
+    # lives on one screen; the thread is where the estimator and the customer both go back to.
+    #
+    # GUARDED ON contract_atts RATHER THAN ON contract_pdf, so the filename can only ever have
+    # ONE spelling: if the emails are carrying a document, the thread carries THAT document
+    # named identically, and a customer never sees two names for one file. It also folds the
+    # two cases that must post nothing into one condition -- a build that failed (both emails
+    # say so instead, and the download rebuilds it) and a Budget Pricing approval, which has no
+    # contract to attach because it has no Terms and Conditions to sign.
+    if contract_atts:
+        _post_contract_to_thread(p["proposal_id"], contract_atts[0][0], contract_atts[0][1])
+
     deposit_due = p.get("deposit_required") is not False
     email_sender.notify_team(
         f"Proposal APPROVED — {project_name}",
@@ -1093,11 +1184,13 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         + (f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>" if deposit_due
            else "<p>No deposit required for this project — the customer has been asked for "
                 "their project contacts.</p>")
-        + f"<p>Project: {html.escape(project_name)}.</p>",
+        + f"<p>Project: {html.escape(project_name)}.</p>"
+        + staff_contract_html,
         kind="approved",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
         reply_to=email_sender.proposal_reply_to(p.get("token")),
         token=p.get("token"), project=p.get("project_name"),
+        attachments=contract_atts,
     )
     # Confirm the approval to the customer in writing. They'd just committed to a
     # price and heard nothing back except (later) an invoice.
@@ -1110,7 +1203,12 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         + (f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves your place on our "
            f"schedule; the invoice follows separately.</p>" if deposit_due
            else "<p>No deposit is needed. Next, please add your project contacts so we can "
-                "schedule the work.</p>"),
+                "schedule the work.</p>")
+        # ESIGN 7001(d)/(e): the signer has to be ABLE TO RETAIN their own copy. Before this,
+        # nobody could -- an approval left a database row and an email naming a total. This
+        # line and its attachment are that requirement, and the portal download is the other
+        # half (api_signed_contract_pdf).
+        + customer_contract_html,
         # The other contacts hear WHO approved rather than "your approval". Named from the typed
         # signature, which every recipient already sees on the proposal itself, falling back to
         # the first name of whoever was signed in.
@@ -1123,7 +1221,9 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
             f"<strong>${total:,.2f}</strong>.</p>"
             + (f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves the schedule; "
                f"the invoice follows separately.</p>" if deposit_due
-               else "<p>No deposit is needed. Next, the project contacts.</p>")),
+               else "<p>No deposit is needed. Next, the project contacts.</p>")
+            + customer_contract_html),
+        attachments=contract_atts,
     )
     if not deposit_due:
         # The contacts prompt normally rides on deposit-received (admin_deposit_received).
@@ -1533,18 +1633,29 @@ async def api_contacts(token: str, request: Request) -> JSONResponse:
     return _json({"ok": True})
 
 
-@app.get("/api/portal/{token}/pdf")
-def api_pdf(token: str, request: Request):
-    p = _require(request, token)
-    if not p:
-        return _json({"ok": False, "error": "unauthorized"}, 401)
+def _proposal_pdf_bytes(p: dict, *, timeout: float = 90.0) -> Optional[bytes]:
+    """The official proposal PDF for this row's PINNED revision, from cache or the tool.
+
+    ONE FETCHER, TWO READERS, and that is the point rather than tidiness: the customer's viewer
+    (api_pdf) and the e-signature capture (api_approve) have to hash and sign THE SAME BYTES the
+    customer read. Two call sites each running their own httpx.get would render the document
+    twice -- two LibreOffice passes for one approval -- and could disagree, which would put a
+    hash on a signature certificate for a document nobody ever saw.
+
+    None on every failure, never an exception: both readers degrade. The viewer falls through to
+    its stored-URL fallback; the signing path leaves the contract unbuilt for the lazy rebuild.
+
+    `timeout` is a parameter because the two callers are not in the same hurry. A cold render is
+    worth 90 seconds to somebody staring at a viewer waiting for it, and is not worth making a
+    customer wait that long to have their approval recorded.
+    """
     pid = p["proposal_id"]
     # The ROW's revision, never the client's. `?rev=` on the viewer's URL is a cache-buster only;
     # honouring it as a selector would let anyone read a superseded revision's document.
     rev = p.get("current_revision_no") or 0
     hit = _PDF_CACHE.get(_pdf_cache_key(pid, rev))
     if hit and hit[0] > time.monotonic():
-        return Response(content=hit[1], media_type="application/pdf", headers=_pdf_headers(rev))
+        return hit[1]
     # Preferred: render the real Treadwell PDF on demand from the proposal tool.
     if config.PROPOSAL_TOOL_URL and config.SERVICE_TOKEN:
         try:
@@ -1557,15 +1668,28 @@ def api_pdf(token: str, request: Request):
                 config.PROPOSAL_TOOL_URL + "/api/admin/proposal-pdf",
                 params=params,
                 headers={"X-Service-Token": config.SERVICE_TOKEN},
-                timeout=90,
+                timeout=timeout,
             )
             if r.status_code == 200:
                 _pdf_cache_put(pid, rev, r.content)
-                return Response(content=r.content, media_type="application/pdf",
-                                headers=_pdf_headers(rev))
+                return r.content
             log.info("proposal-pdf upstream %s for %s", r.status_code, pid)
         except Exception as exc:  # noqa: BLE001
-            log.warning("proposal-pdf fetch failed: %s", exc)
+            # The TYPE as well as the message. "fetch failed: " with an empty ConnectError
+            # behind it is the log line that costs an SSH session to interpret.
+            log.warning("proposal-pdf fetch failed: %s: %s", type(exc).__name__, exc)
+    return None
+
+
+@app.get("/api/portal/{token}/pdf")
+def api_pdf(token: str, request: Request):
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    rev = p.get("current_revision_no") or 0
+    content = _proposal_pdf_bytes(p)
+    if content is not None:
+        return Response(content=content, media_type="application/pdf", headers=_pdf_headers(rev))
     if p.get("pdf_path"):  # fallback: a stored Storage URL (prod option)
         return RedirectResponse(p["pdf_path"])
     return _json({"ok": False, "error": "no_pdf"}, 404)
@@ -1599,6 +1723,285 @@ def api_deposit_invoice_pdf(token: str, request: Request):
                  f'attachment; filename="{invoice.invoice_filename(invoice_no)}"',
                  "Cache-Control": "private, max-age=0, no-store"},
     )
+
+
+def _store_signed_contract(proposal_id: str, approval_id, certificate: dict,
+                           proposal_pdf: Optional[bytes]
+                           ) -> tuple[Optional[bytes], Optional[str]]:
+    """Build the signed contract and persist it. Returns (pdf, why-not).
+
+    NEVER RAISES. Both callers are in the middle of something a customer is watching -- an
+    approval and a download -- and neither may fail over a document assembly.
+
+    THE TWO HALVES ARE GUARDED SEPARATELY, deliberately: a database that refuses the blob must
+    not throw away a PDF we already hold and are about to email. The customer gets their copy
+    either way; only the stored copy is lost, and the next download rebuilds it.
+
+    EVERY FAILURE NAMES ITSELF, exception type included. A log line that says "refused"
+    without saying why has cost an SSH session and a container probe before now."""
+    pdf: Optional[bytes] = None
+    err: Optional[str] = None
+    try:
+        pdf = signing.render_signed_contract(proposal_pdf or b"", certificate)
+    except signing.ContractUnavailable as exc:
+        err = str(exc)
+        log.warning("signed contract not built for %s: %s", proposal_id, err)
+    except Exception as exc:  # noqa: BLE001 -- an unexpected shape must not cost the approval
+        err = "%s: %s" % (type(exc).__name__, exc)
+        log.error("signed contract build raised for %s: %s", proposal_id, err)
+    if not approval_id:
+        # Nothing to hang it off. On a real database this means the approval insert did not
+        # happen, which is worth an error line of its own rather than a silent skip.
+        log.error("no approval id for %s -- the signed contract cannot be stored", proposal_id)
+        return pdf, err
+    try:
+        db.upsert_signed_contract(approval_id, proposal_id, pdf=pdf,
+                                  pdf_sha256=signing.sha256_hex(pdf) if pdf else None,
+                                  built_at=_now_utc() if pdf else None)
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not store the signed contract for %s: %s: %s",
+                  proposal_id, type(exc).__name__, exc)
+    return pdf, err
+
+
+def _contract_email_parts(project_name: Optional[str], pdf: Optional[bytes],
+                          error: Optional[str], *, signing_required: bool
+                          ) -> tuple[str, str, Optional[list[tuple[str, bytes]]]]:
+    """(staff html, customer html, attachments) for the two approval emails.
+
+    THE FAILURE WORDING IS THE POINT OF THIS FUNCTION. A publish once refused an attachment
+    AFTER the proposal row was written, logged it, and returned 200 -- the estimator read
+    "Sent" and the customer got an email with nothing attached. So when the build failed both
+    emails say the document is not here yet, rather than quietly arriving thinner than usual.
+
+    Nothing at all for a Budget Pricing approval: there is no contract to mention, and a line
+    apologising for a missing one would invent an expectation nobody had."""
+    if not signing_required:
+        return "", "", None
+    if not pdf:
+        if error:
+            log.info("approval email will say the contract is pending: %s", error)
+        return ("<p><strong>The signed contract could not be built yet.</strong> It will be "
+                "available in the staff tool shortly.</p>",
+                "<p>Your signed copy is being prepared. It will be available to download "
+                "from your project page shortly.</p>",
+                None)
+    short = html.escape(signing.short_hash(signing.sha256_hex(pdf)))
+    staff = ("<p>The signed contract is attached (SHA-256 <code>%s</code>).</p>" % short)
+    customer = ("<p>Your signed contract is attached, and can always be downloaded from your "
+                "project page.</p>"
+                '<p style="color:#64748b;font-size:13px">Document fingerprint (SHA-256): '
+                "<code>%s</code>.</p>" % short)
+    return staff, customer, [(signing.contract_filename(project_name), pdf)]
+
+
+def _post_contract_to_thread(proposal_id: str, filename: str, pdf: bytes) -> None:
+    """Put the signed contract in the project's chat thread, carried in `meta.attachments`.
+
+    NO NEW STORE AND NO DDL. `portal_questions.meta` is jsonb and uploads.store already writes
+    the bytes to the upload volume and hands back exactly the record a message's attachment
+    list is made of -- the same two steps the publish path takes for an estimator's files.
+
+    msg_type IS "text", NOT "system", AND THAT IS NOT A STYLE CHOICE. Neither renderer draws
+    attachments on a system row: the customer portal's renderMsg returns a title/body card for
+    msg_type "system", and the staff drawer's msgHtml renders one as a single `p.note.sys`
+    line. Only the message bubble and the proposal card call attHtml. A system row here would
+    store the attachment perfectly and show NOBODY a download -- the feature would be invisible
+    on both sides with every test green. A bubble from Treadwell is also the honest reading of
+    what this is: us handing over a document, not the thread reporting an event. The event is
+    already recorded, by the "Approved by ..." system line written further up.
+
+    IT NEVER RAISES. Everything that matters is committed by the time this runs, the customer
+    has already been told their proposal is approved, and both emails are carrying the same
+    document. A full disk or a refused insert costs the chat copy and nothing else.
+
+    THE TWO HALVES ARE GUARDED SEPARATELY, like _store_signed_contract's are, so the log says
+    WHICH one failed -- a stored file with no message is an orphan on the volume, a failed
+    store is nothing at all, and they are diagnosed differently. Every line names the exception
+    type and its message: "refused" without a reason has cost an SSH session before now.
+
+    IT CARRIES `system_doc`, AND WITHOUT IT THIS FEATURE HIDES CUSTOMER QUESTIONS. This is the
+    first staff `text` row the SERVER writes by itself, and `db.unread_counts` counts customer
+    text newer than the last staff TEXT message -- its own docstring leans on the invariant that
+    staff-authored rows are never `text`. So a customer who asks "can you start in October?" and
+    then approves would have their question fall behind this row: the board badge clears, the
+    drawer's Chat count clears, and the drawer stops opening on Chat. Kyle would never see the
+    question, and nothing anywhere would say so. The marker keeps the row out of that one
+    subquery while leaving it a normal bubble everywhere a human looks."""
+    try:
+        rec = uploads.store(proposal_id, filename, "application/pdf", pdf)
+    except Exception as exc:  # noqa: BLE001 -- an approval is never lost over a file write
+        log.error("signed contract not attached to the thread for %s: %s: %s",
+                  proposal_id, type(exc).__name__, exc)
+        return
+    try:
+        db.add_message(
+            proposal_id, "staff", None,
+            "Your signed contract is attached. This is your copy to keep, and you can "
+            "download it here any time.",
+            msg_type="text",
+            # sanitize rather than the raw record, matching the publish path: `meta` is read
+            # back into two web pages and an email, so the list is rebuilt field by field.
+            #
+            # `system_doc` is read by db.unread_counts and by nothing else. A dedicated
+            # msg_type would be tidier but portal_questions.msg_type carries a CHECK
+            # constraint, so it would cost DDL on both databases for a flag one query reads.
+            meta={"attachments": uploads.sanitize([rec]), "system_doc": True})
+    except Exception as exc:  # noqa: BLE001
+        log.error("signed contract stored as %s but not posted to the thread for %s: %s: %s",
+                  rec.get("id"), proposal_id, type(exc).__name__, exc)
+
+
+def _approval_signed_at(approval: dict) -> Optional[datetime]:
+    """When the signature was given, as an aware datetime. None when the row cannot say.
+
+    latest_approval_record reads through to_jsonb, so this arrives as an ISO string rather
+    than a datetime. A naive value is read as UTC, which is what the column stores.
+
+    None rather than "now" on a value we cannot parse: the moment of signing IS the evidence,
+    and a certificate stamped with the time somebody happened to press Download would be a
+    confident statement of something false."""
+    raw = approval.get("signed_at")
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _signed_contract_pdf(p: dict) -> tuple[Optional[bytes], Optional[str], int]:
+    """(pdf, refusal sentence, http status) for one proposal's signed contract.
+
+    LAZY-BUILDS ON A NULL BLOB, mirroring what the proposal tool's Done page does with a
+    download token a restart expired: the thing being asked for is reconstructible, so
+    reconstruct it rather than dead-ending somebody on a failure they can do nothing about.
+    api_approve deliberately leaves the row unbuilt when the renderer is down, so this is a
+    normal path and not an error path.
+
+    EVERY REFUSAL IS A SENTENCE THE UI CAN SHOW AS-IS, because both callers render it
+    unchanged and the customer-facing one is read by a customer."""
+    pid = p["proposal_id"]
+    data = db.get_pinned_draft_data(p) or {}
+    # THE AUDIENCE TRAVELS TOO, since 2026-09-19. The signature is written onto the proposal's
+    # own ACCEPTANCE row and only the Direct artwork has one, so "can this be signed" is a
+    # question about the FORM, which is (work_type, audience) -- not work type alone. Reading
+    # only the first half here would offer a GC customer a signature the tool then refuses.
+    blocked = signing.signing_blocked_reason(data.get("work_type"),
+                                             signing.draft_audience(data))
+    if blocked:
+        # Nowhere on this form to sign, so no contract was ever signed and none can be produced.
+        return None, blocked, 400
+    try:
+        row = db.get_signed_contract(pid)
+    except Exception as exc:  # noqa: BLE001 -- a missing migration reads as "not built"
+        log.error("could not read the signed contract for %s: %s: %s",
+                  pid, type(exc).__name__, exc)
+        row = None
+    if row and row.get("pdf"):
+        return bytes(row["pdf"]), None, 200
+    try:
+        approval = db.latest_approval_record(pid)
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not read the approval for %s: %s: %s", pid, type(exc).__name__, exc)
+        return None, "We could not look up your signed contract. Please try again shortly.", 502
+    if not approval:
+        return None, "This proposal has not been signed yet.", 404
+    signed_at = _approval_signed_at(approval)
+    if signed_at is None:
+        log.error("approval %s for %s has an unreadable signed_at %r -- refusing to certify",
+                  approval.get("id"), pid, approval.get("signed_at"))
+        return None, ("We could not confirm when this proposal was signed. Please contact "
+                      "Treadwell and we will send you your copy."), 502
+    proposal_pdf = _proposal_pdf_bytes(p)
+    if not proposal_pdf:
+        return None, ("The proposal document could not be retrieved, so your signed contract "
+                      "cannot be rebuilt just now. Please try again shortly."), 502
+    fetched_sha = signing.sha256_hex(proposal_pdf)
+    signed_sha = approval.get("contract_sha256")
+    if signed_sha and signed_sha != fetched_sha:
+        # THE DOCUMENT MOVED UNDER THE SIGNATURE. Binding a certificate that attests to one
+        # hash onto bytes carrying a different one would produce a contract that misstates
+        # what was agreed, which is the worst thing this feature could emit. Refuse, loudly.
+        log.error("signed contract for %s cannot be rebuilt: the proposal PDF now hashes %s, "
+                  "the signature attests to %s", pid, signing.short_hash(fetched_sha),
+                  signing.short_hash(signed_sha))
+        return None, ("Your signed contract cannot be rebuilt because the proposal document "
+                      "has changed since it was signed. Please contact Treadwell and we will "
+                      "send you your copy."), 409
+    try:
+        certificate = signing.build_certificate(
+            project_name=signing.signing_project_name(p, data), proposal_id=pid,
+            revision_no=approval.get("revision_no") or p.get("current_revision_no"),
+            signer_name=approval.get("name") or "", signer_title=approval.get("title"),
+            signer_email=approval.get("approver_email"), signed_at=signed_at,
+            ip_address=approval.get("ip"), user_agent=approval.get("user_agent"),
+            options_summary=approval.get("option_label"),
+            total=_float_or_none(approval.get("total")),
+            deposit_amount=_float_or_none(p.get("deposit_amount")),
+            proposal_pdf_sha256=signed_sha or fetched_sha,
+            revision_sha=approval.get("revision_sha256") or "",
+            # The version THIS customer ticked. An approval taken before e-signature existed
+            # has none, and falls back to the current wording -- which is honest only because
+            # such a row also has no consent to certify; the log line is how that surfaces.
+            consent_version=approval.get("consent_version"))
+    except signing.UnknownConsentVersion as exc:
+        log.error("cannot rebuild the contract for %s: %s", pid, exc)
+        return None, ("Your signed contract cannot be rebuilt by this version of the portal. "
+                      "Please contact Treadwell and we will send you your copy."), 502
+    if not approval.get("consent_version"):
+        log.warning("rebuilding a contract for %s from an approval with no consent version -- "
+                    "it predates e-signature capture", pid)
+    approval_id = (row or {}).get("approval_id") or approval.get("id")
+    pdf, err = _store_signed_contract(pid, approval_id, certificate, proposal_pdf)
+    if not pdf:
+        return None, ("Your signed contract could not be built just now. Please try again "
+                      "shortly."), 502
+    return pdf, None, 200
+
+
+def _float_or_none(v):
+    """Postgres numerics arrive as Decimal (or as a JSON number through to_jsonb); the
+    certificate is JSON-encoded, which neither Decimal nor a stray string survives."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _signed_contract_response(pdf: bytes, project_name: Optional[str]) -> Response:
+    """PRIVATE, NEVER STORED. Same posture as the deposit invoice: this is one customer's
+    executed contract, and a shared cache holding it would be a disclosure, not a saving."""
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition":
+                 'attachment; filename="%s"' % signing.contract_filename(project_name),
+                 "Cache-Control": "private, max-age=0, no-store"},
+    )
+
+
+@app.get("/api/portal/{token}/signed-contract.pdf")
+def api_signed_contract_pdf(token: str, request: Request):
+    """The customer's own copy of what they signed.
+
+    THE REASON THIS ENDPOINT EXISTS. ESIGN 7001(d)/(e) requires that the signer be able to
+    RETAIN their copy of an electronically signed agreement. Until now nobody could: an
+    approval left a row in portal_approvals and an email naming a total. The confirmation
+    email attaches it too; this is the copy that is still here when the email is not.
+
+    Session-gated exactly like api_deposit_invoice_pdf -- _require checks the customer's own
+    session against this proposal, so the /p/<token> link is a deep link and not the gate."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    pdf, err, status = _signed_contract_pdf(p)
+    if pdf is None:
+        return _json({"ok": False, "error": err or "No signed contract is available."}, status)
+    return _signed_contract_response(pdf, p.get("project_name"))
+
 
 
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
@@ -1928,8 +2331,8 @@ def _proposal_card_files(proposal_id: str) -> list[tuple[str, bytes]]:
     posts a new card, so this follows the current version without needing to know about revisions
     at all.
     """
-    # NOT include_internal. A proposal card is never an internal row -- it is the customer's own
-    # "your proposal is ready" -- so opting in would widen the staff-only rule for nothing, and
+    # NOT include_internal. A proposal card is never an internal row -- it is the customer's own
+    # "your proposal is ready" -- so opting in would widen the staff-only rule for nothing, and
     # test_only_the_staff_reader_opts_in is right to refuse a third opted-in reader.
     for m in reversed(db.list_messages(proposal_id)):
         if (m.get("msg_type") or "") == "proposal_card":
@@ -3362,6 +3765,30 @@ async def admin_followup_recipient(proposal_id: str, request: Request) -> JSONRe
     if not db.set_followup_recipient(proposal_id, email, enabled):
         return _json({"ok": False, "error": "not_a_recipient"}, 404)
     return _json({"ok": True, "email": email, "followups": enabled})
+
+
+@app.get("/api/admin/signed-contract.pdf")
+def admin_signed_contract_pdf(proposal_id: str, request: Request):
+    """The executed contract, for staff and for the proposal tool.
+
+    SERVICE_TOKEN-gated like every other /api/admin/* route here, because it serves a
+    customer's signed agreement to anything that asks. The staff UI for a proposal lives in
+    the OTHER repository (treadwell-proposal-tool frontend/js/portal.js) and is not touched
+    from here; this endpoint is what a later link there will call.
+
+    Lazy-builds on the same path the customer download uses, so an approval taken while the
+    renderer was down produces a document the first time anybody asks for one, from either
+    side."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id) if proposal_id else None
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    pdf, err, status = _signed_contract_pdf(p)
+    if pdf is None:
+        return _json({"ok": False, "error": err or "No signed contract is available."}, status)
+    return _signed_contract_response(pdf, p.get("project_name"))
+
 
 
 @app.post("/api/admin/proposal/{proposal_id}/deposit-received")

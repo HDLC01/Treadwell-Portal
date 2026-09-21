@@ -124,3 +124,19 @@ grant select, insert, update, delete on public.portal_proposal_views to portal_a
 drop policy if exists portal_app_rw on public.portal_proposal_views;
 create policy portal_app_rw on public.portal_proposal_views
   for all to portal_app using (true) with check (true);
+
+-- 3e) E-signature: the built signed contract (portal-owned). RLS is enabled in schema.sql, so
+--     grants alone are default-deny -- the POLICY is required. Without it prod would store no
+--     signed contract at all while staging (broad role) looked correct, and the customer's
+--     /signed-contract.pdf would rebuild from the proposal tool on every single download,
+--     which is a LibreOffice pass per click.
+--
+--     NOT APPLIED TO PRODUCTION AS OF 2026-09-18. Kept here so this file stays the reproducible
+--     truth about the prod posture for when the prod DDL is approved; the columns and table it
+--     references live in schema.sql and have so far been applied to STAGING only. Applying this
+--     before the schema.sql half will fail on a table that does not exist yet -- run the
+--     portal_approvals ALTERs and the portal_signed_contracts CREATE first, as the owner role.
+grant select, insert, update, delete on public.portal_signed_contracts to portal_app;
+drop policy if exists portal_app_rw on public.portal_signed_contracts;
+create policy portal_app_rw on public.portal_signed_contracts
+  for all to portal_app using (true) with check (true);

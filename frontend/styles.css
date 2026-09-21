@@ -172,6 +172,90 @@ textarea { min-height: 96px; resize: vertical; }
 .help { font-size: .8rem; color: var(--secondary); margin-top: 4px; text-transform: none; letter-spacing: 0; font-weight: 400; }
 .code-input { letter-spacing: 10px; text-align: center; font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 
+/* Signature and consent — the approve card is a contract being signed.
+   A typed name plus a ticked box IS a signature under the ESIGN Act and the Kansas UETA, so
+   the field has to READ as a signature line rather than as one more text input; a customer who
+   does not notice they are signing has not really assented. Nothing here changes what is
+   recorded: the certificate quotes the typed name and the served consent sentence, and the
+   script face below is a rendering of the former, never a second value. */
+.sig-preview {
+  display: flex; align-items: flex-end; gap: 8px;
+  min-height: 54px; margin-top: 10px; padding: 4px 2px 6px;
+  border-bottom: 1px solid var(--outline-variant);
+}
+/* NO WEBFONT REQUEST. This is a customer on a phone with a proposal open, and a script face is
+   the one thing on this card that may not hold up the page — nor may it fail to a serif that
+   looks like body text. Platform faces first (macOS, Windows, Office), then the generic, which
+   every engine maps to something handwritten. */
+.sig-preview .sig-ink {
+  font-family: 'Snell Roundhand', 'Segoe Script', 'Brush Script MT', 'Lucida Handwriting', cursive;
+  font-size: 1.9rem; line-height: 1.15; color: var(--fg); overflow-wrap: anywhere;
+}
+/* The empty state: the line is there before anything is typed, so it has to say what it is for
+   rather than sit blank and look like a rendering bug. */
+.sig-preview .sig-hint { font-size: .8rem; color: var(--secondary); padding-bottom: 6px; }
+
+/* The consent row. Its own class, not .option.opt-check: an option is a priced thing the
+   customer chooses between, and this sits directly under three of them. Reusing that class
+   would make the sentence they are bound by look like a fourth item on the menu. */
+.consent {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px; border: 1px solid var(--surface-highest); border-radius: var(--radius);
+  background: var(--surface-low); cursor: pointer;
+  /* Beats the global `label` rule on specificity, (0,1,0) over (0,0,1), rather than on position
+     in this file. That rule is uppercase .72rem label-caps, which is right for "Title" and
+     unreadable for the paragraph a customer is agreeing to be bound by. */
+  text-transform: none; letter-spacing: 0; font-size: .9rem; font-weight: 400;
+  line-height: 1.45; color: var(--fg); margin-bottom: 0;
+  transition: border-color .15s ease, background .15s ease;
+}
+/* Sits directly above the tick and reads as the step before it. Deliberately quieter than
+   Approve -- reading the terms is not the action the card is for -- but a real button rather
+   than a link, because on a phone a text link inside a form is a target people miss.
+
+   THE MARGINS ARE ASYMMETRIC ON PURPOSE, and this is the half that is easy to undo by
+   accident. `margin: 0 0 10px` used to zero the TOP margin, which beat `.stack > * + *`
+   on source order alone and left 0px between this button and the Title input above it
+   against 12px to the tick below -- proximity bonding it to the field it has nothing to
+   do with. 20px above, and the consent row's own 12px below, points it at the tick
+   instead. 20px because this file already uses it nine times; 22px appears nowhere in it.
+
+   SHRINK-TO-FIT, not `.btn-block`. At the fields' full width and their 46px height, down
+   to the same 6px corner, it WAS a form field and scanned as one more thing to fill in --
+   `.btn-secondary` even bordered it darker (--outline) than the real inputs
+   (--outline-variant). Hanz, 2026-09-22: "can we improve its placement? and maybe make it
+   smaller".
+
+   THE GROUND IS LOAD-BEARING, NOT DECORATION. This page is read under a forced dark mode
+   (there is no prefers-color-scheme block in this file), and a hairline is the first thing
+   such an engine flattens. Every hairline token here sits near 1.3:1 on white and the next
+   step up is --outline at 4.4:1, i.e. the heavy look above, so no border alone can carry
+   this control. The tonal step does: if the border goes, a filled chip whose label and
+   glyph ride currentColor still reads as a labelled control rather than as nothing.
+   --surface-low ground and --surface-highest border are the consent box's own two values,
+   which is also what ties this to the tick. Hover answers on both channels for the same
+   reason -- a border-only hover is invisible there. */
+.read-terms {
+  min-height: 44px; padding: 0 10px; margin: 20px 0 0;
+  background: var(--surface-low); border-color: var(--surface-highest);
+  color: var(--fg); font-size: .85rem; font-weight: 600;
+  letter-spacing: 0; text-transform: none;
+}
+.read-terms:hover { background: var(--surface-container); border-color: var(--outline); }
+.read-terms svg { flex: none; pointer-events: none; }
+.consent:hover { border-color: var(--outline); }
+.consent:focus-within { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+/* Same wash as .option.selected, deliberately the same literal: "ticked" already means this
+   colour on this page, and there is no token for it. A near-miss shade would be a new one. */
+.consent.is-agreed { border-color: var(--primary); background: #FFF5F5; }
+.consent input[type="checkbox"] {
+  width: 20px; height: 20px; margin: 1px 0 0; flex: none;
+  accent-color: var(--primary); cursor: pointer;
+}
+.consent .consent-text { flex: 1; min-width: 0; }
+/* A hint that has stopped being a hint: the approve path is broken and refreshing is the fix. */
+.help.is-error { color: var(--error); font-weight: 600; }
+
 /* Badges / status chips — minimal tint + high-contrast text */
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: .72rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
 .badge.pending { background: var(--surface-high); color: var(--secondary); }
@@ -428,6 +512,31 @@ textarea { min-height: 96px; resize: vertical; }
 .msg.customer .att-img, .msg.customer .att-file { background: rgba(255, 255, 255, .16); }
 .msg.customer .att-img:hover,
 .msg.customer .att-file:hover { background: rgba(255, 255, 255, .28); }
+
+/* ── the chip's EDGE, because the wash alone cannot carry it ───────────────────
+   Hanz, 2026-09-21, on the signed contract now sitting in the thread: "can we make this
+   contrast though so its just more visible". The text was never the problem -- the name and size
+   lines are in the table above. The SURFACE is: 1.14:1 on the staff bubble, which is the one the
+   contract arrives on, so a chip that is nothing but a wash reads as words rather than a thing to
+   click. The customer's own bubble is barely better at 1.29:1.
+
+   RAISING THE WASH IS THE WRONG LEVER: on the red, white@.26 gets the surface to 1.59:1 and takes
+   the size line to 4.4:1, under the 4.5 floor for 12px. A border buys the edge without moving what
+   the text sits on, so every number in the table above still holds:
+                  border vs bubble
+     staff        rgba(0,0,0,.45)        3.2:1
+     customer     rgba(255,255,255,.55)  3.2:1
+   Both clear the 3:1 WCAG 1.4.11 floor for a control's boundary.
+
+   .att-file ONLY, not .att-img: a photo tile already has a defined edge -- its own image -- and
+   .att-well is sized in px, so a border there would shift a layout that is not broken.
+
+   KEPT IDENTICAL to the staff drawer's copy in the proposal tool's portal.html, like the rest of
+   this block. One document, two threads, and a customer comparing them should see one chip. */
+.att-file { border: 1px solid rgba(0, 0, 0, .45); }
+.att-file:hover { border-color: rgba(0, 0, 0, .62); }
+.msg.customer .att-file { border-color: rgba(255, 255, 255, .55); }
+.msg.customer .att-file:hover { border-color: rgba(255, 255, 255, .78); }
 
 /* The queue above the composer, before anything is sent. */
 .att-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 2px; }

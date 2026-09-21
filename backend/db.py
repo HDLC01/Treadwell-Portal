@@ -403,6 +403,13 @@ def unread_counts() -> dict[str, int]:
     author_kind='staff', are msg_type!='text' so they never count as a reply.
     One aggregate query for the whole board (no N+1).
 
+    THE ONE STAFF ROW THE SERVER WRITES ITSELF IS EXEMPT. The signed contract posted on
+    approval is author_kind='staff' AND msg_type='text', so it would break the invariant
+    above: a customer who asks a question and then approves would have it fall behind the
+    contract and lose its badge, and nobody would learn the question went unanswered. Those
+    rows carry meta.system_doc, and only this subquery reads it -- the row is an ordinary
+    bubble everywhere a human looks.
+
     Deliberately excludes 'deposit_submitted': nothing clears it (staff answer a
     deposit by marking it Received, not by typing a chat reply), so counting it
     would pin a badge on the card forever. It reaches staff via the bell feed
@@ -412,7 +419,8 @@ def unread_counts() -> dict[str, int]:
         "from public.portal_questions q "
         "where q.author_kind='customer' and q.msg_type='text' "
         "and q.id > coalesce((select max(s.id) from public.portal_questions s "
-        "  where s.proposal_id=q.proposal_id and s.author_kind='staff' and s.msg_type='text'), 0) "
+        "  where s.proposal_id=q.proposal_id and s.author_kind='staff' and s.msg_type='text' "
+        "    and coalesce(s.meta->>'system_doc', '') <> 'true'), 0) "
         "group by q.proposal_id"
     )
     return {r["pid"]: int(r["n"]) for r in rows}
@@ -1454,13 +1462,83 @@ def clear_notify_override(proposal_id: str, email: str) -> None:
 
 # ── Approvals ───────────────────────────────────────────────────────────────────
 def add_approval(proposal_id, name, title, approved_date, total, option_label, ip,
-                 approver_email=None, options=None) -> None:
-    execute(
+                 approver_email=None, options=None, consent_version=None,
+                 user_agent=None, revision_no=None, revision_sha256=None,
+                 contract_sha256=None) -> Optional[int]:
+    """Record the signed acceptance, and return the new row's id.
+
+    THE FIVE E-SIGNATURE COLUMNS ARE NAMED IN THE INSERT, which makes this the one place the
+    2026-09-18 migration has to be applied FIRST -- the same note add_deposit carries about
+    `submitted_by`, for the same reason: a write cannot fall back to a missing column the way a
+    read can fall back through to_jsonb. On a database without them psycopg raises
+    UndefinedColumn and the approval fails outright.
+
+    THAT IS THE INTENDED FAILURE, not an oversight. The alternative is an approval that reports
+    success to a customer who just ticked a consent box while storing no record of which wording
+    they agreed to -- a signature with no evidence behind it is worse than a button that says it
+    could not record one. Ship schema.sql with this code; staging applies it on boot, prod needs
+    the owner role (see security_prod.sql).
+
+    THE RETURN VALUE is what portal_signed_contracts hangs off. Callers must tolerate None:
+    `returning id` has nothing to answer with if the insert did not happen, and a test double
+    standing in for this function has no id to give either.
+    """
+    row = q1(
         "insert into public.portal_approvals "
-        "(proposal_id, name, title, approved_date, total, option_label, ip, approver_email, options) "
-        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "(proposal_id, name, title, approved_date, total, option_label, ip, approver_email, "
+        "options, consent_version, user_agent, revision_no, revision_sha256, contract_sha256) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
         (proposal_id, name, title, approved_date, total, option_label, ip, approver_email,
-         Jsonb(options) if options is not None else None),
+         Jsonb(options) if options is not None else None,
+         consent_version, user_agent, revision_no, revision_sha256, contract_sha256),
+    )
+    return (row or {}).get("id")
+
+
+def latest_approval_record(proposal_id: str) -> Optional[dict[str, Any]]:
+    """EVERY column on the newest approval, read through to_jsonb.
+
+    The e-signature rebuild needs the signer, the moment, the consent version and the two
+    fingerprints, and naming those columns would raise UndefinedColumn on a database where the
+    migration has not landed -- prod cannot apply its own DDL, so the code arrives before the
+    ALTER does. An absent jsonb key reads as None, which is the literal truth about an approval
+    taken before e-signature existed: nobody was shown a consent box.
+
+    Separate from latest_approval(), which serves the staff drawer a fixed, narrow column list
+    and is not the place to widen."""
+    row = q1("select to_jsonb(a) as fields from public.portal_approvals a "
+             "where a.proposal_id = %s order by a.signed_at desc limit 1", (proposal_id,))
+    return (row or {}).get("fields") or None
+
+
+# -- the built signed contract ------------------------------------------------
+def upsert_signed_contract(approval_id, proposal_id, pdf=None, pdf_sha256=None,
+                           built_at=None) -> None:
+    """Store (or replace) the signed contract for one approval.
+
+    UPSERT, not insert. api_approve writes the row unbuilt when the proposal tool is down, and
+    the download endpoints build it on first read -- so the second write is the normal path, not
+    a retry. Keyed on approval_id, so a rebuild overwrites rather than accumulating copies of a
+    multi-megabyte blob."""
+    execute(
+        "insert into public.portal_signed_contracts "
+        "(approval_id, proposal_id, pdf, pdf_sha256, built_at) values (%s,%s,%s,%s,%s) "
+        "on conflict (approval_id) do update set pdf = excluded.pdf, "
+        "pdf_sha256 = excluded.pdf_sha256, built_at = excluded.built_at",
+        (approval_id, proposal_id, pdf, pdf_sha256, built_at),
+    )
+
+
+def get_signed_contract(proposal_id: str) -> Optional[dict[str, Any]]:
+    """The signed contract for this proposal, built or not.
+
+    `built_at desc nulls last` so a REVISED-then-re-signed proposal serves the contract that was
+    actually built, and an unbuilt row never shadows a built one."""
+    return q1(
+        "select approval_id, proposal_id, pdf, pdf_sha256, built_at "
+        "from public.portal_signed_contracts where proposal_id = %s "
+        "order by built_at desc nulls last, approval_id desc limit 1",
+        (proposal_id,),
     )
 
 

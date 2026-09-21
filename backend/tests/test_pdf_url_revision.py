@@ -248,3 +248,55 @@ def test_the_server_ignores_the_clients_rev():
     assert 'p.get("current_revision_no")' in body
     assert 'query_params' not in body and '"rev"' not in body, (
         "api_pdf started reading the client's rev — it must only ever bust the cache")
+# ── the Read-the-Terms button opens the document AT the terms ────────────────
+@needs_node
+def test_pressing_read_the_terms_opens_the_proposal_at_them(ran):
+    """Hanz, 2026-09-22: "for the portal plase create a button I have read the terms and
+    conditions". The consent sentence says the customer has reviewed the Terms; this is what
+    lets them.
+
+    PRESSED, NOT READ. The failure this guards is silent: the popup opens on page 1, the
+    customer skims the pricing they have already seen, and confirms they have read terms they
+    never reached. A markup assertion cannot tell that from a working button.
+
+    The page number comes from app.js's own TERMS_HASH, lifted rather than restated, so moving
+    the terms in the template is a one-line change that this test follows."""
+    r = ran["terms"]
+    assert r["termsHash"].startswith("#page="), (
+        "TERMS_HASH no longer selects a page, so the button opens the document at the top")
+    assert r["firstSrc"] == ["/api/portal/tok-123/pdf?rev=2" + r["termsHash"]], (
+        "the popup frame was not pointed at the terms: %r" % (r["firstSrc"],))
+    assert r["shown"] == ["pdf-modal", "pdf-scrim"], (
+        "the popup did not open, so the frame was re-pointed behind a closed modal")
+
+
+@needs_node
+def test_pressing_it_again_takes_the_customer_back_to_the_terms(ran):
+    """WHY THE RE-POINT EXISTS. mountPdf keeps ONE iframe for the life of the page -- deliberate,
+    because the upstream render is a full docx + LibreOffice pass -- and a mounted frame keeps
+    its scroll position. Without the re-point a second press reopens wherever the customer last
+    scrolled to, which is the one place they are certain to have already read.
+
+    The fixture scrolls it away to #page=1 between the presses, so this cannot pass by the frame
+    simply never having moved."""
+    r = ran["termsTwice"]
+    assert r["after"] == ["/api/portal/tok-123/pdf?rev=2" + r["termsHash"]], (
+        "the second press left the frame where the customer had scrolled it: %r" % (r["after"],))
+    assert r["frameCount"] == ran["terms"]["frameCount"], (
+        "the second press mounted another iframe instead of re-pointing the one that exists; "
+        "two frames means two LibreOffice renders of the same document")
+
+
+@needs_node
+def test_with_no_document_the_button_opens_nothing_at_all(ran):
+    """The refusal comes from openPdfModal, which this path goes through -- NOT from a check in
+    openTermsInProposal, which would be a second copy of the same condition. That is asserted
+    rather than assumed: a duplicate guard was written here first and deleting it left every test
+    green, which is what proved it dead.
+
+    The button is also hidden in this case (test_signing_ui_js covers that). This is the layer
+    under it, because an empty popup over a proposal is the customer's evidence that the portal
+    is broken, and they call instead of approving."""
+    r = ran["termsNoPdf"]
+    assert r["firstSrc"] == [], "a frame was mounted for a proposal with no PDF"
+    assert r["shown"] == [], "the popup opened with nothing in it"

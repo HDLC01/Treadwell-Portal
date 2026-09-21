@@ -28,6 +28,13 @@ function fn(name) {
   throw new Error("unbalanced braces reading " + name);
 }
 
+/** Lift a top-level `const NAME = ...;` so a literal cannot be restated here. */
+function grabConst(name) {
+  const m = new RegExp("\\nconst " + name + "\\s*=[^;]*;").exec(src);
+  if (!m) throw new Error(name + " is gone from app.js -- rewrite this harness, don't delete it");
+  return m[0];
+}
+
 /** Run the three mount sites against one STATE and collect every src they set.
  *
  *  `mounted` seeds the once-only latches, so the harness can also ask the question that matters
@@ -126,6 +133,69 @@ function resend(opts) {
   return out;
 }
 
+/** THE READ-THE-TERMS BUTTON, PRESSED. Not "does the markup contain a button" -- pressed, with
+ *  the frame's src read back, because the thing that can go wrong is silent: the popup opens on
+ *  page 1 and the customer never sees the terms they are about to confirm they have read.
+ *
+ *  `pressTwice` is the case the re-point exists for. mountPdf keeps ONE iframe for the life of
+ *  the page, so a second press with no re-point reopens wherever the customer last scrolled. */
+function terms(opts) {
+  const o = opts || {};
+  const frames = [];
+  const mkFrame = () => {
+    const f = { className: "", title: "", src: "", removed: false,
+                setAttribute() {}, addEventListener() {}, remove() { this.removed = true; } };
+    frames.push(f);
+    return f;
+  };
+  const wraps = {};
+  const wrap = (id) => (wraps[id] = wraps[id] || {
+    id, _kids: [],
+    appendChild(f) { this._kids.push(f); },
+    querySelectorAll: () => wraps[id]._kids.filter((f) => !f.removed),
+    remove() {}, classList: { add() {}, remove() {}, contains: () => false },
+  });
+  const shown = [];
+  const nodes = {};
+  const el = (id) => (id.endsWith("-wrap") ? wrap(id)
+    : (nodes[id] = nodes[id] || { id, href: "", textContent: "", remove() {},
+        querySelectorAll: () => [],
+        classList: { add() {}, remove() {}, contains: () => false } }));
+  const doc = { createElement: mkFrame, body: { style: {} } };
+
+  const scope = new Function(
+    "STATE", "TOKEN", "$", "document", "setEligible", "show", "hide", "PRESS_TWICE",
+    `let PDF_MOUNTED = false, INLINE_PDF_MOUNTED = false;
+     ${fn("pdfUrl")}
+     ${fn("renderPdf")}
+     ${fn("mountPdf")}
+     ${fn("mountInlinePdf")}
+     ${fn("resetPdfMounts")}
+     ${grabConst("TERMS_HASH")}
+     ${fn("openPdfModal")}
+     ${fn("openTermsInProposal")}
+     renderPdf(STATE.has_pdf);
+     openTermsInProposal();
+     const firstSrc = $("pdf-frame-wrap").querySelectorAll("iframe").map((f) => f.src);
+     if (PRESS_TWICE) {
+       // …the customer scrolls away, closes, and presses it again.
+       const f = $("pdf-frame-wrap").querySelectorAll("iframe")[0];
+       if (f) f.src = "/api/portal/tok-123/pdf?rev=2#page=1";
+       openTermsInProposal();
+     }
+     return { firstSrc, termsHash: TERMS_HASH,
+              after: $("pdf-frame-wrap").querySelectorAll("iframe").map((f) => f.src) };`);
+
+  const out = scope(
+    { has_pdf: o.has_pdf === undefined ? true : o.has_pdf, revision_no: o.rev || 2 },
+    "tok-123", el, doc, () => {},
+    (x) => { if (x && x.id) shown.push(x.id); },
+    () => {}, !!o.pressTwice);
+  out.shown = shown;
+  out.frameCount = frames.length;
+  return out;
+}
+
 const out = {};
 
 // A pinned revision — the normal case once staff have sent anything.
@@ -154,5 +224,13 @@ out.resendOpen = resend({ rev: 2, modalOpen: true });
 out.paramNames = Object.keys(out.rev2)
   .filter((k) => typeof out.rev2[k] === "string")
   .map((k) => (out.rev2[k].split("?")[1] || "").split("#")[0]);
+
+// ── the Read-the-Terms button ────────────────────────────────────────────────
+out.terms = terms({ rev: 2 });
+// Pressed a second time after the customer scrolled away: the re-point has to take it back.
+out.termsTwice = terms({ rev: 2, pressTwice: true });
+// No document to open. The button is hidden in that case (see the approve-card harness), and
+// the handler must refuse rather than open an empty popup if it is ever reached anyway.
+out.termsNoPdf = terms({ has_pdf: false });
 
 console.log(JSON.stringify(out));

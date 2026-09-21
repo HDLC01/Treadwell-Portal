@@ -212,17 +212,54 @@
         <div class="card" id="approve-card">
           <h2>Approve this proposal</h2>
           <div id="approve-alert" role="alert" aria-live="polite"></div>
+          <!-- Budget Pricing carries no Terms and Conditions, so it cannot be e-signed. The
+               server decides that and says why in prose (view.signing.blocked_reason); this
+               renders that sentence unchanged, so one refusal has exactly one wording. -->
+          <div id="signing-blocked" class="alert info hidden"></div>
           <form id="approve-form" class="stack" novalidate>
             <div class="field">
-              <label for="ap-name">Full name <span class="req">*</span></label>
+              <label for="ap-name">Signature &mdash; type your full legal name <span class="req">*</span></label>
               <input id="ap-name" type="text" autocomplete="name" required>
+              <!-- A rendering of what is in the input above, never a second value: what gets
+                   recorded, and what the certificate quotes, is #ap-name. aria-hidden so a
+                   screen reader is not read the same name twice. -->
+              <div class="sig-preview" id="sig-preview" aria-hidden="true">
+                <span class="sig-hint" id="sig-hint">Your signature appears here as you type</span><span class="sig-ink" id="sig-ink"></span>
+              </div>
             </div>
             <div class="field">
               <label for="ap-title">Title</label>
               <input id="ap-title" type="text" autocomplete="organization-title">
             </div>
-            <p class="small muted">By approving, you confirm acceptance of the option(s) selected above and their combined total. Date is recorded automatically.</p>
+            <!-- THE CONSENT SENTENCE IS NEVER WRITTEN IN THIS FILE. It is served by the API
+                 (view.signing.consent_text) and put here by app.js, because the signature
+                 certificate quotes that string verbatim: a second copy in the markup becomes a
+                 second sentence the first time either one is edited, and the legal record would
+                 then quote wording this customer never read. -->
+            <!-- READ IT BEFORE YOU CONFIRM IT. The consent sentence says the customer has
+                 reviewed the Terms and Conditions, and until this button existed the portal never
+                 put them in front of anybody: they are their own pages of the proposal document,
+                 reachable only by opening the PDF and scrolling past the pricing.
+
+                 Hanz, 2026-09-22: "for the portal plase create a button I have read the terms and
+                 conditions". Presenting the terms is also the half that makes a clickwrap consent
+                 hold up -- an unread statement is the first thing a dispute attacks -- so this is
+                 evidence, not decoration.
+
+                 IT OPENS THE PROPOSAL, not a second copy of the wording. The signed contract
+                 attaches those same pages, so a copy kept here would be a second source that
+                 drifts from the document the customer is bound by the first time either changes. -->
+            <button class="btn read-terms hidden" type="button" id="read-terms">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>Read the Terms and Conditions</button>
+            <label class="consent hidden" id="consent-row">
+              <input type="checkbox" id="ap-consent">
+              <span class="consent-text" id="consent-text"></span>
+            </label>
+            <p class="small muted" id="approve-plain-note">By approving, you confirm acceptance of the option(s) selected above and their combined total. Date is recorded automatically.</p>
             <button class="btn btn-primary btn-block" type="submit" id="approve-btn">Approve proposal</button>
+            <!-- Why the button is not pressable yet. A disabled control with no reason beside it
+                 is how a customer decides the page is broken and calls instead. -->
+            <p class="help center hidden" id="ap-gate-hint" role="status"></p>
           </form>
         </div>
 

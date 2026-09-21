@@ -633,3 +633,68 @@ alter table public.portal_proposals add column if not exists deleted_at timestam
 -- rows that query wants and a deleted project costs it nothing.
 create index if not exists portal_proposals_live_idx
   on public.portal_proposals (created_at desc) where deleted_at is null;
+
+-- == E-signature: the approval IS the signed contract (2026-09-18) ============================
+--
+-- Kyle wants an approval to produce a real signed document rather than a row and an email that
+-- names a total. Typed name plus recorded consent, on the federal ESIGN Act (15 U.S.C. 7001) and
+-- the Kansas UETA (K.S.A. 16-1601 et seq.); neither needs a drawn signature. See backend/signing.py.
+--
+-- FIVE COLUMNS ON THE EXISTING APPROVAL ROW, not a new table, because every one of them is a fact
+-- ABOUT that approval and there is exactly one approval per signature. portal_approvals already
+-- carries the name, title, date, total and IP; what was missing is which consent wording they
+-- agreed to, what browser said so, and fingerprints of the two things they were agreeing to.
+--
+-- ALL NULLABLE. Every approval taken before today has none of this and must keep reading back
+-- exactly as it did -- a NOT NULL here would either refuse the migration or invent a consent
+-- version for customers who were never shown one.
+alter table public.portal_approvals
+  add column if not exists consent_version text;
+alter table public.portal_approvals
+  add column if not exists user_agent text;
+-- Which revision of the proposal was on screen. portal_proposals.current_revision_no moves on a
+-- re-send, so reading it later would report the CURRENT document rather than the signed one.
+alter table public.portal_approvals
+  add column if not exists revision_no int;
+-- sha256 of the canonical JSON of the pinned draft blob: the prices, options and scope as sent.
+alter table public.portal_approvals
+  add column if not exists revision_sha256 text;
+-- sha256 of the proposal PDF bytes the customer actually had open. Named contract_sha256 rather
+-- than proposal_pdf_sha256 because it is the input document the certificate attests to.
+alter table public.portal_approvals
+  add column if not exists contract_sha256 text;
+
+-- The built document. A SEPARATE TABLE, not a bytea column on portal_approvals, because a
+-- multi-megabyte blob on a row that `select *` reads on every staff pipeline poll would drag the
+-- whole board across the wire. Nothing selects from here except the two download endpoints.
+--
+-- Keyed on approval_id: one signed contract per signature, so the primary key IS the relationship
+-- and a second build overwrites rather than accumulating. proposal_id is carried as well so the
+-- staff/admin endpoint can find it by project without joining back through the approval.
+--
+-- pdf and built_at are NULLABLE ON PURPOSE. The customer's approval must succeed even when the
+-- proposal tool is down or slow, so the row is written unbuilt and the download endpoints build it
+-- on first read (main.py _signed_contract_pdf). NULL here means "not built yet", never "failed
+-- forever" -- there is no state in which an approval waits on a PDF renderer.
+create table if not exists public.portal_signed_contracts (
+  approval_id  bigint primary key references public.portal_approvals(id) on delete cascade,
+  proposal_id  text not null references public.portal_proposals(proposal_id) on delete cascade,
+  pdf          bytea,
+  pdf_sha256   text,
+  built_at     timestamptz
+);
+-- The customer's download reads by proposal, not by approval id.
+create index if not exists portal_signed_contracts_proposal_idx
+  on public.portal_signed_contracts (proposal_id);
+-- Same posture as every other portal_* table: owners bypass RLS (local/staging), prod's
+-- least-privilege portal_app is admitted by an explicit policy in security_prod.sql.
+alter table public.portal_signed_contracts enable row level security;
+-- Grant AND policy, together -- the fourth time this file has had to say so, and the guard in
+-- test_portal_shell_and_feedback.py caught this one before it shipped. RLS on with neither reads
+-- as "locked down" and is broken on PROD only, where the portal connects as portal_app and does
+-- not bypass RLS: every signed contract would silently fail to store, so every download would
+-- rebuild from scratch through LibreOffice, while staging on a broad role looked perfect.
+grant select, insert, update, delete on public.portal_signed_contracts to portal_app;
+drop policy if exists portal_app_rw on public.portal_signed_contracts;
+create policy portal_app_rw on public.portal_signed_contracts
+  for all to portal_app using (true) with check (true);

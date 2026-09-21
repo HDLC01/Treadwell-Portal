@@ -237,8 +237,12 @@ def _row(**over):
 
 
 def _approve(client):
+    # `consent` joined the body on 2026-09-18: an approval IS the signature now, and
+    # api_approve refuses one without an affirmative tick (see test_signed_contract.py, which
+    # owns that rule). Sent here so these tests keep asking their own question -- whether a
+    # closed-lost job can be re-signed -- rather than failing at a gate they are not about.
     return client.post("/api/portal/tok/approve",
-                       json={"name": "Dana Reed", "title": "Owner",
+                       json={"name": "Dana Reed", "title": "Owner", "consent": True,
                              "option_labels": ["Base bid"], "date": "2026-08-10"})
 
 
