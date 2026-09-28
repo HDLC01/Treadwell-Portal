@@ -2252,9 +2252,17 @@ async def api_inbound_resend(request: Request):
     # privileged path here and roster membership alone isn't enough — a From header
     # is forgeable. Require the receiving MTA's SPF+DKIM verdict too. Failing closed
     # just sends the message through the roster forward instead.
-    if is_staff and not inbound.sender_authenticated(full.get("headers")):
-        log.warning("inbound: %r is on the roster but SPF/DKIM did not both pass — "
-                    "refusing the staff path for proposal %s", from_email, pid)
+    #
+    # Security audit, 2026-09-28: the verdict must be a DMARC pass for the From domain in the header
+    # our receiving server wrote (inbound.sender_authenticated), and INBOUND_STAFF_EMAIL_POSTS can
+    # switch the path off altogether (config.py says when to).
+    if is_staff and not config.INBOUND_STAFF_EMAIL_POSTS:
+        log.info("inbound: staff email from %r for proposal %s — forwarded to the roster "
+                 "(staff email posting is off)", from_email, pid)
+        is_staff = False
+    if is_staff and not inbound.sender_authenticated(full.get("headers"), from_email):
+        log.warning("inbound: %r is on the roster but the receiving server did not verify its "
+                    "domain — refusing the staff path for proposal %s", from_email, pid)
         is_staff = False
     if is_staff:
         if auto:
@@ -2278,7 +2286,13 @@ async def api_inbound_resend(request: Request):
 
     # A sender-matched proposal is verified by construction — that match WAS the
     # sender's address appearing on exactly one proposal.
-    verified = bool(from_email) and (from_email in authorized or matched_by == "sender")
+    #
+    # Except that a SENDER match is chosen by the From address alone, which anyone can write. So it
+    # posts as the customer only when the receiving server verified that the mail really comes from
+    # that address's domain (security audit, 2026-09-28). An unverified one is still forwarded to
+    # staff below, marked as unverified; it just never appears in the thread as the customer.
+    sender_ok = matched_by != "sender" or inbound.sender_authenticated(full.get("headers"), from_email)
+    verified = bool(from_email) and sender_ok and (from_email in authorized or matched_by == "sender")
 
     if verified:
         db.add_message(pid, "customer", from_email, body_txt, msg_type="text", meta=meta)
