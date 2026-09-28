@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import re
 import time
 from email.utils import parseaddr
@@ -138,27 +139,59 @@ def find_thread_token(headers) -> str | None:
     return None
 
 
-_SPF_PASS = re.compile(r"\bspf\s*=\s*pass\b", re.IGNORECASE)
-_DKIM_PASS = re.compile(r"\bdkim\s*=\s*pass\b", re.IGNORECASE)
+# The server that receives our mail. Resend receives through Amazon SES, which puts its verdict on
+# every message as the TOP `Authentication-Results` header, e.g. (read off live mail, 2026-09-28):
+#   amazonses.com; spf=pass (...) ...; dkim=pass header.i=@usd232.org; dmarc=pass header.from=usd232.org;
+RECEIVER_AUTHSERV_ID = "amazonses.com"
+_DMARC_PASS_FROM = re.compile(r"\bdmarc\s*=\s*pass\b[^;]*?\bheader\.from\s*=\s*([^\s;]+)", re.IGNORECASE)
 
 
-def sender_authenticated(headers) -> bool:
-    """True when the receiving MTA verified BOTH SPF and DKIM for this message.
+def _receiver_verdict(headers) -> str:
+    """The `Authentication-Results` header OUR receiving server added, or "".
 
-    Resend's inbound payload carries an `authentication-results` header from SES.
-    A From address is trivially forgeable and the svix signature only proves the
-    webhook came from Resend — this is the one signal that says the sending domain
-    actually authorised the message. Used to gate the privileged path where an
-    inbound email may speak AS Treadwell to a customer.
+    Only the top one counts. Anyone can write their own `Authentication-Results` (or ARC) header
+    into a message before sending it, and those arrive BELOW the one the receiving server prepends.
+    So the first value is read, and only when it names SES as the server that wrote it. ARC results
+    are another hop's claim and are never read here. Resend sometimes hands several same-name headers
+    over as one JSON-array string; that is unpacked, first entry first."""
+    values: list[str] = []
+    for v in _header_values(headers, "authentication-results"):
+        s = (v or "").strip()
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                values.extend(str(x) for x in parsed if isinstance(x, (str, int, float)))
+                continue
+        values.append(s)
+    if not values:
+        return ""
+    top = values[0].strip()
+    return top if top.split(";", 1)[0].strip().lower() == RECEIVER_AUTHSERV_ID else ""
 
-    Absent or unparseable header → False. Failing closed only costs a staff reply
-    a trip through the roster forward; failing open would let a forged From post
-    to a customer's thread."""
-    for value in _header_values(headers, "authentication-results",
-                               "arc-authentication-results"):
-        if _SPF_PASS.search(value) and _DKIM_PASS.search(value):
-            return True
-    return False
+
+def sender_authenticated(headers, from_email=None) -> bool:
+    """True only when the receiving server says this message really comes from the domain in its
+    From address: a DMARC pass for exactly that domain, in the header SES itself wrote.
+
+    Security audit, 2026-09-28. This used to accept any `Authentication-Results` or ARC header that
+    contained "spf=pass" and "dkim=pass" -- a header the sender can write themselves, and a pass
+    that could be for ANY domain. That let a forged "From: <staff address>" speak as Treadwell in a
+    customer's thread. DMARC pass means SPF or DKIM passed for the From domain itself (aligned).
+
+    Absent, forged-looking or unparseable → False. Failing closed costs a message a trip through the
+    roster forward; failing open would let a forged From post into a customer's thread."""
+    top = _receiver_verdict(headers)
+    if not top:
+        return False
+    addr = (parseaddr(str(from_email or ""))[1] or str(from_email or "")).strip().lower()
+    domain = addr.rpartition("@")[2].strip().rstrip(".")
+    if "@" not in addr or not domain:
+        return False
+    return any(m.group(1).strip().lower().rstrip(".") == domain
+               for m in _DMARC_PASS_FROM.finditer(top))
 
 
 def is_own_address(from_email: str, own_from: str, domains) -> bool:

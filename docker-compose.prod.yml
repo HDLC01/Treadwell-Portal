@@ -55,6 +55,11 @@ services:
       # this Resend account and receives the same events, so keeping it off there is
       # what stops staging acting on a production customer's email.
       INBOUND_SENDER_FALLBACK: "true"
+      # Staff reply-by-email posting AS TREADWELL to the customer (config.py INBOUND_STAFF_EMAIL_POSTS).
+      # OFF since 2026-09-28 (Hanz): wetreadwell.com's SPF still authorises the hacked WordPress host,
+      # so a forged staff reply could pass as us. Staff reply from the portal; an emailed staff reply
+      # is forwarded to the roster instead. Turn back on once SPF/DKIM are fixed.
+      INBOUND_STAFF_EMAIL_POSTS: "false"
     networks:
       - shared
 

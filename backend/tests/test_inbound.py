@@ -268,10 +268,17 @@ def test_reply_to_is_one_clean_address_when_configured(monkeypatch):
 
 
 # ── SPF/DKIM verdict, used to gate the privileged staff path ─────────────────
-def test_sender_authenticated_requires_both_spf_and_dkim():
-    assert inbound.sender_authenticated({"authentication-results": REAL_AUTH}) is True
-    assert inbound.sender_authenticated({"authentication-results": "spf=pass; dkim=fail"}) is False
-    assert inbound.sender_authenticated({"authentication-results": "spf=softfail; dkim=pass"}) is False
+def test_sender_authenticated_requires_our_receivers_dmarc_pass_for_the_from_domain():
+    real = REAL_AUTH + "; dmarc=pass header.from=wetreadwell.com;"
+    assert inbound.sender_authenticated({"authentication-results": real}, "hanz@wetreadwell.com") is True
+    assert inbound.sender_authenticated({"authentication-results": real}, "Hanz <HANZ@WeTreadwell.com>") is True
+    # A pass for OUR domain says nothing about a message From someone else.
+    assert inbound.sender_authenticated({"authentication-results": real}, "x@example.com") is False
+    # SPF and DKIM passing, with no DMARC verdict for the From domain, is not enough any more.
+    assert inbound.sender_authenticated({"authentication-results": REAL_AUTH}, "hanz@wetreadwell.com") is False
+    no_server = "spf=pass; dkim=pass; dmarc=pass header.from=wetreadwell.com"
+    assert inbound.sender_authenticated({"authentication-results": no_server}, "hanz@wetreadwell.com") is False
+    assert inbound.sender_authenticated({"authentication-results": real}, None) is False
     # Absent or unreadable → False. Failing closed only costs a staff reply a trip
     # through the roster forward; failing open would let a forged From post as us.
     assert inbound.sender_authenticated({}) is False

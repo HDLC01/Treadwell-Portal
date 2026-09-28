@@ -111,6 +111,15 @@ INBOUND_REPLY_ADDRESS = _env("INBOUND_REPLY_ADDRESS", "")
 # forwarding a production customer's email.
 INBOUND_SENDER_FALLBACK = _env("INBOUND_SENDER_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
 
+# A staff member's email reply posting straight into a customer's thread AS TREADWELL, and being
+# emailed on to the customer (Hanz, 2026-08-11: staff replies by email must reach the customer). It is
+# the one path where an inbound email speaks for Treadwell, so since the 2026-09-28 security audit it
+# needs the receiving server's DMARC pass for wetreadwell.com (inbound.sender_authenticated), and this
+# is its OFF switch: set INBOUND_STAFF_EMAIL_POSTS=false and a staff reply is forwarded to the roster
+# like any unverified message instead. Worth switching off while wetreadwell.com's SPF record still
+# authorises a host we do not control, because mail from that host passes DMARC as us.
+INBOUND_STAFF_EMAIL_POSTS = _env("INBOUND_STAFF_EMAIL_POSTS", "true").strip().lower() in ("1", "true", "yes")
+
 # ── Proposal follow-up automation ─────────────────────────────────────────────
 # The cadence that chases sent proposals (followup_rules / followup_worker). The
 # worker re-reads BOTH of these from the environment on every tick, so production

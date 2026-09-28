@@ -71,6 +71,11 @@ services:
       # Token-addressed replies are unaffected and still work here: staging mints
       # and resolves its own tokens on the branded domain, prod resolves its own.
       INBOUND_SENDER_FALLBACK: "false"
+      # Staff reply-by-email posting AS TREADWELL to the customer (config.py INBOUND_STAFF_EMAIL_POSTS).
+      # OFF since 2026-09-28 (Hanz): wetreadwell.com's SPF still authorises the hacked WordPress host,
+      # so a forged staff reply could pass as us. Staff reply from the portal; an emailed staff reply
+      # is forwarded to the roster instead. Turn back on once SPF/DKIM are fixed.
+      INBOUND_STAFF_EMAIL_POSTS: "false"
     networks:
       - shared
 

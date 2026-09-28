@@ -6,6 +6,8 @@ what an arriving email BECOMES: a customer message, a staff reply relayed to the
 customer, a forward to the roster, or nothing. Signature verification is stubbed
 (it has its own tests) so each case is only about routing.
 """
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -17,6 +19,14 @@ TOKEN = "tokABC123"
 PID = "pid-0001"
 CUSTOMER = "customer@example.com"
 STAFF = "kyle@wetreadwell.com"
+
+
+def ses(domain, dmarc="pass"):
+    """The verdict SES really puts on the top of an inbound message (format read off live mail)."""
+    return (f"amazonses.com; spf=pass (spfCheck: domain of {domain} designates 1.2.3.4 as permitted "
+            f"sender) client-ip=1.2.3.4; envelope-from=x@{domain}; dkim=pass header.i=@{domain}; "
+            f"dmarc={dmarc} header.from={domain};")
+
 
 PROPOSAL = {"proposal_id": PID, "token": TOKEN, "project_name": "Test Project",
             "customer_email": CUSTOMER}
@@ -68,8 +78,7 @@ def env(monkeypatch):
     # A real inbound payload carries an SPF/DKIM verdict from the receiving MTA;
     # the staff path is gated on it, so the default fixture supplies a passing one.
     # Tests that care about spoofing override calls["headers"].
-    calls["headers"] = {"authentication-results":
-                        "amazonses.com; spf=pass; dkim=pass header.i=@wetreadwell.com"}
+    calls["headers"] = {"authentication-results": ses("example.com")}
 
     def fake_get(url, headers=None, timeout=None):
         class R:
@@ -125,7 +134,10 @@ def test_unverified_sender_is_forwarded_but_never_posted(env):
 
 
 # ── staff replies by email (the new path) ────────────────────────────────────
-def test_staff_reply_posts_as_staff_and_notifies_the_customer(env):
+def test_staff_reply_posts_as_staff_and_notifies_the_customer(env, monkeypatch):
+    """Only with the path switched on (INBOUND_STAFF_EMAIL_POSTS) and a verified wetreadwell.com."""
+    monkeypatch.setattr(config, "INBOUND_STAFF_EMAIL_POSTS", True)
+    env["headers"] = {"authentication-results": ses("wetreadwell.com")}
     r = post(env, [f"{TOKEN}@{PRIMARY}"], f"Kyle Loseke <{STAFF}>")
     assert r.json()["staff"] is True
     (msg,) = env["messages"]
@@ -138,17 +150,20 @@ def test_staff_reply_posts_as_staff_and_notifies_the_customer(env):
     assert env["sends"] == []
 
 
-def test_staff_membership_is_case_insensitive_via_roster(env):
+def test_staff_membership_is_case_insensitive_via_roster(env, monkeypatch):
+    monkeypatch.setattr(config, "INBOUND_STAFF_EMAIL_POSTS", True)
+    env["headers"] = {"authentication-results": ses("wetreadwell.com")}
     r = post(env, [f"{TOKEN}@{PRIMARY}"], "KYLE@WeTreadwell.com")
     assert r.json()["staff"] is True
     assert env["messages"][0]["args"][1] == "staff"
 
 
-def test_forged_staff_from_cannot_speak_as_treadwell(env):
+def test_forged_staff_from_cannot_speak_as_treadwell(env, monkeypatch):
     """Roster membership alone must not grant the privileged path — a From header is
     forgeable and svix only proves the webhook came from Resend. Without a passing
     SPF/DKIM verdict the message is demoted, never posted as Treadwell."""
-    env["headers"] = {"authentication-results": "amazonses.com; spf=fail; dkim=fail"}
+    monkeypatch.setattr(config, "INBOUND_STAFF_EMAIL_POSTS", True)
+    env["headers"] = {"authentication-results": ses("wetreadwell.com", dmarc="fail")}
     r = post(env, [f"{TOKEN}@{PRIMARY}"], STAFF)
     assert "staff" not in r.json()
     # Not posted as Treadwell, and the customer was never emailed on its behalf.
@@ -159,9 +174,10 @@ def test_forged_staff_from_cannot_speak_as_treadwell(env):
     assert "UNVERIFIED SENDER" in fwd["html"]
 
 
-def test_missing_auth_verdict_also_demotes_staff(env):
+def test_missing_auth_verdict_also_demotes_staff(env, monkeypatch):
     """Absent header → fail closed. The cost is a roster forward; the alternative
     is letting a forged From post into a customer's thread."""
+    monkeypatch.setattr(config, "INBOUND_STAFF_EMAIL_POSTS", True)
     env["headers"] = None
     r = post(env, [f"{TOKEN}@{PRIMARY}"], STAFF)
     assert "staff" not in r.json()
@@ -202,7 +218,7 @@ def test_clean_address_with_no_thread_header_falls_back_to_sender(env, monkeypat
     import main
     monkeypatch.setattr(main.db, "list_proposals_by_email",
                         lambda e: [dict(PROPOSAL)] if e == CUSTOMER else [])
-    env["headers"] = {"authentication-results": "spf=pass; dkim=pass"}
+    env["headers"] = {"authentication-results": ses("example.com")}
     r = post(env, [f"proposals@{PRIMARY}"], CUSTOMER)
     assert r.json()["verified"] is True
     assert env["messages"][0]["args"][1] == "customer"
@@ -320,3 +336,63 @@ def test_not_configured_without_a_signing_secret(env, monkeypatch):
     monkeypatch.setattr(config, "RESEND_WEBHOOK_SECRET", "")
     r = post(env, [f"{TOKEN}@{PRIMARY}"], CUSTOMER)
     assert r.status_code == 503
+
+
+# -- security audit, 2026-09-28: a forged sender cannot speak for anyone ---------------------------
+def test_staff_email_is_forwarded_not_posted_while_the_path_is_off(env, monkeypatch):
+    """The off switch. Even a fully verified staff email is then not posted as Treadwell nor emailed
+    to the customer: it goes to the roster like any other message.
+
+    Mutation: ignore INBOUND_STAFF_EMAIL_POSTS -- the customer is emailed."""
+    monkeypatch.setattr(config, "INBOUND_STAFF_EMAIL_POSTS", False)
+    env["headers"] = {"authentication-results": ses("wetreadwell.com")}
+    r = post(env, [f"{TOKEN}@{PRIMARY}"], STAFF)
+    assert "staff" not in r.json()
+    assert env["reply_notifications"] == []
+    assert [m for m in env["messages"] if m["args"][1] == "staff"] == []
+    assert len(env["sends"]) == 1
+
+
+FAIL_TOP = ses("wetreadwell.com", dmarc="fail")
+FORGED = [
+    ("a pass header the sender wrote, below the real one",
+     {"authentication-results": [FAIL_TOP, ses("wetreadwell.com")]}),
+    ("the same, handed over as a JSON-array string",
+     {"authentication-results": json.dumps([FAIL_TOP, ses("wetreadwell.com")])}),
+    ("an ARC header that even claims to be from SES", {"arc-authentication-results": ses("wetreadwell.com")}),
+    ("a pass only in an ARC header", {"arc-authentication-results":
+     "i=1; mx.microsoft.com 1; spf=pass; dmarc=pass header.from=wetreadwell.com; dkim=pass"}),
+    ("a pass written by some other server", {"authentication-results":
+     "mx.attacker.example; spf=pass; dkim=pass; dmarc=pass header.from=wetreadwell.com"}),
+    ("SPF and DKIM pass, but for a different domain", {"authentication-results":
+     "amazonses.com; spf=pass; dkim=pass header.i=@attacker.example; dmarc=pass header.from=attacker.example"}),
+]
+
+
+@pytest.mark.parametrize("why, headers", FORGED)
+def test_a_forged_verdict_never_opens_the_staff_path(env, monkeypatch, why, headers):
+    """Every way the old check could be satisfied without the mail really coming from us.
+
+    Mutation: read every Authentication-Results/ARC value (the old check) -- the first rows post
+    as staff."""
+    monkeypatch.setattr(config, "INBOUND_STAFF_EMAIL_POSTS", True)
+    env["headers"] = headers
+    r = post(env, [f"{TOKEN}@{PRIMARY}"], STAFF)
+    assert "staff" not in r.json(), why
+    assert env["reply_notifications"] == [], why
+
+
+def test_a_forged_customer_from_is_not_posted_by_a_sender_match(env, monkeypatch):
+    """A sender match picks the proposal by the From address alone. Without the receiving server
+    verifying the customer's domain, it is forwarded to staff as unverified, never posted as them.
+
+    Mutation: drop sender_ok from `verified` -- the forged message lands in the thread."""
+    import main
+    monkeypatch.setattr(main.db, "list_proposals_by_email",
+                        lambda e: [dict(PROPOSAL)] if e == CUSTOMER else [])
+    env["headers"] = {"authentication-results": ses("example.com", dmarc="fail")}
+    r = post(env, [f"proposals@{PRIMARY}"], CUSTOMER)
+    assert r.json()["verified"] is False
+    assert env["messages"] == []
+    (fwd,) = env["sends"]
+    assert "UNVERIFIED SENDER" in fwd["html"]

@@ -36,7 +36,11 @@ CUSTOMER = "customer@example.com"
 SECOND = "partner@example.com"
 STAFF = "kyle@wetreadwell.com"
 ADDED = "rj@wetreadwell.com"            # on THIS project only, via a notify override
-PASSING_AUTH = "amazonses.com; spf=pass; dkim=pass header.i=@wetreadwell.com"
+# The verdict SES puts on a real staff reply from Google Workspace: SPF passes for Google's servers
+# with a wetreadwell.com envelope, so DMARC passes for wetreadwell.com (inbound.sender_authenticated).
+PASSING_AUTH = ("amazonses.com; spf=pass (spfCheck: domain of wetreadwell.com designates 209.85.218.52 "
+                "as permitted sender) envelope-from=hanz@wetreadwell.com; dkim=pass header.i=@wetreadwell.com; "
+                "dmarc=pass header.from=wetreadwell.com;")
 
 PROPOSAL = {"proposal_id": PID, "token": TOKEN, "project_name": "Test Project",
             "customer_email": CUSTOMER}
