@@ -255,6 +255,16 @@ def test_the_read_survives_a_database_without_the_column_but_the_write_does_not(
     assert "submitted_by" in inspect.getsource(db.add_deposit)
 
 
+def test_routing_masked_is_read_safely_but_written_by_name_so_the_column_ships_first():
+    """The same asymmetry for routing_masked (bank numbers encrypted at rest, 2026-09-29). The drawer's
+    SELECT reads it through to_jsonb, so it survives a database without the column; add_deposit's
+    INSERT names it, and add_deposit records EVERY deposit, ACH and cheque. So on each database run
+    `alter table public.portal_deposits add column if not exists routing_masked text;` BEFORE this
+    portal code deploys to it, or every deposit submission fails."""
+    assert "to_jsonb(d) ->> 'routing_masked'" in inspect.getsource(db.list_deposits)
+    assert "routing_masked" in inspect.getsource(db.add_deposit)
+
+
 def test_the_customer_sees_a_first_name_and_never_an_address():
     """Same rule as the chat thread. The deposit banner is the other place a peer's address could
     reach a customer."""
