@@ -1,6 +1,6 @@
 """The public repo must not publish how to reach the server.
 
-The repos stay public (Hanz, 2026-09-28). An address, a login name or a key filename in a
+The repos stay public (Hanz, 2026-09-28). An address, a login, a port or a key filename in a
 committed file hands anyone scanning GitHub the box and the account to try. Those details live
 in the owner's SSH config under the alias `treadwell-vps`, and `deploy/ship.sh` and
 `deploy/ship-prod.sh` point at the alias. Git history still holds the old values; these tests
@@ -31,6 +31,28 @@ ROOT_LOGIN = re.compile(r"\broot@")
 # A key file under ~/.ssh names the key. `~/.ssh/config` is where the alias lives, so it may be named.
 KEY_PATH = re.compile(r"\.ssh/(?!config\b)[\w.-]+")
 
+# The SSH port and a root login take more shapes than an address. Port 22 is every server's
+# default and gives nothing away, so it may be written (deploy.yml falls back to it).
+SSH_WORD = re.compile(r"\b(?:ssh|scp|sftp|rsync)\b", re.I)
+# Anywhere: `ssh://box:2222`, `VPS_PORT="${VPS_PORT:-2222}"`, "SSH listens on port 2222".
+PORT_ANYWHERE = (
+    re.compile(r"\bssh://[^\s/]*:(\d+)", re.I),
+    re.compile(r"\b(?:SSH|VPS)_PORT\b[^\n]{0,20}?(?:[=:]-?|\|\|)\s*[\"']?(\d+)"),
+    re.compile(r"\bssh\b[^\n]{0,30}?(?<!-)\bport\s*[:=]?\s*(\d+)", re.I),
+)
+# On a line that runs ssh or scp: `-p 2222`, `-P 2222`, `-o Port=2222`. A docker `-p 8888:8888`
+# run over ssh publishes a container port, so a number followed by a colon is not one.
+PORT_FLAG = re.compile(r"(?:^|\s)-(?:[pP]\s*|o\s*Port[=\s]\s*)(\d+)(?![\d:])")
+# In a file about SSH: an ssh_config `Port 2222` line or a deploy action's `port: 2222` key.
+# A shell script's upper-case `PORT=8898` is the app's port, so that spelling is left alone.
+PORT_KEY = re.compile(r"^\s*(?!PORT\b)(?i:port)(?:\s*[:=]\s*[\"']?|\s+)(\d+)[\"']?\s*(?:#.*)?$")
+# A root login without the `@`: `VPS_USER="${VPS_USER:-root}"` anywhere, `ssh -l root` on an ssh
+# line, and in a file about SSH an ssh_config `User root` or a deploy action's `username: root`.
+# A Dockerfile's upper-case `USER root` is the container's user, not a login.
+ROOT_VAR = re.compile(r"\b(?:SSH|VPS)_USER\b[^\n]{0,20}?[=:]-?\s*[\"']?root\b")
+ROOT_FLAG = re.compile(r"(?:^|\s)-l\s*root\b")
+ROOT_KEY = re.compile(r"^\s*(?!USER\b)(?i:user(?:name)?)(?:\s*[:=]\s*[\"']?|\s+)root\b")
+
 
 def _tracked_text_files():
     try:
@@ -46,6 +68,7 @@ def _tracked_text_files():
 
 
 def _findings(rel, text):
+    about_ssh = bool(SSH_WORD.search(text))
     for number, line in enumerate(text.splitlines(), 1):
         for m in IPV4.finditer(line):
             try:
@@ -58,6 +81,17 @@ def _findings(rel, text):
             yield "%s:%d root@ login" % (rel, number)
         if KEY_PATH.search(line):
             yield "%s:%d SSH key file path" % (rel, number)
+        ssh_line = bool(SSH_WORD.search(line))
+        ports = [p for rx in PORT_ANYWHERE for p in rx.findall(line)]
+        if ssh_line:
+            ports += PORT_FLAG.findall(line)
+        if about_ssh:
+            ports += PORT_KEY.findall(line)
+        if any(int(p) != 22 for p in ports):
+            yield "%s:%d SSH port" % (rel, number)
+        if (ROOT_VAR.search(line) or (ssh_line and ROOT_FLAG.search(line))
+                or (about_ssh and ROOT_KEY.search(line))):
+            yield "%s:%d root login" % (rel, number)
 
 
 def test_no_tracked_doc_or_script_says_how_to_reach_the_server():
@@ -84,9 +118,37 @@ def test_the_scan_flags_each_kind_of_detail():
         'VPS_HOST="${VPS_HOST:-8.8.8.8}"',
         'SSH_KEY="$HOME/.ssh/some_key"',
         "fine: 127.0.0.1, 10.0.0.5, 203.0.113.9, v1.2.3.4.5, ~/.ssh/config, ssh treadwell-vps",
+        "ssh -p 2222 treadwell-vps",
+        'VPS_PORT="${VPS_PORT:-2222}"',
+        "ssh -l root -p 2222 treadwell-vps",
+        "scp -P 2222 docker-compose.yml treadwell-vps:/opt/app/",
+        "    Port 2222",
+        "    User root",
+        "          port: 2222",
+        "          username: root",
+        'VPS_USER="${VPS_USER:-root}"',
+        "SSH listens on port 2222 now",
+        "rsync -e 'ssh -o Port=2222' out/ treadwell-vps:",
+        "git remote add vps ssh://git@treadwell-vps:2222/app.git",
+        # Not a detail: port 22, the CI fallback, app and database ports, a container's user.
+        "          port: ${{ secrets.VPS_PORT || '22' }}   # SSH moved off 22 on 2026-09-28",
+        "ssh -p 22 treadwell-vps",
+        'ssh treadwell-vps "docker run -p 8888:8888 app"',
+        'ssh treadwell-vps "uvicorn app --port 8888"',
+        "PORT=8898",
+        "USER root",
+        "ls -l root",
+        "psql -h db -p 5432",
     ])
     assert list(_findings("x.md", text)) == [
-        "x.md:1 root@ login", "x.md:2 public IP address", "x.md:3 SSH key file path"]
+        "x.md:1 root@ login", "x.md:2 public IP address", "x.md:3 SSH key file path",
+        "x.md:5 SSH port", "x.md:6 SSH port", "x.md:7 SSH port", "x.md:7 root login",
+        "x.md:8 SSH port", "x.md:9 SSH port", "x.md:10 root login", "x.md:11 SSH port",
+        "x.md:12 root login", "x.md:13 root login", "x.md:14 SSH port", "x.md:15 SSH port",
+        "x.md:16 SSH port"]
+    # In a file that never mentions SSH, a service's `user: root` and `port:` are the container's.
+    compose = "services:\n  db:\n    user: root\n    port: 5432\n"
+    assert list(_findings("docker-compose.yml", compose)) == []
 
 
 def _bash():
