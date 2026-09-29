@@ -579,16 +579,33 @@ def views_by_proposal() -> dict[str, list[str]]:
 
 
 def list_deposits(proposal_id: str) -> list[dict[str, Any]]:
+    """Deliberately does NOT select routing_number/account_number (encrypted at rest, 2026-09-29)
+    -- this is the query behind the CRM drawer, the customer view model and the recipient-activity
+    feed, and none of those three callers has any business reading the ciphertext. The one place
+    that decrypts is get_deposit_bank_details() below, used only by the staff reveal endpoint.
+    `id` is selected so the reveal endpoint has something to key on from the drawer."""
     return qall(
-        "select method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "
+        "select id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "
         "sent_to_beneficiary, sent_to_bank, sent_to_routing, sent_to_account, check_number, "
-        "routing_number, account_number, account_type, submitted_at, "
+        "account_type, submitted_at, "
         # to_jsonb rather than a bare column so a database that has not had the ALTER yet
         # returns null instead of erroring — the house trick, same as the columns above it
         # were introduced with. Code can therefore ship before the migration.
-        "(to_jsonb(d) ->> 'submitted_by') as submitted_by "
+        "(to_jsonb(d) ->> 'submitted_by') as submitted_by, "
+        "(to_jsonb(d) ->> 'routing_masked') as routing_masked "
         "from public.portal_deposits d where proposal_id=%s order by submitted_at desc",
         (proposal_id,),
+    )
+
+
+def get_deposit_bank_details(deposit_id) -> dict[str, Any] | None:
+    """The ONE read path allowed to return the (encrypted) routing/account numbers -- used solely
+    by the SERVICE_TOKEN-gated reveal endpoint, which decrypts them via bank_crypto before handing
+    them to a signed-in staff member. Every other reader goes through list_deposits() above."""
+    return q1(
+        "select id, proposal_id, method, routing_number, account_number, account_type "
+        "from public.portal_deposits where id=%s",
+        (deposit_id,),
     )
 
 
@@ -1548,19 +1565,25 @@ def add_deposit(proposal_id, method, account_name, bank_name, masked_ref, note,
                 sent_to_beneficiary=None, sent_to_bank=None,
                 sent_to_routing=None, sent_to_account=None,
                 check_number=None, routing_number=None, account_number=None,
-                account_type=None, submitted_by=None) -> None:
+                account_type=None, submitted_by=None, routing_masked=None) -> None:
     """`submitted_by` is which CONTACT paid. Named in the INSERT rather than read through
     to_jsonb like the SELECT does, so this is the one place the migration has to be applied
-    first — a write cannot fall back to null the way a read can."""
+    first — a write cannot fall back to null the way a read can.
+
+    `routing_number`/`account_number` are expected to already be `enc:v1:`-ciphertext by the time
+    they reach this function (main.py encrypts before calling this) -- this function does not
+    know about bank_crypto and does not encrypt anything itself, it only stores what it is given.
+    `routing_masked` is the routing-number twin of `masked_ref` (which has carried the account
+    mask since before this change) -- both are plaintext last-4 display strings, never ciphertext."""
     execute(
         "insert into public.portal_deposits "
         "(proposal_id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref, "
         "sent_to_beneficiary, sent_to_bank, sent_to_routing, sent_to_account, check_number, "
-        "routing_number, account_number, account_type, submitted_by) "
-        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "routing_number, account_number, account_type, submitted_by, routing_masked) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (proposal_id, method, account_name, bank_name, masked_ref, note, sent_date, trace_ref,
          sent_to_beneficiary, sent_to_bank, sent_to_routing, sent_to_account, check_number,
-         routing_number, account_number, account_type, submitted_by),
+         routing_number, account_number, account_type, submitted_by, routing_masked),
     )
 
 
