@@ -9,18 +9,24 @@
 # The prod .env (DATABASE_URL / SERVICE_TOKEN / RESEND_API_KEY / EMAIL_FROM) is
 # managed ONLY on the VPS at $APP_DIR/.env (chmod 600) and is never shipped from here.
 #
-# Prereqs: local Docker engine running; SSH key at ~/.ssh/treadwell_vps; the VPS
-#          already has $APP_DIR/.env in place.
+# Prereqs: local Docker engine running; a `Host treadwell-vps` entry in your SSH config
+#          (the address, login, port and key live there, not in this public repo); the
+#          VPS already has $APP_DIR/.env in place.
 # Usage:   bash deploy/ship-prod.sh
+#          VPS_HOST, VPS_USER and SSH_KEY still override it (another box, another key).
 set -euo pipefail
 
-VPS_HOST="${VPS_HOST:-50.6.110.215}"
-VPS_USER="${VPS_USER:-root}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/treadwell_vps}"
+VPS_HOST="${VPS_HOST:-treadwell-vps}"
+VPS_USER="${VPS_USER:-}"   # empty: the User from the SSH config entry
+SSH_KEY="${SSH_KEY:-}"     # empty: the IdentityFile from the SSH config entry
 APP_DIR="/opt/treadwell-portal"
 IMAGE="treadwell-portal:latest"
 COMPOSE="docker-compose.prod.yml"
-SSH=(ssh -i "$SSH_KEY" -o ConnectTimeout=20 "${VPS_USER}@${VPS_HOST}")
+TARGET="${VPS_USER:+$VPS_USER@}$VPS_HOST"
+SSH=(ssh -o ConnectTimeout=20)
+SCP=(scp)
+if [ -n "$SSH_KEY" ]; then SSH+=(-i "$SSH_KEY"); SCP+=(-i "$SSH_KEY"); fi
+SSH+=("$TARGET")
 
 cd "$(dirname "$0")/.."
 
@@ -29,7 +35,7 @@ docker build --platform linux/amd64 -t "$IMAGE" .
 
 echo "==> Shipping image + compose over SSH…"
 docker save "$IMAGE" | gzip | "${SSH[@]}" "cat > /tmp/portal-prod.tar.gz"
-scp -i "$SSH_KEY" "$COMPOSE" "${VPS_USER}@${VPS_HOST}:$APP_DIR/$COMPOSE.new"
+"${SCP[@]}" "$COMPOSE" "$TARGET:$APP_DIR/$COMPOSE.new"
 
 echo "==> Load + restart on the VPS (NO build)…"
 "${SSH[@]}" "set -euo pipefail

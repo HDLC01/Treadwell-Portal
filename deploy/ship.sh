@@ -6,17 +6,23 @@
 # image HERE, ship it over SSH, push the compose file (the VPS dir is NOT a git
 # checkout), then load + restart (NO --build).
 #
-# Prereqs: local Docker engine running; SSH key at ~/.ssh/treadwell_vps.
+# Prereqs: local Docker engine running; a `Host treadwell-vps` entry in your SSH config.
+#          The address, login, port and key live in that entry, not in this public repo.
 # Usage:   bash deploy/ship.sh
+#          VPS_HOST, VPS_USER and SSH_KEY still override it (another box, another key).
 set -euo pipefail
 
-VPS_HOST="${VPS_HOST:-50.6.110.215}"
-VPS_USER="${VPS_USER:-root}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/treadwell_vps}"
+VPS_HOST="${VPS_HOST:-treadwell-vps}"
+VPS_USER="${VPS_USER:-}"   # empty: the User from the SSH config entry
+SSH_KEY="${SSH_KEY:-}"     # empty: the IdentityFile from the SSH config entry
 APP_DIR="/opt/treadwell-portal-staging"
 IMAGE="treadwell-portal-staging:latest"
 COMPOSE="docker-compose.staging.yml"
-SSH=(ssh -i "$SSH_KEY" -o ConnectTimeout=20 "${VPS_USER}@${VPS_HOST}")
+TARGET="${VPS_USER:+$VPS_USER@}$VPS_HOST"
+SSH=(ssh -o ConnectTimeout=20)
+SCP=(scp)
+if [ -n "$SSH_KEY" ]; then SSH+=(-i "$SSH_KEY"); SCP+=(-i "$SSH_KEY"); fi
+SSH+=("$TARGET")
 
 cd "$(dirname "$0")/.."
 
@@ -25,7 +31,7 @@ docker build --platform linux/amd64 -t "$IMAGE" .
 
 echo "==> Shipping image + compose over SSH…"
 docker save "$IMAGE" | gzip | "${SSH[@]}" "cat > /tmp/portal-staging.tar.gz"
-scp -i "$SSH_KEY" "$COMPOSE" "${VPS_USER}@${VPS_HOST}:$APP_DIR/$COMPOSE.new"
+"${SCP[@]}" "$COMPOSE" "$TARGET:$APP_DIR/$COMPOSE.new"
 
 echo "==> Load + restart on the VPS (NO build)…"
 "${SSH[@]}" "set -euo pipefail
