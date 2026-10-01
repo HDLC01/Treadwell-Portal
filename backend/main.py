@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import automations
+import bank_crypto
 import config
 import customer_auth as ca
 import db
@@ -77,6 +78,13 @@ def _startup() -> None:
                  " + dev seed" if config.DEV_SEED else "")
     except Exception as exc:  # noqa: BLE001
         log.error("startup failed: %s", exc)
+    # One loud line at boot, never the key itself -- so "ACH stopped working" is a log grep,
+    # not an SSH session. Bank details are still refused per-request even if this line is
+    # somehow missed; this is a convenience, not the enforcement point (see api_deposit).
+    if bank_crypto.key_configured():
+        log.info("ACH bank-detail encryption ready (PORTAL_BANK_KEY configured)")
+    else:
+        log.warning("ACH is OFF: PORTAL_BANK_KEY is missing or invalid -- ACH deposits will be refused")
     # Started here rather than lazily off a request: the proposals that most need
     # chasing are the ones nobody is looking at, so waiting for traffic would mean
     # the quiet ones never get followed up. Guarded internally by the env flag.
@@ -1440,10 +1448,22 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
     note = _cap(body.get("note"), 1000) or None
 
     # ACH: the customer's OWN routing + account numbers (double-entry verified on the
-    # client). We store the full numbers so Treadwell can initiate the debit; the team
-    # email + chat only ever show the last-4 mask. Normalize to digits before storing.
-    routing_number = account_number = masked_ref = account_type = None
+    # client). We store them Fernet-encrypted (bank_crypto.py) so Treadwell can still
+    # initiate the debit later via the staff reveal endpoint; the team email + chat +
+    # CRM drawer only ever show the last-4 mask. Normalize to digits before storing.
+    routing_number = account_number = masked_ref = routing_masked = account_type = None
     if method == "ach":
+        # Fail CLOSED before touching anything the customer typed: a broken/missing key
+        # must refuse the payment, never fall back to storing it in the clear. Checked
+        # first (not just at startup) because the key can go bad mid-run — e.g. an env
+        # var dropped by a bad deploy — and every request must re-verify, not trust boot.
+        if not bank_crypto.key_configured():
+            log.warning("ACH deposit refused for %s: PORTAL_BANK_KEY missing/invalid", p["proposal_id"])
+            return _json({
+                "ok": False,
+                "error": "Bank transfer isn't available right now — please pay by check instead, "
+                         "or contact us and we'll sort it out.",
+            }, 503)
         routing_number = "".join(ch for ch in str(body.get("routing_number") or "") if ch.isdigit())
         account_number = "".join(ch for ch in str(body.get("account_number") or "") if ch.isdigit())
         account_type = (str(body.get("account_type") or "").strip().lower() or None)
@@ -1458,11 +1478,26 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
             return _json({"ok": False, "error": "Account number must be at least 4 digits."}, 400)
         if account_type not in ("checking", "savings"):
             return _json({"ok": False, "error": "Please choose an account type (checking or savings)."}, 400)
-        masked_ref = f"••••{account_number[-4:]}"
+        masked_ref = bank_crypto.mask_last4(account_number)
+        routing_masked = bank_crypto.mask_last4(routing_number)
+        try:
+            routing_number = bank_crypto.encrypt(routing_number)
+            account_number = bank_crypto.encrypt(account_number)
+        except bank_crypto.BankKeyError as exc:
+            # Lost the race with the startup check above (key removed/broken between the two
+            # reads). Never store what we have in plaintext -- refuse, exactly like the
+            # startup-guarded branch above, and say why in the log without repeating the key.
+            log.warning("ACH deposit refused for %s: encrypt failed, %s: %s",
+                        p["proposal_id"], type(exc).__name__, exc)
+            return _json({
+                "ok": False,
+                "error": "Bank transfer isn't available right now — please pay by check instead, "
+                         "or contact us and we'll sort it out.",
+            }, 503)
 
     db.add_deposit(p["proposal_id"], method, account_name, None, masked_ref, note,
                    routing_number=routing_number, account_number=account_number,
-                   account_type=account_type,
+                   account_type=account_type, routing_masked=routing_masked,
                    # Which contact paid. From the session, not from account_name — that is
                    # a bank account holder and can be a company.
                    submitted_by=_session_email(request))
@@ -1490,9 +1525,10 @@ async def api_deposit(token: str, request: Request) -> JSONResponse:
         detail = (
             f"<p>Name on account: {html.escape(account_name or '—')} · "
             f"Type: {html.escape((account_type or '—').title())} · "
-            f"Routing: {html.escape(routing_number or '—')} · "
+            f"Routing: {html.escape(routing_masked or '—')} · "
             f"Account: {masked_ref or '—'} · Note: {html.escape(note or '—')}</p>"
-            f"<p>Full account number is in the proposal's admin view.</p>"
+            f"<p>Full numbers are encrypted at rest — reveal them for this deposit in the "
+            f"proposal tool's CRM drawer.</p>"
         )
         lead = (f"Customer provided ACH details to pay the deposit for "
                 f"<strong>{html.escape(project_name)}</strong> ({html.escape(ref)}).")
@@ -3033,10 +3069,13 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
         # the proposal, and the CRM's own actions) are written for whoever is reading here.
         "messages": [_msg(m) for m in db.list_messages(proposal_id, include_internal=True)],
         "deposit_ref": proposals.deposit_ref(proposal_id),
+        # Masked only (2026-09-29) -- routing_number/account_number are encrypted at rest and
+        # list_deposits() does not even select them. A staff member who needs the full numbers
+        # calls POST /api/admin/deposit/{id}/reveal for that one deposit; see bank_crypto.py.
         "deposits": [{
+            "id": d.get("id"),
             "method": d["method"], "account_name": d.get("account_name"), "bank_name": d.get("bank_name"),
-            "masked_ref": d.get("masked_ref"), "note": d.get("note"),
-            "routing_number": d.get("routing_number"), "account_number": d.get("account_number"),
+            "masked_ref": d.get("masked_ref"), "routing_masked": d.get("routing_masked"), "note": d.get("note"),
             "account_type": d.get("account_type"),
             "sent_date": d["sent_date"].isoformat() if d.get("sent_date") else None,
             "trace_ref": d.get("trace_ref"),
@@ -3843,6 +3882,47 @@ def admin_deposit_received(proposal_id: str, request: Request) -> JSONResponse:
         f"<p>Next: add your project contacts so we can schedule the work.</p>",
     )
     return _json({"ok": True})
+
+
+@app.post("/api/admin/deposit/{deposit_id}/reveal")
+async def admin_deposit_reveal(deposit_id: str, request: Request) -> JSONResponse:
+    """Decrypt ONE deposit's routing/account numbers for a staff member who is looking at it in
+    the CRM drawer. SERVICE_TOKEN-gated like every other /api/admin/* route (the tool re-checks
+    its own nav-access rules before ever calling this), and additionally requires the acting
+    staff member's email in the body so the audit line below can say who looked.
+
+    Every branch that can fail returns before touching the numbers, and the response never
+    appears in a log line -- only this JSON body carries the plaintext, and the caller sets
+    Cache-Control: no-store."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    staff_email = (body.get("staff_email") or "").strip()
+    if not staff_email:
+        return _json({"ok": False, "error": "staff_email is required"}, 400)
+    dep = db.get_deposit_bank_details(deposit_id)
+    if not dep or dep.get("method") != "ach":
+        return _json({"ok": False, "error": "not_found"}, 404)
+    try:
+        routing_number = bank_crypto.decrypt(dep.get("routing_number"))
+        account_number = bank_crypto.decrypt(dep.get("account_number"))
+    except (bank_crypto.BankKeyError, bank_crypto.BankDecryptError) as exc:
+        log.warning("deposit reveal failed for %s: %s: %s", deposit_id, type(exc).__name__, exc)
+        return _json({
+            "ok": False,
+            "error": "These numbers can't be decrypted right now — check PORTAL_BANK_KEY.",
+        }, 503)
+    # WHO / WHEN / WHICH deposit — never the numbers. Timestamp is embedded explicitly rather
+    # than relied on from ambient log formatting (this app's logging.basicConfig has no
+    # timestamp in its default format).
+    log.info("bank-detail reveal: deposit=%s by=%s at=%s",
+             deposit_id, staff_email, datetime.now(timezone.utc).isoformat())
+    return _json({
+        "ok": True,
+        "routing_number": routing_number,
+        "account_number": account_number,
+        "account_type": dep.get("account_type"),
+    })
 
 
 @app.post("/api/admin/proposal/{proposal_id}/deposit-request")

@@ -76,8 +76,13 @@ create index if not exists portal_proposals_email_idx on public.portal_proposals
 
 -- Deposit intake. masked_ref = last-4 display value (derived server-side). Full
 -- customer ACH routing/account numbers live in routing_number/account_number (added
--- in the V1 alter block below) so Treadwell can initiate the debit; those are exposed
--- ONLY via the SERVICE_TOKEN-gated admin endpoint (masked in email + chat).
+-- in the V1 alter block below) so Treadwell can initiate the debit. Since the
+-- 2026-09-29 encrypt-at-rest change (bank_crypto.py) both columns hold
+-- `enc:v1:<fernet token>`, not plaintext -- see routing_masked below. The one
+-- reader that decrypts them is the SERVICE_TOKEN-gated POST
+-- /api/admin/deposit/{id}/reveal; every other reader, including the staff drawer
+-- (GET /api/admin/proposal/{id}) and the team-notify email, sees masked_ref /
+-- routing_masked only.
 create table if not exists public.portal_deposits (
   id            bigint generated always as identity primary key,
   proposal_id   text not null references public.portal_proposals(proposal_id) on delete cascade,
@@ -290,12 +295,21 @@ alter table public.portal_deposits add column if not exists sent_to_account text
 alter table public.portal_deposits add column if not exists check_number text;
 
 -- ACH debit intake (V1): the customer's OWN routing + account numbers, collected so
--- Treadwell can initiate the deposit debit. Full values are stored deliberately and
--- surfaced only through the SERVICE_TOKEN-gated admin endpoint (masked in email/chat).
+-- Treadwell can initiate the deposit debit. ENCRYPTED AT REST since 2026-09-29 (both
+-- columns hold `enc:v1:<fernet token>`, written by bank_crypto.py); decryptable only
+-- through the SERVICE_TOKEN-gated POST /api/admin/deposit/{id}/reveal (masked
+-- everywhere else -- see routing_masked below and the comment on this table above).
+-- A row written before that date is still plaintext until
+-- scripts/encrypt_bank_numbers.py --apply has been run against it.
 alter table public.portal_deposits add column if not exists routing_number text;
 alter table public.portal_deposits add column if not exists account_number text;
 -- Account type the customer selected on the ACH form: 'checking' or 'savings'.
 alter table public.portal_deposits add column if not exists account_type text;
+-- Masked routing display value, the routing-number twin of masked_ref above -- e.g.
+-- "••••0021". Derived server-side from the PLAINTEXT digits before they are ever
+-- encrypted, same as masked_ref; the drawer and the team email read this and
+-- masked_ref, never the encrypted columns.
+alter table public.portal_deposits add column if not exists routing_masked text;
 
 -- ── Deposit 'submitted' state (customer has paid; staff have not verified yet) ─
 -- Without this the board could not tell "approved, nothing paid" from "customer

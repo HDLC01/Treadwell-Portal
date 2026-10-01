@@ -43,6 +43,13 @@ PAYABLE_TO = _env("PORTAL_DEPOSIT_PAYABLE_TO", "Treadwell")
 # ── Service token (admin proposal tool -> this portal /api/notify) ────────────
 SERVICE_TOKEN = _env("SERVICE_TOKEN")
 
+# ── Bank-detail encryption at rest (2026-09-29) ────────────────────────────────
+# A Fernet key (urlsafe base64 of 32 random bytes; `Fernet.generate_key()`), read by
+# bank_crypto.py ONLY. Encrypts the customer's ACH routing/account numbers before they are
+# stored, and is required again to decrypt them for the staff reveal endpoint. Missing or
+# malformed = ACH is refused rather than falling back to storing plaintext; see bank_crypto.py.
+PORTAL_BANK_KEY = _env("PORTAL_BANK_KEY")
+
 # ── Proposal tool (renders the real Treadwell proposal PDF on demand) ─────────
 # When set, the portal fetches the official PDF from the proposal tool's
 # SERVICE_TOKEN-gated /api/admin/proposal-pdf and serves it to the customer.
