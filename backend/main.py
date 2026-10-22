@@ -3496,7 +3496,15 @@ _SNOOZE_MAX_DAYS = 366
 def _task_draft(detail: dict) -> dict:
     """The draft a task opens with: what was stored on it, or the stage's template as a floor."""
     d = detail.get("draft") if isinstance(detail.get("draft"), dict) else {}
-    base = followup_draft.default_draft(detail.get("template") or "checkin", _followup_cfg())
+    template = detail.get("template") or "checkin"
+    if d.get("title") and d.get("body"):
+        # The normal case: every task stores its draft when it is raised, so the bell's feed does
+        # not read the settings row once per task.
+        cta = d.get("cta") or (followup_settings.DEFAULT_TEMPLATES.get(template)
+                               or followup_settings.DEFAULT_TEMPLATES["checkin"])["cta"]
+        return {"title": d["title"], "body": d["body"], "cta": cta,
+                "source": d.get("source") or "default"}
+    base = followup_draft.default_draft(template, _followup_cfg())
     return {"title": d.get("title") or base["title"], "body": d.get("body") or base["body"],
             "cta": d.get("cta") or base["cta"], "source": d.get("source") or "default"}
 
