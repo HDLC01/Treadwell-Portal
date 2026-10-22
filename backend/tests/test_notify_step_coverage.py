@@ -60,14 +60,25 @@ def _all_calls() -> list[tuple[pathlib.Path, ast.Call]]:
 
 
 def test_the_sources_and_the_calls_were_actually_found():
-    """A walk that finds nothing passes every assertion below, so pin the count. Nine in the
-    portal's main.py plus followup_worker's own explicit-recipients send."""
+    """A walk that finds nothing passes every assertion below, so pin the count. Ten in the
+    portal's main.py (nine moments, with "sent" fired from two places -- see SHARED_STEPS) plus
+    followup_worker's own explicit-recipients send."""
     found = _all_calls()
     assert [p.name for p in SOURCES] == ["email_sender.py", "followup_worker.py", "main.py"]
     by_file = {}
     for path, _ in found:
         by_file[path.name] = by_file.get(path.name, 0) + 1
-    assert by_file == {"followup_worker.py": 1, "main.py": 9}, by_file
+    assert by_file == {"followup_worker.py": 1, "main.py": 10}, by_file
+
+
+# Steps DELIBERATELY fired from more than one call site, each with the number of sites. Kept short
+# and explicit so a second site sharing a step by accident still fails below.
+#
+# "sent": the ordinary publish confirms its own send, and a multi-scope project (RJ's scope
+# groups, 2026-10-23) is confirmed ONCE for all its scopes by the combined send, because publishing
+# a scope sends nothing. Same CRM moment -- "the proposal went out" -- so it must reach the same
+# roster bucket; a separate step would make staff opt in to scope-group sends separately.
+SHARED_STEPS = {"sent": 2}
 
 
 def test_every_call_names_a_step_the_resolver_recognises():
@@ -110,8 +121,11 @@ def test_the_nine_moments_are_each_covered_exactly_once():
     step, and it needs no maintenance at all."""
     used = [_kw(c, "kind").value for p, c in _all_calls()
             if _kw(c, "recipients") is None and isinstance(_kw(c, "kind"), ast.Constant)]
-    assert sorted(used) == sorted(email_sender.NOTIFY_STEP_IDS)
-    assert len(set(used)) == len(used), "two call sites share one step: " + repr(used)
+    assert sorted(set(used)) == sorted(email_sender.NOTIFY_STEP_IDS)
+    counts = {k: used.count(k) for k in set(used)}
+    shared = {k: n for k, n in counts.items() if n > 1}
+    assert shared == SHARED_STEPS, "call sites sharing a step: %r (allowed: %r)" % (
+        shared, SHARED_STEPS)
 
 
 def test_each_step_id_is_a_slug_that_fits_the_column_and_the_url():

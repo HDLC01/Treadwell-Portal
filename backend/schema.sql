@@ -712,3 +712,29 @@ grant select, insert, update, delete on public.portal_signed_contracts to portal
 drop policy if exists portal_app_rw on public.portal_signed_contracts;
 create policy portal_app_rw on public.portal_signed_contracts
   for all to portal_app using (true) with check (true);
+
+-- == Scope groups: one project, several separately priced scopes (2026-10-23) ==================
+--
+-- RJ asked for projects with no single base bid: "Breakroom" polish, "Lab 1" epoxy and "Lab 2"
+-- epoxy under one project name, each its OWN proposal the customer approves on its own. Every
+-- scope is therefore an ordinary portal_proposals row (its own proposal_id, token, approval,
+-- deposit and revisions), and these two columns are the only thing that links them. The board,
+-- the customer's list, the combined "all your scopes" email, the approve notice and the follow-up
+-- worker read the link; nothing in pricing, documents, signing or deposits does.
+--
+-- Written from the draft's own blob at publish (`data.scope_group = {id, label}`), never from a
+-- request body. NULLABLE with no default: every existing row is ungrouped, and a publish whose
+-- draft carries no scope_group writes neither column, so a stored value is never cleared by it.
+--
+-- Plain additive statements with no grant, so they can be lifted out and hand-applied on staging
+-- (where the portal_app grants elsewhere in this file roll the whole boot apply back) and on
+-- prod (which never applies this file on boot). The readers that must survive a database without
+-- them go through to_jsonb, the same as deleted_at and last_sent_at.
+--
+-- No column records "the combined email went out". That is a staff_note row in portal_followups
+-- with detail.action = 'scope_group_sent' on each scope, claimed under a row lock
+-- (db.claim_scope_group_send): no DDL, and it lands in each scope's follow-up history for free.
+alter table public.portal_proposals add column if not exists scope_group text;
+alter table public.portal_proposals add column if not exists scope_label text;
+create index if not exists portal_proposals_scope_group_idx
+  on public.portal_proposals (scope_group) where scope_group is not null;

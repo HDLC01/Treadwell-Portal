@@ -371,6 +371,47 @@ def _echo_to_thread(pid: str, due) -> None:
         log.warning("[followup] could not echo %s to %s's thread: %s", template, pid, exc)
 
 
+def _customer_chase_live(p: dict) -> bool:
+    """Is the CUSTOMER side of this proposal's cadence still running at all?
+
+    Enrolled, switched on, and either open (sent/viewed) or approved with the deposit not yet on
+    its way. The same stops `followup_rules` applies to customer sends; a pause does NOT end it,
+    because a pause is the customer asking us to wait, not the chase being over."""
+    if not p.get("followup_enrolled_at") or p.get("followup_disabled_at"):
+        return False
+    status = (p.get("proposal_status") or "")
+    if status in ("sent", "viewed"):
+        return True
+    return status == "approved" and rules.deposit_outstanding(p, for_customer=True)
+
+
+def _group_leads(rows: list[dict]) -> dict[str, str]:
+    """{scope_group: proposal_id} — which scope of each group may email the CUSTOMER.
+
+    RJ's multi-scope projects are several proposals to ONE customer about one project, each on its
+    own cadence. Left alone, three scopes published together come due together and the customer
+    gets three reminders in the same minute, every step of the way. So each group has one LEAD,
+    and only the lead's customer emails go out; the other scopes skip theirs.
+
+    THE LEAD is the scope whose customer chase started first (earliest followup_enrolled_at, then
+    proposal_id, so it is stable from tick to tick), among the scopes whose customer side is still
+    running. When the lead stops -- approved and paid, closed, switched off -- the next scope takes
+    over on the following tick and picks the chase up where its own cadence stands.
+
+    Only CUSTOMER sends are deduplicated. Staff notes stay per scope: each scope is its own job,
+    and "Lab 2 still not opened" is a different call from "Lab 1 still not opened"."""
+    best: dict[str, tuple] = {}
+    for r in rows:
+        group = r.get("scope_group")
+        if not group or not _customer_chase_live(r):
+            continue
+        enrolled = rules._aware(r.get("followup_enrolled_at"))
+        key = (enrolled.timestamp() if enrolled else float("inf"), str(r.get("proposal_id")))
+        if group not in best or key < best[group][0]:
+            best[group] = (key, r.get("proposal_id"))
+    return {g: v[1] for g, v in best.items()}
+
+
 def _tick(now: datetime | None = None) -> None:
     if not _enabled():
         return
@@ -385,6 +426,13 @@ def _tick(now: datetime | None = None) -> None:
         log.error("[followup] could not list candidates: %s", exc)
         return
 
+    # At most ONE customer email per scope group per tick (see _group_leads). Two layers: only the
+    # group's lead may send, and a group that has already had a customer email this tick gets no
+    # second one whatever the lead table says. An ungrouped proposal has no scope_group and passes
+    # both untouched -- for it this tick is exactly what it always was.
+    leads = _group_leads(candidates)
+    chased_groups: set[str] = set()
+
     for row in candidates:
         pid = row.get("proposal_id")
         try:
@@ -394,7 +442,16 @@ def _tick(now: datetime | None = None) -> None:
             fresh = db.get_proposal(pid) or row
             if fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
                 continue
+            group = fresh.get("scope_group") or None
             for due in rules.due_now(fresh, now, cfg):
+                if group and due.audience == "customer" and (
+                        leads.get(group) != pid or group in chased_groups):
+                    # NOT reserved: this scope's step stays unspent, so if it becomes the lead
+                    # later it chases from where its own cadence stands instead of finding the
+                    # step used up by an email that never went out.
+                    log.info("[followup] %s %s skipped: scope group %s is chased by %s",
+                             pid, due.rule_key, group, leads.get(group))
+                    continue
                 rid = db.reserve_followup(pid, due.rule_key, {
                     "audience": due.audience, "template": due.template,
                 })
@@ -411,6 +468,8 @@ def _tick(now: datetime | None = None) -> None:
                              pid, due.rule_key)
                 else:
                     log.info("[followup] %s %s -> %s", pid, due.rule_key, due.audience)
+                    if group and due.audience == "customer":
+                        chased_groups.add(group)
                     _echo_to_thread(pid, due)
         except Exception as exc:  # noqa: BLE001 — never let one row end the sweep
             log.warning("[followup] skipped %s: %s", pid, exc)

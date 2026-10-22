@@ -401,6 +401,57 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
                  _thread_headers(email, token), reply_to=reply_to, attachments=attachments)
 
 
+def send_scope_group_links(email: str, name: str, project_name: str, scopes: list[dict],
+                           reply_to: str | None = None, note: str | None = None,
+                           token: str | None = None) -> bool:
+    """ONE email for a project priced as several separate scopes, with a link per scope.
+
+    RJ, 2026-10: a client gets "Breakroom", "Lab 1" and "Lab 2" as three separate proposals they
+    can approve independently, and hears about them in one email rather than three. `scopes` is
+    `[{"label", "url", "approved"}]` in the order to list them, and is already narrowed by the
+    caller to the scopes THIS recipient is on.
+
+    Same conventions as send_portal_link: the project's one thread subject, first-name greeting,
+    the estimator's optional note, the red button style. `token` is the scope whose thread a reply
+    lands in (the first one listed); every scope's own page is one click away regardless.
+
+    Fixed wording rather than the editable "Proposal sent" template, because that template has one
+    {link} and this email's whole point is several."""
+    scopes = [s for s in (scopes or []) if s and s.get("url")]
+    if not scopes:
+        return False
+    note_html = ""
+    if note and str(note).strip():
+        note_html = (
+            f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
+            f'border-left:3px solid {_BRAND_RED};white-space:pre-wrap">{_esc(note)}</p>'
+        )
+    rows = []
+    for s in scopes:
+        label = _esc(s.get("label") or "Proposal")
+        action = "view" if s.get("approved") else "view &amp; approve"
+        rows.append(
+            f'<p style="margin:10px 0"><a href="{_esc(s["url"])}" style="display:inline-block;'
+            f'background:{_BRAND_RED};color:#fff;padding:10px 16px;border-radius:8px;'
+            f'text-decoration:none;font-weight:700">{label} — {action}</a></p>')
+    many = len(scopes) > 1
+    lead = (f"Your proposals for <strong>{_esc(project_name)}</strong> are ready to review. "
+            f"Each scope below is its own proposal, and you can approve any of them on its own."
+            if many else
+            f"Your proposal for <strong>{_esc(project_name)}</strong> is ready to review.")
+    body = (
+        f'<p>Hi {_esc(_first_name(name) or "there")},</p>'
+        f'<p>{lead}</p>'
+        f'{note_html}'
+        + "".join(rows)
+        + '<p style="color:#64748b">You can view each one, ask questions, and approve it right '
+          'on the page.</p>'
+    )
+    return _send([email], customer_thread_subject(project_name),
+                 _wrap("Your proposals are ready" if many else "Your proposal is ready", body),
+                 _thread_headers(email, token), reply_to=reply_to)
+
+
 _SENT_TPL_TTL = 60.0
 _sent_tpl_cache: tuple[float, dict] | None = None
 
