@@ -30,6 +30,7 @@ import config
 import customer_auth as ca
 import db
 import email_sender
+import followup_draft
 import followup_rules
 import followup_settings
 import followup_worker
@@ -137,6 +138,9 @@ def _followup_state(p: dict) -> dict:
         "paused_until": _iso(p.get("followup_paused_until")),
         "closed_lost_reason": p.get("closed_lost_reason"),
         "closed_at": _iso(p.get("closed_at")),
+        # Always 'remind' in v1 (decisions 1-2): a due reminder tells the estimator, and only the
+        # estimator sends. Travels so the drawer can say so instead of "automated".
+        "mode": followup_rules.followup_mode(p),
     }
 
 
@@ -2266,6 +2270,11 @@ async def api_inbound_resend(request: Request):
     auto = inbound.is_auto_reply(subject, full.get("headers"))
     project = p.get("project_name") or "proposal"
     meta = {"source": "email", "email_id": email_id, "from": from_email}
+    if auto:
+        # An out-of-office is recorded in the thread (it is still the customer's mailbox talking)
+        # but it is NOT the customer coming back to us: db._CUSTOMER_TOUCH_SQL skips rows marked
+        # this way, so an autoresponder cannot reset their follow-up reminder count.
+        meta["auto_reply"] = True
 
     authorized = set(e.lower() for e in (db.get_recipients(pid) or []))
     authorized.add((p.get("customer_email") or "").strip().lower())
@@ -2873,6 +2882,12 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # otherwise exists nowhere a human can see. None = nothing is coming
             # (not automated, switched off, approved, closed, or cadence exhausted).
             "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc(), followup_cfg)),
+            # Remind-only (2026-10-23). The open follow-up task, if any — the staff bell can read
+            # it here off the poll it already makes ({id, status, template, label, stage, due_at}
+            # or null; full detail at GET /api/admin/followup-task/{id}) — and this proposal's own
+            # schedule ({mode, interval_days, stop_after, next_at, anchor_at}; nulls = global).
+            "followup_task": _task_summary(r.get("pending_task")),
+            "followup_plan": _followup_plan(r),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
             # staff side picks the latest of these — it also owns turning the
@@ -3417,7 +3432,23 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
         return _json({"ok": False, "error": "invalid_kind"}, 400)
     note = _cap(body.get("note"), 2000) or None
     by = _cap(body.get("by"), 120) or None
-    row = db.add_followup(proposal_id, kind, {"note": note}, by)
+    row = _log_staff_followup(proposal_id, kind, note, by)
+    return _json({"ok": True, "followup": {
+        "kind": row["kind"], "detail": row.get("detail") or {},
+        "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})
+
+
+def _log_staff_followup(proposal_id: str, kind: str, note: Optional[str], by: Optional[str],
+                        extra: Optional[dict] = None) -> dict:
+    """Record an estimator's own outreach and put it in the thread. Shared by the drawer's "log a
+    call" and a follow-up task's "I called them instead", so the two cannot record it differently.
+
+    The row is a staff touch (db._STAFF_FOLLOWUP_SQL), which is what now re-anchors the follow-up
+    schedule: before 2026-10-23 logging a call removed the project from the morning digest and
+    changed nothing else, so the estimator was told to follow up the next day anyway."""
+    detail = {"note": note}
+    detail.update(extra or {})
+    row = db.add_followup(proposal_id, kind, detail, by)
     # THE MOST VALUABLE OF THESE CARDS, because until now a phone call left no mark anywhere a
     # person reads. portal_followups recorded it — the digest queries it and stops recommending a
     # chase — but nothing rendered it, so the estimator who rang on Tuesday and the estimator who
@@ -3435,9 +3466,7 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
     # The note is what makes the card worth reading — "they're waiting on the GC's schedule" is
     # the whole content of the call. Quoted so it stays distinguishable from our own sentence.
     _crm_card(proposal_id, text + (' — "%s"' % note if note else "."), "followup")
-    return _json({"ok": True, "followup": {
-        "kind": row["kind"], "detail": row.get("detail") or {},
-        "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})
+    return row
 
 
 @app.get("/api/admin/proposal/{proposal_id}/followups")
@@ -3448,6 +3477,475 @@ def admin_list_followups(proposal_id: str, request: Request) -> JSONResponse:
         "kind": f["kind"], "detail": f.get("detail") or {},
         "by": f.get("created_by"), "created_at": _iso(f.get("created_at")),
     } for f in db.list_followups(proposal_id)]})
+
+
+# ── remind-only follow-up tasks (2026-10-23) ──────────────────────────────────
+# Hanz's decisions: every proposal is REMIND-ONLY (1, 2). When a customer reminder comes due the
+# worker raises a follow-up task and tells the estimator; nothing reaches the customer until the
+# estimator sends it from here. The staff tool proxies these with its service token, exactly like
+# every other /api/admin route.
+#
+# EVERY decision is a touch that re-anchors the schedule (followup_rules._customer_plan): the next
+# reminder lands one interval after the decision, not one interval after an anchor nobody moved.
+# Each also clears a snooze date, except the snooze itself.
+_TASK_LOG_KINDS = {"call": "staff_call", "text": "staff_text", "email": "staff_email",
+                   "note": "staff_note"}
+_SNOOZE_MAX_DAYS = 366
+
+
+def _task_draft(detail: dict) -> dict:
+    """The draft a task opens with: what was stored on it, or the stage's template as a floor."""
+    d = detail.get("draft") if isinstance(detail.get("draft"), dict) else {}
+    base = followup_draft.default_draft(detail.get("template") or "checkin", _followup_cfg())
+    return {"title": d.get("title") or base["title"], "body": d.get("body") or base["body"],
+            "cta": d.get("cta") or base["cta"], "source": d.get("source") or "default"}
+
+
+def _task_view(row: dict) -> dict:
+    """One task, as every task endpoint returns it (the shape the staff tool renders)."""
+    d = row.get("detail") or {}
+    template = d.get("template") or "checkin"
+    return {
+        "id": row.get("id"),
+        "proposal_id": row.get("proposal_id"),
+        "status": d.get("status") or "pending",
+        "template": template,
+        "label": followup_settings.label(template),
+        "stage": d.get("stage") or followup_rules.task_stage(template),
+        "rule_key": d.get("rule_key"),
+        "include_status_ask": bool(d.get("include_status_ask")),
+        "due_at": _iso(row.get("created_at")),
+        "decided_by": d.get("decided_by"),
+        "decided_at": d.get("decided_at"),
+        "draft": _task_draft(d),
+    }
+
+
+def _task_summary(raw) -> Optional[dict]:
+    """The pipeline's compact form of the open task (the jsonb pending_task column)."""
+    if not isinstance(raw, dict) or not raw.get("id"):
+        return None
+    d = raw.get("detail") or {}
+    template = d.get("template") or "checkin"
+    return {"id": raw.get("id"), "status": d.get("status") or "pending", "template": template,
+            "label": followup_settings.label(template),
+            "stage": d.get("stage") or followup_rules.task_stage(template),
+            "due_at": _iso(raw.get("created_at"))}
+
+
+def _followup_plan(p: dict) -> dict:
+    """This proposal's own schedule, for the drawer. None everywhere = the global cadence."""
+    return {"mode": followup_rules.followup_mode(p),
+            "interval_days": p.get("followup_interval_days"),
+            "stop_after": p.get("followup_stop_after"),
+            "next_at": _iso(p.get("followup_next_at")),
+            "anchor_at": _iso(p.get("followup_anchor_at"))}
+
+
+def _followup_cfg() -> dict:
+    try:
+        return followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not read the cadence, using the shipped one: %s", exc)
+        return followup_settings.defaults()
+
+
+def _load_task(task_id: str):
+    """(task, proposal, error_response). Exactly one of the first two pairs is usable."""
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return None, None, _json({"ok": False, "error": "not_found"}, 404)
+    task = db.get_followup_task(tid)
+    if not task:
+        return None, None, _json({"ok": False, "error": "not_found"}, 404)
+    return task, db.get_proposal(task["proposal_id"]), None
+
+
+def _not_pending(task: dict) -> Optional[JSONResponse]:
+    status = (task.get("detail") or {}).get("status") or "pending"
+    if status != "pending":
+        return _json({"ok": False, "error": "already_decided", "status": status}, 409)
+    return None
+
+
+def _stamp_touch(proposal_id: str, clear_next: bool = True) -> None:
+    """Re-anchor on a decision. Guarded: the decision is already recorded, and for send and
+    called the staff_* row it wrote re-anchors the schedule on its own (db._STAFF_FOLLOWUP_SQL)."""
+    try:
+        db.stamp_followup_anchor(proposal_id, clear_next=clear_next)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not stamp the follow-up anchor on %s: %s", proposal_id, exc)
+
+
+def _parse_when(raw) -> Optional[datetime]:
+    """A snooze date: 'YYYY-MM-DD' (8am Central that day) or a full ISO timestamp."""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        if len(s) == 10:
+            d = date.fromisoformat(s)
+            return datetime(d.year, d.month, d.day, followup_rules.SEND_START_HOUR,
+                            tzinfo=followup_rules.BUSINESS_TZ)
+        when = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=followup_rules.BUSINESS_TZ)
+
+
+def _future_when(raw) -> tuple:
+    """(datetime, None) for a usable snooze date, or (None, error_code)."""
+    when = _parse_when(raw)
+    if when is None:
+        return None, "invalid_date"
+    now = _now_utc()
+    if when <= now:
+        return None, "date_in_past"
+    if (when - now).days > _SNOOZE_MAX_DAYS:
+        return None, "date_too_far"
+    return when, None
+
+
+@app.get("/api/admin/followup-tasks")
+def admin_followup_tasks(request: Request) -> JSONResponse:
+    """Every OPEN follow-up task, oldest first — the feed the staff tool's bell polls.
+
+    `?estimator=<email>` narrows it to one estimator's queue (matched on the same coalesce the
+    board uses: assigned estimator, then the draft's owner, then whoever published)."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    who = str(request.query_params.get("estimator") or "").strip().lower()
+    out = []
+    for r in db.list_pending_followup_tasks():
+        est = (r.get("estimator_email") or "").strip().lower()
+        if who and est != who:
+            continue
+        v = _task_view(r)
+        v.update({"project_name": r.get("project_name"), "customer_name": r.get("customer_name"),
+                  "customer_email": r.get("customer_email"), "estimator_email": est or None})
+        out.append(v)
+    return _json({"ok": True, "tasks": out})
+
+
+@app.get("/api/admin/followup-task/{task_id}")
+def admin_followup_task(task_id: str, request: Request) -> JSONResponse:
+    """One task with what the compose box needs: the draft, who it would go to, and whether it can
+    still be sent at all (`live`; `why` names the reason it cannot)."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    live, why = followup_rules.task_is_live(task.get("detail") or {}, p, _now_utc())
+    try:
+        to = followup_worker._customer_recipients(p) if p else []
+    except Exception:  # noqa: BLE001 — labels only
+        to = []
+    return _json({"ok": True, "task": _task_view(task), "live": live, "why": why or None,
+                  "recipients": to,
+                  "proposal": ({"proposal_id": p["proposal_id"],
+                                "project_name": p.get("project_name"),
+                                "customer_name": p.get("customer_name"),
+                                "customer_email": p.get("customer_email"),
+                                "followup_plan": _followup_plan(p)} if p else None)})
+
+
+@app.get("/api/admin/followup-task/{task_id}/draft")
+def admin_followup_task_draft(task_id: str, request: Request) -> JSONResponse:
+    """The compose box's starting point, and the request for an AI draft.
+
+    `draft` is always usable on its own: the AI draft if one has been accepted, otherwise the
+    stage's template — the words the automatic email used to send. `ai_request` is what the staff
+    tool runs through its Claude CLI (`_autofill_via_cli(input, system)`; this container has no
+    CLI) before posting the model's answer back to the POST below. The thread inside `input` is
+    the CUSTOMER-VISIBLE thread only and is JSON-quoted data in the user slot."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    d = task.get("detail") or {}
+    template = d.get("template") or "checkin"
+    draft = _task_draft(d)
+    try:
+        messages = db.list_messages(p["proposal_id"])          # default: no internal rows
+    except Exception as exc:  # noqa: BLE001 — without the thread the default still stands
+        log.warning("[followup] could not read the thread for task %s: %s", task_id, exc)
+        messages = []
+    if draft["source"] != "ai" and (d.get("status") or "pending") == "pending":
+        # An in-process hook, if one is ever wired (followup_draft.set_run_claude). Unset in v1.
+        got = followup_draft.draft_for(p, template, messages, _followup_cfg())
+        if got.get("source") == "ai":
+            draft = got
+            try:
+                db.set_followup_task_draft(task["id"], got)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[followup] could not store the draft on task %s: %s", task_id, exc)
+    return _json({"ok": True, "draft": draft,
+                  "ai_request": {"system": followup_draft.DRAFT_SYSTEM,
+                                 "input": followup_draft.build_input(p, template, messages)}})
+
+
+@app.post("/api/admin/followup-task/{task_id}/draft")
+async def admin_followup_task_draft_submit(task_id: str, request: Request) -> JSONResponse:
+    """Hand back what the model wrote. Kept only if it passes every check in
+    followup_draft.clean_model_output; anything else returns the default with `fallback: true`,
+    and a 200 either way — the compose box must always open with something sendable."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    blocked = _not_pending(task)
+    if blocked:
+        return blocked
+    body = await _body(request)
+    d = task.get("detail") or {}
+    template = d.get("template") or "checkin"
+    got = followup_draft.clean_model_output(body.get("model_output"), template)
+    if not got:
+        return _json({"ok": True, "fallback": True, "draft": _task_draft(d)})
+    draft = dict(got, source="ai")
+    try:
+        db.set_followup_task_draft(task["id"], draft)
+    except Exception as exc:  # noqa: BLE001 — the estimator still gets it on screen
+        log.warning("[followup] could not store the AI draft on task %s: %s", task_id, exc)
+    return _json({"ok": True, "fallback": False, "draft": draft})
+
+
+@app.post("/api/admin/followup-task/{task_id}/send")
+async def admin_followup_task_send(task_id: str, request: Request) -> JSONResponse:
+    """Send the estimator's reviewed follow-up to the customer. Body: {title, body, by, cta?}.
+
+    Order is the whole safety story:
+      1. validate the text with the SAME rules a saved customer template gets ({link} required,
+         no HTML, no unknown placeholders, length-limited) — 400 otherwise;
+      2. re-check the proposal is still in scope — signed and paid, closed lost, automation off,
+         paused, re-sent or moved stage all return 409 and expire the task. A task raised on
+         Tuesday must never email a customer who signed on Wednesday;
+      3. CLAIM the task (pending -> sent) before emailing, so a double click or a second tab finds
+         nothing to claim and sends nothing;
+      4. send; if nothing went out, put the task back to pending and return 502;
+      5. record it as a staff email (a touch: the schedule re-anchors on it), stamp the anchor,
+         echo it into the customer's thread like every reminder, and card it for staff."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    blocked = _not_pending(task)
+    if blocked:
+        return blocked
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    d = task.get("detail") or {}
+    template = d.get("template") or "checkin"
+    if template not in followup_settings.TEMPLATE_KEYS:
+        template = "checkin"
+    raw_body = body.get("body")
+    if not isinstance(raw_body, str) or not raw_body.strip():
+        return _json({"ok": False, "error": "empty"}, 400)
+    try:
+        tpl = followup_settings.validate_template(
+            template, {"title": body.get("title"), "body": raw_body, "cta": body.get("cta")})
+    except followup_settings.ValidationError as exc:
+        return _json({"ok": False, "error": "invalid_draft", "message": str(exc)}, 400)
+
+    live, why = followup_rules.task_is_live(d, p, _now_utc())
+    if not live:
+        try:
+            db.decide_followup_task(task["id"], "expired", None, {"reason": why})
+        except Exception as exc:  # noqa: BLE001 — the refusal is the important half
+            log.warning("[followup] could not expire task %s: %s", task_id, exc)
+        return _json({"ok": False, "error": "out_of_scope", "reason": why}, 409)
+
+    claimed = db.decide_followup_task(task["id"], "sent", by,
+                                      {"sent": {"title": tpl["title"], "body": tpl["body"]}})
+    if not claimed:
+        return _json({"ok": False, "error": "already_decided"}, 409)
+    pid = p["proposal_id"]
+    ask = bool(d.get("include_status_ask")) and template != "deposit_nudge"
+    try:
+        sent = followup_worker.send_task_email(p, template, ask, tpl, d.get("rule_key") or "task")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] task %s send raised: %s", task_id, exc)
+        sent = False
+    if not sent:
+        try:
+            db.reopen_followup_task(task["id"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("[followup] task %s did not send AND could not be reopened: %s", task_id, exc)
+        return _json({"ok": False, "error": "send_failed"}, 502)
+
+    db.add_followup(pid, "staff_email",
+                    {"note": tpl["title"], "task_id": task["id"], "followup_task": True}, by)
+    _stamp_touch(pid)
+    followup_worker._echo_to_thread(
+        pid, followup_rules.Due(d.get("rule_key") or "task", "customer", template),
+        {"task_id": task["id"]})
+    who = _actor_name(by)
+    _crm_card(pid, ('%s sent a follow-up email — "%s"' % (who, tpl["title"])) if who
+              else ('A follow-up email was sent — "%s"' % tpl["title"]), "followup_sent")
+    return _json({"ok": True, "task": _task_view(claimed)})
+
+
+@app.post("/api/admin/followup-task/{task_id}/skip")
+async def admin_followup_task_skip(task_id: str, request: Request) -> JSONResponse:
+    """Not now. Body: {by, note?}. Still a touch: an explicit human "not yet" restarts the
+    interval, so the estimator is not asked again tomorrow about the same customer."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    blocked = _not_pending(task)
+    if blocked:
+        return blocked
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    note = _cap(body.get("note"), _NOTE_MAX) or None
+    claimed = db.decide_followup_task(task["id"], "skipped", by, {"note": note})
+    if not claimed:
+        return _json({"ok": False, "error": "already_decided"}, 409)
+    pid = task["proposal_id"]
+    _stamp_touch(pid)
+    # Bookkeeping (`action`), not outreach: nobody contacted the customer, so the digest must not
+    # read this as "chased" — the anchor stamp above is what moves the schedule.
+    db.add_followup(pid, "staff_note",
+                    {"action": "followup_skipped", "task_id": task["id"], "note": note}, by)
+    who = _actor_name(by)
+    _crm_card(pid, ("%s skipped this follow-up for now" % who if who
+                    else "Follow-up skipped for now")
+              + (' — "%s"' % note if note else "."), "followup_skipped")
+    return _json({"ok": True, "task": _task_view(claimed)})
+
+
+@app.post("/api/admin/followup-task/{task_id}/called")
+async def admin_followup_task_called(task_id: str, request: Request) -> JSONResponse:
+    """Followed up some other way. Body: {by, note?, kind?: call|text|email|note (default call)}.
+
+    Goes through the drawer's own "log a follow-up" path (_log_staff_followup), so it records,
+    cards and re-anchors exactly as logging a call from the drawer does."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    blocked = _not_pending(task)
+    if blocked:
+        return blocked
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    note = _cap(body.get("note"), 2000) or None
+    kind = _TASK_LOG_KINDS.get(str(body.get("kind") or "call").strip().lower())
+    if not kind:
+        return _json({"ok": False, "error": "invalid_kind"}, 400)
+    claimed = db.decide_followup_task(task["id"], "called", by, {"kind": kind, "note": note})
+    if not claimed:
+        return _json({"ok": False, "error": "already_decided"}, 409)
+    pid = task["proposal_id"]
+    _log_staff_followup(pid, kind, note, by, {"task_id": task["id"]})
+    _stamp_touch(pid)
+    return _json({"ok": True, "task": _task_view(claimed)})
+
+
+@app.post("/api/admin/followup-task/{task_id}/snooze")
+async def admin_followup_task_snooze(task_id: str, request: Request) -> JSONResponse:
+    """Remind me on a specific day. Body: {until: 'YYYY-MM-DD' | ISO datetime, by}.
+
+    The next task is raised ON that day (8am Central for a bare date), and the interval runs on
+    from there. Written to the proposal BEFORE the task is resolved, so a failure leaves the task
+    pending rather than resolved with no date behind it."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    task, p, err = _load_task(task_id)
+    if err:
+        return err
+    blocked = _not_pending(task)
+    if blocked:
+        return blocked
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    when, bad = _future_when(body.get("until"))
+    if bad:
+        return _json({"ok": False, "error": bad}, 400)
+    pid = task["proposal_id"]
+    # Stamp first, then the date: the snooze is honoured only while it is later than the latest
+    # touch, and this stamp IS that touch.
+    db.stamp_followup_anchor(pid, clear_next=False)
+    db.set_followup_plan(pid, next_at=when)
+    claimed = db.decide_followup_task(task["id"], "snoozed", by, {"until": when.isoformat()})
+    if not claimed:
+        return _json({"ok": False, "error": "already_decided"}, 409)
+    db.add_followup(pid, "staff_note",
+                    {"action": "followup_snoozed", "task_id": task["id"],
+                     "until": when.isoformat()}, by)
+    day = when.astimezone(followup_rules.BUSINESS_TZ).date().isoformat()
+    who = _actor_name(by)
+    _crm_card(pid, ("%s will follow up on %s." % (who, day)) if who
+              else ("Follow-up snoozed until %s." % day), "followup_snoozed")
+    return _json({"ok": True, "task": _task_view(claimed), "next_at": when.isoformat()})
+
+
+@app.post("/api/admin/proposal/{proposal_id}/followup-plan")
+async def admin_followup_plan(proposal_id: str, request: Request) -> JSONResponse:
+    """This proposal's own schedule. Body (every key optional; null clears it):
+    {interval_days: 1-90, stop_after: 1-60, next_at: 'YYYY-MM-DD' | ISO, by}.
+
+    stop_after is the PRE-DECISION cap only; the deposit chase keeps its own (decision 5)."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    p = db.get_proposal(proposal_id)
+    if not p:
+        return _json({"ok": False, "error": "not_found"}, 404)
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    kw: dict = {}
+    for key, lo, hi in (("interval_days", 1, 90), ("stop_after", 1, 60)):
+        if key in body:
+            v = body.get(key)
+            if v is None or v == "":
+                kw[key] = None
+                continue
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                return _json({"ok": False, "error": "invalid_" + key}, 400)
+            if isinstance(v, bool) or not lo <= n <= hi:
+                return _json({"ok": False, "error": "invalid_" + key}, 400)
+            kw[key] = n
+    if "next_at" in body:
+        if body.get("next_at") in (None, ""):
+            kw["next_at"] = None
+        else:
+            when, bad = _future_when(body.get("next_at"))
+            if bad:
+                return _json({"ok": False, "error": bad}, 400)
+            kw["next_at"] = when
+    if not kw:
+        return _json({"ok": False, "error": "nothing_to_change"}, 400)
+    if kw.get("next_at") is not None:
+        db.stamp_followup_anchor(proposal_id, clear_next=False)
+    db.set_followup_plan(proposal_id, **kw)
+    who = _actor_name(by)
+    parts = []
+    if "interval_days" in kw:
+        parts.append("every %d days" % kw["interval_days"] if kw["interval_days"]
+                     else "the standard interval")
+    if "stop_after" in kw:
+        parts.append("stop after %d reminders" % kw["stop_after"] if kw["stop_after"]
+                     else "the standard reminder limit")
+    if "next_at" in kw:
+        parts.append(("next on %s" % kw["next_at"].astimezone(
+            followup_rules.BUSINESS_TZ).date().isoformat()) if kw["next_at"]
+            else "no fixed next date")
+    _crm_card(proposal_id, ("%s changed this project's follow-ups: %s." % (who, ", ".join(parts)))
+              if who else ("Follow-ups changed: %s." % ", ".join(parts)), "followup_plan")
+    fresh = db.get_proposal(proposal_id) or p
+    return _json({"ok": True, "followup_plan": _followup_plan(fresh)})
 
 
 @app.post("/api/admin/proposal/{proposal_id}/status")
