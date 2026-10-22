@@ -661,7 +661,7 @@ def send_digest(email: str, items: list[dict], *, name: str = "",
         f'{rows}'
         f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 14px">'
         f'<p style="color:#64748b;font-size:13px">Logging a call or a text in the CRM takes it '
-        f'off tomorrow\'s list. Automatic customer follow-ups keep running either way.</p>'
+        f'off tomorrow\'s list and pushes back its next follow-up reminder.</p>'
     )
     subject = f"{n} proposal{'' if n == 1 else 's'} to follow up today"
     return _send([email], subject, _wrap("Your follow-ups for today", body),

@@ -379,7 +379,31 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "   where f.proposal_id = p.proposal_id "
         "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
         "     and f.detail->>'action' is null) "
-        "  as last_staff_followup_at "
+        "  as last_staff_followup_at, "
+        # ── what followup_rules.next_due_at reads, all of it (followup_rules.INPUT_KEYS) ──
+        # The board's "next follow-up" date is next_due_at over THIS row. cycle_viewed_at was
+        # never selected, so for every viewed proposal next_due_at saw no view and computed the
+        # NOT-viewed track's date: anchored on the send instead of the view, and on the wrong step
+        # of the ladder. test_admin_pipeline.py now pins every input key against this select.
+        "p.cycle_viewed_at, "
+        # Remind-only (2026-10-23): the per-proposal schedule and the explicit decision stamp.
+        # Through to_jsonb for the reason the click columns above give — prod gets the code before
+        # the ALTER, and a missing column must read as NULL here, not take the board down.
+        "(to_jsonb(p) ->> 'followup_anchor_at')::timestamptz as followup_anchor_at, "
+        "(to_jsonb(p) ->> 'followup_next_at')::timestamptz as followup_next_at, "
+        "(to_jsonb(p) ->> 'followup_interval_days')::int as followup_interval_days, "
+        "(to_jsonb(p) ->> 'followup_stop_after')::int as followup_stop_after, "
+        "(to_jsonb(p) ->> 'followup_mode') as followup_mode, "
+        # The touches and the reminder count, with the SAME predicates the worker reads them
+        # with (db.followup_signals). customer_replied_at above stays as it was for the board;
+        # this one leaves out auto-replies, which must not reset a reminder count.
+        + _CUSTOMER_TOUCH_SQL.format(pid="p.proposal_id") + " as customer_touch_at, "
+        + _STAFF_MESSAGE_SQL.format(pid="p.proposal_id") + " as last_staff_message_at, "
+        + _REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " as followup_reminder_times, "
+        # The open follow-up task, if any, so the board (polled every 25s) can show it without a
+        # second request.
+        + _PENDING_TASK_SQL.format(pid="p.proposal_id") + " as pending_task "
         "from public.portal_proposals p "
         "left join public.drafts d on d.id = p.proposal_id "
         # A DELETED project is off the board (2026-08-24). The ONE reader of
@@ -1150,6 +1174,193 @@ def reserve_followup(proposal_id: str, rule_key: str, detail: dict) -> Optional[
 def delete_followup(followup_id: int) -> None:
     """Release a reservation whose send failed outright, so the next tick retries."""
     execute("delete from public.portal_followups where id=%s", (followup_id,))
+
+
+# ── Remind-only follow-up tasks (2026-10-23) ──────────────────────────────────
+# A matured customer reminder no longer emails the customer; it raises a `followup_task` row in
+# portal_followups for the estimator to act on. Same table, same rule_key, same partial unique
+# index as the automated emails (schema.sql, portal_followups_rule_v2_uidx), so a task can never be
+# raised for an occurrence the old ladder already emailed, and a future mode that sends on a click
+# cannot double-send what a task already covered. A SECOND table was the alternative and is exactly
+# what would have let the two drift apart.
+#
+# Task state lives in `detail` (jsonb): status (pending | sent | skipped | called | snoozed |
+# expired), template, stage, cycle, draft {title, body, source}, decided_by, decided_at, and
+# whatever the decision carried. A second partial unique index allows only ONE pending task per
+# proposal, so "one open task at a time" holds in the database and not only in the worker.
+
+# The touch predicates, written ONCE and used by both the worker's read (followup_signals) and the
+# board's query (list_all_portal_proposals). If these two disagreed, the board would date the next
+# follow-up off a different set of touches than the worker acts on. `{pid}` is the proposal-id
+# expression: `%s` for one proposal, `p.proposal_id` inside the pipeline.
+#
+# CUSTOMER touch: any customer-authored row — chat, emailed reply, status answer, deposit
+# submission — except an out-of-office the inbound relay recorded (meta.auto_reply). An
+# autoresponder is not the customer coming back to us, and counting it would reset their reminder
+# count (decision 3) every time they went on holiday.
+_CUSTOMER_TOUCH_SQL = (
+    "(select max(q.created_at) from public.portal_questions q "
+    "   where q.proposal_id = {pid} and q.author_kind = 'customer' "
+    "     and coalesce((q.meta ->> 'auto_reply')::boolean, false) is not true)")
+# STAFF message: an estimator writing to the customer in the thread, typed in the drawer or emailed
+# through the relay. Not the server's own signed-contract row (meta.system_doc), and not cards:
+# msg_type 'text' only. That one predicate also keeps out every staff-only row, because every
+# meta.internal row the server writes (view cards, CRM cards, staff reminder echoes) is a 'system'
+# card — so no internal predicate here, and test_internal_rows_are_not_activity keeps guarding the
+# one place it belongs.
+_STAFF_MESSAGE_SQL = (
+    "(select max(q.created_at) from public.portal_questions q "
+    "   where q.proposal_id = {pid} and q.author_kind = 'staff' and q.msg_type = 'text' "
+    "     and coalesce(q.meta ->> 'system_doc', '') <> 'true')")
+# STAFF logged outreach — the same predicate last_staff_followup_at has always used on the board.
+_STAFF_FOLLOWUP_SQL = (
+    "(select max(f.created_at) from public.portal_followups f "
+    "   where f.proposal_id = {pid} "
+    "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
+    "     and f.detail->>'action' is null)")
+# Every reminder of THIS send cycle, for the cap: tasks that were not expired, plus the customer
+# emails the automatic ladder sent before remind-only shipped. jsonb, so it rides one column.
+# Unordered on purpose: only the count after a point in time is used, and the board query's tests
+# locate its own trailing ORDER BY by the first occurrence of those words.
+_REMINDER_TIMES_SQL = (
+    "(select coalesce(jsonb_agg(f.created_at), '[]'::jsonb) "
+    "   from public.portal_followups f "
+    "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
+    "    and ((f.kind = 'followup_task' and coalesce(f.detail->>'status', 'pending') <> 'expired') "
+    "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
+# The newest pending task (there is at most one: portal_followups_one_pending_task_uidx).
+_PENDING_TASK_SQL = (
+    "(select to_jsonb(t) from (select f.id, f.detail, f.created_at "
+    "   from public.portal_followups f "
+    "  where f.id = (select max(f2.id) from public.portal_followups f2 "
+    "                 where f2.proposal_id = {pid} and f2.kind = 'followup_task' "
+    "                   and f2.detail->>'status' = 'pending')) t)")
+
+
+def followup_signals(proposal_id: str) -> dict[str, Any]:
+    """What the schedule needs beyond the proposal row, for ONE proposal (the worker's read).
+
+    Keys match followup_rules.TOUCH_KEYS / INPUT_KEYS, plus `pending_task` ({id, detail,
+    created_at} or None). Reads only tables and columns that exist before this change's DDL, so the
+    worker keeps running on a database that has not had it yet (no task can be raised there,
+    because the widened CHECK is what admits the kind)."""
+    enrolled = "(select pp.followup_enrolled_at from public.portal_proposals pp " \
+               "where pp.proposal_id = %s)"
+    sql = ("select "
+           + _CUSTOMER_TOUCH_SQL.format(pid="%s") + " as customer_touch_at, "
+           + _STAFF_FOLLOWUP_SQL.format(pid="%s") + " as last_staff_followup_at, "
+           + _STAFF_MESSAGE_SQL.format(pid="%s") + " as last_staff_message_at, "
+           + _REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
+           + " as followup_reminder_times, "
+           + _PENDING_TASK_SQL.format(pid="%s") + " as pending_task")
+    return q1(sql, (proposal_id,) * 6) or {}
+
+
+def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Optional[int]:
+    """Raise a follow-up task for one reminder occurrence, or None if it already exists.
+
+    Same contract as reserve_followup: the unique index on (proposal_id, rule_key) is the dedupe,
+    shared with auto_email, and the pending-per-proposal index makes a second open task a no-op
+    too. ON CONFLICT DO NOTHING with no target covers both."""
+    payload = dict(detail or {})
+    payload["rule_key"] = rule_key
+    payload.setdefault("status", "pending")
+    row = q1("insert into public.portal_followups (proposal_id, kind, detail) "
+             "values (%s,'followup_task',%s) on conflict do nothing returning id",
+             (proposal_id, Jsonb(payload)))
+    return int(row["id"]) if row else None
+
+
+def get_followup_task(task_id: int) -> Optional[dict[str, Any]]:
+    return q1("select id, proposal_id, kind, detail, created_by, created_at "
+              "from public.portal_followups where id = %s and kind = 'followup_task'",
+              (int(task_id),))
+
+
+def list_pending_followup_tasks(limit: int = 500) -> list[dict[str, Any]]:
+    """Every open task, oldest first, with what the staff bell needs to label it. Deleted projects
+    are left out; the worker's housekeeping expires their tasks on its next pass."""
+    return qall(
+        "select f.id, f.proposal_id, f.detail, f.created_at, "
+        "       p.project_name, p.customer_name, p.customer_email, "
+        "       coalesce(p.assigned_estimator, d.owner_email, p.published_by) as estimator_email "
+        "from public.portal_followups f "
+        "join public.portal_proposals p on p.proposal_id = f.proposal_id "
+        "left join public.drafts d on d.id = p.proposal_id "
+        "where f.kind = 'followup_task' and f.detail->>'status' = 'pending' "
+        "  and (to_jsonb(p) ->> 'deleted_at') is null "
+        "order by f.created_at asc limit %s",
+        (int(limit),),
+    )
+
+
+def decide_followup_task(task_id: int, status: str, by: Optional[str],
+                         extra: Optional[dict] = None) -> Optional[dict[str, Any]]:
+    """Move a task OUT of pending, atomically. None if it was not pending any more.
+
+    The `status = 'pending'` guard in the WHERE is the double-click and two-tab protection: the
+    send endpoint claims the task here BEFORE emailing, so a second press finds nothing to claim and
+    sends nothing. Reserve, then send — the worker's rule, applied to a human."""
+    patch = dict(extra or {})
+    patch.update({"status": status, "decided_by": by,
+                  "decided_at": _now_iso()})
+    return q1("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) || %s "
+              "where id = %s and kind = 'followup_task' and detail->>'status' = 'pending' "
+              "returning id, proposal_id, detail, created_at",
+              (Jsonb(patch), int(task_id)))
+
+
+def reopen_followup_task(task_id: int) -> None:
+    """Put a claimed task back to pending — the send it was claimed for did not go out."""
+    execute("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) "
+            "  || jsonb_build_object('status', 'pending', 'decided_by', null, 'decided_at', null) "
+            "where id = %s and kind = 'followup_task'", (int(task_id),))
+
+
+def set_followup_task_draft(task_id: int, draft: dict) -> None:
+    """Store the draft the compose box should open with (AI or default). Pending tasks only."""
+    execute("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) "
+            "  || jsonb_build_object('draft', %s::jsonb) "
+            "where id = %s and kind = 'followup_task' and detail->>'status' = 'pending'",
+            (Jsonb(draft), int(task_id)))
+
+
+def stamp_followup_anchor(proposal_id: str, clear_next: bool = True) -> None:
+    """A human decision on this proposal's follow-up: re-anchor the schedule on now.
+
+    `clear_next` drops a snooze date at the same time, because a decision made after the snooze
+    was set supersedes it. Named directly, not through to_jsonb: this is a WRITE, and a write to
+    a column the database does not have must fail loudly rather than pretend."""
+    if clear_next:
+        execute("update public.portal_proposals set followup_anchor_at = now(), "
+                "followup_next_at = null, updated_at = now() where proposal_id = %s",
+                (proposal_id,))
+    else:
+        execute("update public.portal_proposals set followup_anchor_at = now(), "
+                "updated_at = now() where proposal_id = %s", (proposal_id,))
+
+
+_UNSET = object()
+
+
+def set_followup_plan(proposal_id: str, *, next_at: Any = _UNSET, interval_days: Any = _UNSET,
+                      stop_after: Any = _UNSET) -> None:
+    """This proposal's own schedule. Only the fields passed are written; None clears one."""
+    sets, params = [], []
+    for col, val in (("followup_next_at", next_at), ("followup_interval_days", interval_days),
+                     ("followup_stop_after", stop_after)):
+        if val is not _UNSET:
+            sets.append("%s = %%s" % col)
+            params.append(val)
+    if not sets:
+        return
+    execute("update public.portal_proposals set " + ", ".join(sets)
+            + ", updated_at = now() where proposal_id = %s", tuple(params) + (proposal_id,))
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def list_followup_candidates() -> list[dict[str, Any]]:

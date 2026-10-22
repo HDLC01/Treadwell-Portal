@@ -14,6 +14,24 @@ and there is no way to un-send an email. At-most-once is the right bias here.
 
 Everything is per-proposal try/except: one malformed row must never stop the sweep
 for everyone else.
+
+REMIND-ONLY (2026-10-23). Hanz's decisions 1 and 2: every proposal, including every one already
+mid-cadence when this shipped, is in remind mode. A CUSTOMER reminder coming due no longer emails
+the customer. It reserves a `followup_task` row instead — through the SAME partial unique index the
+automated emails used, so an occurrence the old ladder already emailed cannot come back as a task —
+and tells the estimator, by email (`staff_followup_due`) and through the pending-task feed the
+staff tool polls. The estimator then sends a reviewed email, logs a call, skips, or snoozes (main.py,
+/api/admin/followup-task/...). `_send_customer` is not reachable from the tick at all; the only
+caller left is the estimator's explicit send.
+
+One open task per proposal. While one is pending, no second one is raised: the human decision is
+what resolves it, not the clock. A task whose proposal leaves scope (signed and paid, closed lost,
+automation off, paused, re-sent, moved to another stage) is marked expired by the housekeeping pass
+at the top of each tick, so nothing dangles in an estimator's queue for a job that has moved on.
+
+The STAFF reminders are unchanged in kind — they always went to the estimator — except that the two
+pre-decision notes (`staff_not_viewed`, `staff_personal_followup`) are folded into the task email when
+both fall due in the same tick, so the estimator gets one email about one moment rather than two.
 """
 from __future__ import annotations
 
@@ -27,6 +45,7 @@ from datetime import datetime, timezone
 import config
 import db
 import email_sender
+import followup_draft
 import followup_rules as rules
 import followup_settings
 
@@ -199,7 +218,19 @@ def _send_customer(p: dict, due, templates: dict | None = None) -> bool:
     return ok
 
 
-def _send_staff(p: dict, due) -> bool:
+# What the customer has (not) done, in the estimator's words, per customer template. Used by the
+# follow-up-due email so it says WHICH reminder this is — these are different phone calls.
+_TASK_SITUATION = {
+    "not_viewed": "hasn't opened the proposal yet",
+    "next_steps": "has opened the proposal but hasn't approved it",
+    "second_nudge": "has opened the proposal but still hasn't approved it",
+    "checkin": "has had the proposal a while and still hasn't decided",
+    "deposit_nudge": "approved the proposal, and the deposit hasn't come in",
+}
+
+
+def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
+    """`for_template` is the CUSTOMER template a staff_followup_due email is about."""
     to = _staff_recipients(p)
     if not to:
         log.info("[followup] no staff recipient for %s", p["proposal_id"])
@@ -223,7 +254,7 @@ def _send_staff(p: dict, due) -> bool:
     # is about to ask for one specific number, and quoting the contract value would have them
     # asking for the wrong one.
     amount = (p.get("deposit_amount") or p.get("approved_total")
-              if due.template == "staff_deposit_outstanding"
+              if (due.template == "staff_deposit_outstanding" or for_template == "deposit_nudge")
               else p.get("approved_total") or p.get("deposit_amount"))
     amount_txt = f"${float(amount):,.2f}" if amount is not None else "—"
 
@@ -232,13 +263,27 @@ def _send_staff(p: dict, due) -> bool:
         body = (f"<p><strong>{email_sender._esc(who)}</strong> hasn't opened the proposal for "
                 f"<strong>{email_sender._esc(project)}</strong> yet — it went out 24 hours ago.</p>"
                 f"<p>A quick call often beats another email.</p>")
+    elif due.template == "staff_followup_due":
+        # Remind-only: a reminder to the CUSTOMER is due, and nothing has been sent to them. This
+        # email is the estimator's cue; the draft waits in the CRM behind the button below.
+        situation = _TASK_SITUATION.get(for_template or "", "hasn't decided yet")
+        subject = f"Follow-up due — {project}"
+        body = (f"<p><strong>{email_sender._esc(who)}</strong> {situation} on "
+                f"<strong>{email_sender._esc(project)}</strong>, and a follow-up is due.</p>"
+                f"<ul>"
+                f"<li>Customer: {email_sender._esc(who)}</li>"
+                f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
+                f"<li>Amount: {amount_txt}</li>"
+                f"</ul>"
+                f"<p>Nothing has been sent to the customer. Open it in the CRM to review the "
+                f"draft email and send it, log a call instead, or skip it for now.</p>")
     elif due.template == "staff_pause_expired":
         until = p.get("followup_paused_until")
         subject = f"Follow-up reminder — {project}"
         body = (f"<p>The delay window {email_sender._esc(who)} asked for on "
                 f"<strong>{email_sender._esc(project)}</strong> ended "
-                f"{email_sender._esc(until)}. Automated follow-ups have resumed.</p>"
-                f"<p>Worth a personal check-in before the reminders land.</p>")
+                f"{email_sender._esc(until)}. Follow-up reminders have resumed.</p>"
+                f"<p>Worth a personal check-in before the next one comes due.</p>")
     elif due.template == "staff_deposit_outstanding":
         # The half that keeps going after the customer's reminders stop. A cheque "in the post"
         # that never lands has to stay somebody's problem, so this says WHICH of the two it is
@@ -260,8 +305,8 @@ def _send_staff(p: dict, due) -> bool:
                 + ("<p>Their own reminders have stopped — they've told us it's on the way, so "
                    "this one is ours to chase. Mark it received in the CRM when it lands.</p>"
                    if submitted else
-                   "<p>The customer is still being reminded automatically. Dates aren't held "
-                   "until the deposit is in, so a call is worth more than the next email.</p>"))
+                   "<p>You'll keep getting reminders to chase it. Dates aren't held until the "
+                   "deposit is in, so a call is worth more than the next email.</p>"))
     else:   # staff_personal_followup
         subject = f"Time for a personal follow-up — {project}"
         body = (f"<p><strong>{email_sender._esc(who)}</strong> has read the proposal for "
@@ -271,7 +316,7 @@ def _send_staff(p: dict, due) -> bool:
                 f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
                 f"<li>Amount: {amount_txt}</li>"
                 f"</ul>"
-                f"<p>Automated reminders continue, but this one is worth a call.</p>")
+                f"<p>Reminders continue, but this one is worth a call.</p>")
     try:
         # notify_team returns the addresses it DELIVERED to (one send per person), so `bool()`
         # asks the only question the caller has: did anything land? Falsy means the sweep releases
@@ -318,18 +363,23 @@ _ECHO_STAFF = {
                          "was sent, and the estimator has been emailed. A call usually beats "
                          "another email."),
     "staff_personal_followup": ("Worth a call — the customer has read the proposal and not "
-                                "approved it, and the estimator has been emailed. The automated "
+                                "approved it, and the estimator has been emailed. The follow-up "
                                 "reminders carry on either way."),
     "staff_deposit_outstanding": ("Deposit still outstanding — the job is approved and the "
                                   "money has not arrived, and the estimator has been emailed. "
                                   "Dates are not held until it is in."),
     "staff_pause_expired": ("Delay window has ended — the wait the customer asked for is "
-                            "over and the automated follow-ups have resumed. The estimator has "
+                            "over and the follow-up reminders have resumed. The estimator has "
                             "been emailed."),
+    # Remind-only. The card that says a follow-up task was raised. "Nothing has gone to them" is
+    # the sentence that matters: until 2026-10-23 a card at this moment meant an email HAD gone.
+    "staff_followup_due": ("Follow-up due — a reminder for the customer is ready to review and "
+                           "send from the CRM. Nothing has gone to them yet; the estimator has "
+                           "been emailed."),
 }
 
 
-def _echo_to_thread(pid: str, due) -> None:
+def _echo_to_thread(pid: str, due, extra_meta: dict | None = None) -> None:
     """Put a sent reminder into the project's conversation, so both sides can see it happened.
 
     BOTH AUDIENCES, on two different maps, because the two readerships are different people.
@@ -365,10 +415,89 @@ def _echo_to_thread(pid: str, due) -> None:
         return
     if not body:
         return                              # an unmapped template says nothing rather than guessing
+    if extra_meta:
+        # Only ADDS keys (e.g. the task id an estimator's hand-sent reminder came from). The
+        # visibility keys set above are never overridden from here.
+        meta = dict({k: v for k, v in extra_meta.items() if k not in meta}, **meta)
     try:
         db.add_message(pid, "staff", None, body, msg_type="system", meta=meta)
     except Exception as exc:  # noqa: BLE001 — the email is away; the record is a courtesy
         log.warning("[followup] could not echo %s to %s's thread: %s", template, pid, exc)
+
+
+def send_task_email(p: dict, template: str, include_status_ask: bool, tpl: dict,
+                    rule_key: str = "task") -> bool:
+    """Send ONE follow-up the estimator has reviewed. The only route to `_send_customer` left.
+
+    `tpl` is the edited {title, body, cta}, already validated by the caller. It rides the same
+    rendering path a saved template does (email_sender.send_followup with `templates`), so the
+    branded shell, the per-proposal Reply-To, the thread headers, the deposit deep-link and the
+    per-contact opt-outs are exactly what the automatic email had."""
+    due = rules.Due(rule_key, "customer", template, bool(include_status_ask))
+    return _send_customer(p, due, {template: tpl})
+
+
+# The two pre-decision staff notes that say the same thing as a follow-up-due email. When both fall
+# due in one tick (the 24h not-opened step always does), the task email is the one that goes out
+# and the note is consumed without a second email. Deposit and pause-expired notes are different
+# news and are never folded.
+_FOLDED_INTO_TASK = ("staff_not_viewed", "staff_personal_followup")
+
+
+def _expire_stale_tasks(now: datetime) -> None:
+    """Housekeeping: a pending task whose proposal has moved on is marked expired.
+
+    Without this a task raised on Tuesday for a customer who signed on Wednesday would sit in the
+    estimator's queue for ever — and, worse, block every later task on that proposal, because one
+    pending task is the gate. Never raises: housekeeping must not stop the sweep."""
+    try:
+        pending = db.list_pending_followup_tasks()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not list pending tasks: %s", exc)
+        return
+    for t in pending or []:
+        try:
+            p = db.get_proposal(t["proposal_id"])
+            ok, why = rules.task_is_live(t.get("detail") or {}, p, now)
+            if not ok:
+                db.decide_followup_task(t["id"], "expired", None, {"reason": why})
+                log.info("[followup] task %s on %s expired (%s)", t["id"], t["proposal_id"], why)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[followup] could not check task %s: %s", t.get("id"), exc)
+
+
+def _raise_task(p: dict, due, cfg: dict) -> bool:
+    """Reserve a follow-up task for a matured customer reminder and tell the estimator.
+
+    Returns True only when THIS call created the task. The reservation goes through the same
+    partial unique index the automated emails used (db.reserve_followup_task), so the twin
+    container during a deploy, a re-run tick, or an occurrence the old ladder already emailed all
+    dedupe to nothing.
+
+    The staff email is best-effort and the task is NOT released if it fails: unlike an automated
+    customer email, a task that nobody was emailed about is still on the staff tool's bell and
+    in the pipeline, so releasing it would only lose the record."""
+    pid = p["proposal_id"]
+    enrolled = rules._aware(p.get("followup_enrolled_at"))
+    draft = followup_draft.default_draft(due.template, cfg)
+    rid = db.reserve_followup_task(pid, due.rule_key, {
+        "audience": "customer", "template": due.template, "status": "pending",
+        "stage": rules.task_stage(due.template),
+        "cycle": rules.cycle_key(enrolled) if enrolled else None,
+        "include_status_ask": bool(due.include_status_ask),
+        "mode": rules.followup_mode(p),
+        # The plain starting point, stored so the compose box opens instantly. The AI draft is
+        # fetched on demand when the estimator opens the task — see followup_draft.
+        "draft": {"title": draft["title"], "body": draft["body"], "source": "default"},
+    })
+    if rid is None:
+        return False
+    log.info("[followup] %s %s -> task %s (remind)", pid, due.rule_key, rid)
+    note = rules.Due(due.rule_key, "staff", "staff_followup_due")
+    if not _send_staff(p, note, for_template=due.template):
+        log.warning("[followup] task %s raised for %s but the estimator email did not go", rid, pid)
+    _echo_to_thread(pid, note, {"task_id": rid})
+    return True
 
 
 def _tick(now: datetime | None = None) -> None:
@@ -385,6 +514,10 @@ def _tick(now: datetime | None = None) -> None:
         log.error("[followup] could not list candidates: %s", exc)
         return
 
+    # Before the candidates, so a task expired here (stage moved, proposal paused, re-sent) no
+    # longer blocks the fresh task that proposal may be owed in this same tick.
+    _expire_stale_tasks(now)
+
     for row in candidates:
         pid = row.get("proposal_id")
         try:
@@ -394,15 +527,34 @@ def _tick(now: datetime | None = None) -> None:
             fresh = db.get_proposal(pid) or row
             if fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
                 continue
-            for due in rules.due_now(fresh, now, cfg):
+            # The touches, the reminder count and the open task: what the schedule needs beyond
+            # the proposal row. Unguarded on purpose — without the open task we cannot honour
+            # "one task at a time", so a failed read skips this row rather than guessing.
+            signals = db.followup_signals(pid) or {}
+            fresh = dict(fresh, **{k: v for k, v in signals.items() if k != "pending_task"})
+            pending = signals.get("pending_task")
+            dues = rules.due_now(fresh, now, cfg)
+            # Customer first, so the staff notes below know whether a task went out this tick.
+            dues = sorted(dues, key=lambda d: d.audience != "customer")
+            task_raised = False
+            for due in dues:
+                if due.audience == "customer":
+                    # REMIND-ONLY. Never _send_customer from here (decisions 1 and 2).
+                    if pending:
+                        continue            # one open task per proposal; the human resolves it
+                    task_raised = _raise_task(fresh, due, cfg) or task_raised
+                    continue
                 rid = db.reserve_followup(pid, due.rule_key, {
                     "audience": due.audience, "template": due.template,
                 })
                 if rid is None:
                     continue        # already sent — a prior tick, or the twin container
-                ok = _send_customer(fresh, due, (cfg or {}).get("templates")) \
-                    if due.audience == "customer" else _send_staff(fresh, due)
-                if not ok:
+                if task_raised and due.template in _FOLDED_INTO_TASK:
+                    # Consumed, not sent: the follow-up-due email that just went out covers it,
+                    # and the reservation stops it firing on its own next tick.
+                    log.info("[followup] %s %s folded into the task email", pid, due.rule_key)
+                    continue
+                if not _send_staff(fresh, due):
                     # Nothing went out, so release the claim and let the next tick try.
                     # A systemic outage therefore retries at tick cadence rather than
                     # silently swallowing the whole cadence step.
