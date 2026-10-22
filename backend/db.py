@@ -1184,8 +1184,8 @@ def delete_followup(followup_id: int) -> None:
 # cannot double-send what a task already covered. A SECOND table was the alternative and is exactly
 # what would have let the two drift apart.
 #
-# Task state lives in `detail` (jsonb): status (pending | sent | skipped | called | snoozed |
-# expired), template, stage, cycle, draft {title, body, source}, decided_by, decided_at, and
+# Task state lives in `detail` (jsonb): status (pending | sending | sent | skipped | called |
+# snoozed | expired), template, stage, cycle, draft {title, body, source}, decided_by, decided_at, and
 # whatever the decision carried. A second partial unique index allows only ONE pending task per
 # proposal, so "one open task at a time" holds in the database and not only in the worker.
 
@@ -1228,13 +1228,16 @@ _REMINDER_TIMES_SQL = (
     "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
     "    and ((f.kind = 'followup_task' and coalesce(f.detail->>'status', 'pending') <> 'expired') "
     "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
-# The newest pending task (there is at most one: portal_followups_one_pending_task_uidx).
+# The newest OPEN task (there is at most one: portal_followups_one_open_task_uidx). Open means
+# pending, or `sending` — claimed by the send endpoint and not yet confirmed. A `sending` task must
+# hold the slot: if it did not, a tick during the send would raise a second task, and putting the
+# first back to pending after a failed send would then collide with the unique index.
 _PENDING_TASK_SQL = (
     "(select to_jsonb(t) from (select f.id, f.detail, f.created_at "
     "   from public.portal_followups f "
     "  where f.id = (select max(f2.id) from public.portal_followups f2 "
     "                 where f2.proposal_id = {pid} and f2.kind = 'followup_task' "
-    "                   and f2.detail->>'status' = 'pending')) t)")
+    "                   and f2.detail->>'status' in ('pending','sending'))) t)")
 
 
 def followup_signals(proposal_id: str) -> dict[str, Any]:
@@ -1303,26 +1306,60 @@ def list_pending_followup_tasks(limit: int = 500) -> list[dict[str, Any]]:
 
 
 def decide_followup_task(task_id: int, status: str, by: Optional[str],
-                         extra: Optional[dict] = None) -> Optional[dict[str, Any]]:
-    """Move a task OUT of pending, atomically. None if it was not pending any more.
+                         extra: Optional[dict] = None,
+                         from_status: str = "pending") -> Optional[dict[str, Any]]:
+    """Move a task from `from_status` (pending, by default) to `status`, atomically. None if it
+    was not in `from_status` any more.
 
-    The `status = 'pending'` guard in the WHERE is the double-click and two-tab protection: the
-    send endpoint claims the task here BEFORE emailing, so a second press finds nothing to claim and
-    sends nothing. Reserve, then send — the worker's rule, applied to a human."""
+    The status guard in the WHERE is the double-click and two-tab protection: the send endpoint
+    claims the task here (pending -> sending) BEFORE emailing, so a second press finds nothing to
+    claim and sends nothing, and only after the email went does it finish it (sending -> sent).
+    Reserve, then send — the worker's rule, applied to a human."""
     patch = dict(extra or {})
     patch.update({"status": status, "decided_by": by,
                   "decided_at": _now_iso()})
     return q1("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) || %s "
-              "where id = %s and kind = 'followup_task' and detail->>'status' = 'pending' "
+              "where id = %s and kind = 'followup_task' and detail->>'status' = %s "
               "returning id, proposal_id, detail, created_at",
-              (Jsonb(patch), int(task_id)))
+              (Jsonb(patch), int(task_id), from_status))
 
 
-def reopen_followup_task(task_id: int) -> None:
-    """Put a claimed task back to pending — the send it was claimed for did not go out."""
-    execute("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) "
-            "  || jsonb_build_object('status', 'pending', 'decided_by', null, 'decided_at', null) "
-            "where id = %s and kind = 'followup_task'", (int(task_id),))
+def reopen_followup_task(task_id: int, extra: Optional[dict] = None) -> bool:
+    """Put a `sending` task back to pending — the send it was claimed for did not go out (or, from
+    the worker's recovery, nothing says it did). True if this call reopened it.
+
+    Guarded on `sending`, like the claim is guarded on pending: it must never resurrect a task the
+    housekeeping expired or that another request already finished. `extra` rides along — the
+    recovery flags `send_unconfirmed` so the compose box can warn before a second send."""
+    patch = dict(extra or {})
+    patch.update({"status": "pending", "decided_by": None, "decided_at": None,
+                  "sending_at": None})
+    row = q1("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) || %s "
+             "where id = %s and kind = 'followup_task' and detail->>'status' = 'sending' "
+             "returning id", (Jsonb(patch), int(task_id)))
+    return bool(row)
+
+
+def list_stale_sending_tasks(minutes: int) -> list[dict[str, Any]]:
+    """Tasks claimed for a send more than `minutes` ago and never settled: the send endpoint lost
+    its database between claiming the task and finishing or reopening it. The worker settles them
+    (followup_worker._recover_stuck_sends). A task with no `sending_at` counts as stale — it can only
+    have come from a claim this code did not write."""
+    return qall(
+        "select id, proposal_id, detail, created_at from public.portal_followups "
+        "where kind = 'followup_task' and detail->>'status' = 'sending' "
+        "  and coalesce((detail->>'sending_at')::timestamptz, created_at) "
+        "      < now() - make_interval(mins => %s) "
+        "order by id", (int(minutes),))
+
+
+def followup_task_send_recorded(task_id: int) -> bool:
+    """Did the send endpoint record that this task's email went? It writes a staff_email row
+    carrying the task id right after a send succeeds — the evidence the recovery trusts."""
+    row = q1("select 1 as hit from public.portal_followups "
+             "where kind = 'staff_email' and detail->>'task_id' = %s limit 1",
+             (str(int(task_id)),))
+    return bool(row)
 
 
 def set_followup_task_draft(task_id: int, draft: dict) -> None:

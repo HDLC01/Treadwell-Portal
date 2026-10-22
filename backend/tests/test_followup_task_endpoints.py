@@ -61,18 +61,26 @@ def api(monkeypatch):
     monkeypatch.setattr(main.db, "get_followup_task",
                         lambda tid: copy.deepcopy(state["task"]) if tid == 5 else None)
 
-    def decide(tid, status, by, extra=None):
+    def decide(tid, status, by, extra=None, from_status="pending"):
         t = state["task"]
-        if t["detail"].get("status") != "pending":
-            return None                                   # the WHERE status='pending' guard
+        if t["detail"].get("status") != from_status:
+            return None                                   # the WHERE status=<from> guard
         t["detail"].update(dict(extra or {}, status=status, decided_by=by, decided_at="now"))
         calls["decided"].append((tid, status))
         return copy.deepcopy(t)
 
+    def reopen(tid, extra=None):
+        if state.get("reopen_fails", 0) > 0:
+            state["reopen_fails"] -= 1
+            raise RuntimeError("the connection the pool handed out is dead")
+        if state["task"]["detail"].get("status") != "sending":
+            return False                                  # the WHERE status='sending' guard
+        calls["reopened"].append(tid)
+        state["task"]["detail"].update(dict(extra or {}, status="pending"))
+        return True
+
     monkeypatch.setattr(main.db, "decide_followup_task", decide)
-    monkeypatch.setattr(main.db, "reopen_followup_task",
-                        lambda tid: calls["reopened"].append(tid)
-                        or state["task"]["detail"].update(status="pending"))
+    monkeypatch.setattr(main.db, "reopen_followup_task", reopen)
     monkeypatch.setattr(main.db, "set_followup_task_draft",
                         lambda tid, draft: calls["drafts"].append(draft))
     monkeypatch.setattr(main.db, "stamp_followup_anchor",
@@ -165,6 +173,147 @@ def test_a_failed_send_puts_the_task_back(api):
     assert api.calls["followups"] == [] and api.calls["stamped"] == []
     assert not [c for c in api.calls["cards"] if c["meta"].get("followup")], (
         "the thread claims an email that never went")
+
+
+# ── a send that half-fails (audit, 2026-10-23) ───────────────────────────────
+# The claim used to flip the task straight to `sent` BEFORE the email. When the email then failed
+# and the one reopen ALSO failed (portal-pool-has-no-liveness-check: a DB restart hands out dead
+# connections), the task stayed `sent` for ever: every retry was 409 already_decided, and its
+# rule_key blocked the worker from raising that occurrence again. Nobody was emailed and nothing
+# would ever ask again. The claim is now `sending` — still not pending, so a double click sends
+# once — and a `sending` task is never final.
+def test_the_claim_is_sending_not_sent(api, monkeypatch):
+    """While the email is in flight the task is `sending`; it only becomes `sent` after it went."""
+    seen = []
+    real = main.followup_worker.send_task_email
+
+    def spy(*a, **k):
+        seen.append(api.state["task"]["detail"]["status"])
+        return real(*a, **k)
+
+    monkeypatch.setattr(main.followup_worker, "send_task_email", spy)
+    r = api.post("/api/admin/followup-task/5/send", json=GOOD)
+    assert r.status_code == 200, r.text
+    assert seen == ["sending"]
+    assert api.state["task"]["detail"]["status"] == "sent"
+    assert r.json()["task"]["status"] == "sent"
+
+
+def test_a_reopened_unconfirmed_send_is_flagged_for_the_compose_box(api):
+    api.state["task"] = _task(send_unconfirmed=True)
+    task = api.get("/api/admin/followup-task/5").json()["task"]
+    assert task["status"] == "pending" and task["send_unconfirmed"] is True
+    assert api.get("/api/admin/followup-task/5").status_code == 200
+    api.state["task"] = _task()
+    assert api.get("/api/admin/followup-task/5").json()["task"]["send_unconfirmed"] is False
+
+
+def test_a_failed_send_whose_reopen_fails_once_still_puts_the_task_back(api):
+    """One dead pooled connection must not strand the task: the reopen is retried."""
+    api.state["send_ok"] = False
+    api.state["reopen_fails"] = 1
+    r = api.post("/api/admin/followup-task/5/send", json=GOOD)
+    assert r.status_code == 502 and r.json()["error"] == "send_failed"
+    assert api.state["task"]["detail"]["status"] == "pending"
+
+
+def test_a_failed_send_whose_reopen_keeps_failing_is_never_left_sent(api):
+    """The auditor's reproduction. Both reopen attempts fail: the task must NOT read `sent` — it
+    stays `sending`, which the worker's recovery puts back (test_followup_remind_worker)."""
+    api.state["send_ok"] = False
+    api.state["reopen_fails"] = 99
+    r = api.post("/api/admin/followup-task/5/send", json=GOOD)
+    assert r.status_code == 502 and r.json()["error"] == "send_failed"
+    assert api.state["task"]["detail"]["status"] == "sending", (
+        "a task whose email never went is recorded as sent")
+    assert api.calls["followups"] == [] and api.calls["stamped"] == []
+    again = api.post("/api/admin/followup-task/5/send", json=GOOD)
+    assert again.status_code == 409 and again.json()["status"] == "sending"
+    assert len(api.calls["sent"]) == 1, "the retry emailed again"
+
+
+def test_a_failed_record_after_a_real_send_still_answers_ok_and_still_re_anchors(api, monkeypatch):
+    """The email went. A database blip on the staff_email row must not turn that into a 500 (the
+    estimator would believe it failed and send it again), and must not skip the anchor stamp, the
+    thread echo or the card that come after it."""
+    def boom(*a, **k):
+        raise RuntimeError("db blip")
+
+    monkeypatch.setattr(main.db, "add_followup", boom)
+    r = api.post("/api/admin/followup-task/5/send", json=GOOD)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["task"]["status"] == "sent"
+    assert "touch_not_recorded" in body.get("warnings", [])
+    assert len(api.calls["sent"]) == 1
+    assert api.calls["stamped"] == [("pid-1", True)], "the schedule did not re-anchor"
+    assert [c for c in api.calls["cards"] if c["meta"].get("followup")], "no thread echo"
+    assert any(c["meta"].get("crm") == "followup_sent" for c in api.calls["cards"])
+
+
+def test_a_failed_finalise_after_a_real_send_still_answers_ok(api, monkeypatch):
+    """sending -> sent failing is the same story: the email is away, so the answer is 200; the
+    staff_email row it writes is the evidence the worker's recovery finalises the task from."""
+    real = main.db.decide_followup_task
+
+    def decide(tid, status, by, extra=None, from_status="pending"):
+        if status == "sent":
+            raise RuntimeError("db blip")
+        return real(tid, status, by, extra, from_status=from_status)
+
+    monkeypatch.setattr(main.db, "decide_followup_task", decide)
+    r = api.post("/api/admin/followup-task/5/send", json=GOOD)
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "sent"
+    assert "task_not_finalised" in r.json().get("warnings", [])
+    f, = api.calls["followups"]
+    assert f["kind"] == "staff_email" and f["detail"]["task_id"] == 5
+    assert api.calls["stamped"] == [("pid-1", True)]
+
+
+def test_a_sending_task_still_counts_as_the_open_task():
+    """`sending` must hold the one-open-task slot, in the database and in the worker's read.
+    Otherwise a tick during the send raises a second task, and the reopen of the first then
+    collides with the unique index — the other way the task got stranded."""
+    import pathlib
+    import re
+    import db
+    schema = (pathlib.Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
+    m = re.search(r"create unique index if not exists portal_followups_one_open_task_uidx"
+                  r"(.*?);", schema, re.S)
+    assert m, "the one-open-task index is missing"
+    assert "'pending'" in m.group(1) and "'sending'" in m.group(1)
+    assert "drop index if exists public.portal_followups_one_pending_task_uidx" in schema
+    assert "'sending'" in db._PENDING_TASK_SQL
+
+
+def test_reopen_only_reopens_a_task_that_is_sending(monkeypatch):
+    """The reopen is guarded like the claim: it must never resurrect a task the worker expired,
+    or one a second tab already finished."""
+    import db
+    seen = []
+    monkeypatch.setattr(db, "q1", lambda sql, params=(): seen.append((sql, params)) or None)
+    assert db.reopen_followup_task(5, {"send_unconfirmed": True}) is False
+    sql, params = seen[0]
+    assert "detail->>'status' = 'sending'" in sql and 5 in params
+
+
+@pytest.mark.parametrize("path,body", [
+    ("called", {"by": "kyle@wetreadwell.com", "note": "spoke to Rita"}),
+    ("skip", {"by": "kyle@wetreadwell.com"}),
+])
+def test_a_failed_record_after_a_decision_still_answers_ok_and_re_anchors(api, monkeypatch,
+                                                                           path, body):
+    """Same class on called and skip: the task is already decided (a retry would be 409), so a
+    500 here would tell the estimator it failed when it did not, AND skip the anchor stamp."""
+    def boom(*a, **k):
+        raise RuntimeError("db blip")
+
+    monkeypatch.setattr(main.db, "add_followup", boom)
+    r = api.post("/api/admin/followup-task/5/%s" % path, json=body)
+    assert r.status_code == 200, r.text
+    assert "touch_not_recorded" in r.json().get("warnings", [])
+    assert api.calls["stamped"] == [("pid-1", True)], "the schedule did not re-anchor"
 
 
 @pytest.mark.parametrize("body,error", [

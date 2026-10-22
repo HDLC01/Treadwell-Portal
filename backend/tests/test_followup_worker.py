@@ -38,7 +38,7 @@ def _proposal(**over):
 
 def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
           send_ok=True, staff_ok=True, enabled="true", signals=None,
-          reserve_task=lambda pid, key, detail: 7, pending=()):
+          reserve_task=lambda pid, key, detail: 7, pending=(), stale=(), recorded=()):
     calls = {"reserved": [], "deleted": [], "customer": [], "staff": [], "candidates": 0,
              # What the worker echoed into the project's conversation. Stubbed like every other
              # database call here: unstubbed it is a real connection, and this one runs on the
@@ -46,7 +46,9 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
              "thread": [],
              # Remind-only (2026-10-23): the follow-up tasks the tick raised, and the decisions
              # its housekeeping took on open ones.
-             "tasks": [], "decided": []}
+             "tasks": [], "decided": [],
+             # The recovery of a send that was claimed and never confirmed (`sending`).
+             "reopened": []}
     p = proposal if proposal is not None else _proposal()
 
     monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", enabled)
@@ -88,8 +90,14 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
     monkeypatch.setattr(fw.db, "reserve_followup_task", _reserve_task)
     monkeypatch.setattr(fw.db, "list_pending_followup_tasks", lambda: list(pending))
     monkeypatch.setattr(fw.db, "decide_followup_task",
-                        lambda tid, status, by, extra=None: calls["decided"].append(
+                        lambda tid, status, by, extra=None, from_status="pending":
+                        calls["decided"].append(
                             (tid, status, (extra or {}).get("reason"))) or {"id": tid})
+    monkeypatch.setattr(fw.db, "list_stale_sending_tasks", lambda minutes: list(stale))
+    monkeypatch.setattr(fw.db, "followup_task_send_recorded", lambda tid: tid in recorded)
+    monkeypatch.setattr(fw.db, "reopen_followup_task",
+                        lambda tid, extra=None: calls["reopened"].append(
+                            (tid, dict(extra or {}))) or True)
     monkeypatch.setattr(
         fw.db, "add_message",
         lambda pid, kind, who, body, **k: calls["thread"].append(

@@ -758,7 +758,7 @@ alter table public.portal_proposals add constraint portal_proposals_followup_sto
   check (followup_stop_after is null or followup_stop_after between 1 and 60);
 
 -- The task is a ROW IN portal_followups, kind 'followup_task', not a table of its own. Its state
--- (status pending/sent/skipped/called/snoozed/expired, draft {title, body, source}, decided_by,
+-- (status pending/sending/sent/skipped/called/snoozed/expired, draft {title, body, source}, decided_by,
 -- decided_at) lives in `detail`. Same table so it shares the SAME dedupe as the automated emails:
 -- a task can never be raised for an occurrence the old ladder already emailed, and a future mode
 -- that sends on a click cannot double-send what a task already covered.
@@ -779,8 +779,13 @@ create unique index if not exists portal_followups_rule_v2_uidx
   where kind in ('auto_email','followup_task') and (detail->>'rule_key') is not null;
 drop index if exists public.portal_followups_rule_uidx;
 -- ONE OPEN TASK PER PROPOSAL, enforced by the database rather than only by the worker: two
--- containers overlapping during a deploy cannot both raise one. Also what the pending-task reads
--- (staff bell, board) are served by.
-create unique index if not exists portal_followups_one_pending_task_uidx
+-- containers overlapping during a deploy cannot both raise one. Also what the open-task reads
+-- (staff bell, board) are served by. OPEN is pending OR sending: the send endpoint claims a task
+-- as 'sending' before it emails, and that claim must keep the slot, or a tick mid-send raises a
+-- second task and putting the first back after a failed send collides with this index.
+create unique index if not exists portal_followups_one_open_task_uidx
   on public.portal_followups (proposal_id)
-  where kind = 'followup_task' and (detail->>'status') = 'pending';
+  where kind = 'followup_task' and (detail->>'status') in ('pending','sending');
+-- The pending-only predecessor, from the same unreleased change. Dropped AFTER the wider one
+-- exists, the rule_v2 pattern above; a no-op on a database that never had it.
+drop index if exists public.portal_followups_one_pending_task_uidx;

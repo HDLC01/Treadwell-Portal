@@ -466,6 +466,45 @@ def _expire_stale_tasks(now: datetime) -> None:
             log.warning("[followup] could not check task %s: %s", t.get("id"), exc)
 
 
+# How long a `sending` claim may stand before the tick decides the send is not in flight any more.
+# A send is one Resend call per recipient, seconds long; fifteen minutes is far past any live one,
+# so a slow send is never reopened under the estimator who pressed the button.
+SENDING_STALE_MINUTES = 15
+
+
+def _recover_stuck_sends() -> None:
+    """Settle tasks the send endpoint claimed (`sending`) and then lost its database before it
+    could finish or reopen them (audit, 2026-10-23).
+
+    Without this a task whose email failed, and whose reopen ALSO failed, sat claimed for ever:
+    every retry was 409, and because `sending` holds the one-open-task slot no later reminder on
+    that proposal could be raised either. Two outcomes, and neither emails anybody:
+      - the staff_email row the endpoint writes after a REAL send exists -> finish it as `sent`;
+      - otherwise -> back to pending, flagged `send_unconfirmed`, for the estimator to look at.
+    The second guess can be wrong only when the email went AND both later writes failed; then the
+    estimator sees the task again with a warning, which costs a look at the thread. Leaving it
+    stuck cost every reminder that proposal would ever get. Never raises."""
+    try:
+        stuck = db.list_stale_sending_tasks(SENDING_STALE_MINUTES)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not list unsettled sends: %s", exc)
+        return
+    for t in stuck or []:
+        tid = t.get("id")
+        try:
+            if db.followup_task_send_recorded(tid):
+                by = (t.get("detail") or {}).get("decided_by")
+                db.decide_followup_task(tid, "sent", by, {"recovered": True},
+                                        from_status="sending")
+                log.info("[followup] task %s: unsettled send had gone — finished as sent", tid)
+            else:
+                db.reopen_followup_task(tid, {"send_unconfirmed": True})
+                log.warning("[followup] task %s: unsettled send, no record it went — reopened",
+                            tid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[followup] could not settle task %s: %s", tid, exc)
+
+
 def _raise_task(p: dict, due, cfg: dict) -> bool:
     """Reserve a follow-up task for a matured customer reminder and tell the estimator.
 
@@ -514,6 +553,9 @@ def _tick(now: datetime | None = None) -> None:
         log.error("[followup] could not list candidates: %s", exc)
         return
 
+    # Settle unconfirmed sends first, so a task reopened here is judged by the expiry pass below in
+    # the same tick (a reopened task whose proposal has since been signed is expired at once).
+    _recover_stuck_sends()
     # Before the candidates, so a task expired here (stage moved, proposal paused, re-sent) no
     # longer blocks the fresh task that proposal may be owed in this same tick.
     _expire_stale_tasks(now)

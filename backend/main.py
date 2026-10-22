@@ -3538,6 +3538,9 @@ def _task_view(row: dict) -> dict:
         "due_at": _iso(row.get("created_at")),
         "decided_by": d.get("decided_by"),
         "decided_at": d.get("decided_at"),
+        # Set when the worker reopened a send it could not confirm (_recover_stuck_sends): the
+        # email MAY already have gone, so the compose box should say "check the thread first".
+        "send_unconfirmed": bool(d.get("send_unconfirmed")),
         "draft": _task_draft(d),
     }
 
@@ -3747,11 +3750,13 @@ async def admin_followup_task_send(task_id: str, request: Request) -> JSONRespon
       2. re-check the proposal is still in scope — signed and paid, closed lost, automation off,
          paused, re-sent or moved stage all return 409 and expire the task. A task raised on
          Tuesday must never email a customer who signed on Wednesday;
-      3. CLAIM the task (pending -> sent) before emailing, so a double click or a second tab finds
-         nothing to claim and sends nothing;
+      3. CLAIM the task (pending -> sending) before emailing, so a double click or a second tab
+         finds nothing to claim and sends nothing;
       4. send; if nothing went out, put the task back to pending and return 502;
-      5. record it as a staff email (a touch: the schedule re-anchors on it), stamp the anchor,
-         echo it into the customer's thread like every reminder, and card it for staff."""
+      5. finish it (sending -> sent), record it as a staff email (a touch: the schedule re-anchors
+         on it), stamp the anchor, echo it into the customer's thread like every reminder, and
+         card it for staff. Each of these is guarded: the email has gone, so the answer is 200,
+         with `warnings` naming any write that failed."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     task, p, err = _load_task(task_id)
@@ -3783,8 +3788,14 @@ async def admin_followup_task_send(task_id: str, request: Request) -> JSONRespon
             log.warning("[followup] could not expire task %s: %s", task_id, exc)
         return _json({"ok": False, "error": "out_of_scope", "reason": why}, 409)
 
-    claimed = db.decide_followup_task(task["id"], "sent", by,
-                                      {"sent": {"title": tpl["title"], "body": tpl["body"]}})
+    # Claimed as `sending`, NOT `sent` (audit, 2026-10-23). `sent` before the email meant that a
+    # failed send whose reopen ALSO failed left a task that read as sent, refused every retry, and
+    # blocked its occurrence for ever. `sending` is still not pending — a double click finds
+    # nothing to claim — but it is never final: success finishes it below, failure reopens it, and
+    # if both writes are lost the worker settles it (followup_worker._recover_stuck_sends).
+    sent_text = {"title": tpl["title"], "body": tpl["body"]}
+    claimed = db.decide_followup_task(task["id"], "sending", by,
+                                      {"sent": sent_text, "sending_at": _now_utc().isoformat()})
     if not claimed:
         return _json({"ok": False, "error": "already_decided"}, 409)
     pid = p["proposal_id"]
@@ -3795,14 +3806,31 @@ async def admin_followup_task_send(task_id: str, request: Request) -> JSONRespon
         log.warning("[followup] task %s send raised: %s", task_id, exc)
         sent = False
     if not sent:
-        try:
-            db.reopen_followup_task(task["id"])
-        except Exception as exc:  # noqa: BLE001
-            log.error("[followup] task %s did not send AND could not be reopened: %s", task_id, exc)
+        _reopen_after_failed_send(task["id"])
         return _json({"ok": False, "error": "send_failed"}, 502)
 
-    db.add_followup(pid, "staff_email",
-                    {"note": tpl["title"], "task_id": task["id"], "followup_task": True}, by)
+    # THE EMAIL HAS GONE. Everything below is bookkeeping and every step is guarded: an unguarded
+    # write here turned a delivered email into a 500 (the estimator believes it failed and sends it
+    # again) AND skipped the anchor stamp, the thread echo and the card after it. A step that fails
+    # is named in `warnings` instead.
+    warnings = []
+    done = None
+    try:
+        done = db.decide_followup_task(task["id"], "sent", by, {"sent": sent_text},
+                                       from_status="sending")
+    except Exception as exc:  # noqa: BLE001 — the staff_email row below lets the worker finish it
+        log.error("[followup] task %s sent but could not be marked sent: %s", task_id, exc)
+    if not done:
+        warnings.append("task_not_finalised")
+    try:
+        # Written right after the send on purpose: it is a touch (re-anchors the schedule via
+        # db._STAFF_FOLLOWUP_SQL) AND the evidence the worker's recovery reads to finish a task
+        # whose `sent` write was lost.
+        db.add_followup(pid, "staff_email",
+                        {"note": tpl["title"], "task_id": task["id"], "followup_task": True}, by)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[followup] task %s sent but the staff_email row failed: %s", task_id, exc)
+        warnings.append("touch_not_recorded")
     _stamp_touch(pid)
     followup_worker._echo_to_thread(
         pid, followup_rules.Due(d.get("rule_key") or "task", "customer", template),
@@ -3810,7 +3838,27 @@ async def admin_followup_task_send(task_id: str, request: Request) -> JSONRespon
     who = _actor_name(by)
     _crm_card(pid, ('%s sent a follow-up email — "%s"' % (who, tpl["title"])) if who
               else ('A follow-up email was sent — "%s"' % tpl["title"]), "followup_sent")
-    return _json({"ok": True, "task": _task_view(claimed)})
+    view = _task_view(done or claimed)
+    view["status"] = "sent"                 # the email went, whatever the row managed to record
+    out = {"ok": True, "task": view}
+    if warnings:
+        out["warnings"] = warnings
+    return _json(out)
+
+
+def _reopen_after_failed_send(task_id: int) -> None:
+    """Put a `sending` task back after its email did not go. Tried twice: the likeliest failure is
+    a dead pooled connection after a database restart (portal-pool-has-no-liveness-check), which
+    the pool replaces on the next checkout. If both fail the task stays `sending` and the worker
+    reopens it within SENDING_STALE_MINUTES — never `sent`, never lost."""
+    for attempt in (1, 2):
+        try:
+            db.reopen_followup_task(task_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            level = log.warning if attempt == 1 else log.error
+            level("[followup] task %s did not send; reopen attempt %d failed: %s",
+                  task_id, attempt, exc)
 
 
 @app.post("/api/admin/followup-task/{task_id}/skip")
@@ -3833,15 +3881,24 @@ async def admin_followup_task_skip(task_id: str, request: Request) -> JSONRespon
         return _json({"ok": False, "error": "already_decided"}, 409)
     pid = task["proposal_id"]
     _stamp_touch(pid)
+    warnings = []
     # Bookkeeping (`action`), not outreach: nobody contacted the customer, so the digest must not
-    # read this as "chased" — the anchor stamp above is what moves the schedule.
-    db.add_followup(pid, "staff_note",
-                    {"action": "followup_skipped", "task_id": task["id"], "note": note}, by)
+    # read this as "chased" — the anchor stamp above is what moves the schedule. Guarded: the task
+    # is already decided, so a 500 here would report a failure the estimator cannot retry (409).
+    try:
+        db.add_followup(pid, "staff_note",
+                        {"action": "followup_skipped", "task_id": task["id"], "note": note}, by)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] task %s skipped but the note row failed: %s", task_id, exc)
+        warnings.append("touch_not_recorded")
     who = _actor_name(by)
     _crm_card(pid, ("%s skipped this follow-up for now" % who if who
                     else "Follow-up skipped for now")
               + (' — "%s"' % note if note else "."), "followup_skipped")
-    return _json({"ok": True, "task": _task_view(claimed)})
+    out = {"ok": True, "task": _task_view(claimed)}
+    if warnings:
+        out["warnings"] = warnings
+    return _json(out)
 
 
 @app.post("/api/admin/followup-task/{task_id}/called")
@@ -3868,9 +3925,18 @@ async def admin_followup_task_called(task_id: str, request: Request) -> JSONResp
     if not claimed:
         return _json({"ok": False, "error": "already_decided"}, 409)
     pid = task["proposal_id"]
-    _log_staff_followup(pid, kind, note, by, {"task_id": task["id"]})
+    # Stamp FIRST: it is what moves the schedule, and it must not depend on the history row.
     _stamp_touch(pid)
-    return _json({"ok": True, "task": _task_view(claimed)})
+    out = {"ok": True, "task": _task_view(claimed)}
+    try:
+        # Guarded HERE, not inside _log_staff_followup: from the drawer, a failed insert is a real
+        # failure the estimator should see and retry. From a task it is not — the task is already
+        # decided (a retry is 409), and the call itself happened outside this system.
+        _log_staff_followup(pid, kind, note, by, {"task_id": task["id"]})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] task %s marked called but the log row failed: %s", task_id, exc)
+        out["warnings"] = ["touch_not_recorded"]
+    return _json(out)
 
 
 @app.post("/api/admin/followup-task/{task_id}/snooze")
@@ -3901,14 +3967,20 @@ async def admin_followup_task_snooze(task_id: str, request: Request) -> JSONResp
     claimed = db.decide_followup_task(task["id"], "snoozed", by, {"until": when.isoformat()})
     if not claimed:
         return _json({"ok": False, "error": "already_decided"}, 409)
-    db.add_followup(pid, "staff_note",
-                    {"action": "followup_snoozed", "task_id": task["id"],
-                     "until": when.isoformat()}, by)
+    out = {"ok": True, "task": _task_view(claimed), "next_at": when.isoformat()}
+    try:
+        # Guarded for the same reason as skip: the task is decided and the date is written.
+        db.add_followup(pid, "staff_note",
+                        {"action": "followup_snoozed", "task_id": task["id"],
+                         "until": when.isoformat()}, by)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] task %s snoozed but the note row failed: %s", task_id, exc)
+        out["warnings"] = ["touch_not_recorded"]
     day = when.astimezone(followup_rules.BUSINESS_TZ).date().isoformat()
     who = _actor_name(by)
     _crm_card(pid, ("%s will follow up on %s." % (who, day)) if who
               else ("Follow-up snoozed until %s." % day), "followup_snoozed")
-    return _json({"ok": True, "task": _task_view(claimed), "next_at": when.isoformat()})
+    return _json(out)
 
 
 @app.post("/api/admin/proposal/{proposal_id}/followup-plan")
