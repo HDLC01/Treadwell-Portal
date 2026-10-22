@@ -50,7 +50,11 @@ DEFAULTS: Dict[str, Any] = {
     "second_nudge_hours": 72,     # 48h after the first viewed reminder
     "recurring_hours": 72,        # "every 3 days thereafter"
     "staff_personal_hours": 48,   # viewed but still pending -> tell the estimator
-    "max_recurring": 20,          # ~two months past the last real signal
+    "max_recurring": 20,          # PRE-DECISION reminders, counted since the customer last replied
+    # The deposit chase's own cap (decision 5, 2026-10-23). Separate so that lowering the nudge
+    # count above — Kyle's stopgap — can never silence the reminder to chase a deposit on a job that
+    # is already signed. 200 x 3 days is over a year: effectively unbounded.
+    "deposit_max_recurring": 200,
     "send_start_hour": 8,         # business hours, America/Chicago
     "send_end_hour": 18,
 }
@@ -64,6 +68,7 @@ BOUNDS: Dict[str, tuple] = {
     "recurring_hours": (4, 24 * 90),
     "staff_personal_hours": (1, 24 * 90),     # staff mail is unclamped by hours, so 1h is fine
     "max_recurring": (1, 60),
+    "deposit_max_recurring": (1, 1000),
     "send_start_hour": (0, 23),
     "send_end_hour": (1, 24),
 }

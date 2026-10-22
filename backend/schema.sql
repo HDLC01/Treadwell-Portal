@@ -497,9 +497,12 @@ create index if not exists portal_followups_proposal_idx
 -- enforced by the database rather than by application bookkeeping. The worker
 -- reserves a row before sending, so a crashed tick, a container restart, or two
 -- overlapping containers during a deploy cannot double-nag a customer.
-create unique index if not exists portal_followups_rule_uidx
-  on public.portal_followups (proposal_id, (detail->>'rule_key'))
-  where kind = 'auto_email' and (detail->>'rule_key') is not null;
+--
+-- 2026-10-23: that index (portal_followups_rule_uidx, kind = 'auto_email' only) is
+-- superseded by portal_followups_rule_v2_uidx in the remind-only section at the end
+-- of this file, which covers follow-up tasks with the same key. Its create statement
+-- is retired here rather than left in place, or every boot would build it and the
+-- later section would drop it again.
 alter table public.portal_followups enable row level security;
 
 -- ── Settings ──────────────────────────────────────────────────────────────
@@ -712,3 +715,72 @@ grant select, insert, update, delete on public.portal_signed_contracts to portal
 drop policy if exists portal_app_rw on public.portal_signed_contracts;
 create policy portal_app_rw on public.portal_signed_contracts
   for all to portal_app using (true) with check (true);
+
+-- == Remind-only follow-ups (2026-10-23) ======================================================
+--
+-- Hanz's decisions: every proposal is REMIND-ONLY (1), including the ones already mid-cadence when
+-- this ships (2). A customer reminder coming due no longer emails the customer; it raises a
+-- follow-up TASK for the estimator, who sends a reviewed email, logs a call, skips or snoozes. A
+-- customer reply puts the full reminder count back (3). The pre-decision nudge cap and the deposit
+-- chase cap are separate (5) -- that one is a settings key, not DDL.
+--
+-- ALL ADDITIVE AND NULLABLE. Every existing row keeps working with NULL in all five columns, which
+-- reads as "the global cadence, remind mode, no decision taken yet". No backfill. The code reads the
+-- new columns through to_jsonb on the board query and through `select *` in the worker, so it runs
+-- on a database that has not had this block yet -- it just cannot raise a task there, because the
+-- widened CHECK below is what admits the kind. Written as plain statements (no do-blocks): the boot
+-- path's run_script splits this file on semicolons.
+--
+-- The mode. 'remind' is the only value v1 code handles; 'approve' (send a pre-filled template on a
+-- click) and 'auto' (the old automatic ladder) are FUTURE modes, legal here so they need no second
+-- migration, and nothing reads or writes them yet. NULL means remind.
+alter table public.portal_proposals add column if not exists followup_mode text;
+alter table public.portal_proposals drop constraint if exists portal_proposals_followup_mode_check;
+alter table public.portal_proposals add constraint portal_proposals_followup_mode_check
+  check (followup_mode is null or followup_mode in ('remind','approve','auto'));
+-- Stamped on every human decision about a follow-up (send / skip / called / snooze). One of the
+-- touches the schedule re-anchors on; the others (customer replies, staff-logged outreach, staff
+-- chat messages) are read from portal_questions / portal_followups and need no column.
+alter table public.portal_proposals add column if not exists followup_anchor_at timestamptz;
+-- The per-proposal schedule. NULL = the global cadence (portal_settings 'followups').
+--   followup_next_at        a specific date for the next reminder (a snooze)
+--   followup_interval_days  "every N days" for this proposal, and the gap after a touch
+--   followup_stop_after     the PRE-DECISION reminder cap for this proposal. It never reaches the
+--                           deposit chase, which has its own cap (decision 5)
+alter table public.portal_proposals add column if not exists followup_next_at timestamptz;
+alter table public.portal_proposals add column if not exists followup_interval_days int;
+alter table public.portal_proposals add column if not exists followup_stop_after int;
+alter table public.portal_proposals drop constraint if exists portal_proposals_followup_interval_days_check;
+alter table public.portal_proposals add constraint portal_proposals_followup_interval_days_check
+  check (followup_interval_days is null or followup_interval_days between 1 and 90);
+alter table public.portal_proposals drop constraint if exists portal_proposals_followup_stop_after_check;
+alter table public.portal_proposals add constraint portal_proposals_followup_stop_after_check
+  check (followup_stop_after is null or followup_stop_after between 1 and 60);
+
+-- The task is a ROW IN portal_followups, kind 'followup_task', not a table of its own. Its state
+-- (status pending/sent/skipped/called/snoozed/expired, draft {title, body, source}, decided_by,
+-- decided_at) lives in `detail`. Same table so it shares the SAME dedupe as the automated emails:
+-- a task can never be raised for an occurrence the old ladder already emailed, and a future mode
+-- that sends on a click cannot double-send what a task already covered.
+--
+-- The kind CHECK is the inline column check, so its name is Postgres' auto-name
+-- portal_followups_kind_check -- the same convention this file relies on for
+-- portal_notify_recipients_kind_check and portal_questions_msg_type_check above.
+alter table public.portal_followups drop constraint if exists portal_followups_kind_check;
+alter table public.portal_followups add constraint portal_followups_kind_check
+  check (kind in ('auto_email','staff_call','staff_email','staff_text','staff_note',
+                  'customer_status','followup_task'));
+-- The rule-key dedupe, widened to cover both kinds. A NEW index name rather than a drop-and-
+-- recreate of the old one, so a reboot that re-runs this file finds it present and does nothing;
+-- the old, narrower index is dropped only after the wider one exists. Same predicate style as
+-- before, with the new kind OR-ed in.
+create unique index if not exists portal_followups_rule_v2_uidx
+  on public.portal_followups (proposal_id, (detail->>'rule_key'))
+  where kind in ('auto_email','followup_task') and (detail->>'rule_key') is not null;
+drop index if exists public.portal_followups_rule_uidx;
+-- ONE OPEN TASK PER PROPOSAL, enforced by the database rather than only by the worker: two
+-- containers overlapping during a deploy cannot both raise one. Also what the pending-task reads
+-- (staff bell, board) are served by.
+create unique index if not exists portal_followups_one_pending_task_uidx
+  on public.portal_followups (proposal_id)
+  where kind = 'followup_task' and (detail->>'status') = 'pending';
