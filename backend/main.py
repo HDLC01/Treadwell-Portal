@@ -3433,6 +3433,19 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
     note = _cap(body.get("note"), 2000) or None
     by = _cap(body.get("by"), 120) or None
     row = _log_staff_followup(proposal_id, kind, note, by)
+    # A call, email or text logged from the drawer IS the follow-up an open task is asking for, so
+    # it resolves that task as "called" — otherwise the task would sit pending and, being the one
+    # open task, block every later reminder on this proposal. A NOTE is not contact with the
+    # customer and leaves the task alone. Guarded: the log is recorded either way.
+    if kind in ("staff_call", "staff_email", "staff_text"):
+        try:
+            tid = db.pending_followup_task_id(proposal_id)
+            if tid is not None:
+                db.decide_followup_task(tid, "called", by,
+                                        {"kind": kind, "note": note, "via": "drawer_log"})
+                _stamp_touch(proposal_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[followup] could not resolve the open task on %s: %s", proposal_id, exc)
     return _json({"ok": True, "followup": {
         "kind": row["kind"], "detail": row.get("detail") or {},
         "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})

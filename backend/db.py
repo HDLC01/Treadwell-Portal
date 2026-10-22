@@ -1271,6 +1271,14 @@ def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Opti
     return int(row["id"]) if row else None
 
 
+def pending_followup_task_id(proposal_id: str) -> Optional[int]:
+    """The id of this proposal's open follow-up task, or None."""
+    row = q1("select max(id) as id from public.portal_followups "
+             "where proposal_id = %s and kind = 'followup_task' and detail->>'status' = 'pending'",
+             (proposal_id,))
+    return int(row["id"]) if row and row.get("id") is not None else None
+
+
 def get_followup_task(task_id: int) -> Optional[dict[str, Any]]:
     return q1("select id, proposal_id, kind, detail, created_by, created_at "
               "from public.portal_followups where id = %s and kind = 'followup_task'",

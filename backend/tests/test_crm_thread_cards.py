@@ -97,6 +97,9 @@ def crm(monkeypatch):
                 "created_at": dt.datetime(2026, 8, 19, 9, 0)}
 
     monkeypatch.setattr(main.db, "add_followup", add_followup)
+    # Remind-only (2026-10-23): logging a call/email/text resolves an open follow-up task. None is
+    # open in these tests — stubbed so the lookup does not wait on a database that is not there.
+    monkeypatch.setattr(main.db, "pending_followup_task_id", lambda pid: None)
 
     def add_message(pid, kind, who, body, msg_type="text", meta=None):
         calls["cards"].append({"pid": pid, "kind": kind, "author": who, "body": body,

@@ -352,3 +352,22 @@ def test_the_plan_endpoint_validates_and_writes_only_what_was_sent(api):
     assert api.post("/api/admin/proposal/pid-1/followup-plan", json={}).status_code == 400
     r = api.post("/api/admin/proposal/pid-1/followup-plan", json={"interval_days": None})
     assert r.status_code == 200 and api.calls["plan"][-1] == {"interval_days": None}
+
+
+# ── the drawer's own "log a call" ─────────────────────────────────────────────
+@pytest.mark.parametrize("kind,resolves", [("call", True), ("email", True), ("text", True),
+                                           ("note", False)])
+def test_logging_contact_from_the_drawer_resolves_the_open_task(api, monkeypatch, kind, resolves):
+    """A call logged from the drawer IS the follow-up the open task asks for. Left pending, the
+    task would be the one open task and block every later reminder on this proposal. A note is not
+    contact with the customer and leaves it alone."""
+    monkeypatch.setattr(main.db, "pending_followup_task_id", lambda pid: 5)
+    r = api.post("/api/admin/proposal/pid-1/followups",
+                 json={"kind": kind, "note": "spoke to Rita", "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    if resolves:
+        assert api.calls["decided"] == [(5, "called")]
+        assert api.state["task"]["detail"]["via"] == "drawer_log"
+        assert api.calls["stamped"]
+    else:
+        assert api.calls["decided"] == [] and api.state["task"]["detail"]["status"] == "pending"
