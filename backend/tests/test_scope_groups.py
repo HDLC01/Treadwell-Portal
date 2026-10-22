@@ -704,3 +704,176 @@ def test_two_groups_each_get_their_own_one(monkeypatch):
             _fp("e")]
     calls = _tick(monkeypatch, rows)
     assert _chased(calls) == ["tok-a", "tok-c", "tok-e"]
+
+
+# ══ I. the OTHER two "your proposal is ready" paths ═════════════════════════
+# admin_publish was not the only caller of send_portal_link. Adding a contact in the staff drawer
+# (POST /api/admin/proposal/{id}/followup-recipient) and the service route /api/notify with
+# type=published both emailed a single-scope link, so an ordinary "add Pat to Lab 1" sent Pat a
+# one-scope email: the thing the whole group exists to prevent.
+@pytest.fixture
+def add_contact(monkeypatch):
+    calls = {"single": [], "group": [], "added": []}
+    state = {
+        "rows": [_sib("d-break", "Breakroom", last_sent_at=T0),
+                 _sib("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1), last_sent_at=T0),
+                 _sib("d-lab2", "Lab 2", created_at=T0 + timedelta(seconds=2), last_sent_at=T0)],
+        "drafts": ["d-break", "d-lab1", "d-lab2"],
+        "recipients": {"d-break": ["cust@acme.com"], "d-lab1": ["cust@acme.com"],
+                       "d-lab2": ["cust@acme.com"]},
+    }
+
+    def _row(pid):
+        for r in state["rows"]:
+            if r["proposal_id"] == pid:
+                return dict(r)
+        return None
+
+    def _add(pid, email, by=None):
+        calls["added"].append((pid, email))
+        state["recipients"].setdefault(pid, []).append(email)
+
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "get_proposal", _row)
+    monkeypatch.setattr(main.db, "get_recipients", lambda pid: list(state["recipients"].get(pid, [])))
+    monkeypatch.setattr(main.db, "add_recipient", _add)
+    monkeypatch.setattr(main.db, "set_followup_recipient", lambda *a, **k: True)
+    monkeypatch.setattr(main.db, "list_scope_group", lambda gid: [dict(r) for r in state["rows"]
+                                                                 if r.get("scope_group") == gid],
+                        raising=False)
+    monkeypatch.setattr(main.db, "list_scope_group_drafts", lambda gid: list(state["drafts"]),
+                        raising=False)
+    monkeypatch.setattr(main, "_proposal_card_files", lambda pid: [])
+    monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda tok: "rt-" + tok)
+    monkeypatch.setattr(main.email_sender, "send_portal_link",
+                        lambda to, *a, **k: calls["single"].append((to, k.get("token"))) or True)
+
+    def _group(email, name, project, scopes, **k):
+        calls["group"].append({"to": email, "project": project,
+                               "labels": [s["label"] for s in scopes],
+                               "urls": [s["url"] for s in scopes], **k})
+        return True
+
+    monkeypatch.setattr(main.email_sender, "send_scope_group_links", _group, raising=False)
+
+    def go(pid="d-lab1", email="pat@acme.com", **body):
+        b = {"email": email, "add": True, "by": "rj@wetreadwell.com"}
+        b.update(body)
+        return client.post("/api/admin/proposal/%s/followup-recipient" % pid, json=b)
+
+    return go, calls, state
+
+
+def test_adding_a_contact_to_an_ungrouped_proposal_still_sends_the_link(add_contact):
+    """The control: the ordinary path is untouched."""
+    go, calls, state = add_contact
+    for r in state["rows"]:
+        r["scope_group"] = None
+        r["scope_label"] = None
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["single"] == [("pat@acme.com", "tok-d-lab1")]
+    assert calls["group"] == []
+
+
+def test_adding_a_contact_to_a_scope_never_sends_a_single_scope_email(add_contact):
+    """After the combined send: the new contact gets the GROUP email, listing the scopes they
+    are on -- never send_portal_link's one-proposal "your proposal is ready"."""
+    go, calls, _ = add_contact
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["added"] == [("d-lab1", "pat@acme.com")]
+    assert calls["single"] == [], "adding a contact to a scope emailed a single-scope link"
+    assert len(calls["group"]) == 1
+    g = calls["group"][0]
+    assert g["to"] == "pat@acme.com" and g["project"] == "Acme HQ"
+    # Only Lab 1: Pat is on no other scope, and the email lists only what Pat can open.
+    assert g["labels"] == ["Lab 1"]
+    assert g["urls"] == ["%s/p/tok-d-lab1" % main.config.PUBLIC_BASE_URL]
+    assert g["token"] == "tok-d-lab1" and g["reply_to"] == "rt-tok-d-lab1"
+    assert r.json()["followups"] is True
+
+
+def test_a_contact_already_on_another_scope_gets_every_scope_they_are_on(add_contact):
+    go, calls, state = add_contact
+    state["recipients"]["d-break"].append("pat@acme.com")
+    go(pid="d-lab2")
+    assert calls["single"] == []
+    assert [g["labels"] for g in calls["group"]] == [["Breakroom", "Lab 2"]]
+
+
+def test_adding_a_contact_before_the_combined_send_emails_nobody(add_contact):
+    """The group has not gone out: the combined send reads the recipients list, so the new
+    contact is IN that email. Sending now would be the extra email."""
+    go, calls, state = add_contact
+    for r in state["rows"]:
+        r["last_sent_at"] = None
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["added"] == [("d-lab1", "pat@acme.com")]
+    assert calls["single"] == [] and calls["group"] == []
+    assert r.json().get("awaiting_group_send") is True
+
+
+def test_a_closed_or_unsent_sibling_is_not_listed_for_the_new_contact(add_contact):
+    go, calls, state = add_contact
+    state["recipients"]["d-break"].append("pat@acme.com")
+    state["recipients"]["d-lab2"].append("pat@acme.com")
+    state["rows"][0]["proposal_status"] = "closed_lost"     # Breakroom lost
+    state["rows"][2]["last_sent_at"] = None                 # Lab 2 not sent yet
+    go(pid="d-lab1")
+    assert [g["labels"] for g in calls["group"]] == [["Lab 1"]]
+
+
+def test_a_scope_taken_out_of_the_group_is_an_ordinary_proposal_again(add_contact):
+    """The drafts decide membership, as in the combined send: a detached scope keeps a stale
+    scope_group on its portal row, and its contacts get the ordinary link."""
+    go, calls, state = add_contact
+    state["drafts"] = ["d-break", "d-lab2"]
+    go(pid="d-lab1")
+    assert calls["single"] == [("pat@acme.com", "tok-d-lab1")]
+    assert calls["group"] == []
+
+
+def test_a_failing_group_read_sends_no_single_scope_email(add_contact, monkeypatch):
+    """Fail closed: when membership cannot be read, the contact is still added and nothing is
+    sent, rather than falling back to the one-scope email."""
+    go, calls, _ = add_contact
+
+    def boom(gid):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(main.db, "list_scope_group_drafts", boom, raising=False)
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["added"] == [("d-lab1", "pat@acme.com")]
+    assert calls["single"] == []
+
+
+@pytest.fixture
+def notify(add_contact, monkeypatch):
+    _, calls, state = add_contact
+    monkeypatch.setattr(main.config, "SERVICE_TOKEN", "svc-test")
+
+    def go(pid="d-lab1", kind="published"):
+        return client.post("/api/notify", json={"proposal_id": pid, "type": kind},
+                           headers={"x-service-token": "svc-test"})
+
+    return go, calls, state
+
+
+def test_notify_published_sends_nothing_for_a_scope(notify):
+    go, calls, _ = notify
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["single"] == [] and calls["group"] == []
+    assert r.json().get("awaiting_group_send") is True
+
+
+def test_notify_published_still_sends_for_an_ungrouped_proposal(notify):
+    go, calls, state = notify
+    for r in state["rows"]:
+        r["scope_group"] = None
+    r = go()
+    assert r.status_code == 200, r.text
+    assert calls["single"] == [("cust@acme.com", "tok-d-lab1")]

@@ -244,6 +244,60 @@ def _scope_name(project: Optional[str], label: Optional[str]) -> str:
     return f"{project} — {label}" if label else project
 
 
+class _GroupUnreadable(Exception):
+    """The group's membership could not be read. Callers FAIL CLOSED on this: send nothing,
+    because the fallback they would otherwise take is the one-scope email the group forbids."""
+
+
+def _active_scope_group(p: dict) -> Optional[str]:
+    """The group `p` is a live scope of, or None when it is an ordinary proposal.
+
+    THE DRAFTS DECIDE MEMBERSHIP, as in the combined send: a scope the tool has taken back out of
+    its group keeps a stale scope_group on its portal row, and is an ordinary proposal again. With
+    no live draft in the group at all there is nothing to compare against, and the row stands.
+    Raises _GroupUnreadable when the drafts cannot be read."""
+    group = p.get("scope_group")
+    if not group:
+        return None
+    try:
+        expected = db.list_scope_group_drafts(group)
+    except Exception as exc:  # noqa: BLE001
+        raise _GroupUnreadable(str(exc)) from exc
+    return group if (not expected or p.get("proposal_id") in expected) else None
+
+
+def _send_scope_links_to_contact(p: dict, group: str, email: str) -> bool:
+    """A contact added to one scope AFTER the combined send: the group's email, listing every
+    scope of the group this address is on and that has already gone out. Never the one-scope
+    "your proposal is ready", which is the email the group exists to replace.
+
+    `p` itself is always listed -- staff just put this person on it. Closed-lost scopes, scopes
+    taken out of the group and scopes not yet sent are left out, the same as the combined send.
+    Replies land in `p`'s thread, the one they were added to."""
+    expected = db.list_scope_group_drafts(group)
+    mine = []
+    for r in db.list_scope_group(group):
+        pid = r["proposal_id"]
+        if pid != p["proposal_id"]:
+            if expected and pid not in expected:
+                continue
+            if (r.get("proposal_status") or "") == "closed_lost" or not r.get("last_sent_at"):
+                continue
+            on = [(e or "").strip().lower()
+                  for e in (db.get_recipients(pid) or [r.get("customer_email")])]
+            if email not in on:
+                continue
+        mine.append(r)
+    if not any(r["proposal_id"] == p["proposal_id"] for r in mine):
+        mine.append(p)
+    return email_sender.send_scope_group_links(
+        email, "", p.get("project_name") or "your project",
+        [{"label": r.get("scope_label") or r.get("project_name") or "Proposal",
+          "url": f"{config.PUBLIC_BASE_URL}/p/{r['token']}",
+          "approved": (r.get("proposal_status") or "") == "approved"} for r in mine],
+        reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"])
+
+
 _VALID_CONTACT_ROLES = ("primary", "accounts_payable", "other")
 MAX_CONTACTS = 10
 
@@ -2203,6 +2257,15 @@ async def api_notify(request: Request) -> JSONResponse:
     recipients = db.get_recipients(p["proposal_id"]) or ([primary] if primary else [])
     rt = email_sender.proposal_reply_to(p["token"])
     if kind == "published":
+        # A scope of a group is announced only by the combined send, same as admin_publish.
+        # Unreadable membership counts as grouped: sending nothing is the recoverable mistake.
+        try:
+            grouped = _active_scope_group(p)
+        except _GroupUnreadable as exc:
+            log.error("notify %s: scope group unreadable, sent nothing: %s", p["proposal_id"], exc)
+            grouped = p.get("scope_group")
+        if grouped:
+            return _json({"ok": True, "emailed": [], "awaiting_group_send": True})
         for e in recipients:
             email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project,
                                           reply_to=rt, token=p["token"])
@@ -4146,29 +4209,52 @@ async def admin_followup_recipient(proposal_id: str, request: Request) -> JSONRe
     by = _cap(body.get("by"), 120) or None
 
     existing = [e.strip().lower() for e in (db.get_recipients(proposal_id) or [])]
+    awaiting_group_send = False
     if add and email not in existing:
         if len(existing) >= MAX_RECIPIENTS:
             return _json({"ok": False, "error": "too_many_recipients"}, 400)
         db.add_recipient(proposal_id, email, by)
-        # They cannot reach the portal without the link, so adding somebody and not sending it
-        # would put a contact on the list who can never open the thing they are a contact for.
+        # A SCOPE OF A GROUP NEVER SENDS THE ONE-SCOPE EMAIL. Before the combined send, nothing
+        # goes: that send reads this recipients list, so the new contact is in it. After it, the
+        # contact gets the group's email for the scopes they are on. Unreadable membership sends
+        # nothing at all rather than falling through to the single-scope link below.
         try:
-            # WITH THE FILES THE OTHERS GOT. The same omission as the reply path, wearing a
-            # different hat: without this, a contact added after the send is the only recipient
-            # who has to ask what the photo was.
-            email_sender.send_portal_link(
-                email, "", f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
-                p.get("project_name") or "your project",
-                reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"],
-                attachments=_proposal_card_files(proposal_id) or None)
-        except Exception as exc:  # noqa: BLE001 — they are on the list; the link can be re-sent
-            log.error("could not send the portal link to a newly added contact: %s", exc)
+            group = _active_scope_group(p)
+        except _GroupUnreadable as exc:
+            log.error("followup-recipient %s: scope group unreadable, sent nothing: %s",
+                      proposal_id, exc)
+            group, awaiting_group_send = p.get("scope_group"), True
+        if group and not awaiting_group_send:
+            if not p.get("last_sent_at"):
+                awaiting_group_send = True
+            else:
+                try:
+                    _send_scope_links_to_contact(p, group, email)
+                except Exception as exc:  # noqa: BLE001 — they are on the list; resend covers it
+                    log.error("could not send the scope links to a newly added contact: %s", exc)
+        elif not group:
+            # They cannot reach the portal without the link, so adding somebody and not sending it
+            # would put a contact on the list who can never open the thing they are a contact for.
+            try:
+                # WITH THE FILES THE OTHERS GOT. The same omission as the reply path, wearing a
+                # different hat: without this, a contact added after the send is the only recipient
+                # who has to ask what the photo was.
+                email_sender.send_portal_link(
+                    email, "", f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
+                    p.get("project_name") or "your project",
+                    reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"],
+                    attachments=_proposal_card_files(proposal_id) or None)
+            except Exception as exc:  # noqa: BLE001 — they are on the list; the link can be re-sent
+                log.error("could not send the portal link to a newly added contact: %s", exc)
     elif email not in existing:
         return _json({"ok": False, "error": "not_a_recipient"}, 404)
 
     if not db.set_followup_recipient(proposal_id, email, enabled):
         return _json({"ok": False, "error": "not_a_recipient"}, 404)
-    return _json({"ok": True, "email": email, "followups": enabled})
+    out = {"ok": True, "email": email, "followups": enabled}
+    if awaiting_group_send:
+        out["awaiting_group_send"] = True
+    return _json(out)
 
 
 @app.get("/api/admin/signed-contract.pdf")
