@@ -3015,7 +3015,13 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
     if missing or not rows:
         return _json({"ok": False, "error": "scopes_not_published",
                       "missing": missing, "published": published}, 409)
-    live = [r for r in rows if (r.get("proposal_status") or "") != "closed_lost"]
+    # THE DRAFTS DECIDE MEMBERSHIP. A portal row keeps its scope_group when a later publish carries
+    # none (that is the "legacy publish touches nothing" rule), so a scope split back out of the
+    # group in the tool can still be tagged here. It is reported, not emailed. With no live draft
+    # in the group at all there is nothing to compare against, and the portal's rows stand.
+    detached = [pid for pid in published if expected and pid not in expected]
+    live = [r for r in rows if r["proposal_id"] not in detached
+            and (r.get("proposal_status") or "") != "closed_lost"]
     if not live:
         return _json({"ok": False, "error": "nothing_to_send"}, 409)
 
@@ -3046,7 +3052,7 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
                                         by=by, resend=resend)
     if send_no is None:
         return _json({"ok": True, "already_sent": True, "group_id": group_id,
-                      "scopes": scopes_out, "emailed": []})
+                      "scopes": scopes_out, "detached": detached, "emailed": []})
 
     emailed: list[str] = []
     for e, mine in per.items():
@@ -3128,7 +3134,8 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
 
     return _json({"ok": True, "already_sent": False, "group_id": group_id,
                   "send_no": send_no if emailed else None, "resend": resend,
-                  "scopes": scopes_out, "recipients": list(per), "emailed": emailed})
+                  "scopes": scopes_out, "detached": detached,
+                  "recipients": list(per), "emailed": emailed})
 
 
 @app.get("/api/admin/pipeline")
@@ -3167,6 +3174,10 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # are null for every ungrouped proposal.
             "scope_group": r.get("scope_group") or None,
             "scope_label": (r.get("scope_label") or None) if r.get("scope_group") else None,
+            # Published but not yet in a combined email: the row reads 'sent' and sent_at falls
+            # back to created_at, so without this the board would show a scope the customer has
+            # never been told about as sent. Only the combined send stamps last_sent_at on a scope.
+            "scope_send_pending": bool(r.get("scope_group")) and not r.get("last_sent_at"),
             "deposit_status": r["deposit_status"], "schedule_status": r["schedule_status"],
             "contacts_status": r.get("contacts_status") or "pending",
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,

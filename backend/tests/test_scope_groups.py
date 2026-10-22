@@ -329,6 +329,18 @@ def test_a_closed_scope_is_left_out_of_the_email(group):
     assert "d-lab2" not in calls["enrol"]
 
 
+def test_a_scope_the_tool_has_taken_out_of_the_group_is_not_emailed(group):
+    """The drafts are the membership. A portal row can keep a stale scope_group (a publish without
+    one leaves the stored value alone), and it must not ride along in the customer's email."""
+    go, calls, state = group
+    state["drafts"] = ["d-break", "d-lab1"]           # Lab 2 was split back out in the tool
+    r = go()
+    assert r.status_code == 200, r.text
+    assert [s["label"] for s in calls["emails"][0]["scopes"]] == ["Breakroom", "Lab 1"]
+    assert r.json()["detached"] == ["d-lab2"]
+    assert "d-lab2" not in calls["enrol"] and "d-lab2" not in calls["last_sent"]
+
+
 def test_unknown_or_malformed_group(group):
     go, _, state = group
     assert go(gid="bad%20id").status_code == 400
@@ -475,6 +487,23 @@ def test_the_pipeline_carries_scope_group_and_label(monkeypatch):
     rows = client.get("/api/admin/pipeline").json()["proposals"]
     assert (rows[0]["scope_group"], rows[0]["scope_label"]) == (GID, "Lab 1")
     assert (rows[1]["scope_group"], rows[1]["scope_label"]) == (None, None)
+
+
+def test_the_pipeline_says_when_a_scope_has_not_gone_out_yet(monkeypatch):
+    """A published scope sits in 'sent' before the combined email. The board must be able to tell
+    "waiting for the group send" from "the customer has it" -- sent_at alone falls back to
+    created_at and cannot."""
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "get_settings", lambda key: None)
+    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [
+        _sib("d-wait", "Lab 1"),
+        _sib("d-out", "Lab 2", last_sent_at=T0 + timedelta(hours=1)),
+        dict(TABLE[3])])
+    rows = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
+    assert rows["d-wait"]["scope_send_pending"] is True
+    assert rows["d-out"]["scope_send_pending"] is False
+    assert rows["d-solo"]["scope_send_pending"] is False, "an ungrouped proposal is never pending"
 
 
 def test_the_pipeline_query_reads_the_columns_ddl_safely(monkeypatch):
