@@ -1661,3 +1661,39 @@ def test_the_combined_send_end_to_end_and_a_failed_revision_unannounces_nothing(
     assert r.status_code == 200, r.text
     assert [(s["proposal_id"], s["kind"]) for s in r.json()["scopes"]] == [(b, "revised")]
     assert r.json()["emailed"] == ["buyer1@customer.example"]
+
+
+def test_each_approval_of_a_scope_raises_its_own_decision_task(clean, outbox):
+    """Fix round #2, on the real rule_v2 index (no status filter: a decided task keeps its key for
+    ever). C approved -> task -> 'keep' -> C revised and approved again: a NEW task and email."""
+    gid, (a, b, c) = group_of_three(sent=True)
+    set_cols(c, proposal_status="approved", approved_at=ago(0))
+    p = db.get_proposal(c)
+    main._raise_scope_decision(dict(p, _approval_id=1))
+    first, = [t for t in all_tasks() if t["detail"].get("stage") == rules.DECISION_STAGE]
+    mails = lambda: [m["subject"] for m in outbox.sent].count(  # noqa: E731
+        "Decide the other scopes — Acme HQ")
+    once = mails()
+    assert once >= 1, "the first approval emailed nobody"
+    assert first["detail"]["rule_key"] == f"sd:{gid}:{c}:1"
+    db.decide_followup_task(first["id"], "decided", KYLE, {"outcome": "keep"})
+    main._raise_scope_decision(dict(p, _approval_id=2))
+    main._raise_scope_decision(dict(p, _approval_id=2))          # a re-run of the same approval
+    decs = [t for t in all_tasks() if t["detail"].get("stage") == rules.DECISION_STAGE]
+    assert [(t["detail"]["rule_key"], t["detail"]["status"]) for t in decs] == [
+        (f"sd:{gid}:{c}:1", "decided"), (f"sd:{gid}:{c}:2", "pending")]
+    assert mails() == 2 * once, "the second approval's estimator email did not go (once)"
+
+
+def test_a_scope_published_since_the_email_is_not_in_the_group_reminder(clean):
+    """Fix round #1 on real rows: a grouped publish leaves followup_enrolled_at null (only the
+    combined send enrols), and the group's reminder speaks only for the announced scopes."""
+    gid, ids = group_of_three(sent=True)
+    age_group(ids)
+    add_draft(f"{gid}-d", gid, "Lab 3")
+    add_proposal(f"{gid}-d", gid, "Lab 3", days_ago=1, enrolled=None, sent=False)
+    assert db.get_proposal(f"{gid}-d")["followup_enrolled_at"] is None
+    view, why, members = followup_worker.group_state_for(gid, db_now())
+    assert why == "" and f"{gid}-d" in [m["proposal_id"] for m in members]
+    assert [s["proposal_id"] for s in view["scopes"]] == ids
+    assert [m["proposal_id"] for m in view["_open_members"]] == ids
