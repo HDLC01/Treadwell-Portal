@@ -1316,7 +1316,8 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     # byte-for-byte what it was.
     scope_note_html = _notice_scope_siblings(p)
     # ...and their chase stops, with ONE task asking staff what to do about them (never closed).
-    _raise_scope_decision(dict(p, proposal_status="approved", approved_at=signed_at))
+    _raise_scope_decision(dict(p, proposal_status="approved", approved_at=signed_at,
+                               _approval_id=approval_id))
 
     # Staff decided at send time whether this job collects a deposit. When it
     # doesn't, every mention of one has to go — promising an invoice that will
@@ -1485,7 +1486,7 @@ def _raise_scope_decision(p: dict) -> None:
       2. the chase stop itself is DERIVED FROM DATA: followup_rules.group_view returns None while a
          live member is approved and nobody has chosen 'keep' since -- no column;
       3. one `followup_task` with stage 'decision' on the APPROVED scope, rule key
-         'sd:<group>:<approved scope>', listing each still-open sibling, and one email to the
+         'sd:<group>:<approved scope>:<approval>', listing each still-open sibling, and one email to the
          estimator (staff_scope_decision). It shows on the bell like any open task and is answered
          at /api/admin/followup-task/{id}/scope-decision.
 
@@ -1517,7 +1518,15 @@ def _raise_scope_decision(p: dict) -> None:
     scopes = [{"proposal_id": s["proposal_id"],
                "label": s.get("scope_label") or s.get("project_name") or "Proposal",
                "status": s.get("proposal_status")} for s in sibs]
-    key = "sd:%s:%s" % (group, pid)
+    # Keyed on THIS approval (fix round #2), not on the scope alone: the rule_v2 index holds a key for
+    # ever, decided or not, so after 'keep' a revised scope that was approved AGAIN reserved nothing,
+    # sent nothing, and left the siblings' chase stopped with no task to restart it. The approval
+    # row's id, or the approval time when there is no id.
+    ref = p.get("_approval_id")
+    if ref is None:
+        at = followup_rules._ts(p.get("approved_at"))
+        ref = followup_rules._stamp(at) if at else "0"
+    key = "sd:%s:%s:%s" % (group, pid, ref)
     try:
         rid = db.reserve_followup_task(pid, key, {
             "audience": "staff", "template": followup_rules.GROUP_TASK_TEMPLATE_DECISION,

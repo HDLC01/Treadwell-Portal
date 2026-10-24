@@ -601,7 +601,7 @@ def test_approving_one_scope_raises_one_decision_task_and_stops_the_group(approv
     assert reminder["detail"]["reason"] == "scope_approved"
     dec, = f.tasks(stage="decision")
     assert dec["proposal_id"] == "d-lab1"
-    assert dec["detail"]["rule_key"] == "sd:%s:d-lab1" % GID
+    assert dec["detail"]["rule_key"] == "sd:%s:d-lab1:1" % GID, "keyed on the approval (#2)"
     assert [s["proposal_id"] for s in dec["detail"]["scopes"]] == ["d-break", "d-lab2"]
     assert [s["subject"] for s in f.sent["staff"]].count("Decide the other scopes — Acme HQ") == 1
     # NEVER auto-closed.
@@ -1070,3 +1070,28 @@ def test_an_ungrouped_status_email_is_unchanged(status):
     mail, = f.sent["staff"]
     assert mail["subject"] == "Project delayed — Acme HQ"
     assert "<p>Automated follow-ups are paused until " in mail["body"]
+
+
+def test_a_scope_approved_again_after_keep_raises_a_new_decision_task(approve, admin, monkeypatch):
+    """#2: C approved -> decision task -> 'keep' -> C revised (approval retired) -> C approved
+    again. The second approval must raise its own task and email, or the siblings stay un-chased
+    for ever with nothing on the bell."""
+    f, go = approve
+    ids = iter(range(1, 10))
+    monkeypatch.setattr(main.db, "add_approval", lambda *a, **k: next(ids))
+    first = _decision(f, go)
+    f.clock = NOW + H
+    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, first).status_code == 200
+    assert fw.group_state_for(GID, NOW + H)[0] is not None
+    f.rows["d-lab1"].update(proposal_status="viewed", approved_at=None)     # the revision
+    f.clock = NOW + 2 * H
+    assert go().status_code == 200
+    decs = f.tasks(stage="decision")
+    assert [d["detail"]["status"] for d in decs] == ["decided", "pending"]
+    assert decs[1]["detail"]["rule_key"] == "sd:%s:d-lab1:2" % GID
+    assert [s["subject"] for s in f.sent["staff"]].count("Decide the other scopes — Acme HQ") == 2
+    assert fw.group_state_for(GID, NOW + 2 * H)[:2] == (None, "scope_approved")
+    # ...and answering it restarts the chase: the stop is not for ever.
+    f.clock = NOW + 3 * H
+    assert _decide({"action": "keep"}, decs[1]["id"]).status_code == 200
+    assert fw.group_state_for(GID, NOW + 3 * H)[0] is not None
