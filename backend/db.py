@@ -327,6 +327,53 @@ def list_scope_group_drafts(group_id: str) -> list[str]:
     )]
 
 
+def list_scope_group_draft_states(group_id: str) -> list[dict[str, Any]]:
+    """`[{"id", "archived"}]` for every non-deleted draft that carries this scope group.
+
+    The follow-up side's membership read (followup_rules.live_members): an ARCHIVED draft is still
+    in the group but is not a live member, so it must neither be chased with the group nor fall out
+    into a one-scope chase of its own. `archived` lives inside the draft blob (drafts.set_archived)."""
+    return [{"id": r["id"], "archived": bool(r.get("archived"))} for r in qall(
+        "select id, coalesce(data ->> 'archived', '') = 'true' as archived from public.drafts "
+        "where deleted_at is null and data -> 'scope_group' ->> 'id' = %s order by id",
+        (group_id,),
+    )]
+
+
+def list_open_group_tasks(group_id: str) -> list[dict[str, Any]]:
+    """Every OPEN (pending/sending) follow-up task filed for one scope group, on any proposal --
+    the group's reminder task on its home scope, and any "decide the other scopes" task. Not
+    filtered on deleted rows on purpose: a task left on a deleted home is exactly what re-homing
+    has to find and expire."""
+    return qall(
+        "select id, proposal_id, detail, created_at from public.portal_followups "
+        "where kind = 'followup_task' and detail->>'status' in ('pending','sending') "
+        "  and detail->>'scope_group' = %s order by id",
+        (group_id,),
+    )
+
+
+_SCOPE_RESUME = "scope_group_resume"
+
+
+def scope_group_resumed_at(group_id: str) -> Any:
+    """When somebody last chose 'keep chasing the other scopes' for this group, or None. Read by
+    followup_rules.group_chase_stopped: newer than the latest approval -> the group chase runs."""
+    row = q1("select max(created_at) as at from public.portal_followups "
+             "where kind = 'staff_note' and detail->>'action' = %s "
+             "  and detail->>'scope_group' = %s", (_SCOPE_RESUME, group_id))
+    return (row or {}).get("at")
+
+
+def followup_rule_key_exists(proposal_id: str, rule_key: str) -> bool:
+    """Has this occurrence already been reserved (an automated email or a task)? Read-only; the
+    dry run uses it to say what the next tick would REALLY raise after the dedupe index."""
+    row = q1("select 1 as hit from public.portal_followups "
+             "where proposal_id = %s and kind in ('auto_email','followup_task') "
+             "  and detail->>'rule_key' = %s limit 1", (proposal_id, rule_key))
+    return bool(row)
+
+
 _SCOPE_SENT = "scope_group_sent"
 
 
@@ -497,7 +544,7 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         + " as followup_reminder_times, "
         # The open follow-up task, if any, so the board (polled every 25s) can show it without a
         # second request.
-        + _PENDING_TASK_SQL.format(pid="p.proposal_id") + " as pending_task "
+        + _ROW_OPEN_TASK_SQL + " as pending_task "
         "from public.portal_proposals p "
         "left join public.drafts d on d.id = p.proposal_id "
         # A DELETED project is off the board (2026-08-24). The ONE reader of
@@ -1312,15 +1359,19 @@ _STAFF_FOLLOWUP_SQL = (
     "   where f.proposal_id = {pid} "
     "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
     "     and f.detail->>'action' is null)")
-# Every reminder of THIS send cycle, for the cap: tasks that were not expired, plus the customer
-# emails the automatic ladder sent before remind-only shipped. jsonb, so it rides one column.
-# Unordered on purpose: only the count after a point in time is used, and the board query's tests
-# locate its own trailing ORDER BY by the first occurrence of those words.
+# Every reminder of THIS send cycle, for the cap: tasks the estimator SENT or answered with a CALL,
+# plus the customer emails the automatic ladder sent before remind-only shipped. jsonb, so it rides
+# one column. Unordered on purpose: only the count after a point in time is used, and the board
+# query's tests locate its own trailing ORDER BY by the first occurrence of those words.
+#
+# Hanz, 2026-10-24 (decision 6): only a reminder that actually reached the customer, by email or by
+# phone, counts toward "Stop after N". A skipped or snoozed task did not, and neither did one that
+# is still open, expired, or a "decide the other scopes" task (that one is for staff).
 _REMINDER_TIMES_SQL = (
     "(select coalesce(jsonb_agg(f.created_at), '[]'::jsonb) "
     "   from public.portal_followups f "
     "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
-    "    and ((f.kind = 'followup_task' and coalesce(f.detail->>'status', 'pending') <> 'expired') "
+    "    and ((f.kind = 'followup_task' and f.detail->>'status' in ('sent','called')) "
     "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
 # The newest OPEN task (there is at most one: portal_followups_one_open_task_uidx). Open means
 # pending, or `sending` — claimed by the send endpoint and not yet confirmed. A `sending` task must
@@ -1332,6 +1383,21 @@ _PENDING_TASK_SQL = (
     "  where f.id = (select max(f2.id) from public.portal_followups f2 "
     "                 where f2.proposal_id = {pid} and f2.kind = 'followup_task' "
     "                   and f2.detail->>'status' in ('pending','sending'))) t)")
+# The board's version for ONE ROW: a scope of a group also shows the GROUP's open task, which lives
+# on the group's home scope, so every scope's drawer shows it. An ungrouped row takes the first
+# branch, which is exactly _PENDING_TASK_SQL. scope_group is read through to_jsonb for the reason
+# every pipeline column is: prod may get this code before its ALTER.
+_ROW_OPEN_TASK_SQL = (
+    "(case when (to_jsonb(p) ->> 'scope_group') is null then "
+    + _PENDING_TASK_SQL.format(pid="p.proposal_id") +
+    " else (select to_jsonb(t) from (select f.id, f.proposal_id, f.detail, f.created_at "
+    "   from public.portal_followups f "
+    "  where f.id = (select max(f2.id) from public.portal_followups f2 "
+    "                 where f2.kind = 'followup_task' "
+    "                   and f2.detail->>'status' in ('pending','sending') "
+    "                   and (f2.proposal_id = p.proposal_id "
+    "                        or f2.detail->>'scope_group' = (to_jsonb(p) ->> 'scope_group')))) t)"
+    " end)")
 
 
 def followup_signals(proposal_id: str) -> dict[str, Any]:
@@ -1370,8 +1436,11 @@ def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Opti
 
 def pending_followup_task_id(proposal_id: str) -> Optional[int]:
     """The id of this proposal's open follow-up task, or None."""
+    # Never a "decide the other scopes" task: logging a call on the approved scope is not that
+    # decision, and resolving it as `called` would leave the siblings un-chased and un-closed.
     row = q1("select max(id) as id from public.portal_followups "
-             "where proposal_id = %s and kind = 'followup_task' and detail->>'status' = 'pending'",
+             "where proposal_id = %s and kind = 'followup_task' and detail->>'status' = 'pending' "
+             "  and coalesce(detail->>'stage', '') <> 'decision'",
              (proposal_id,))
     return int(row["id"]) if row and row.get("id") is not None else None
 

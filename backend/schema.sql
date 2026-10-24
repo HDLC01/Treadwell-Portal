@@ -778,14 +778,26 @@ create unique index if not exists portal_followups_rule_v2_uidx
   on public.portal_followups (proposal_id, (detail->>'rule_key'))
   where kind in ('auto_email','followup_task') and (detail->>'rule_key') is not null;
 drop index if exists public.portal_followups_rule_uidx;
--- ONE OPEN TASK PER PROPOSAL, enforced by the database rather than only by the worker: two
--- containers overlapping during a deploy cannot both raise one. Also what the open-task reads
+-- ONE OPEN TASK PER PROPOSAL PER STAGE, enforced by the database rather than only by the worker:
+-- two containers overlapping during a deploy cannot both raise one. Also what the open-task reads
 -- (staff bell, board) are served by. OPEN is pending OR sending: the send endpoint claims a task
 -- as 'sending' before it emails, and that claim must keep the slot, or a tick mid-send raises a
 -- second task and putting the first back after a failed send collides with this index.
-create unique index if not exists portal_followups_one_open_task_uidx
-  on public.portal_followups (proposal_id)
+--
+-- 2026-10-24 (scope groups): keyed on (proposal_id, stage), not proposal_id alone. Approving one
+-- scope of a group files ONE "decide what to do with the other scopes" task (stage 'decision') on
+-- the approved scope, and that scope still owes its own deposit reminder (stage 'deposit'). With
+-- one slot per proposal the decision task would block the deposit chase until somebody decided.
+-- A task with no stage is a pre-decision one, as followup_rules.task_stage reads it.
+--
+-- A NEW index name, created before the narrower predecessor is dropped (the rule_v2 pattern
+-- above): a reboot that re-runs this file finds it present and does nothing. The predecessor's
+-- create statement (portal_followups_one_open_task_uidx, on proposal_id alone) is retired here
+-- rather than left in place, or every boot would build it and the drop below would remove it again.
+create unique index if not exists portal_followups_one_open_task_v2_uidx
+  on public.portal_followups (proposal_id, (coalesce(detail->>'stage', 'pre')))
   where kind = 'followup_task' and (detail->>'status') in ('pending','sending');
+drop index if exists public.portal_followups_one_open_task_uidx;
 -- The pending-only predecessor, from the same unreleased change. Dropped AFTER the wider one
 -- exists, the rule_v2 pattern above; a no-op on a database that never had it.
 drop index if exists public.portal_followups_one_pending_task_uidx;

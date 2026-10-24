@@ -279,10 +279,13 @@ def test_a_sending_task_still_counts_as_the_open_task():
     import re
     import db
     schema = (pathlib.Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
-    m = re.search(r"create unique index if not exists portal_followups_one_open_task_uidx"
+    # Widened to one open task per (proposal, stage) for scope groups (2026-10-24): the v2 index.
+    m = re.search(r"create unique index if not exists portal_followups_one_open_task_v2_uidx"
                   r"(.*?);", schema, re.S)
     assert m, "the one-open-task index is missing"
     assert "'pending'" in m.group(1) and "'sending'" in m.group(1)
+    assert "coalesce(detail->>'stage', 'pre')" in m.group(1)
+    assert "drop index if exists public.portal_followups_one_open_task_uidx" in schema
     assert "drop index if exists public.portal_followups_one_pending_task_uidx" in schema
     assert "'sending'" in db._PENDING_TASK_SQL
 
