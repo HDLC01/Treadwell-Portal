@@ -1626,6 +1626,12 @@ async def api_project_status(token: str, request: Request) -> JSONResponse:
     who = _session_email(request) or p.get("customer_email")
     name = p.get("customer_name") or who or "the customer"
     project = p.get("project_name") or "the project"
+    # One scope of a multi-scope project (fix round #15): the customer answered on ONE scope's page,
+    # and only that scope is paused or closed. The staff email names the scope and says what happens
+    # to the others. None for every other proposal, whose emails stay exactly as they were. Read
+    # only for the two answers that use it.
+    scope_ctx = (_scope_status_context(p) if status in ("delayed", "not_moving_forward")
+                 else None)
 
     if status == "delayed":
         try:
@@ -1649,6 +1655,19 @@ async def api_project_status(token: str, request: Request) -> JSONResponse:
                              "paused_until": until.isoformat()})
         db.add_followup(pid, "customer_status",
                         {"status": "delayed", "months": months, "until": until.isoformat()}, who)
+        if scope_ctx:
+            shown = scope_ctx["shown"]
+            _notify_staff_status(
+                p, f"Project delayed — {shown}",
+                f"<p><strong>{html.escape(str(name))}</strong> says "
+                f"<strong>{html.escape(shown)}</strong> is delayed by about "
+                f"{html.escape(window)}.</p>"
+                f"<p>Automated follow-ups are paused for the "
+                f"<strong>{html.escape(scope_ctx['label'])}</strong> scope until "
+                f"{html.escape(until.isoformat())}, and you'll get a reminder then.</p>"
+                + _scope_others_html(scope_ctx))
+            return _json({"ok": True, "project_status": {"paused_until": until.isoformat(),
+                                                         "closed": False}})
         _notify_staff_status(
             p, f"Project delayed — {project}",
             f"<p><strong>{html.escape(str(name))}</strong> says "
@@ -1676,6 +1695,19 @@ async def api_project_status(token: str, request: Request) -> JSONResponse:
                        meta={"status": "not_moving_forward", "reason": reason, "note": note})
         db.add_followup(pid, "customer_status",
                         {"status": "not_moving_forward", "reason": reason, "note": note}, who)
+        if scope_ctx:
+            shown = scope_ctx["shown"]
+            _notify_staff_status(
+                p, f"Closed–Lost — {shown}",
+                f"<p><strong>{html.escape(str(name))}</strong> is not moving forward with "
+                f"<strong>{html.escape(shown)}</strong>.</p>"
+                + (f"<p>Reason: <strong>{html.escape(label)}</strong></p>" if label else "")
+                + (f"<blockquote>{html.escape(note)}</blockquote>" if note else "")
+                + f"<p>Follow-ups have stopped for the "
+                  f"<strong>{html.escape(scope_ctx['label'])}</strong> scope, and it is marked "
+                  f"Closed–Lost.</p>"
+                + _scope_others_html(scope_ctx))
+            return _json({"ok": True, "project_status": {"paused_until": None, "closed": True}})
         _notify_staff_status(
             p, f"Closed–Lost — {project}",
             f"<p><strong>{html.escape(str(name))}</strong> is not moving forward with "
@@ -1697,6 +1729,52 @@ async def api_project_status(token: str, request: Request) -> JSONResponse:
         return _json({"ok": True, "project_status": {"paused_until": None, "closed": False}})
 
     return _json({"ok": False, "error": "invalid_status"}, 400)
+
+
+def _scope_status_context(p: dict) -> Optional[dict]:
+    """For a customer's pause / not-moving-forward on ONE scope of a group: its name and what the
+    other scopes are doing, for the staff email (fix round #15). None when `p` is not a live member
+    of a scope group (an ordinary proposal, a scope taken out of its group), or the group cannot be
+    read -- the email then reads exactly as it always did.
+
+    `chased`: the other open scopes the customer has been told about whose follow-ups carry on (not
+    paused, and the group's chase not stopped by an approval). `waiting`: the other open scopes that
+    are not being chased right now."""
+    gid = p.get("scope_group")
+    if not gid:
+        return None
+    try:
+        members = followup_worker.group_members(gid, strict=False)
+    except Exception as exc:  # noqa: BLE001 — the customer's answer is recorded either way
+        log.warning("[followup] scope group %s unreadable for a status email: %s", gid, exc)
+        return None
+    pid = p.get("proposal_id")
+    if not any(m.get("proposal_id") == pid for m in members):
+        return None
+    now = _now_utc()
+    stopped = followup_rules.group_chase_stopped(members)
+    others = [m for m in members if m.get("proposal_id") != pid and followup_rules.is_open(m)]
+    chased = [m for m in others if not stopped and m.get("followup_enrolled_at")
+              and not followup_rules.is_paused(m, now)]
+    name = lambda m: m.get("scope_label") or m.get("project_name") or "a scope"  # noqa: E731
+    return {"shown": scope_groups.display_project_name(p) or (p.get("project_name") or ""),
+            "label": p.get("scope_label") or p.get("project_name") or "this",
+            "chased": [name(m) for m in chased],
+            "waiting": [name(m) for m in others if m not in chased]}
+
+
+def _scope_others_html(ctx: dict) -> str:
+    """The line about the OTHER scopes in a scope's status email ("" when there are none)."""
+    out = ""
+    if ctx.get("chased"):
+        out += ("<p>The other scopes are still being followed up: <strong>%s</strong>.</p>"
+                % ", ".join(html.escape(n) for n in ctx["chased"]))
+    if ctx.get("waiting"):
+        out += ("<p>%s: <strong>%s</strong>.</p>"
+                % ("Also open, but not being followed up right now" if ctx.get("chased")
+                   else "The other open scopes are not being followed up right now",
+                   ", ".join(html.escape(n) for n in ctx["waiting"])))
+    return out
 
 
 def _notify_staff_status(p: dict, subject: str, body_html: str) -> None:

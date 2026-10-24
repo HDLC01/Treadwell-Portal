@@ -1001,3 +1001,72 @@ def test_the_group_reminder_never_mails_an_unannounced_scope_so_email_again_send
              for p in ("d-break", "d-lab1", "d-lab2")]
     plan = scope_groups.plan_send(list(f.rows.values()), marks, NOW)
     assert plan["pending"] == ["d-lab3"] and plan["kinds"] == {"d-lab3": "new"}
+
+
+def test_a_paused_scope_is_left_out_of_the_group_reminder():
+    """#15: one scope paused, the others chased -- the reminder does not list (or mail) it."""
+    rows = _three()
+    rows[1]["followup_paused_until"] = (NOW + timedelta(days=30)).date()
+    v = rules.group_view(rows, NOW)
+    assert [s["proposal_id"] for s in v["scopes"]] == ["d-break", "d-lab2"]
+    assert [m["proposal_id"] for m in v["_open_members"]] == ["d-break", "d-lab2"]
+
+
+@pytest.fixture
+def status(fake, monkeypatch):
+    f = fake(_three())
+    monkeypatch.setattr(main, "_require",
+                        lambda request, token: f.get_proposal(token.replace("tok-", "")))
+    monkeypatch.setattr(main, "_session_email", lambda request: "dana@acme.com")
+    monkeypatch.setattr(main.ratelimit, "allow_ip", lambda *a, **k: True)
+    monkeypatch.setattr(db, "pause_followups",
+                        lambda pid, until: f.rows[pid].update(followup_paused_until=until),
+                        raising=False)
+    client = TestClient(main.app)
+
+    def go(pid, **body):
+        return client.post("/api/portal/tok-%s/project-status" % pid, json=body)
+    return f, go
+
+
+def test_a_paused_scopes_staff_email_names_the_scope_and_says_the_others_carry_on(status):
+    """#15: the estimator read 'Automated follow-ups are paused' about the whole project, and three
+    days later a task listed the paused scope."""
+    f, go = status
+    assert go("d-lab1", status="delayed", months=2).status_code == 200
+    mail, = f.sent["staff"]
+    assert mail["subject"] == "Project delayed — Acme HQ - Lab 1"
+    assert "paused for the <strong>Lab 1</strong> scope" in mail["body"]
+    assert "still being followed up: <strong>Breakroom, Lab 2</strong>" in mail["body"]
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert [s["label"] for s in t["detail"]["scopes"]] == ["Breakroom", "Lab 2"]
+
+
+def test_a_scope_closed_by_the_customer_says_only_that_scope_stopped(status):
+    f, go = status
+    assert go("d-lab2", status="not_moving_forward", reason="price").status_code == 200
+    mail, = f.sent["staff"]
+    assert mail["subject"] == "Closed–Lost — Acme HQ - Lab 2"
+    assert "Follow-ups have stopped for the <strong>Lab 2</strong> scope" in mail["body"]
+    assert "still being followed up: <strong>Breakroom, Lab 1</strong>" in mail["body"]
+    assert "Follow-ups have stopped and the opportunity" not in mail["body"]
+
+
+def test_a_scope_status_email_names_others_that_are_not_being_chased(status):
+    f, go = status
+    f.rows["d-break"]["followup_paused_until"] = (NOW + timedelta(days=9)).date()
+    go("d-lab2", status="delayed", months=1)
+    body = f.sent["staff"][0]["body"]
+    assert "still being followed up: <strong>Lab 1</strong>" in body
+    assert "not being followed up right now: <strong>Breakroom</strong>" in body
+
+
+def test_an_ungrouped_status_email_is_unchanged(status):
+    f, go = status
+    for k in ("scope_group", "scope_label"):
+        f.rows["d-lab1"][k] = None
+    go("d-lab1", status="delayed", months=2)
+    mail, = f.sent["staff"]
+    assert mail["subject"] == "Project delayed — Acme HQ"
+    assert "<p>Automated follow-ups are paused until " in mail["body"]

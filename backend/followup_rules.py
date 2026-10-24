@@ -828,14 +828,19 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
     for k in ("followup_interval_days", "followup_stop_after", "followup_next_at"):
         view[k] = home.get(k)
     view["scope_group"] = home.get("scope_group")
+    # Fix round #15: a scope the customer paused ("delayed, 2 months" on its page) is left out of
+    # the reminder while the others are chased -- it is not emailed, and not listed on the task. Only
+    # when every open scope is paused (the group itself is paused, so nothing is due) are they all
+    # kept, so the board still has the group's scopes to show.
+    listed = [m for m in open_ if not is_paused(m, now)] or open_
     view["scopes"] = [{"proposal_id": m.get("proposal_id"),
                        "label": m.get("scope_label") or m.get("project_name") or "Proposal",
-                       "status": m.get("proposal_status")} for m in open_]
+                       "status": m.get("proposal_status")} for m in listed]
     view["home_proposal_id"] = home.get("proposal_id")
     # Where a staff link should land: an OPEN scope, never a possibly-approved home.
-    view["link_proposal_id"] = (home.get("proposal_id") if any(m is home for m in open_)
-                                else open_[0].get("proposal_id"))
-    view["_open_members"] = open_
+    view["link_proposal_id"] = (home.get("proposal_id") if any(m is home for m in listed)
+                                else listed[0].get("proposal_id"))
+    view["_open_members"] = listed
     return view, ""
 
 
