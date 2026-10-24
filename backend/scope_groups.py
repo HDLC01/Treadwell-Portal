@@ -90,13 +90,18 @@ def _same_rev(a: Any, b: Any) -> bool:
 
 
 def mark_status(mark: dict, now: datetime) -> Optional[str]:
-    """'counts', 'inflight' or None for one scope_group_sent mark.
+    """'counts', 'inflight', 'unknown' or None for one scope_group_sent mark.
 
     - no `revision_no`: written before revisions were recorded. It counts, at an unknown revision.
     - `adopted`: a scope that had been emailed as an ordinary proposal before it joined the group.
     - `delivery` recorded: counts only if somebody actually got it.
     - neither: a send in progress. It holds the scope for INFLIGHT_TTL (so a double click cannot
-      mail twice), after which it is a send that died half way and is ignored."""
+      mail twice). After that it depends on `attempt_at`, stamped just before the first email:
+      without it the send died before mailing anybody, and the mark is ignored; WITH it the emails
+      may well have gone out and only the result was lost (a restart mid-loop, a database blip on
+      settle). That is 'unknown': never announced, but never pending again on its own either --
+      a person decides (the send's `resend_unknown`), because guessing wrong mails the customer
+      the same proposals twice."""
     d = (mark or {}).get("detail") or {}
     if "revision_no" not in d:
         return "counts"
@@ -107,6 +112,8 @@ def mark_status(mark: dict, now: datetime) -> Optional[str]:
     made = _ts((mark or {}).get("created_at"))
     if made is not None and now - made < INFLIGHT_TTL:
         return "inflight"
+    if d.get("attempt_at"):
+        return "unknown"
     return None
 
 
@@ -130,33 +137,43 @@ def scope_states(rows: list, marks: list, now: datetime) -> dict:
         rev = r.get("current_revision_no")
         counting = [m for m in ms if mark_status(m, now) == "counts"]
         inflight = any(mark_status(m, now) == "inflight" for m in ms)
+        # Only an unsettled mark at the CURRENT revision: a lost result about revision 1 says
+        # nothing about whether revision 2 has gone out.
+        unknown = any(mark_status(m, now) == "unknown"
+                      and _same_rev((m.get("detail") or {}).get("revision_no"), rev) for m in ms)
         announced = any("revision_no" not in (m.get("detail") or {})
                         or _same_rev((m.get("detail") or {}).get("revision_no"), rev)
                         for m in counting)
         ever = bool(counting)
         if not ms and r.get("last_sent_at"):
             announced = ever = True
-        out[pid] = {"announced": announced, "inflight": inflight and not announced, "ever": ever}
+        out[pid] = {"announced": announced, "inflight": inflight and not announced, "ever": ever,
+                    "unknown": unknown and not announced and not inflight}
     return out
 
 
-def plan_send(rows: list, marks: list, now: datetime) -> dict:
+def plan_send(rows: list, marks: list, now: datetime, include_unknown: bool = False) -> dict:
     """What a combined send would email right now, for the group's published LIVE scopes `rows`.
 
     `pending`: not announced and not already being sent, in `rows` order. `first`: nothing in the
     group has ever reached the customer. `kinds`: per pending scope, 'first' on the first send,
-    otherwise 'new' or 'revised'."""
+    otherwise 'new' or 'revised'. `unknown`: scopes whose last send lost its result (mark_status);
+    they are left out of `pending` unless `include_unknown` (a person said send them again)."""
     st = scope_states(rows, marks, now)
     first = not any(s["ever"] for s in st.values())
-    pending, kinds = [], {}
+    pending, kinds, unknown = [], {}, []
     for r in rows or []:
         pid = r.get("proposal_id")
         s = st.get(pid) or {}
         if s.get("announced") or s.get("inflight"):
             continue
+        if s.get("unknown"):
+            unknown.append(pid)
+            if not include_unknown:
+                continue
         pending.append(pid)
         kinds[pid] = "first" if first else ("revised" if s.get("ever") else "new")
-    return {"pending": pending, "kinds": kinds, "first": first, "states": st}
+    return {"pending": pending, "kinds": kinds, "first": first, "states": st, "unknown": unknown}
 
 
 def retry_targets(rows: list, marks: list, now: datetime) -> dict:
@@ -188,7 +205,42 @@ def retry_targets(rows: list, marks: list, now: datetime) -> dict:
         if not failed or (busy is not None and now - busy < INFLIGHT_TTL):
             continue
         out[pid] = {"mark_id": best.get("id"), "failed": failed, "kind": d.get("kind") or "first",
-                    "delivered": list((d.get("delivery") or {}).get("delivered") or [])}
+                    "delivered": list((d.get("delivery") or {}).get("delivered") or []),
+                    # What the original email carried (main._scope_send_extras), so a retry sends
+                    # the same note and files rather than a bare list of links.
+                    "note": d.get("note") or None, "files": list(d.get("files") or [])}
+    return out
+
+
+# ── the Files page's note and files for a scope, held for the combined email ────
+# A grouped publish emails nobody (the combined send does), so the note and the files the estimator
+# gave that publish are kept as a `scope_group_note` staff_note row (db.stash_scope_group_note) and
+# picked up by the next combined send that names the scope (finding #17).
+def stashed_extras(rows: list, stashes: list) -> dict:
+    """{proposal_id: {"note", "files"}}: the NEWEST stash of each scope in `rows` made for its
+    CURRENT revision. One made for an older revision belongs to an email that has gone, or never
+    will; a stash with neither a note nor a file is nothing."""
+    by: dict = {}
+    for s in stashes or []:
+        by.setdefault((s or {}).get("proposal_id"), []).append(s)
+    out = {}
+    for r in rows or []:
+        pid = r.get("proposal_id")
+        rev = r.get("current_revision_no")
+        best = None
+        for s in by.get(pid, []):
+            d = s.get("detail") or {}
+            if not _same_rev(d.get("revision_no"), rev):
+                continue
+            if best is None or (s.get("id") or 0) > (best.get("id") or 0):
+                best = s
+        if best is None:
+            continue
+        d = best.get("detail") or {}
+        note = str(d.get("note") or "").strip() or None
+        files = [f for f in (d.get("files") or []) if isinstance(f, dict) and f.get("id")]
+        if note or files:
+            out[pid] = {"note": note, "files": files}
     return out
 
 

@@ -456,7 +456,8 @@ def _lock_scope_rows(conn, ids: list[str]) -> list[dict[str, Any]]:
 
 
 def claim_scope_group_send(group_id: str, proposal_ids: list[str],
-                           by: Optional[str] = None) -> Optional[dict[str, Any]]:
+                           by: Optional[str] = None,
+                           include_unknown: bool = False) -> Optional[dict[str, Any]]:
     """Claim the scopes of one group that the customer has NOT been told about yet.
 
     Returns `{"send_no", "pending", "kinds", "first", "revisions"}` (scope_groups.plan_send) or None
@@ -466,8 +467,10 @@ def claim_scope_group_send(group_id: str, proposal_ids: list[str],
     RESERVE FIRST, SEND SECOND, exactly as the follow-up worker does. The record is a `staff_note`
     row with `detail.action = 'scope_group_sent'` per claimed scope carrying `revision_no` and
     `kind`; settle_scope_group_send adds who it reached (`delivery`). Until then it is IN FLIGHT and
-    holds the scope for scope_groups.INFLIGHT_TTL; a process that dies half way leaves a mark that
-    stops counting after that, so the scope becomes sendable again. Rows, not a column: no DDL."""
+    holds the scope for scope_groups.INFLIGHT_TTL. A process that dies BEFORE the first email
+    (no `attempt_at`, mark_scope_group_attempt) leaves a mark that stops counting after that; one
+    that dies after it leaves the scope 'unknown', which only `include_unknown` (a person's
+    decision) sends again. Rows, not a column: no DDL."""
     import scope_groups
 
     order = [p for p in dict.fromkeys(proposal_ids or []) if p]
@@ -481,7 +484,7 @@ def claim_scope_group_send(group_id: str, proposal_ids: list[str],
                              "and proposal_id = any(%s) order by id",
                              (_SCOPE_SENT, group_id, ids)).fetchall()
         rows = [locked[p] for p in order if p in locked]
-        plan = scope_groups.plan_send(rows, marks, now)
+        plan = scope_groups.plan_send(rows, marks, now, include_unknown=include_unknown)
         if not plan["pending"]:
             return None
         row = conn.execute(
@@ -502,6 +505,54 @@ def claim_scope_group_send(group_id: str, proposal_ids: list[str],
                              "scopes": plan["pending"]}), by))
     return {"send_no": n, "pending": plan["pending"], "kinds": plan["kinds"],
             "first": plan["first"], "revisions": revisions}
+
+
+def mark_scope_group_attempt(group_id: str, send_no: int, sent_with: dict[str, dict]) -> None:
+    """Stamp a claimed send as ABOUT TO EMAIL, before the first address is tried.
+
+    `attempt_at` is what lets scope_groups.mark_status tell a send that died before mailing anybody
+    (the scope may simply be sent again) from one whose result was lost after the emails went out
+    (never re-sent on its own: the customer would get it twice). `sent_with` is
+    `{proposal_id: {"note", "files"}}`, what the email carries for that scope, kept so a
+    `retry_failed` sends the same note and files."""
+    from datetime import datetime, timezone
+
+    at = datetime.now(timezone.utc).isoformat()
+    with pool().connection() as conn:
+        for pid, extra in (sent_with or {}).items():
+            conn.execute(
+                "update public.portal_followups set detail = detail || %s "
+                "where kind = 'staff_note' and proposal_id = %s and detail ->> 'action' = %s "
+                "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s",
+                (Jsonb({"attempt_at": at, "note": (extra or {}).get("note"),
+                        "files": list((extra or {}).get("files") or [])}),
+                 pid, _SCOPE_SENT, group_id, int(send_no)))
+
+
+_SCOPE_NOTE = "scope_group_note"
+
+
+def stash_scope_group_note(proposal_id: str, group_id: str, revision_no: Optional[int],
+                           note: Optional[str], files: list[dict[str, Any]],
+                           by: Optional[str] = None) -> None:
+    """Keep the note and the files a GROUPED publish was given, for the combined email that will
+    carry them (a grouped publish emails nobody: finding #17). `files` are uploads.store records
+    already on disk under this proposal. Read back by list_scope_group_notes."""
+    execute("insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+            "values (%s, 'staff_note', %s, %s)",
+            (proposal_id, Jsonb({"action": _SCOPE_NOTE, "scope_group": group_id,
+                                 "revision_no": revision_no, "note": note,
+                                 "files": list(files or [])}), by))
+
+
+def list_scope_group_notes(group_id: str, proposal_ids: list[str]) -> list[dict[str, Any]]:
+    """The stashed publish notes of these scopes (scope_groups.stashed_extras picks the current
+    one per scope)."""
+    ids = sorted({p for p in proposal_ids or [] if p})
+    if not ids:
+        return []
+    return qall(_MARKS_SQL + "and detail ->> 'scope_group' = %s and proposal_id = any(%s) "
+                "order by id", (_SCOPE_NOTE, group_id, ids))
 
 
 def settle_scope_group_send(group_id: str, send_no: int, delivery: dict[str, dict]) -> None:

@@ -515,8 +515,10 @@ def test_every_customer_facing_send_that_can_carry_files_does():
     assert src.count("attachments=mail_atts or None") == 1
     assert src.count("attachments=_proposal_card_files(proposal_id) or None") == 1
     # The combined scope-group email and its retry (2026-10-24, finding #17: they used to drop
-    # the estimator's files for a scope).
-    assert src.count("attachments=group_atts or None") == 2
+    # the estimator's files for a scope). Since 2026-10-25 both also carry the scope's own
+    # Files-page files and, on a retry, the original email's.
+    assert src.count("attachments=_scope_files_for(group_atts, mine, extras) or None") == 1
+    assert src.count("attachments=_retry_files_for(group_atts, mine, targets) or None") == 1
     # The chat reply.
     assert src.count("attachments=files or None") == 1
 

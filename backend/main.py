@@ -2946,6 +2946,26 @@ async def admin_publish(request: Request) -> JSONResponse:
         if stored:
             db.attach_to_latest_card(draft_id, uploads.sanitize(stored))
 
+    # A SCOPE OF A GROUP emails nobody here, so the note and the files typed on the Files page are
+    # KEPT for the combined email that will name this scope (finding #17: they used to be dropped
+    # with nothing to say so). The response says what was deferred, and whether it was kept.
+    deferred: dict[str, Any] = {}
+    if scope_group:
+        kept_files = uploads.sanitize(stored) if pub_atts else []
+        deferred = {"note_deferred": bool(note),
+                    "attachments_deferred": [f["name"] for f in kept_files]}
+        if note or kept_files:
+            try:
+                # Kept against the revision the row now points at, which is what the combined
+                # send compares (a call with no revision_no leaves the row's own).
+                at_rev = rev_no or (db.get_proposal(draft_id) or {}).get("current_revision_no")
+                db.stash_scope_group_note(draft_id, scope_group, at_rev, note, kept_files, by)
+                deferred["deferred_saved"] = True
+            except Exception as exc:  # noqa: BLE001 — the publish stands; say the extras did not
+                log.error("publish %s: could not keep its note/files for the group email: %s",
+                          draft_id, exc)
+                deferred["deferred_saved"] = False
+
     # Whoever BUILT this estimate hears about the project, roster or no roster.
     #
     # Will, via Hanz on 2026-08-13: "There are set members for the global notification. And this
@@ -3163,7 +3183,7 @@ async def admin_publish(request: Request) -> JSONResponse:
                   # For a scope of a group: nothing has been emailed yet, and the tool's next step
                   # is the combined send once every scope is published.
                   "scope_group": scope_group, "scope_label": scope_label,
-                  "awaiting_group_send": bool(scope_group)})
+                  "awaiting_group_send": bool(scope_group), **deferred})
 
 
 @app.post("/api/admin/scope-group/{group_id}/send")
@@ -3204,6 +3224,9 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
     by = _cap(body.get("by"), 120) or None
     note = _cap(body.get("message"), 2000) or None
     retry = body.get("retry_failed") is True
+    # A person's answer to "the last send's result was lost -- send those scopes again?"
+    # (scope_groups.mark_status 'unknown'). Never assumed: guessing yes mails the customer twice.
+    resend_unknown = body.get("resend_unknown") is True
     # The estimator's files, accepted exactly as a single-scope publish accepts them (finding #17:
     # they used to be dropped on the floor for a scope), and checked before anything is claimed.
     try:
@@ -3243,7 +3266,8 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
     detached = [pid for pid in published_ids if known and pid not in known]
     live = scope_groups.send_rows(rows, states)
     not_included = [d for d in expected if d not in published_ids]
-    plan = scope_groups.plan_send(live, db.list_scope_group_marks([group_id]), _now_utc())
+    plan = scope_groups.plan_send(live, db.list_scope_group_marks([group_id]), _now_utc(),
+                                  include_unknown=resend_unknown)
     if not retry and plan["first"] and (not_included or not rows):
         return _json({"ok": False, "error": "scopes_not_published",
                       "missing": not_included, "published": published_ids}, 409)
@@ -3270,10 +3294,11 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
         return _retry_scope_group_send(group_id, live, by_pid, project, lead, by, note, group_atts,
                                        _label, _url, _on, not_included, detached)
 
-    claim = db.claim_scope_group_send(group_id, [r["proposal_id"] for r in live], by=by)
+    claim = db.claim_scope_group_send(group_id, [r["proposal_id"] for r in live], by=by,
+                                      include_unknown=resend_unknown)
     if not claim:
         return _json({"ok": False, "error": "nothing_to_send", "not_included": not_included,
-                      "detached": detached}, 409)
+                      "detached": detached, "unknown": list(plan.get("unknown") or [])}, 409)
     send_no, kinds = claim["send_no"], claim["kinds"]
     pending = [by_pid[pid] for pid in claim["pending"] if pid in by_pid]
 
@@ -3285,6 +3310,23 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
     if not per:
         db.settle_scope_group_send(group_id, send_no, {r["proposal_id"]: {} for r in pending})
         return _json({"ok": False, "error": "no_contact_email"}, 400)
+
+    # What each scope's email carries: this request's note and files, plus the note and files each
+    # scope's own (grouped) publish was given on the Files page (finding #17).
+    extras = _scope_send_extras(group_id, pending, note, group_atts)
+    # STAMPED BEFORE THE FIRST EMAIL. From here on a lost result means "maybe sent", and the scope
+    # is never re-sent on its own (scope_groups.mark_status 'unknown'). A stamp that cannot be
+    # written means nothing has been mailed yet, so the claim is undone and nobody is.
+    try:
+        db.mark_scope_group_attempt(group_id, send_no, {
+            pid: {"note": x["note"], "files": x["refs"]} for pid, x in extras.items()})
+    except Exception as exc:  # noqa: BLE001
+        log.error("scope group %s: could not stamp send %s: %s", group_id, send_no, exc)
+        try:
+            db.release_scope_group_send(group_id, send_no)
+        except Exception as exc2:  # noqa: BLE001 — unstamped, the claim expires on its own
+            log.error("scope group %s: could not release send %s: %s", group_id, send_no, exc2)
+        return _json({"ok": False, "error": "send_not_recorded", "emailed": []}, 503)
 
     primary = (lead.get("customer_email") or "").strip().lower()
     emailed: list[str] = []
@@ -3299,7 +3341,8 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
                 # The first of THEIR scopes, so a reply from a contact on Lab 2 alone lands in
                 # Lab 2's thread rather than in one they cannot open.
                 reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
-                note=note, token=mine[0]["token"], attachments=group_atts or None)
+                note=_scope_note_for(note, mine, extras, _label), token=mine[0]["token"],
+                attachments=_scope_files_for(group_atts, mine, extras) or None)
         except Exception as exc:  # noqa: BLE001 — one bad address must not stop the others
             log.warning("scope group %s: send to %s failed: %s", group_id, e, exc)
             ok = False
@@ -3313,10 +3356,17 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
         "delivered": [e for e in emailed if _has(e, r["proposal_id"])],
         "failed": [e for e in per if e not in emailed and _has(e, r["proposal_id"])]}
         for r in pending}
-    try:
-        db.settle_scope_group_send(group_id, send_no, delivery)
-    except Exception as exc:  # noqa: BLE001 — the emails are out; the marks expire on their own
-        log.error("scope group %s: could not record send %s: %s", group_id, send_no, exc)
+    # Tried twice: a mark left unsettled after the emails went out is 'unknown' -- safe (never
+    # re-sent on its own) but it needs a person, so one database blip is not allowed to cause it.
+    recorded = False
+    for attempt in (1, 2):
+        try:
+            db.settle_scope_group_send(group_id, send_no, delivery)
+            recorded = True
+            break
+        except Exception as exc:  # noqa: BLE001 — the emails are out; never undo that
+            log.error("scope group %s: could not record send %s (try %d): %s",
+                      group_id, send_no, attempt, exc)
     reached = [r for r in pending if delivery[r["proposal_id"]]["delivered"]]
     for r in reached:
         pid = r["proposal_id"]
@@ -3361,11 +3411,110 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
                       for r in pending],
            "not_included": not_included, "detached": detached,
            "recipients": [{"email": e, "delivered": e in emailed} for e in per],
-           "emailed": emailed}
+           "emailed": emailed,
+           # False: the emails above went out but could not be recorded. The scopes show as
+           # 'unknown' (scope_send_state.unknown_scope_ids) instead of quietly becoming pending.
+           "recorded": recorded}
     if not emailed:
         out["error"] = "delivery_failed"
         return _json(out, 502)
     return _json(out)
+
+
+def _scope_send_extras(group_id: str, pending: list, note: Optional[str],
+                       group_atts: list) -> dict:
+    """{proposal_id: {"note", "stash_files", "refs"}} for a combined send's pending scopes.
+
+    `note`: this request's message, else the note the scope's grouped publish was given on the
+    Files page (scope_groups.stashed_extras). `stash_files`: that publish's files, already on disk
+    under the scope. `refs`: every file the scope's email carries as `{pid, id, name}`, recorded on
+    the send mark so a `retry_failed` sends the same files: this request's own files are stored
+    once, under the first pending scope, to make that possible (best-effort -- a file that cannot
+    be stored is still emailed now, it just cannot be retried)."""
+    pids = [r["proposal_id"] for r in pending]
+    try:
+        stashed = scope_groups.stashed_extras(pending, db.list_scope_group_notes(group_id, pids))
+    except Exception as exc:  # noqa: BLE001 — the email matters more than a note
+        log.warning("scope group %s: stashed publish notes unreadable: %s", group_id, exc)
+        stashed = {}
+    own_refs: list[dict] = []
+    if group_atts and pids:
+        for name_, blob_ in group_atts:
+            try:
+                rec = uploads.store(pids[0], name_, None, blob_)
+                own_refs.append({"pid": pids[0], "id": rec["id"], "name": rec["name"]})
+            except (ValueError, OSError) as exc:
+                log.warning("scope group %s: %r not kept for a retry: %s", group_id, name_, exc)
+    out = {}
+    for pid in pids:
+        s = stashed.get(pid) or {}
+        files = list(s.get("files") or [])
+        out[pid] = {"note": note or s.get("note"), "stash_files": files,
+                    "refs": own_refs + [{"pid": pid, "id": f["id"], "name": f.get("name")}
+                                        for f in files]}
+    return out
+
+
+def _scope_note_for(note: Optional[str], mine: list, extras: dict, label) -> Optional[str]:
+    """The note one recipient's combined email carries. The request's own message wins; otherwise
+    the Files-page notes of THEIR scopes, each named when there is more than one."""
+    if note:
+        return note
+    notes: list[tuple[str, str]] = []
+    for r in mine:
+        n = (extras.get(r["proposal_id"]) or {}).get("note")
+        if n and n not in [x[1] for x in notes]:
+            notes.append((label(r), n))
+    if not notes:
+        return None
+    if len(notes) == 1:
+        return notes[0][1]
+    return _cap("\n\n".join("%s: %s" % (lbl, n) for lbl, n in notes), 4000)
+
+
+def _read_stored_file(pid: str, f: dict) -> Optional[tuple[str, bytes]]:
+    """(name, bytes) of one file already on disk under proposal `pid`, or None (logged)."""
+    try:
+        p = uploads.path_of(pid, str(f.get("id") or ""))
+        if p is None:
+            log.warning("stored file %s of %s is gone", f.get("id"), pid)
+            return None
+        return uploads.clean_name(f.get("name")), p.read_bytes()
+    except OSError as exc:
+        log.warning("stored file %s of %s unreadable: %s", f.get("id"), pid, exc)
+        return None
+
+
+def _scope_files_for(group_atts: list, mine: list, extras: dict) -> list:
+    """The files one recipient's combined email carries: this request's, then the Files-page
+    files of THEIR scopes (a contact on Lab 2 alone never gets Lab 1's drawings)."""
+    out = list(group_atts or [])
+    for r in mine:
+        for f in (extras.get(r["proposal_id"]) or {}).get("stash_files") or []:
+            got = _read_stored_file(r["proposal_id"], f)
+            if got:
+                out.append(got)
+    return out
+
+
+def _retry_files_for(group_atts: list, mine: list, targets: dict) -> list:
+    """A retry's files for one recipient: this request's own if it brought any, otherwise the
+    files the ORIGINAL email carried for their scopes (the `{pid, id}` refs on the send mark),
+    each once."""
+    if group_atts:
+        return list(group_atts)
+    seen: set = set()
+    out = []
+    for r in mine:
+        for f in (targets.get(r["proposal_id"]) or {}).get("files") or []:
+            key = (f.get("pid"), f.get("id"))
+            if not f.get("pid") or key in seen:
+                continue
+            seen.add(key)
+            got = _read_stored_file(f["pid"], f)
+            if got:
+                out.append(got)
+    return out
 
 
 def _retry_scope_group_send(group_id, live, by_pid, project, lead, by, note, group_atts,
@@ -3388,6 +3537,9 @@ def _retry_scope_group_send(group_id, live, by_pid, project, lead, by, note, gro
                 per.setdefault(e, []).append(r)
     primary = (lead.get("customer_email") or "").strip().lower()
     emailed: list[str] = []
+    # THE ORIGINAL EMAIL'S note and files (recorded on the mark by mark_scope_group_attempt),
+    # unless this request brings its own: the person it failed for gets what everyone else got.
+    orig = {pid: {"note": t.get("note")} for pid, t in targets.items()}
     for e, mine in per.items():
         try:
             ok = email_sender.send_scope_group_links(
@@ -3397,7 +3549,8 @@ def _retry_scope_group_send(group_id, live, by_pid, project, lead, by, note, gro
                   "change": None if targets[r["proposal_id"]]["kind"] == "first"
                   else targets[r["proposal_id"]]["kind"]} for r in mine],
                 reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
-                note=note, token=mine[0]["token"], attachments=group_atts or None)
+                note=_scope_note_for(note, mine, orig, _label), token=mine[0]["token"],
+                attachments=_retry_files_for(group_atts, mine, targets) or None)
         except Exception as exc:  # noqa: BLE001
             log.warning("scope group %s: retry to %s failed: %s", group_id, e, exc)
             ok = False
@@ -3541,6 +3694,10 @@ def _apply_group_schedules(rows: list, out: list, followup_cfg: dict) -> None:
                                   .get("announced")),
                 "pending_scope_ids": list(s["plan"]["pending"]),
                 "not_included": list(s["not_included"]),
+                # A send whose result was lost after the emails went out: maybe delivered. Not
+                # pending (a second press would mail them twice); the send's `resend_unknown`
+                # is a person's call to send them again.
+                "unknown_scope_ids": list(s["plan"].get("unknown") or []),
             }
         g = groups.get(r.get("scope_group") or "")
         if not g or r["proposal_id"] not in g["ids"] or not followup_rules.is_open(r):

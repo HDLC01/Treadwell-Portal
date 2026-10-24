@@ -164,6 +164,92 @@ def test_a_send_that_died_half_way_can_be_sent_again(send):
     assert r.json()["send_no"] == 2
 
 
+def _settle_fails(f, times):
+    """Make the fake's settle raise `times` times (a database blip after the emails went out)."""
+    real = f.settle_scope_group_send
+    left = {"n": times}
+
+    def flaky(gid, send_no, delivery):
+        if left["n"] > 0:
+            left["n"] -= 1
+            raise RuntimeError("connection lost")
+        return real(gid, send_no, delivery)
+    return flaky
+
+
+def test_a_send_whose_result_was_lost_is_never_re_sent_on_its_own(send, monkeypatch):
+    """Review 2026-10-25: the emails reached the customer, then settle failed (or the container
+    restarted mid-loop). Ten minutes later the marks used to expire into 'pending', the board said
+    'Email not sent', and the next press mailed the customer the same three proposals again."""
+    go, calls, f = send
+    monkeypatch.setattr(main.db, "settle_scope_group_send", _settle_fails(f, 99))
+    r = go()
+    assert r.status_code == 200, r.text
+    assert r.json()["recorded"] is False
+    assert len(calls["emails"]) == 1
+    f.now = f.now + scope_groups.INFLIGHT_TTL + timedelta(minutes=1)
+    r = go()
+    assert r.status_code == 409, r.text
+    j = r.json()
+    assert j["error"] == "nothing_to_send"
+    assert j["unknown"] == ["d-break", "d-lab1", "d-lab2"]
+    assert len(calls["emails"]) == 1, "a lost result re-mailed the customer"
+    plan = scope_groups.plan_send([f.row(p) for p in ("d-break", "d-lab1", "d-lab2")],
+                                  f.marks, f.now)
+    assert plan["pending"] == [] and plan["unknown"] == ["d-break", "d-lab1", "d-lab2"]
+
+
+def test_a_lost_result_is_sent_again_only_when_a_person_says_so(send, monkeypatch):
+    go, calls, f = send
+    monkeypatch.setattr(main.db, "settle_scope_group_send", _settle_fails(f, 2))
+    go()
+    f.now = f.now + scope_groups.INFLIGHT_TTL + timedelta(minutes=1)
+    r = go(resend_unknown=True)
+    assert r.status_code == 200, r.text
+    assert _labels(calls["emails"][-1]) == ["Breakroom", "Lab 1", "Lab 2"]
+    assert r.json()["recorded"] is True
+    # Now settled: announced, and neither pending nor unknown.
+    r = go(resend_unknown=True)
+    assert r.status_code == 409 and r.json()["unknown"] == []
+
+
+def test_settle_is_tried_a_second_time_before_giving_up(send, monkeypatch):
+    go, calls, f = send
+    monkeypatch.setattr(main.db, "settle_scope_group_send", _settle_fails(f, 1))
+    r = go()
+    assert r.status_code == 200 and r.json()["recorded"] is True
+    f.now = f.now + scope_groups.INFLIGHT_TTL + timedelta(minutes=1)
+    r = go()
+    assert r.status_code == 409 and r.json()["unknown"] == [], "one blip left the send unknown"
+
+
+def test_a_send_that_cannot_stamp_its_attempt_mails_nobody(send, monkeypatch):
+    """The stamp is what separates 'died before mailing' from 'maybe mailed'. If it cannot be
+    written nothing is emailed and the claim is undone, so the next press sends normally."""
+    go, calls, f = send
+
+    def boom(*a, **k):
+        raise RuntimeError("connection lost")
+    monkeypatch.setattr(main.db, "mark_scope_group_attempt", boom)
+    r = go()
+    assert r.status_code == 503 and r.json()["error"] == "send_not_recorded"
+    assert calls["emails"] == [] and f.marks == []
+
+
+def test_an_unknown_send_of_an_older_revision_does_not_hold_back_a_revision():
+    now = T0 + timedelta(days=1)
+    stale = now - scope_groups.INFLIGHT_TTL - timedelta(minutes=1)
+    mark = {"id": 1, "proposal_id": "d-lab1", "created_at": stale,
+            "detail": {"action": "scope_group_sent", "scope_group": GID, "send_no": 1,
+                       "revision_no": 1, "kind": "first", "attempt_at": stale.isoformat()}}
+    assert scope_groups.mark_status(mark, now) == "unknown"
+    # The same mark without the stamp: the send died before mailing anybody.
+    bare = {**mark, "detail": {k: v for k, v in mark["detail"].items() if k != "attempt_at"}}
+    assert scope_groups.mark_status(bare, now) is None
+    plan = scope_groups.plan_send([_row("d-lab1", "Lab 1", current_revision_no=2)], [mark], now)
+    assert plan["pending"] == ["d-lab1"] and plan["unknown"] == []
+
+
 def test_a_scope_added_after_the_first_send_is_emailed_alone_as_new(send):
     """Findings #7/#11/#14: the drawer's button used to answer 'already sent' and reach nobody."""
     go, calls, f = send
@@ -321,6 +407,128 @@ def test_the_note_and_attachments_ride_along(send):
     assert e["attachments"] == [("drawings.pdf", pdf)]
 
 
+PDF = b"%PDF-1.4\n%fake\n"
+
+
+@pytest.fixture
+def files_page(send, monkeypatch, tmp_path):
+    """The combined send PLUS a grouped publish of Lab 1 from the Files page, over the same
+    in-memory group, with uploads on a temp disk."""
+    import config
+    go, calls, f = send
+    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path), raising=False)
+    f.draft_data["d-lab1"] = {"contact_email": "cust@acme.com", "contact_name": "Dana Reed",
+                              "project_name": "Acme HQ",
+                              "scope_group": {"id": GID, "label": "Lab 1"}}
+    for name, fn in {
+        "update_portal_proposal": lambda *a, **k: None,
+        "reset_for_revision": lambda *a, **k: False,
+        "supersede_proposal_cards": lambda *a, **k: None,
+        "reopen_if_closed": lambda pid: False,
+        "set_recipients": lambda *a, **k: None,
+        "add_recipient": lambda *a, **k: None,
+        "remove_recipient": lambda *a, **k: None,
+        "set_assigned_estimator": lambda *a, **k: None,
+        "add_notify_override_if_absent": lambda *a, **k: None,
+        "attach_to_latest_card": lambda *a, **k: None,
+    }.items():
+        monkeypatch.setattr(main.db, name, fn, raising=False)
+    monkeypatch.setattr(main, "_pdf_cache_drop", lambda pid: None)
+    monkeypatch.setattr(main.email_sender, "send_portal_link",
+                        lambda *a, **k: pytest.fail("a grouped publish emailed on its own"))
+
+    def publish(**extra):
+        import base64
+        body = {"draft_id": "d-lab1", "by": "rj@wetreadwell.com", "revision_no": 1,
+                "message": "Includes the revised drawings, call me Monday",
+                "attachments": [{"name": "drawings.pdf", "mime": "application/pdf",
+                                 "b64": base64.b64encode(PDF).decode()}]}
+        body.update(extra)
+        return client.post("/api/admin/publish", json=body)
+
+    return go, calls, f, publish
+
+
+def test_a_grouped_publish_keeps_its_note_and_files_for_the_combined_email(files_page):
+    """Finding #17's own scenario: RJ types a note and attaches a PDF on Lab 1's Files page and
+    publishes; the drawer's combined send posts only {by}. The note and the PDF used to vanish."""
+    go, calls, f, publish = files_page
+    r = publish()
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["awaiting_group_send"] is True
+    assert j["note_deferred"] is True and j["attachments_deferred"] == ["drawings.pdf"]
+    assert j["deferred_saved"] is True
+    r = go(by="rj@wetreadwell.com")
+    assert r.status_code == 200, r.text
+    e = calls["emails"][0]
+    assert e["note"] == "Includes the revised drawings, call me Monday"
+    assert e["attachments"] == [("drawings.pdf", PDF)]
+
+
+def test_a_files_page_note_rides_only_with_its_own_scope(files_page):
+    """Pat is on Breakroom alone and never gets Lab 1's note or drawings."""
+    go, calls, f, publish = files_page
+    f.recipients["d-break"] = ["cust@acme.com", "pat@acme.com"]
+    publish()
+    assert go().status_code == 200
+    by_to = {e["to"]: e for e in calls["emails"]}
+    assert by_to["pat@acme.com"]["note"] is None
+    assert by_to["pat@acme.com"]["attachments"] is None
+    assert by_to["cust@acme.com"]["attachments"] == [("drawings.pdf", PDF)]
+
+
+def test_a_note_kept_for_an_older_revision_is_not_sent_with_a_newer_one(files_page):
+    go, calls, f, publish = files_page
+    publish()
+    f.publish_revision("d-lab1", 2)
+    assert go().status_code == 200
+    assert calls["emails"][0]["note"] is None and calls["emails"][0]["attachments"] is None
+
+
+def test_the_send_requests_own_message_wins_over_the_kept_note(files_page):
+    go, calls, f, publish = files_page
+    publish()
+    assert go(message="Here are all three").status_code == 200
+    e = calls["emails"][0]
+    assert e["note"] == "Here are all three"
+    assert e["attachments"] == [("drawings.pdf", PDF)], "the Files-page PDF was dropped"
+
+
+def test_a_publish_whose_note_cannot_be_kept_says_so(files_page, monkeypatch):
+    go, calls, f, publish = files_page
+
+    def boom(*a, **k):
+        raise RuntimeError("connection lost")
+    monkeypatch.setattr(main.db, "stash_scope_group_note", boom)
+    r = publish()
+    assert r.status_code == 200, r.text
+    assert r.json()["deferred_saved"] is False and r.json()["note_deferred"] is True
+
+
+def test_retry_failed_sends_the_original_note_and_files(files_page):
+    """The spec's retry rule: the address it failed for gets what everyone else got -- the
+    request's own note and files AND the scope's Files-page ones -- with a bare retry body."""
+    import base64
+    go, calls, f, publish = files_page
+    publish()
+    f.recipients["d-lab1"] = ["cust@acme.com", "pat@acme.com"]
+    calls["ok"]["fn"] = lambda to: to != "pat@acme.com"
+    extra = b"%PDF-1.4\n%schedule\n"
+    r = go(message="All three attached", attachments=[
+        {"name": "schedule.pdf", "mime": "application/pdf",
+         "b64": base64.b64encode(extra).decode()}])
+    assert r.status_code == 200, r.text
+    calls["emails"].clear()
+    calls["ok"]["fn"] = lambda to: True
+    r = go(retry_failed=True)
+    assert r.status_code == 200, r.text
+    [e] = calls["emails"]
+    assert e["to"] == "pat@acme.com"
+    assert e["note"] == "All three attached"
+    assert sorted(e["attachments"]) == sorted([("schedule.pdf", extra), ("drawings.pdf", PDF)])
+
+
 def test_an_unreadable_attachment_is_refused_before_anything_is_claimed(send):
     go, calls, f = send
     r = go(attachments=[{"name": "x.pdf", "mime": "application/pdf", "b64": "!!not base64!!"}])
@@ -380,10 +588,38 @@ def test_the_pipeline_exposes_scope_send_state(monkeypatch):
         r.setdefault("schedule_status", "pending")
     out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
     assert out["d-break"]["scope_send_state"] == {
-        "announced": True, "pending_scope_ids": ["d-lab1"], "not_included": ["d-lab2"]}
+        "announced": True, "pending_scope_ids": ["d-lab1"], "not_included": ["d-lab2"],
+        "unknown_scope_ids": []}
     # Lab 1 went out at revision 1 and is now at 2: not announced, and pending.
     assert out["d-lab1"]["scope_send_state"]["announced"] is False
     assert "scope_send_state" not in out["d-solo"], "an ungrouped row changed shape"
+
+
+def test_the_board_names_a_send_whose_result_was_lost(monkeypatch):
+    """Not 'Email not sent' (a second press would mail it twice) and not 'sent' (nobody knows):
+    its own list, for a person to decide."""
+    rows = [_row("d-break", "Breakroom"),
+            _row("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1))]
+    stale = datetime.now(timezone.utc) - scope_groups.INFLIGHT_TTL - timedelta(minutes=5)
+    marks = [{"id": i, "proposal_id": p, "created_at": stale,
+              "detail": {"action": "scope_group_sent", "scope_group": GID, "send_no": 1,
+                         "revision_no": 1, "kind": "first", "attempt_at": stale.isoformat()}}
+             for i, p in enumerate(("d-break", "d-lab1"), 1)]
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "get_settings", lambda key: None)
+    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states",
+                        lambda gid: [_st("d-break"), _st("d-lab1")])
+    monkeypatch.setattr(main.db, "scope_group_resumed_at", lambda gid: None)
+    monkeypatch.setattr(main.db, "list_scope_group_marks", lambda gids: marks)
+    for r in rows:
+        r.setdefault("deposit_status", "pending")
+        r.setdefault("schedule_status", "pending")
+    out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-break"]["scope_send_state"] == {
+        "announced": False, "pending_scope_ids": [], "not_included": [],
+        "unknown_scope_ids": ["d-break", "d-lab1"]}
 
 
 # ══ 8. publish safety on a database without the DDL ══════════════════════════

@@ -23,6 +23,7 @@ class FakeSendDB:
                                  else [r["proposal_id"] for r in self.rows])]
         self.recipients = recipients or {}
         self.marks: list[dict] = []
+        self.stashes: list[dict] = []
         self.now = now or (T0 + timedelta(days=1))
         self.draft_data: dict = {}
         self.calls = {"last_sent": [], "enrol": [], "messages": [], "claims": [],
@@ -68,11 +69,12 @@ class FakeSendDB:
                            "created_at": created_at or self.now})
         return mid
 
-    def claim_scope_group_send(self, gid, pids, by=None):
+    def claim_scope_group_send(self, gid, pids, by=None, include_unknown=False):
         self.calls["claims"].append(list(pids))
         order = [p for p in dict.fromkeys(pids) if p]
         rows = [self.row(p) for p in order if self.row(p)]
-        plan = scope_groups.plan_send(rows, self._marks_for(gid, set(order)), self.now)
+        plan = scope_groups.plan_send(rows, self._marks_for(gid, set(order)), self.now,
+                                      include_unknown=include_unknown)
         if not plan["pending"]:
             return None
         n = max([int(m["detail"].get("send_no") or 0) for m in self.marks
@@ -86,6 +88,32 @@ class FakeSendDB:
                                  "scopes": plan["pending"]})
         return {"send_no": n, "pending": plan["pending"], "kinds": plan["kinds"],
                 "first": plan["first"], "revisions": revs}
+
+    def mark_scope_group_attempt(self, gid, send_no, sent_with):
+        self.calls.setdefault("attempts", []).append((send_no, copy.deepcopy(sent_with)))
+        for m in self.marks:
+            d = m["detail"]
+            if (d.get("scope_group") == gid and d.get("send_no") == send_no
+                    and m["proposal_id"] in sent_with):
+                extra = sent_with[m["proposal_id"]] or {}
+                d.update({"attempt_at": self.now.isoformat(), "note": extra.get("note"),
+                          "files": list(extra.get("files") or [])})
+
+    def release_scope_group_send(self, gid, send_no):
+        self.marks = [m for m in self.marks
+                      if not (m["detail"].get("scope_group") == gid
+                              and m["detail"].get("send_no") == send_no)]
+
+    # ── a grouped publish's note and files, kept for the combined email ──────
+    def stash_scope_group_note(self, pid, gid, rev, note, files, by=None):
+        self.stashes.append({"id": 1000 + len(self.stashes), "proposal_id": pid,
+                             "detail": {"action": "scope_group_note", "scope_group": gid,
+                                        "revision_no": rev, "note": note,
+                                        "files": list(files or [])}})
+
+    def list_scope_group_notes(self, gid, pids):
+        return [copy.deepcopy(s) for s in self.stashes
+                if s["detail"]["scope_group"] == gid and s["proposal_id"] in set(pids)]
 
     def settle_scope_group_send(self, gid, send_no, delivery):
         self.calls["settled"].append((send_no, copy.deepcopy(delivery)))
@@ -151,6 +179,8 @@ class FakeSendDB:
         for name in ("list_scope_group", "list_scope_group_draft_states", "list_scope_group_drafts",
                      "list_scope_group_marks", "get_proposal", "get_draft_data", "get_recipients",
                      "claim_scope_group_send", "settle_scope_group_send",
+                     "mark_scope_group_attempt", "release_scope_group_send",
+                     "stash_scope_group_note", "list_scope_group_notes",
                      "claim_scope_group_retry", "settle_scope_group_retry",
                      "adopt_into_scope_group", "mark_last_sent", "enroll_followup",
                      "add_message"):
