@@ -109,6 +109,12 @@ class FakeDB:
     def list_scope_group_drafts(self, gid):
         return [d["id"] for d in self.drafts]
 
+    def list_scope_group_marks(self, gids):
+        # The board's combined-send state read (P2, 2026-10-24).
+        return [dict(f) for f in self.followups if f["kind"] == "staff_note"
+                and f["detail"].get("action") == "scope_group_sent"
+                and f["detail"].get("scope_group") in set(gids or [])]
+
     def close_lost(self, pid, reason):
         if pid not in self.rows:
             return False

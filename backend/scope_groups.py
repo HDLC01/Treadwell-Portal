@@ -159,6 +159,39 @@ def plan_send(rows: list, marks: list, now: datetime) -> dict:
     return {"pending": pending, "kinds": kinds, "first": first, "states": st}
 
 
+def retry_targets(rows: list, marks: list, now: datetime) -> dict:
+    """{proposal_id: {"mark_id", "failed", "kind"}}: the addresses that did NOT get a scope's
+    latest delivered email at its current revision, for `retry_failed`. Only those addresses are
+    mailed again, never everybody (finding #16). A mark another retry is working on (`retry_at`
+    within INFLIGHT_TTL) is left alone, so a double click cannot mail them twice."""
+    by: dict = {}
+    for m in marks or []:
+        by.setdefault((m or {}).get("proposal_id"), []).append(m)
+    out = {}
+    for r in rows or []:
+        pid = r.get("proposal_id")
+        rev = r.get("current_revision_no")
+        best = None
+        for m in by.get(pid, []):
+            d = m.get("detail") or {}
+            if "delivery" not in d or mark_status(m, now) != "counts":
+                continue
+            if "revision_no" in d and not _same_rev(d.get("revision_no"), rev):
+                continue
+            if best is None or (m.get("id") or 0) > (best.get("id") or 0):
+                best = m
+        if best is None:
+            continue
+        d = best.get("detail") or {}
+        failed = [e for e in ((d.get("delivery") or {}).get("failed") or []) if e]
+        busy = _ts(d.get("retry_at"))
+        if not failed or (busy is not None and now - busy < INFLIGHT_TTL):
+            continue
+        out[pid] = {"mark_id": best.get("id"), "failed": failed, "kind": d.get("kind") or "first",
+                    "delivered": list((d.get("delivery") or {}).get("delivered") or [])}
+    return out
+
+
 def send_rows(rows: list, states: Optional[list]) -> list:
     """The group's portal rows that a combined send speaks for: published, not deleted, not closed
     lost, and a LIVE member (split_members). With no draft at all there is nothing to compare

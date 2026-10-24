@@ -261,7 +261,23 @@ def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] 
 # ── admin (publish + pipeline) ──────────────────────────────────────────────────
 def create_portal_proposal(proposal_id, token, customer_email, customer_name, project_name, pdf_path,
                            published_by, deposit_required: bool = True,
-                           revision_no: Optional[int] = None) -> None:
+                           revision_no: Optional[int] = None,
+                           scope_group: Optional[str] = None,
+                           scope_label: Optional[str] = None) -> None:
+    """A new portal row. A SCOPE writes its group in the SAME insert, so a database without the
+    scope-group DDL refuses the whole row instead of leaving a visible, ungrouped, un-emailed one
+    (findings #24/#40). An ungrouped row's insert is exactly what it always was."""
+    if scope_group:
+        execute(
+            "insert into public.portal_proposals "
+            "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, "
+            "published_by, deposit_required, current_revision_no, scope_group, scope_label) "
+            "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (proposal_id, token, customer_email, customer_name, project_name, pdf_path,
+             published_by, bool(deposit_required),
+             None if revision_no is None else int(revision_no), scope_group, scope_label or None),
+        )
+        return
     execute(
         "insert into public.portal_proposals "
         "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by, "
@@ -287,6 +303,18 @@ def update_portal_proposal(proposal_id, customer_email, customer_name, project_n
          None if deposit_required is None else bool(deposit_required),
          None if revision_no is None else int(revision_no), proposal_id),
     )
+
+
+def scope_group_columns_ready() -> bool:
+    """Does this database have portal_proposals.scope_group and scope_label? Read only: the
+    capability handshake (GET /api/admin/capabilities) says "no scope groups" rather than let a
+    grouped publish be refused after the tool has already minted a revision. Any failure is "no"."""
+    try:
+        q1("select scope_group, scope_label from public.portal_proposals limit 0")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("scope-group columns not readable: %s", exc)
+        return False
 
 
 def set_scope_group(proposal_id: str, group_id: str, label: Optional[str]) -> None:
@@ -401,45 +429,99 @@ def followup_rule_key_exists(proposal_id: str, rule_key: str) -> bool:
 _SCOPE_SENT = "scope_group_sent"
 
 
-def claim_scope_group_send(group_id: str, proposal_ids: list[str], by: Optional[str] = None,
-                           resend: bool = False) -> Optional[int]:
-    """Claim the right to send the combined "all your scopes" email. Returns the send number
-    (1 for the first send, 2 for the first resend, ...) or None when it has already gone out and
-    this is not an explicit resend.
+_MARKS_SQL = ("select id, proposal_id, detail, created_at from public.portal_followups "
+              "where kind = 'staff_note' and detail ->> 'action' = %s ")
 
-    RESERVE FIRST, SEND SECOND, exactly as the follow-up worker does: a crash between the two costs
-    one email the caller can resend, while sending first could mail the customer twice.
 
-    The record is a `staff_note` row with `detail.action = 'scope_group_sent'` on EVERY scope, so
-    each scope's follow-up history says when it went out (a row with an `action` is bookkeeping and
-    is not counted as an estimator's outreach). Kept as rows rather than a column: no DDL.
+def list_scope_group_marks(group_ids: list[str]) -> list[dict[str, Any]]:
+    """Every `scope_group_sent` mark of these groups: `[{id, proposal_id, detail, created_at}]`.
+    What scope_groups.scope_states reads to say which scopes the customer has been told about."""
+    gids = sorted({g for g in group_ids or [] if g})
+    if not gids:
+        return []
+    return qall(_MARKS_SQL + "and detail ->> 'scope_group' = any(%s) order by id",
+                (_SCOPE_SENT, gids))
 
-    TWO SIMULTANEOUS CALLS CANNOT BOTH WIN. The scope rows are locked `for update` in a fixed order
-    before the check, so a second caller blocks until the first commits and then reads its rows
-    (READ COMMITTED takes a fresh snapshot per statement)."""
-    ids = sorted({p for p in proposal_ids if p})
+
+def _lock_scope_rows(conn, ids: list[str]) -> list[dict[str, Any]]:
+    """Lock the scopes `for update` in a fixed order and read what the send plan needs. A second
+    caller blocks here until the first commits, then reads its marks (READ COMMITTED takes a fresh
+    snapshot per statement), so two simultaneous sends cannot both claim a scope.
+    `last_sent_at` through to_jsonb, like every column prod may get after the code."""
+    return conn.execute(
+        "select proposal_id, current_revision_no, "
+        "(to_jsonb(p) ->> 'last_sent_at') as last_sent_at "
+        "from public.portal_proposals p where proposal_id = any(%s) "
+        "order by proposal_id for update", (ids,)).fetchall()
+
+
+def claim_scope_group_send(group_id: str, proposal_ids: list[str],
+                           by: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Claim the scopes of one group that the customer has NOT been told about yet.
+
+    Returns `{"send_no", "pending", "kinds", "first", "revisions"}` (scope_groups.plan_send) or None
+    when every scope in `proposal_ids` is already announced at its current revision or is being
+    sent right now: that None is what makes a double click, a retried request or a second tab safe.
+
+    RESERVE FIRST, SEND SECOND, exactly as the follow-up worker does. The record is a `staff_note`
+    row with `detail.action = 'scope_group_sent'` per claimed scope carrying `revision_no` and
+    `kind`; settle_scope_group_send adds who it reached (`delivery`). Until then it is IN FLIGHT and
+    holds the scope for scope_groups.INFLIGHT_TTL; a process that dies half way leaves a mark that
+    stops counting after that, so the scope becomes sendable again. Rows, not a column: no DDL."""
+    import scope_groups
+
+    order = [p for p in dict.fromkeys(proposal_ids or []) if p]
+    ids = sorted(order)
     if not ids:
         return None
     with pool().connection() as conn:
-        conn.execute("select proposal_id from public.portal_proposals "
-                     "where proposal_id = any(%s) order by proposal_id for update", (ids,))
+        locked = {r["proposal_id"]: r for r in _lock_scope_rows(conn, ids)}
+        now = conn.execute("select now() as now").fetchone()["now"]
+        marks = conn.execute(_MARKS_SQL + "and detail ->> 'scope_group' = %s "
+                             "and proposal_id = any(%s) order by id",
+                             (_SCOPE_SENT, group_id, ids)).fetchall()
+        rows = [locked[p] for p in order if p in locked]
+        plan = scope_groups.plan_send(rows, marks, now)
+        if not plan["pending"]:
+            return None
         row = conn.execute(
             "select coalesce(max((detail ->> 'send_no')::int), 0) as n "
-            "from public.portal_followups "
-            "where proposal_id = any(%s) and kind = 'staff_note' "
+            "from public.portal_followups where kind = 'staff_note' "
             "  and detail ->> 'action' = %s and detail ->> 'scope_group' = %s",
-            (ids, _SCOPE_SENT, group_id)).fetchone()
-        n = int((row or {}).get("n") or 0)
-        if n and not resend:
-            return None
-        n += 1
-        for pid in ids:
+            (_SCOPE_SENT, group_id)).fetchone()
+        n = int((row or {}).get("n") or 0) + 1
+        revisions = {}
+        for pid in plan["pending"]:
+            rev = locked[pid].get("current_revision_no")
+            revisions[pid] = rev
             conn.execute(
                 "insert into public.portal_followups (proposal_id, kind, detail, created_by) "
                 "values (%s, 'staff_note', %s, %s)",
                 (pid, Jsonb({"action": _SCOPE_SENT, "scope_group": group_id, "send_no": n,
-                             "scopes": ids}), by))
-    return n
+                             "revision_no": rev, "kind": plan["kinds"][pid],
+                             "scopes": plan["pending"]}), by))
+    return {"send_no": n, "pending": plan["pending"], "kinds": plan["kinds"],
+            "first": plan["first"], "revisions": revisions}
+
+
+def settle_scope_group_send(group_id: str, send_no: int, delivery: dict[str, dict]) -> None:
+    """Record who each claimed scope reached: `{proposal_id: {"delivered": [...], "failed": [...]}}`.
+
+    A scope that reached NOBODY loses its mark (it is not announced, and the next send can try it
+    again); a scope that reached somebody keeps it with the delivery list, which is where
+    `retry_failed` reads the addresses to try again. One transaction for the whole send."""
+    where = ("where kind = 'staff_note' and proposal_id = %s and detail ->> 'action' = %s "
+             "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s")
+    with pool().connection() as conn:
+        for pid, dv in (delivery or {}).items():
+            args = (pid, _SCOPE_SENT, group_id, int(send_no))
+            if (dv or {}).get("delivered"):
+                conn.execute("update public.portal_followups set detail = detail || %s " + where,
+                             (Jsonb({"delivery": {"delivered": list(dv.get("delivered") or []),
+                                                  "failed": list(dv.get("failed") or [])}}),)
+                             + args)
+            else:
+                conn.execute("delete from public.portal_followups " + where, args)
 
 
 def release_scope_group_send(group_id: str, send_no: int) -> None:
@@ -448,6 +530,73 @@ def release_scope_group_send(group_id: str, send_no: int) -> None:
             "where kind = 'staff_note' and detail ->> 'action' = %s "
             "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s",
             (_SCOPE_SENT, group_id, int(send_no)))
+
+
+def claim_scope_group_retry(group_id: str, proposal_ids: list[str]) -> dict[str, dict]:
+    """`{proposal_id: {"mark_id", "failed", "kind"}}`: the addresses that did not get each scope's
+    latest email (scope_groups.retry_targets), claimed by stamping `retry_at` on the mark under the
+    same row lock as a send, so two retries cannot both mail them. {} = nothing to retry."""
+    import scope_groups
+
+    ids = sorted({p for p in proposal_ids or [] if p})
+    if not ids:
+        return {}
+    with pool().connection() as conn:
+        rows = _lock_scope_rows(conn, ids)
+        now = conn.execute("select now() as now").fetchone()["now"]
+        marks = conn.execute(_MARKS_SQL + "and detail ->> 'scope_group' = %s "
+                             "and proposal_id = any(%s) order by id",
+                             (_SCOPE_SENT, group_id, ids)).fetchall()
+        targets = scope_groups.retry_targets(rows, marks, now)
+        for t in targets.values():
+            conn.execute("update public.portal_followups set detail = detail || %s where id = %s",
+                         (Jsonb({"retry_at": now.isoformat()}), t["mark_id"]))
+    return targets
+
+
+def settle_scope_group_retry(results: dict[int, dict]) -> None:
+    """`{mark_id: {"delivered": [...], "failed": [...]}}` after a retry: the new delivery lists,
+    and the retry claim released."""
+    with pool().connection() as conn:
+        for mark_id, dv in (results or {}).items():
+            conn.execute(
+                "update public.portal_followups set detail = (detail - 'retry_at') || %s "
+                "where id = %s",
+                (Jsonb({"delivery": {"delivered": list(dv.get("delivered") or []),
+                                     "failed": list(dv.get("failed") or [])}}), int(mark_id)))
+
+
+def adopt_into_scope_group(proposal_id: str, group_id: str, label: Optional[str]) -> None:
+    """Put an EXISTING portal row into its scope group, before anything else about a publish or a
+    send touches it.
+
+    The columns are named directly, so on a database without the scope-group DDL this raises
+    BEFORE a customer-visible write (findings #24/#40). And a row the customer was already emailed
+    as an ordinary proposal (a project sent, then given "New scope": findings #1/#2) gets an
+    `adopted` mark at the revision it was sent at, so it counts as announced -- and a later revision
+    of it as revised -- instead of blocking the group or being emailed again as new."""
+    with pool().connection() as conn:
+        conn.execute("update public.portal_proposals set scope_group=%s, scope_label=%s, "
+                     "updated_at=now() where proposal_id=%s",
+                     (group_id, label or None, proposal_id))
+        row = conn.execute(
+            "select current_revision_no, (to_jsonb(p) ->> 'last_sent_at') as last_sent_at "
+            "from public.portal_proposals p where proposal_id = %s", (proposal_id,)).fetchone()
+        if not row or not row.get("last_sent_at"):
+            return
+        seen = conn.execute("select 1 as hit from public.portal_followups "
+                            "where proposal_id = %s and kind = 'staff_note' "
+                            "  and detail ->> 'action' = %s and detail ->> 'scope_group' = %s "
+                            "limit 1", (proposal_id, _SCOPE_SENT, group_id)).fetchone()
+        if seen:
+            return
+        conn.execute(
+            "insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+            "values (%s, 'staff_note', %s, null)",
+            (proposal_id, Jsonb({"action": _SCOPE_SENT, "scope_group": group_id, "send_no": 0,
+                                 "revision_no": row.get("current_revision_no"),
+                                 "adopted": True, "kind": "first",
+                                 "scopes": [proposal_id]})))
 
 
 def list_all_portal_proposals() -> list[dict[str, Any]]:
@@ -495,6 +644,9 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # same reason: prod gets the code before the ALTER, and NULL just means "ungrouped".
         "(to_jsonb(p) ->> 'scope_group') as scope_group, "
         "(to_jsonb(p) ->> 'scope_label') as scope_label, "
+        # Which revision the customer link points at: a scope is "announced" only at the revision
+        # its combined email named (scope_groups.scope_states), so the board's send state needs it.
+        "p.current_revision_no, "
         # Follow-up automation state.
         "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
         "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "
@@ -1147,12 +1299,19 @@ def set_assigned_estimator(proposal_id: str, email: Optional[str]) -> None:
             "where proposal_id=%s", ((email or None), proposal_id))
 
 
-def enroll_followup(proposal_id: str) -> None:
+def enroll_followup(proposal_id: str, keep_pause: bool = False) -> None:
     """Start (or restart) the cadence for a freshly sent proposal.
 
     Deliberately does NOT clear `followup_disabled_at`: an estimator taking a
     proposal off automation is a human decision, and sending a revision should not
-    quietly undo it. The drawer toggle is how you turn it back on."""
+    quietly undo it. The drawer toggle is how you turn it back on.
+
+    `keep_pause`: the combined scope-group email, which must never wipe a customer's own
+    "we're delayed" pause by emailing them about a new or revised scope."""
+    if keep_pause:
+        execute("update public.portal_proposals set followup_enrolled_at=now(), "
+                "cycle_viewed_at=null, updated_at=now() where proposal_id=%s", (proposal_id,))
+        return
     execute("update public.portal_proposals set followup_enrolled_at=now(), "
             "cycle_viewed_at=null, followup_paused_until=null, updated_at=now() "
             "where proposal_id=%s", (proposal_id,))

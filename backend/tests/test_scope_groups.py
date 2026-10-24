@@ -57,8 +57,17 @@ def publish(monkeypatch):
     monkeypatch.setattr(main.db, "get_draft_data", lambda pid: dict(state["draft"]))
     monkeypatch.setattr(main.db, "get_proposal",
                         lambda pid: dict(state["existing"]) if state["existing"] else None)
-    monkeypatch.setattr(main.db, "create_portal_proposal",
-                        lambda pid, *a, **k: calls["created"].append(pid))
+    def _create(pid, *a, **k):
+        calls["created"].append(pid)
+        # A new scope carries its group in its own insert (2026-10-24, findings #24/#40).
+        if k.get("scope_group"):
+            calls["scope"].append((pid, k["scope_group"], k.get("scope_label")))
+
+    monkeypatch.setattr(main.db, "create_portal_proposal", _create)
+    # An existing row joins its group before anything else is written.
+    monkeypatch.setattr(main.db, "adopt_into_scope_group",
+                        lambda pid, gid, label: calls["scope"].append((pid, gid, label)),
+                        raising=False)
     monkeypatch.setattr(main.db, "update_portal_proposal", lambda *a, **k: None)
     monkeypatch.setattr(main.db, "reset_for_revision", lambda *a, **k: False)
     monkeypatch.setattr(main.db, "supersede_proposal_cards", lambda *a, **k: None)
@@ -176,45 +185,23 @@ def test_scope_group_parsing_shape():
 # ══ C. the combined send ═════════════════════════════════════════════════════
 @pytest.fixture
 def group(monkeypatch):
-    calls = {"emails": [], "claims": [], "released": [], "enrol": [], "last_sent": [],
-             "notify": [], "messages": []}
+    """The combined send over an in-memory group (tests/scope_send_fake.py, which runs the same
+    planning code as db.py). `state` is read when the first request is made, so a test can edit
+    the rows, drafts and recipients before it calls go()."""
+    from scope_send_fake import FakeSendDB
+
+    calls = {"emails": [], "notify": []}
     state = {
         "rows": [_sib("d-break", "Breakroom"),
                  _sib("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1)),
                  _sib("d-lab2", "Lab 2", created_at=T0 + timedelta(seconds=2))],
         "drafts": ["d-break", "d-lab1", "d-lab2"],
         "recipients": {},
-        "sent_no": 0,
         "send_ok": lambda to: True,
+        "fake": None,
     }
 
     monkeypatch.setattr(main, "_admin_ok", lambda request: True)
-    monkeypatch.setattr(main.db, "list_scope_group", lambda gid: [dict(r) for r in state["rows"]],
-                        raising=False)
-    monkeypatch.setattr(main.db, "list_scope_group_drafts", lambda gid: list(state["drafts"]),
-                        raising=False)
-
-    def _claim(gid, pids, by=None, resend=False):
-        # The real one is a row-locked transaction; this models what it promises.
-        calls["claims"].append({"gid": gid, "pids": list(pids), "resend": resend})
-        if state["sent_no"] and not resend:
-            return None
-        state["sent_no"] += 1
-        return state["sent_no"]
-
-    def _release(gid, n):
-        calls["released"].append((gid, n))
-        state["sent_no"] -= 1
-
-    monkeypatch.setattr(main.db, "claim_scope_group_send", _claim, raising=False)
-    monkeypatch.setattr(main.db, "release_scope_group_send", _release, raising=False)
-    monkeypatch.setattr(main.db, "get_recipients",
-                        lambda pid: state["recipients"].get(pid, ["cust@acme.com"]))
-    monkeypatch.setattr(main.db, "enroll_followup", lambda pid: calls["enrol"].append(pid))
-    monkeypatch.setattr(main.db, "mark_last_sent", lambda pid: calls["last_sent"].append(pid))
-    monkeypatch.setattr(main.db, "add_message",
-                        lambda pid, kind, who, body, **k: calls["messages"].append(
-                            {"pid": pid, "body": body, "meta": k.get("meta")}) or {"id": 1})
     monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda tok: None)
 
     def _send(email, name, project, scopes, **k):
@@ -228,6 +215,17 @@ def group(monkeypatch):
                             {"heading": heading, "body": body, **k}) or True)
 
     def go(gid=GID, **body):
+        if state["fake"] is None:
+            recips = {r["proposal_id"]: state["recipients"].get(r["proposal_id"],
+                                                                ["cust@acme.com"])
+                      for r in state["rows"]}
+            state["fake"] = FakeSendDB(state["rows"], state["drafts"], recips).install(
+                monkeypatch, main)
+            f = state["fake"]
+            calls["claims"] = f.calls["claims"]
+            calls["last_sent"] = f.calls["last_sent"]
+            calls["messages"] = f.calls["messages"]
+            calls["enrol"] = f.calls["enrol"]
         return client.post("/api/admin/scope-group/%s/send" % gid, json=body)
 
     return go, calls, state
@@ -255,7 +253,8 @@ def test_the_send_marks_every_scope_sent_and_starts_the_chase(group):
     go, calls, _ = group
     go(by="rj@wetreadwell.com")
     assert sorted(calls["last_sent"]) == ["d-break", "d-lab1", "d-lab2"]
-    assert sorted(calls["enrol"]) == ["d-break", "d-lab1", "d-lab2"]
+    # Enrolled, and (2026-10-24) without wiping a customer's pause.
+    assert sorted(calls["enrol"]) == [("d-break", True), ("d-lab1", True), ("d-lab2", True)]
     assert len(calls["notify"]) == 1
     n = calls["notify"][0]
     assert n["heading"] == "Proposals sent — Acme HQ"
@@ -277,32 +276,34 @@ def test_refuses_and_reports_when_a_scope_is_not_published_yet(group):
 
 
 def test_a_second_call_does_not_send_twice(group):
+    """Since 2026-10-24 the second press is 409 nothing_to_send: every scope is announced."""
     go, calls, _ = group
     assert go().json()["send_no"] == 1
     r = go()
-    assert r.status_code == 200
-    assert r.json()["already_sent"] is True
+    assert r.status_code == 409 and r.json()["error"] == "nothing_to_send"
     assert len(calls["emails"]) == 1, "the second call emailed the customer again"
     assert len(calls["notify"]) == 1
 
 
-def test_an_explicit_resend_does_send_again(group):
-    """After a revision, say. Opt-in, so a double click can never be one."""
+def test_resend_no_longer_re_mails_everyone(group):
+    """The old `resend: true` re-mailed every scope to every contact (finding #16). It is ignored
+    now: only a new or revised scope is ever sent again."""
     go, calls, _ = group
     go()
     r = go(resend=True)
-    assert r.status_code == 200 and r.json()["send_no"] == 2
-    assert len(calls["emails"]) == 2
-    assert calls["claims"][-1]["resend"] is True
+    assert r.status_code == 409 and r.json()["error"] == "nothing_to_send"
+    assert len(calls["emails"]) == 1
 
 
-def test_a_send_that_reached_nobody_releases_the_claim(group):
-    """At-most-once, like the follow-up worker: nothing went out, so a retry must be possible."""
+def test_a_send_that_reached_nobody_marks_nothing_and_says_so(group):
+    """At-most-once, like the follow-up worker: nothing went out, so a retry must be possible --
+    and the answer is a 502, not a 200 the drawer reads as 'Sent' (findings #12/#15)."""
     go, calls, state = group
     state["send_ok"] = lambda to: False
     r = go()
-    assert r.status_code == 200 and r.json()["emailed"] == []
-    assert calls["released"] == [(GID, 1)]
+    assert r.status_code == 502 and r.json()["error"] == "delivery_failed"
+    assert r.json()["emailed"] == []
+    assert state["fake"].marks == [], "a send that reached nobody left a scope marked sent"
     assert calls["enrol"] == [] and calls["last_sent"] == []
     assert "did NOT send" in calls["notify"][0]["heading"]
     # And the retry really can go.
@@ -344,6 +345,7 @@ def test_unknown_or_malformed_group(group):
     go, _, state = group
     assert go(gid="bad%20id").status_code == 400
     state["rows"], state["drafts"] = [], []
+    state["fake"] = None                  # the in-memory group is built from state on first use
     assert go().status_code == 404
 
 

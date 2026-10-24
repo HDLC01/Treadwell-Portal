@@ -514,6 +514,9 @@ def test_every_customer_facing_send_that_can_carry_files_does():
     # The publish loop and the newly-added-recipient send.
     assert src.count("attachments=mail_atts or None") == 1
     assert src.count("attachments=_proposal_card_files(proposal_id) or None") == 1
+    # The combined scope-group email and its retry (2026-10-24, finding #17: they used to drop
+    # the estimator's files for a scope).
+    assert src.count("attachments=group_atts or None") == 2
     # The chat reply.
     assert src.count("attachments=files or None") == 1
 
