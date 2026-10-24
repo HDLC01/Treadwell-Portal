@@ -68,12 +68,14 @@ post_check_script() {
   if [ "$healthy" != 1 ]; then echo '   post-deploy healthcheck failed'; exit 1; fi
   echo '   healthz ok'
   logs="$(docker logs @CONTAINER@ 2>&1 || true)"
-  if printf '%s\n' "$logs" | grep -q 'startup failed'; then
+  # Here-strings, never `printf | grep -q`: under pipefail a log bigger than the pipe buffer makes
+  # printf die of SIGPIPE when grep -q stops at its first match, and the pipeline reads as no match.
+  if grep -q 'startup failed' <<<"$logs"; then
     echo '   STARTUP FAILED:'
     printf '%s\n' "$logs" | grep 'startup failed' | tail -3
     exit 1
   fi
-  if ! printf '%s\n' "$logs" | grep -q 'startup ok'; then
+  if ! grep -q 'startup ok' <<<"$logs"; then
     echo "   no 'startup ok' line in the container log"
     exit 1
   fi

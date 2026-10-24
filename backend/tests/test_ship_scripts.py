@@ -44,7 +44,7 @@ case "$1" in
   save) echo image-bytes ;;
   load) cat >/dev/null; echo "Loaded image" ;;
   image) exit "${STUB_PREV_RC:-0}" ;;
-  logs) printf '%b\n' "$STUB_LOGS" ;;
+  logs) if [ -n "${STUB_LOGS_FILE:-}" ]; then cat "$STUB_LOGS_FILE"; else printf '%b\n' "$STUB_LOGS"; fi ;;
   exec) printf '%s\n' "$STUB_CAPS"; exit "${STUB_EXEC_RC:-0}" ;;
 esac
 exit 0
@@ -89,7 +89,7 @@ def ship(tmp_path):
 
     def run(script, *args, dirty="", main=HEAD, fetch_rc=0, logs=GOOD_LOGS,
             caps="scope_groups=true group_followups=true version=1", exec_rc=0, curl_rc=0,
-            prev_rc=0):
+            prev_rc=0, logs_file=None):
         env = {"STUB_DIRTY": dirty, "STUB_MAIN": main, "STUB_HEAD": HEAD,
                "STUB_FETCH_RC": str(fetch_rc), "STUB_LOGS": logs, "STUB_CAPS": caps,
                "STUB_EXEC_RC": str(exec_rc), "STUB_CURL_RC": str(curl_rc),
@@ -101,6 +101,11 @@ def ship(tmp_path):
                  "export STUB_LOG=\"$(to_posix %s)\"" % shlex.quote(str(log)),
                  "export REMOTE_DIR=\"$(to_posix %s)\"" % shlex.quote(str(box))]
         lines += ["export %s=%s" % (k, shlex.quote(v)) for k, v in env.items()]
+        if logs_file is not None:
+            # A log too big for an environment variable: the docker stub cats this file instead.
+            big = tmp_path / "container.log"
+            big.write_bytes(logs_file.encode("utf-8"))
+            lines.append("export STUB_LOGS_FILE=\"$(to_posix %s)\"" % shlex.quote(str(big)))
         lines += ["cd \"$(to_posix %s)\"" % shlex.quote(str(repo)),
                   "bash deploy/%s %s" % (script, " ".join(shlex.quote(a) for a in args))]
         if log.exists():
@@ -188,6 +193,24 @@ def test_a_good_ship_tags_the_commit_keeps_the_previous_image_and_checks_the_box
 ])
 def test_a_failed_check_exits_non_zero_and_prints_the_rollback(ship, case, kwargs, why):
     _failed_check(ship, "ship-prod.sh", case, kwargs, why)
+
+
+@pytest.mark.parametrize("script", ["ship.sh", "ship-prod.sh"])
+def test_a_long_container_log_does_not_fail_a_healthy_ship(ship, script):
+    """Review of PF1: under `set -o pipefail`, `printf "$logs" | grep -q` fails once the log is
+    bigger than a pipe buffer, because grep -q exits at its first match and printf dies of SIGPIPE.
+    Re-running the same commit does not recreate the container, so the log is its whole history."""
+    log = ("INFO:portal:startup ok (schema_apply=False)\n"
+           "INFO:portal:[followup] worker started (tick=900s)\n"
+           + 'INFO:     10.0.0.1:0 - "GET /api/proposal/x HTTP/1.1" 200 OK\n' * 4000)
+    assert len(log) > 200_000
+    rc, out, _calls = ship(script, logs_file=log)
+    assert rc == 0, out[-2000:]
+    assert "no 'startup ok' line" not in out
+    assert "follow-up worker: INFO:portal:[followup] worker started" in out
+    # ...and a startup failure far down a long log is still caught.
+    rc, out, _calls = ship(script, logs_file=log + "ERROR:portal:startup failed: boom\n")
+    assert rc == 1 and "STARTUP FAILED" in out and "POST-DEPLOY CHECK FAILED" in out
 
 
 def test_staging_shares_the_checks(ship):
