@@ -886,22 +886,51 @@ def test_the_group_task_shows_on_every_member_row(clean):
     assert board["solo"]["pending_task"]["id"] == solo_task
     assert all(board[i]["pending_task"] is None for i in other_ids)
 
-    # The approved scope's decision task is newer, so the members show it; the home still holds
-    # the reminder task under its own stage.
+    # The approved scope's decision task is newer. Fix round #8: each row shows its OWN open task
+    # first (the home its reminder), an open member the group's newest (the decision task), and
+    # the approved scope, with nothing else of its own open, its own decision task.
     set_cols(c, proposal_status="approved", approved_at=ago(0))
     dec = db.reserve_followup_task(c, f"sd:{gid}:{c}", {
         "audience": "staff", "template": "scope_decision", "stage": "decision",
         "scope_group": gid, "scopes": [{"proposal_id": a}, {"proposal_id": b}]})
     board = _board()
-    assert {board[i]["pending_task"]["id"] for i in ids} == {dec}
+    assert [board[i]["pending_task"]["id"] for i in ids] == [group_task, dec, dec]
     assert board["solo"]["pending_task"]["id"] == solo_task
     open_ids = [t["id"] for t in db.list_open_group_tasks(gid)]
     assert open_ids == [group_task, dec]
 
-    # Once decided, the members fall back to the open reminder task.
+    # Once decided, the open members fall back to the open reminder task; the approved scope has
+    # nothing open of its own and is not an open member, so it shows none.
     db.decide_followup_task(dec, "decided", "kyle", {"action": "leave"})
     board = _board()
-    assert {board[i]["pending_task"]["id"] for i in ids} == {group_task}
+    assert [(board[i]["pending_task"] or {}).get("id") for i in ids] == [group_task, group_task, None]
+
+
+def test_a_rows_own_task_is_never_hidden_by_the_groups(clean):
+    """Fix round #8, on Postgres: an approved scope's deposit task and a removed scope's own task
+    show on their own rows even though a newer group task exists."""
+    gid, (a, b, c) = group_of_three(sent=True)
+    set_cols(c, proposal_status="approved", approved_at=ago(1))
+    deposit = db.reserve_followup_task(c, "dep:1", {"stage": "deposit",
+                                                    "template": "deposit_nudge"})
+    dec = db.reserve_followup_task(c, f"sd:{gid}:{c}:1", {
+        "audience": "staff", "template": "scope_decision", "stage": "decision",
+        "scope_group": gid, "scopes": [{"proposal_id": a}, {"proposal_id": b}]})
+    reminder = db.reserve_followup_task(a, "grp:1", {"stage": "pre", "scope_group": gid})
+    assert deposit < dec < reminder
+    board = _board()
+    assert board[c]["pending_task"]["id"] == deposit, "the deposit task was hidden"
+    assert board[a]["pending_task"]["id"] == reminder
+    assert board[b]["pending_task"]["id"] == reminder
+
+    # A scope taken out of the group keeps the stale scope_group on its row and its own task.
+    g2, (x, y, z) = group_of_three(sent=True)
+    own = db.reserve_followup_task(z, "solo:z", {"stage": "pre"})
+    grp = db.reserve_followup_task(x, "grp:2", {"stage": "pre", "scope_group": g2})
+    assert own < grp
+    board = _board()
+    assert board[z]["pending_task"]["id"] == own, "the removed scope's own task was hidden"
+    assert board[y]["pending_task"]["id"] == grp
 
 
 def test_group_history_and_resume_reads(clean):

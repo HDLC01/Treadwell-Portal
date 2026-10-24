@@ -1160,3 +1160,31 @@ def test_the_board_reads_every_groups_drafts_in_one_query(fake, admin, monkeypat
     assert TestClient(main.app).get("/api/admin/pipeline").status_code == 200
     drafts = [r for r in f.reads if r[0] in ("drafts", "drafts_many")]
     assert drafts == [("drafts_many", (GID, "grp-other"))], drafts
+
+
+def test_an_open_scope_out_of_the_group_never_shows_the_groups_task(fake, admin, monkeypatch):
+    """#8: SQL hands an open row with a scope_group the group's task when it has none of its own;
+    a scope the tool took out of the group (its draft no longer carries it) is not a member."""
+    f = fake(_three(), drafts=[{"id": "d-break", "archived": False},
+                               {"id": "d-lab1", "archived": False}])
+    grp = {"id": 7, "proposal_id": "d-break", "created_at": NOW,
+           "detail": {"status": "pending", "template": "not_viewed", "stage": "pre",
+                      "scope_group": GID, "scopes": [{"proposal_id": "d-break"}]}}
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r, pending_task=grp) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-break"]["followup_task"]["id"] == 7
+    assert out["d-lab1"]["followup_task"]["id"] == 7
+    assert out["d-lab2"]["followup_task"] is None
+
+
+def test_a_decision_tasks_link_opens_a_scope_it_is_about():
+    """#8: the approved scope's drawer shows its own deposit task, so the bell's decision entry
+    opens the first sibling it lists, where the board shows the decision card."""
+    row = {"id": 9, "proposal_id": "d-lab1", "created_at": NOW,
+           "detail": {"status": "pending", "template": "scope_decision", "stage": "decision",
+                      "scope_group": GID,
+                      "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab2"}]}}
+    assert main._task_view(row)["link_proposal_id"] == "d-break"

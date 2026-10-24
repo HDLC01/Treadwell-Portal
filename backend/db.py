@@ -1735,16 +1735,27 @@ _GROUP_OPEN_TASKS_SQL = (
     "  where f.kind = 'followup_task' and f.detail->>'status' in ('pending','sending') "
     "    and f.detail->>'scope_group' is not null "
     "  group by f.detail->>'scope_group')")
+#
+# WHICH task, for a grouped row (fix round #8): the row's OWN open task first -- an approved scope's
+# deposit task, the group reminder on the home, a scope taken out of the group with its own single
+# task -- never hidden behind a newer group task; then, only for an OPEN row (sent / viewed), the
+# group's newest open task (a sibling's drawer shows the group reminder or the "decide the other
+# scopes" task); last, the row's own decision task. main._apply_group_schedules then drops a group
+# task from an open row that is not a LIVE member (the drafts decide that, not SQL).
 _ROW_OPEN_TASK_SQL = (
     "(case when (pj.j ->> 'scope_group') is null then "
     + _PENDING_TASK_SQL.format(pid="p.proposal_id") +
     " else (select to_jsonb(t) from (select f.id, f.proposal_id, f.detail, f.created_at "
     "   from public.portal_followups f "
-    "  where f.id = greatest("
+    "  where f.id = coalesce("
     "      (select max(f2.id) from public.portal_followups f2 "
     "        where f2.proposal_id = p.proposal_id and f2.kind = 'followup_task' "
-    "          and f2.detail->>'status' in ('pending','sending')), "
-    "      gt.id)) t)"
+    "          and f2.detail->>'status' in ('pending','sending') "
+    "          and coalesce(f2.detail->>'stage', '') <> 'decision'), "
+    "      case when p.proposal_status in ('sent','viewed') then gt.id end, "
+    "      (select max(f3.id) from public.portal_followups f3 "
+    "        where f3.proposal_id = p.proposal_id and f3.kind = 'followup_task' "
+    "          and f3.detail->>'status' in ('pending','sending')))) t)"
     " end)")
 
 

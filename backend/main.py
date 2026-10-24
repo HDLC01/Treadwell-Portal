@@ -3802,6 +3802,14 @@ def _apply_group_schedules(rows: list, out: list, followup_cfg: dict) -> None:
                           for pid, k in (s["plan"].get("kinds") or {}).items()},
             }
         g = groups.get(r.get("scope_group") or "")
+        pt = r.get("pending_task")
+        if (g and isinstance(pt, dict) and pt.get("proposal_id") not in (None, r["proposal_id"])
+                and r["proposal_id"] not in g["ids"]):
+            # Fix round #8: the GROUP's task (filed on another scope) belongs on the drawers of the
+            # group's live members only. A scope the tool has taken out of the group, or parked
+            # (archived, a Test scope in a real project), keeps a stale scope_group on its row; it
+            # is not chased with the group, and its drawer must not offer the group's reminder.
+            o["followup_task"] = None
         if not g or r["proposal_id"] not in g["ids"] or not followup_rules.is_open(r):
             continue
         o["next_followup_at"] = _iso(followup_rules.next_due_at(g["view"], now, followup_cfg)
@@ -4579,11 +4587,18 @@ def _task_group_fields(row: dict) -> dict:
     """Scope groups: which group a task belongs to, the scopes it covers, and the proposal a staff
     link should OPEN. A group reminder lives on the group's home scope, which may since have been
     approved, so the link goes to the first scope it covers that was open when it was raised; a
-    decision task opens the approved scope it is filed on. {} -> nulls for every other task."""
+    decision task opens the first sibling it lists (its approved scope's drawer shows that scope's
+    own deposit task). {} -> nulls for every other task."""
     d = row.get("detail") or {}
     scopes = [s for s in (d.get("scopes") or []) if isinstance(s, dict)]
     link = row.get("proposal_id")
-    if d.get("scope_group") and d.get("stage") != followup_rules.DECISION_STAGE:
+    if d.get("stage") == followup_rules.DECISION_STAGE:
+        # Fix round #8: the approved scope's drawer shows its OWN deposit task first, so a decision
+        # task opens on a scope it is about (the board shows the group's task on an open member).
+        ids = [s.get("proposal_id") for s in scopes if s.get("proposal_id")]
+        if ids:
+            link = ids[0]
+    elif d.get("scope_group"):
         ids = [s.get("proposal_id") for s in scopes
                if (s.get("status") or "") in followup_rules.OPEN_STATUSES]
         if ids and link not in ids:
