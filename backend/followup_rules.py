@@ -79,6 +79,11 @@ DEPOSIT_MAX_RECURRING = 200
 MODE_REMIND = "remind"
 FOLLOWUP_MODES = ("remind", "approve", "auto")
 
+# Scope groups (see group_view below). Defined up here because task_stage / task_is_live use them.
+OPEN_STATUSES = ("sent", "viewed")
+DECISION_STAGE = "decision"
+GROUP_TASK_TEMPLATE_DECISION = "scope_decision"
+
 
 def followup_mode(p: dict) -> str:
     """The mode this proposal runs in. Always 'remind' in v1 — see FOLLOWUP_MODES."""
@@ -453,6 +458,8 @@ def customer_stage(p: dict) -> Optional[str]:
 
 
 def task_stage(template: str) -> str:
+    if template == GROUP_TASK_TEMPLATE_DECISION:
+        return DECISION_STAGE
     return "deposit" if template == "deposit_nudge" else "pre"
 
 
@@ -464,6 +471,13 @@ def task_is_live(detail: Optional[dict], p: Optional[dict], now: datetime) -> tu
     paid, asked for a pause or was closed out after the task was raised. A stale task in an
     estimator's queue is harmless; a stale task SENT is a nag to somebody who already answered."""
     d = detail or {}
+    if d.get("stage") == DECISION_STAGE:
+        # A "decide what to do with the other scopes" task (scope groups). It is about the
+        # SIBLINGS, not about the approved proposal it is filed on, so none of the checks below
+        # apply: the approved scope's stage is 'deposit' or None, and judged like a reminder this
+        # task would be expired on the first tick after it was raised. The caller passes the
+        # group's live members as `p["scope_members"]`.
+        return decision_task_is_live(d, (p or {}).get("scope_members"))
     if not p:
         return False, "missing"
     if p.get("deleted_at"):
@@ -487,6 +501,177 @@ def task_is_live(detail: Optional[dict], p: Optional[dict], now: datetime) -> tu
     if d.get("cycle") and d.get("cycle") != cycle_key(enrolled):
         return False, "resent"
     return True, ""
+
+
+# ── scope groups: one project, several separately approved proposals ──────────
+# RJ's "one project, many proposals": the customer is chased about the PROJECT, not about each
+# scope. Hanz, 2026-10-24: the group's live OPEN scopes are folded into one synthetic proposal that
+# the schedule functions above already understand (`group_view`), so a group raises ONE task per
+# due occurrence and the cadence code has no second copy. An approved scope leaves the group pass
+# and keeps its own ordinary deposit chase. (OPEN_STATUSES / DECISION_STAGE are near the top.)
+def is_open(m: dict) -> bool:
+    return (m.get("proposal_status") or "") in OPEN_STATUSES
+
+
+def live_members(rows: list, drafts: Optional[list]) -> list:
+    """The LIVE members of one scope group, from its portal rows and its drafts. Pure.
+
+    `drafts` is `[{"id", "archived"}]` for every non-deleted draft that carries this group (the
+    drafts decide membership, as in main._active_scope_group). A row whose draft is not among them
+    has been taken out of the group in the tool and is an ordinary proposal again; a row whose
+    draft is archived is in the group but not live. With no draft at all there is nothing to
+    compare against and the stored rows stand. Deleted, closed-lost and automation-off rows are
+    never live."""
+    by_id = {d.get("id"): d for d in (drafts or []) if isinstance(d, dict)}
+    out = []
+    for r in rows or []:
+        if not r or r.get("deleted_at") or r.get("followup_disabled_at"):
+            continue
+        if (r.get("proposal_status") or "") == "closed_lost":
+            continue
+        if by_id:
+            d = by_id.get(r.get("proposal_id"))
+            if d is None or d.get("archived"):
+                continue
+        out.append(r)
+    return out
+
+
+def detached_ids(rows: list, drafts: Optional[list]) -> set:
+    """Rows that still carry the group on the portal but whose draft has left it: ordinary
+    proposals again, chased on their own. Archived drafts are NOT detached (still in the group)."""
+    ids = {d.get("id") for d in (drafts or []) if isinstance(d, dict)}
+    if not ids:
+        return set()
+    return {r.get("proposal_id") for r in rows or [] if r and r.get("proposal_id") not in ids}
+
+
+def _sort_ts(v: Any) -> datetime:
+    return _ts(v) or datetime.max.replace(tzinfo=timezone.utc)
+
+
+def group_home(members: list) -> Optional[dict]:
+    """The STABLE home of a group's task row: the earliest (created_at, proposal_id) live member.
+    Approved members count, so approving the home scope does not move the group's schedule (its
+    interval, stop-after and snooze live on the home row)."""
+    live = [m for m in members or [] if m and m.get("proposal_id")]
+    if not live:
+        return None
+    return min(live, key=lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id"))))
+
+
+def _min_ts(vals) -> Optional[datetime]:
+    got = [t for t in (_ts(v) for v in vals) if t is not None]
+    return min(got) if got else None
+
+
+def _max_ts(vals) -> Optional[datetime]:
+    got = [t for t in (_ts(v) for v in vals) if t is not None]
+    return max(got) if got else None
+
+
+def _times_list(raw: Any) -> list:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    return list(raw) if isinstance(raw, (list, tuple)) else []
+
+
+def group_chase_stopped(members: list) -> bool:
+    """Has a live member been approved since the last "keep chasing the others" decision?
+
+    Hanz's decision 2: approving ANY scope stops chasing its siblings until somebody decides what
+    to do with them. DERIVED FROM DATA, no column: an approved live member stops the group, and a
+    `scope_group_resume` note (the decision task's 'keep' outcome, read into every member as
+    `scope_group_resumed_at`) written after the latest approval starts it again."""
+    approved = [m for m in members or [] if (m.get("proposal_status") or "") == "approved"]
+    if not approved:
+        return False
+    latest = _max_ts(m.get("approved_at") for m in approved)
+    resumed = _max_ts(m.get("scope_group_resumed_at") for m in members)
+    if resumed is None:
+        return True
+    return latest is not None and resumed < latest
+
+
+def group_state(members: list, now: datetime) -> tuple:
+    """(view, reason). See group_view; `reason` names why there is no view ('' when there is)."""
+    live = [m for m in members or [] if m and not m.get("deleted_at")
+            and not m.get("followup_disabled_at")
+            and (m.get("proposal_status") or "") != "closed_lost"]
+    if not live:
+        return None, "no_members"
+    if group_chase_stopped(live):
+        return None, "scope_approved"
+    open_ = [m for m in live if is_open(m)]
+    if not open_:
+        return None, "no_open_scope"
+    enrolled = _min_ts(m.get("followup_enrolled_at") for m in open_)
+    if enrolled is None:
+        return None, "not_enrolled"
+    home = group_home(live)
+    opened = [m for m in open_ if m.get("cycle_viewed_at") or
+              (m.get("proposal_status") or "") == "viewed"]
+    view = dict(home)
+    view.update({
+        "proposal_status": "viewed" if opened else "sent",
+        "followup_enrolled_at": enrolled,
+        "cycle_viewed_at": _min_ts(m.get("cycle_viewed_at") for m in open_),
+        "followup_disabled_at": None,
+        "deleted_at": None,
+        "approved_at": None,
+    })
+    # Decision 7: the group is paused only while EVERY open scope is. The group's pause ends when
+    # the first of them does, which is also where an expired pause restarts the clock.
+    pauses = [as_date(m.get("followup_paused_until")) for m in open_]
+    view["followup_paused_until"] = (min(pauses) if pauses and all(pauses) else None)
+    # A reply, a logged call, a decision on ANY scope re-anchors the whole group.
+    for k in TOUCH_KEYS:
+        view[k] = _max_ts(m.get(k) for m in live)
+    # The cap is per group: every member's counted reminders (db: only sent / called count).
+    times = []
+    for m in live:
+        times.extend(_times_list(m.get("followup_reminder_times")))
+    view["followup_reminder_times"] = times
+    # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there).
+    for k in ("followup_interval_days", "followup_stop_after", "followup_next_at"):
+        view[k] = home.get(k)
+    view["scope_group"] = home.get("scope_group")
+    view["scopes"] = [{"proposal_id": m.get("proposal_id"),
+                       "label": m.get("scope_label") or m.get("project_name") or "Proposal",
+                       "status": m.get("proposal_status")} for m in open_]
+    view["home_proposal_id"] = home.get("proposal_id")
+    # Where a staff link should land: an OPEN scope, never a possibly-approved home.
+    view["link_proposal_id"] = (home.get("proposal_id") if is_open(home)
+                                else open_[0].get("proposal_id"))
+    view["_open_members"] = open_
+    return view, ""
+
+
+def group_view(members: list, now: datetime) -> Optional[dict]:
+    """One synthetic proposal for a scope group's customer chase, or None when there is none.
+
+    Input: the LIVE members of one group (see live_members), each carrying its follow-up signals
+    (TOUCH_KEYS, followup_reminder_times) and `scope_group_resumed_at`. Output: a dict `due_now`,
+    `next_due_at`, `_customer_plan` and `task_is_live` already understand, filed under the HOME
+    scope's proposal_id. None when any live member is approved (and nobody has said "keep
+    chasing the others" since), or when no scope is open. Pure."""
+    return group_state(members, now)[0]
+
+
+def decision_task_is_live(detail: Optional[dict], members: Optional[list]) -> tuple:
+    """A decision task is live while at least one sibling it lists is still open. (ok, reason)."""
+    if members is None:
+        return False, "missing"
+    listed = {s.get("proposal_id") for s in (detail or {}).get("scopes") or []
+              if isinstance(s, dict)}
+    open_ids = {m.get("proposal_id") for m in members
+                if m and is_open(m) and not m.get("deleted_at")}
+    if listed & open_ids:
+        return True, ""
+    return False, "decision_moot"
 
 
 def _anchors(p: dict, now: datetime, c: "_Cadence") -> tuple:
