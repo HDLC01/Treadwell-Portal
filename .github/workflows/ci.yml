@@ -24,3 +24,42 @@ jobs:
       - name: Run tests
         working-directory: backend
         run: python -m pytest -q -n auto --dist loadfile
+
+  # The real-Postgres tests (tests/test_pg_*.py) execute the portal's SQL against a scratch server:
+  # every jsonb predicate, cast and ON CONFLICT the rest of the suite stubs. They skip unless
+  # PORTAL_TEST_PG_URL is set, so without this job they never ran in CI (fix round #21). A throwaway
+  # service container, reachable on localhost only (tests/pg_fixture.py refuses any other host);
+  # each test module creates and drops its own tw_p3_* database in it.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PORTAL_TEST_PG_URL: postgresql://postgres:test@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+      # A skipped pg test is a green tick that proved nothing, so the run fails if any is skipped.
+      - name: Run the real-Postgres tests
+        working-directory: backend
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_pg_*.py -q -rs -p no:cacheprovider | tee pg-tests.log
+          if grep -Eq "SKIPPED|[0-9]+ skipped" pg-tests.log; then
+            echo "a real-Postgres test was skipped"; exit 1
+          fi
