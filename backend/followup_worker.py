@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -910,37 +911,86 @@ def _process_group(gid: str, now: datetime, cfg: dict) -> None:
 
 
 # ── the deploy-day dry run ────────────────────────────────────────────────────
+# A customer reminder in the TOUCHED shape (followup_rules._customer_plan): 'nvrt@', 'vrt@', 'deprt@'.
+# No old automatic email ever used one of these keys, so these are the tasks the deploy itself causes.
+_TOUCHED_KEY = re.compile(r":(?:nvr|vr|depr)t@")
+_DEPOSIT_TEMPLATES = ("deposit_nudge", "staff_deposit_outstanding")
+
+
 def dry_run_count(now: datetime | None = None) -> dict:
-    """How many follow-up tasks the NEXT tick would raise, and for which proposals. READ-ONLY.
+    """What the NEXT tick would do: the tasks it would raise AND every estimator email it would
+    send. READ-ONLY.
 
     Why it exists (critic finding, 2026-10-24): the TOUCHED shape of the schedule keys its
     occurrences on time ('vrt@<stamp>'), a key no old automatic email ever used, so any live
     proposal with a prior reply, chat message or logged call that has been quiet for more than one
     interval matures on the first tick after deploy. Hanz runs this before switching automation on,
-    to see that burst before the estimators do.
+    to see that burst before the estimators do. Entry point: backend/ops/followup_dry_run.py.
 
     It evaluates exactly what the tick evaluates (the same candidates, the same single/group
-    partition, the same signals, the same schedule) and reserves, sends, expires and writes
-    NOTHING. It runs whatever FOLLOWUP_AUTOMATION_ENABLED says, because it is the check you make
-    before turning that on. An occurrence whose rule key is already reserved (an old automatic
-    email, a task already raised) is left out, as the dedupe index would leave it out; a proposal
-    whose open task the housekeeping would expire first is still counted as blocked.
+    partition, the same signals, the same schedule, the same per-proposal order as _act_on_dues)
+    and reserves, sends, expires and writes NOTHING. It runs whatever FOLLOWUP_AUTOMATION_ENABLED
+    says, because it is the check you make before turning that on. An occurrence whose rule key is
+    already reserved (an old automatic email, a task already raised) is left out, as the dedupe
+    index would leave it out; a proposal whose open task the housekeeping would expire first is
+    still counted as blocked.
 
-    Returns {"count", "tasks": [{proposal_id, rule_key, template, scope_group}], "skipped": [...]}.
+    Returns (fix round #12/#18/#4 added everything after `skipped`):
+      count, tasks [{proposal_id, rule_key, template, scope_group}]   the tasks it would raise
+      skipped [...]                                                    rows it could not evaluate
+      staff_emails [{proposal_id, rule_key, template, scope_group}], staff_email_count
+          every estimator email: one staff_followup_due per task, each staff note whose key is not
+          reserved yet (deposit outstanding, pause expired, not viewed ...) and is not folded into a
+          task email, and each decision-task re-nag
+      touched_tasks [...]     the tasks in the touched shape: the deploy-day burst itself
+      deposit_restarts [...]  deposit reminders (task or estimator email) on a job whose OLD ladder
+                              had already finished that chase. The schedule holds these
+                              (followup_rules.deposit_series_done), so anything here is a bug.
+      deposit_held [{proposal_id, audience}]  the finished deposit chases being held, for review.
     """
     now = now or datetime.now(timezone.utc)
     cfg = _settings()
-    out: dict = {"count": 0, "tasks": [], "skipped": [], "at": now.isoformat()}
+    out: dict = {"count": 0, "tasks": [], "skipped": [], "at": now.isoformat(),
+                 "staff_emails": [], "staff_email_count": 0, "touched_tasks": [],
+                 "deposit_restarts": [], "deposit_held": []}
 
-    def _would_raise(pid: str, due, gid=None) -> None:
+    def _used(pid: str, key: str) -> bool:
         try:
-            used = db.followup_rule_key_exists(pid, due.rule_key)
+            return db.followup_rule_key_exists(pid, key)
         except Exception:  # noqa: BLE001 — unknown counts as new: over-reporting is the safe side
-            used = False
-        if used:
+            return False
+
+    def _restart(p: dict, pid: str, due, gid) -> None:
+        if (p.get("proposal_status") or "") != "approved" or due.template not in _DEPOSIT_TEMPLATES:
             return
-        out["tasks"].append({"proposal_id": pid, "rule_key": due.rule_key,
-                             "template": due.template, "scope_group": gid})
+        c = rules._Cadence(rules.effective_cfg(cfg, p))
+        audience = "customer" if due.audience == "customer" else "staff"
+        if rules.deposit_legacy_finished(p, audience, c):
+            out["deposit_restarts"].append({"proposal_id": pid, "rule_key": due.rule_key,
+                                            "template": due.template, "scope_group": gid})
+
+    def _simulate(p: dict, pid: str, dues: list, pending, gid=None) -> None:
+        """_act_on_dues, minus every write."""
+        task_raised = False
+        for due in sorted(dues, key=lambda d: d.audience != "customer"):
+            entry = {"proposal_id": pid, "rule_key": due.rule_key, "template": due.template,
+                     "scope_group": gid}
+            if due.audience == "customer":
+                if pending or _used(pid, due.rule_key):
+                    continue
+                out["tasks"].append(entry)
+                if _TOUCHED_KEY.search(due.rule_key):
+                    out["touched_tasks"].append(entry)
+                out["staff_emails"].append(dict(entry, template="staff_followup_due"))
+                task_raised = True
+                _restart(p, pid, due, gid)
+                continue
+            if _used(pid, due.rule_key):
+                continue
+            if task_raised and due.template in _FOLDED_INTO_TASK:
+                continue
+            out["staff_emails"].append(entry)
+            _restart(p, pid, due, gid)
 
     candidates = db.list_followup_candidates()
     singles, groups = _partition(candidates)
@@ -955,9 +1005,13 @@ def dry_run_count(now: datetime | None = None) -> dict:
             pending = signals.get("pending_task")
             if pending and is_group_task((pending or {}).get("detail")):
                 pending = None
-            for due in rules.due_now(fresh, now, cfg):
-                if due.audience == "customer" and not pending:
-                    _would_raise(pid, due)
+            if (fresh.get("proposal_status") or "") == "approved":
+                c = rules._Cadence(rules.effective_cfg(cfg, fresh))
+                for audience in ("customer", "staff"):
+                    if rules.deposit_outstanding(fresh, for_customer=audience == "customer") \
+                            and rules.deposit_legacy_finished(fresh, audience, c):
+                        out["deposit_held"].append({"proposal_id": pid, "audience": audience})
+            _simulate(fresh, pid, rules.due_now(fresh, now, cfg), pending)
         except Exception as exc:  # noqa: BLE001
             out["skipped"].append({"proposal_id": pid, "error": str(exc)})
     for gid in groups:
@@ -965,15 +1019,41 @@ def dry_run_count(now: datetime | None = None) -> dict:
             view, _why, _m = group_state_for(gid, now)
             if view is None:
                 continue
+            # _process_group expires an open group task that is not on the home; one on the home
+            # holds the group's slot (no new task) but the staff notes still go.
             open_tasks = [t for t in db.list_open_group_tasks(gid) or []
                           if (t.get("detail") or {}).get("stage") != rules.DECISION_STAGE
                           and t.get("proposal_id") == view["proposal_id"]]
-            if open_tasks:
-                continue
-            for due in rules.due_now(view, now, cfg):
-                if due.audience == "customer":
-                    _would_raise(view["proposal_id"], due, gid)
+            _simulate(view, view["proposal_id"], rules.due_now(view, now, cfg),
+                      open_tasks[0] if open_tasks else None, gid)
         except Exception as exc:  # noqa: BLE001
             out["skipped"].append({"scope_group": gid, "error": str(exc)})
+    # The housekeeping pass re-emails the estimator about an unresolved decision task
+    # (_renag_decision): the same live check, the same key, nothing sent.
+    try:
+        pending_tasks = db.list_pending_followup_tasks() or []
+    except Exception as exc:  # noqa: BLE001
+        pending_tasks = []
+        out["skipped"].append({"pending_tasks": True, "error": str(exc)})
+    for t in pending_tasks:
+        d = t.get("detail") or {}
+        if d.get("stage") != rules.DECISION_STAGE:
+            continue
+        try:
+            ok, _why, _subject = judge_task(t, now)
+            created = rules._ts(t.get("created_at"))
+            if not ok or created is None:
+                continue
+            n = int((now - created).total_seconds() // (DECISION_RENAG_DAYS * 86400))
+            if n < 1:
+                continue
+            key = "sdn:%s:%d" % (t["id"], min(n, DECISION_RENAG_MAX))
+            if not _used(t["proposal_id"], key):
+                out["staff_emails"].append({"proposal_id": t["proposal_id"], "rule_key": key,
+                                            "template": "staff_scope_decision",
+                                            "scope_group": d.get("scope_group")})
+        except Exception as exc:  # noqa: BLE001
+            out["skipped"].append({"task_id": t.get("id"), "error": str(exc)})
     out["count"] = len(out["tasks"])
+    out["staff_email_count"] = len(out["staff_emails"])
     return out

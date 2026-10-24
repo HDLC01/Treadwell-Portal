@@ -160,3 +160,123 @@ def test_customer_deposit_reminders_already_sent_count_toward_the_deposit_cap():
     cfg = dict(ALL_DAY, deposit_max_recurring=6)
     p = _approved(100, 5)            # dep1 + 5 depr = 6 counted customer reminders
     assert cust(p, cfg=cfg) is None
+
+
+# ── #12 / #18 / #4: the dry run counts every estimator email, and can run first ───
+import copy as _copy                                                      # noqa: E402
+import json as _json                                                      # noqa: E402
+import sys as _sys                                                        # noqa: E402
+
+import followup_worker as fw                                              # noqa: E402
+from test_group_followups import NOW as G_NOW, _scope, _three, fake      # noqa: E402,F401
+
+_ops = __import__("pathlib").Path(__file__).resolve().parents[1] / "ops"
+if str(_ops) not in _sys.path:
+    _sys.path.insert(0, str(_ops))
+import followup_dry_run                                                   # noqa: E402
+
+
+def _solo(pid, minutes, **over):
+    return _scope(pid, None, minutes, scope_group=None, scope_label=None, **over)
+
+
+def test_the_dry_run_counts_the_staff_emails_the_tick_sends(fake):
+    """Finding #12: the real tick sent 56 estimator emails where the dry run said 41. Here the dry
+    run's staff_emails must equal what the tick actually sends, email for email."""
+    approved = _solo("won", 5, proposal_status="approved", approved_at=G_NOW - 10 * D,
+                     deposit_status="submitted")
+    viewed = _solo("chat", 6, proposal_status="viewed", cycle_viewed_at=G_NOW - 20 * D)
+    f = fake(_three() + [_solo("solo", 9), approved, viewed])
+    f.signals["chat"] = {"customer_touch_at": G_NOW - 10 * D}
+    before = _copy.deepcopy(f.followups)
+    got = fw.dry_run_count(G_NOW)
+    assert f.followups == before and f.sent["staff"] == [], "the dry run wrote or sent"
+    templates = sorted(e["template"] for e in got["staff_emails"])
+    # One follow-up-due per task (group, solo, chat) and the deposit note on the submitted job,
+    # which has no customer due at all. The not-viewed and 48h notes fold into the task emails.
+    assert templates == ["staff_deposit_outstanding", "staff_followup_due", "staff_followup_due",
+                         "staff_followup_due"], templates
+    assert got["staff_email_count"] == 4
+    fw._tick(G_NOW)
+    assert len(f.sent["staff"]) == got["staff_email_count"]
+    assert fw.dry_run_count(G_NOW)["staff_emails"] == []
+
+
+def test_the_dry_run_buckets_the_touched_tasks(fake):
+    viewed = _solo("chat", 6, proposal_status="viewed", cycle_viewed_at=G_NOW - 20 * D)
+    f = fake([viewed, _solo("solo", 9)])
+    f.signals["chat"] = {"customer_touch_at": G_NOW - 10 * D}
+    got = fw.dry_run_count(G_NOW)
+    assert [t["proposal_id"] for t in got["touched_tasks"]] == ["chat"]
+    assert ":vrt@" in got["touched_tasks"][0]["rule_key"]
+    assert {t["proposal_id"] for t in got["tasks"]} == {"chat", "solo"}
+
+
+def _finished_deposit_job():
+    return _solo("won", 5, proposal_status="approved", approved_at=G_NOW - 100 * D,
+                 followup_enrolled_at=G_NOW - 110 * D, cycle_viewed_at=G_NOW - 109 * D)
+
+
+def test_the_dry_run_lists_finished_deposit_chases_held_and_none_restarted(fake):
+    f = fake([_finished_deposit_job()])
+    f.signals["won"] = {"deposit_history": {"customer_legacy": 20, "staff_legacy": 20,
+                                            "staff": 21}}
+    got = fw.dry_run_count(G_NOW)
+    assert got["deposit_restarts"] == [] and got["tasks"] == [] and got["staff_emails"] == []
+    assert sorted(h["audience"] for h in got["deposit_held"]) == ["customer", "staff"]
+
+
+def test_the_dry_run_names_a_restart_if_the_guard_ever_lets_one_through(fake, monkeypatch):
+    """The bucket is the alarm for the guard: with the guard broken it must fill."""
+    f = fake([_finished_deposit_job()])
+    f.signals["won"] = {"deposit_history": {"customer_legacy": 20, "staff_legacy": 20,
+                                            "staff": 21}}
+    monkeypatch.setattr(fr, "deposit_series_done", lambda p, audience, c=None: False)
+    got = fw.dry_run_count(G_NOW)
+    assert sorted(r["template"] for r in got["deposit_restarts"]) == \
+        ["deposit_nudge", "staff_deposit_outstanding"]
+
+
+def test_a_group_whose_home_holds_an_open_task_still_counts_its_staff_notes(fake):
+    """The old dry run skipped such a group outright; the tick still sends its staff notes."""
+    rows = [dict(r, proposal_status="viewed", cycle_viewed_at=G_NOW - 3 * D) for r in _three()]
+    f = fake(rows)
+    f.reserve_followup_task("d-break", "held", {"stage": "pre", "scope_group": rows[0]["scope_group"]})
+    got = fw.dry_run_count(G_NOW)
+    assert got["tasks"] == []
+    assert [e["template"] for e in got["staff_emails"]] == ["staff_personal_followup"]
+    fw._tick(G_NOW)
+    assert len(f.sent["staff"]) == 1
+
+
+def test_the_dry_run_entry_point_prints_json_and_a_table_and_cannot_send(monkeypatch, capsys):
+    import email_sender
+
+    seen = {}
+    monkeypatch.setattr(followup_dry_run, "install_read_only_pool",
+                        lambda url: seen.setdefault("url", url))
+    monkeypatch.setattr(email_sender, "_send", email_sender._send)       # restored afterwards
+    result = {"at": "x", "count": 1, "tasks": [{"proposal_id": "p1", "rule_key": "c1:vrt@1",
+                                                "template": "checkin", "scope_group": None}],
+              "skipped": [], "staff_emails": [{"template": "staff_followup_due"}],
+              "staff_email_count": 1, "touched_tasks": [{"proposal_id": "p1"}],
+              "deposit_restarts": [], "deposit_held": [{"proposal_id": "w", "audience": "staff"}]}
+    monkeypatch.setattr(fw, "dry_run_count", lambda now=None: result)
+    assert followup_dry_run.main([]) == 0
+    out = capsys.readouterr().out
+    head, _, tail = out.partition("\n\n")
+    assert _json.loads(head) == result
+    assert "tasks the tick would raise ........ 1" in tail
+    assert "of which touched (deploy burst) . 1" in tail
+    assert "estimator emails it would send .... 1" in tail
+    assert "finished deposit chases held ...... 1" in tail
+    assert "c1:vrt@1" in tail
+    assert seen["url"]
+    with pytest.raises(RuntimeError, match="never sends email"):
+        email_sender._send(["a@b.c"], "s", "h")
+    assert followup_dry_run.main(["--json"]) == 0
+    assert _json.loads(capsys.readouterr().out) == result
+
+
+def test_the_entry_point_opens_a_read_only_pool():
+    assert followup_dry_run.READ_ONLY == "-c default_transaction_read_only=on"

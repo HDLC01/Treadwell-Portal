@@ -1,0 +1,93 @@
+"""What the follow-up worker's NEXT tick would do, without doing any of it.
+
+Run it BEFORE follow-up automation is switched on after a deploy (fix round #12/#18/#4): the first
+tick runs 20 seconds after the container boots when FOLLOWUP_AUTOMATION_ENABLED is true, and once a
+tick has run, its tasks are reserved and this reports nothing. So:
+
+  1. deploy with FOLLOWUP_AUTOMATION_ENABLED=false in the box's .env;
+  2. inside the running container (WORKDIR is /app/backend):
+         docker exec <container> python ops/followup_dry_run.py
+     add --json for the JSON alone;
+  3. read the counts; when they look right, set the flag to true and restart the container.
+
+READ-ONLY, three ways: followup_worker.dry_run_count reserves, sends and writes nothing; this
+script opens its database pool with every transaction READ ONLY, so a write anywhere underneath
+would fail instead of landing; and the one function that sends email is replaced with a refusal.
+It works whatever FOLLOWUP_AUTOMATION_ENABLED says.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BACKEND not in sys.path:
+    sys.path.insert(0, BACKEND)
+
+READ_ONLY = "-c default_transaction_read_only=on"
+
+
+def install_read_only_pool(url: str):
+    """Point db.py at a pool whose every transaction is READ ONLY. Returns the pool."""
+    import db
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+
+    pool = ConnectionPool(url, min_size=1, max_size=2, open=True, timeout=30,
+                          kwargs={"row_factory": dict_row, "options": READ_ONLY})
+    db._pool = pool
+    return pool
+
+
+def refuse_email() -> None:
+    import email_sender
+
+    def _refused(*a, **k):
+        raise RuntimeError("the follow-up dry run never sends email")
+
+    email_sender._send = _refused
+
+
+def table(result: dict) -> str:
+    """The short human summary printed after the JSON."""
+    lines = [
+        "follow-up dry run at %s" % result.get("at"),
+        "  tasks the tick would raise ........ %d" % len(result.get("tasks") or []),
+        "    of which touched (deploy burst) . %d" % len(result.get("touched_tasks") or []),
+        "  estimator emails it would send .... %d" % len(result.get("staff_emails") or []),
+        "  finished deposit chases restarted . %d" % len(result.get("deposit_restarts") or []),
+        "  finished deposit chases held ...... %d" % len(result.get("deposit_held") or []),
+        "  rows it could not evaluate ........ %d" % len(result.get("skipped") or []),
+    ]
+    by_template: dict = {}
+    for e in result.get("staff_emails") or []:
+        by_template[e.get("template")] = by_template.get(e.get("template"), 0) + 1
+    for tpl in sorted(by_template):
+        lines.append("    %-32s %d" % (tpl, by_template[tpl]))
+    if result.get("tasks"):
+        lines.append("")
+        lines.append("  %-38s %-12s %s" % ("proposal", "template", "rule key"))
+        for t in result["tasks"]:
+            lines.append("  %-38s %-12s %s" % (t.get("proposal_id"), t.get("template"),
+                                               t.get("rule_key")))
+    return "\n".join(lines)
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    import config
+    import followup_worker
+
+    install_read_only_pool(config.DATABASE_URL)
+    refuse_email()
+    result = followup_worker.dry_run_count()
+    print(json.dumps(result, default=str, indent=2))
+    if "--json" not in argv:
+        print()
+        print(table(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
