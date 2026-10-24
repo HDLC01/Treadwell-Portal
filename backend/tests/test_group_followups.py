@@ -752,3 +752,40 @@ def test_the_dry_run_reports_the_touched_burst(fake):
     f.signals["solo"] = {"customer_touch_at": NOW - 10 * 24 * H}
     got = fw.dry_run_count(NOW)
     assert got["count"] == 1 and re.search(r"vrt@\d{8}T\d{2}$", got["tasks"][0]["rule_key"])
+
+
+def test_the_board_query_uses_the_group_aware_task_column(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    db.list_all_portal_proposals()
+    sql = " ".join(seen["sql"].split())
+    assert " ".join(db._ROW_OPEN_TASK_SQL.split()) + " as pending_task" in sql
+
+
+def test_logging_a_call_never_resolves_a_decision_task(monkeypatch):
+    """The drawer's log-a-call resolves the open task; it must not answer 'what about the other
+    scopes?' by marking it called."""
+    seen = {}
+    monkeypatch.setattr(db, "q1", lambda sql, params=(): seen.update(sql=sql) or None)
+    db.pending_followup_task_id("d-lab1")
+    assert "coalesce(detail->>'stage', '') <> 'decision'" in seen["sql"]
+
+
+def test_the_group_email_lists_this_recipients_scopes_under_the_estimators_text(monkeypatch):
+    import email_sender
+    out = {}
+    monkeypatch.setattr(email_sender, "_send",
+                        lambda to, subject, html, headers=None, **k: out.update(
+                            to=to, subject=subject, html=html) or True)
+    ok = email_sender.send_scope_group_followup(
+        "dana@acme.com", "Dana Reed", "Acme HQ",
+        [{"label": "Breakroom", "url": "https://p/x/tok-a"},
+         {"label": "Lab 1", "url": "https://p/x/tok-b"}],
+        {"title": "Checking in", "body": "Hi {first_name},\n\nAny questions on {project}?\n\n{link}"},
+        token="tok-a")
+    assert ok and out["to"] == ["dana@acme.com"]
+    html = out["html"]
+    assert "Checking in" in html and "Hi Dana," in html and "Any questions on Acme HQ?" in html
+    assert "https://p/x/tok-a" in html and "https://p/x/tok-b" in html
+    assert "Breakroom" in html and "Lab 1" in html
+    assert "Not moving forward" not in html, "one scope's close button on a whole-project email"
