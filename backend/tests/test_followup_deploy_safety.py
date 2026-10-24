@@ -280,3 +280,42 @@ def test_the_dry_run_entry_point_prints_json_and_a_table_and_cannot_send(monkeyp
 
 def test_the_entry_point_opens_a_read_only_pool():
     assert followup_dry_run.READ_ONLY == "-c default_transaction_read_only=on"
+
+
+# ── #13: the out-of-office backfill's body heuristics ─────────────────────────────
+import backfill_auto_reply                                                # noqa: E402
+
+AUTO_BODIES = [
+    "I am currently out of the office and will return on Monday, October 28.",
+    "Thank you for your email. I'm out of the office until 11/4 with limited access to email.",
+    "I\u2019m on vacation this week. For urgent matters please call Dave at the office.",
+    "I will be on leave from 10/1 to 10/15. I will respond to your message upon my return.",
+    "This is an automated reply. Your message has been received.",
+    "Automatic reply: Proposal for Acme HQ\nI am away from the office and will return on 10/30.",
+]
+REAL_BODIES = [
+    "Looks good, we'd like to move forward with the epoxy option.",
+    "I was out of the office last week, sorry. Yes, please send the contract.",
+    "I'm out of the office today but go ahead and schedule us for November.",
+    "We are on vacation next month, can you start after the 15th? I will return the signed copy.",
+    "Out of office until Monday but approved - send the invoice",
+    "Can you call me? " + "We have a few questions about the scope. " * 40
+    + "I am out of the office and will return on Monday.",
+    "",
+]
+
+
+@pytest.mark.parametrize("body", AUTO_BODIES)
+def test_an_autoresponder_body_is_recognised(body):
+    assert backfill_auto_reply.auto_reply_reason(None, body)
+
+
+@pytest.mark.parametrize("body", REAL_BODIES)
+def test_a_real_reply_is_never_flagged(body):
+    """A false positive hides a real reply from the schedule, so these must all stay unflagged."""
+    assert backfill_auto_reply.auto_reply_reason(None, body) is None
+
+
+def test_a_stored_subject_uses_the_live_rule():
+    assert backfill_auto_reply.auto_reply_reason("Out of Office: Re: Acme", "anything") == "subject"
+    assert backfill_auto_reply.auto_reply_reason("Re: Acme proposal", REAL_BODIES[0]) is None

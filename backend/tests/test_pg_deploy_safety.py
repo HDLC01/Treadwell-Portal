@@ -318,3 +318,91 @@ def test_group_followups_is_true_only_with_the_remind_only_ddl(fresh_db, monkeyp
 def test_a_kind_check_with_no_kind_restriction_at_all_still_reads_as_ready(fresh_db):
     db.execute("alter table public.portal_followups drop constraint portal_followups_kind_check")
     assert db.followup_tasks_ready(max_age=0) is True
+
+
+# ── #13: the out-of-office backfill, on rows the OLD relay stored ──────────────────
+def message(pid, author, body, meta, days_ago):
+    row = db.q1("insert into public.portal_questions (proposal_id, author_kind, author_email, body, "
+                "msg_type, meta, created_at) values (%s, %s, %s, %s, 'text', %s, "
+                "now() - make_interval(secs => %s)) returning id",
+                (pid, author, pid + "@customer.example", body,
+                 Jsonb(meta) if meta is not None else None, float(days_ago) * 86400))
+    return int(row["id"])
+
+
+def _flags():
+    return {r["id"]: r["meta"] for r in db.qall(
+        "select id, meta from public.portal_questions order by id")}
+
+
+def test_the_backfill_dry_runs_by_default_then_flags_only_autoresponders_once(clean, pgdb):
+    import io
+    import pathlib
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "ops"))
+    import backfill_auto_reply
+
+    add_proposal("ooo", cycle_viewed_at=ago(59))
+    add_proposal("real", cycle_viewed_at=ago(59))
+    old = {"source": "email", "email_id": "e1", "from": "ooo@customer.example"}
+    ooo = message("ooo", "customer", "I am currently out of the office and will return on "
+                  "Monday. For urgent matters call the front desk.", old, 5)
+    ooo2 = message("ooo", "customer", "This is an automated reply.", dict(old, email_id="e2"), 3)
+    real = message("real", "customer", "Looks good, please send the contract.",
+                   dict(old, email_id="e3"), 4)
+    chat = message("real", "customer", "I am on vacation and will return on Monday.",
+                   {"source": "portal"}, 2)            # typed in the portal: never touched
+    staff = message("real", "staff", "I am out of the office and will return on Monday.",
+                    {"source": "email"}, 1)            # staff rows are never touched
+    done = message("ooo", "customer", "Automatic reply: away",
+                   dict(old, email_id="e4", auto_reply=True), 6)
+    before = _flags()
+    touch_before = db.followup_signals("ooo")["customer_touch_at"]
+
+    buf = io.StringIO()
+    got = backfill_auto_reply.run(pgdb.conninfo, False, buf)
+    assert _flags() == before, "the dry run wrote"
+    assert sorted(m["id"] for m in got["matches"]) == [ooo, ooo2] and got["changed"] == 0
+    text = buf.getvalue()
+    assert "DRY RUN: 2 inbound customer row(s)" in text
+    assert "I am currently out of the office" in text and "This is an automated reply." in text
+
+    got = backfill_auto_reply.run(pgdb.conninfo, True, io.StringIO())
+    assert got["changed"] == 2
+    after = _flags()
+    assert after[ooo]["auto_reply"] is True and after[ooo]["auto_reply_backfill"]
+    assert after[ooo]["email_id"] == "e1", "the backfill dropped the row's own meta"
+    assert after[ooo2]["auto_reply"] is True
+    for untouched in (real, chat, staff, done):
+        assert after[untouched] == before[untouched], untouched
+    # The schedule stops counting them: with both flagged, "ooo" has no customer reply left.
+    assert touch_before is not None and db.followup_signals("ooo")["customer_touch_at"] is None
+    assert db.followup_signals("real")["customer_touch_at"] is not None
+    # Idempotent.
+    again = backfill_auto_reply.run(pgdb.conninfo, True, io.StringIO())
+    assert again["matches"] == [] and again["changed"] == 0 and _flags() == after
+
+
+def test_the_backfill_dry_run_cannot_write(clean, pgdb, monkeypatch):
+    import io
+    import pathlib
+    import sys
+
+    import psycopg
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "ops"))
+    import backfill_auto_reply
+
+    add_proposal("ooo")
+    message("ooo", "customer", "This is an automated reply.", {"source": "email"}, 1)
+    # Even a dry run that tried to write would be refused by its read-only connection.
+    real_apply = backfill_auto_reply.apply
+
+    def sneaky(conn):
+        real_apply(conn, [1], "2026-10-25")
+        return []
+
+    monkeypatch.setattr(backfill_auto_reply, "find", sneaky)
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+        backfill_auto_reply.run(pgdb.conninfo, False, io.StringIO())
