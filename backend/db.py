@@ -317,6 +317,47 @@ def scope_group_columns_ready() -> bool:
         return False
 
 
+# Fix round #29/#30: the remind-only DDL that every follow-up task needs. Without the widened kind
+# CHECK a task insert raises CheckViolation (caught and only logged: the worker raises nothing and an
+# approval files no "decide the other scopes" task), and without the two v2 indexes the dedupe and
+# the one-open-task-per-stage slot are not what the code relies on. Catalog reads only.
+_FOLLOWUP_DDL_SQL = (
+    "select "
+    # No CHECK on portal_followups that names `kind` may leave 'followup_task' out. (No such CHECK
+    # at all also admits it.) strpos, not LIKE: a `%` would collide with the driver's markers.
+    " not exists (select 1 from pg_constraint c "
+    "   where c.conrelid = 'public.portal_followups'::regclass and c.contype = 'c' "
+    "     and strpos(pg_get_constraintdef(c.oid), 'kind') > 0 "
+    "     and strpos(pg_get_constraintdef(c.oid), 'followup_task') = 0) as kind_ok, "
+    " exists (select 1 from pg_indexes where schemaname = 'public' "
+    "   and indexname = 'portal_followups_one_open_task_v2_uidx') as open_ok, "
+    " exists (select 1 from pg_indexes where schemaname = 'public' "
+    "   and indexname = 'portal_followups_rule_v2_uidx') as rule_ok")
+_FOLLOWUP_DDL_CACHE: dict = {"at": None, "value": False}
+
+
+def followup_tasks_ready(max_age: float = 5.0) -> bool:
+    """Does this database have the remind-only DDL (the kind CHECK admits 'followup_task', and the
+    one_open_task_v2 and rule_v2 indexes exist)? Read only, cached for `max_age` seconds because
+    the capability route is polled by the tool. Any failure is "no"."""
+    import time
+
+    now = time.monotonic()
+    at = _FOLLOWUP_DDL_CACHE["at"]
+    if at is not None and now - at < max_age:
+        return _FOLLOWUP_DDL_CACHE["value"]
+    try:
+        row = q1(_FOLLOWUP_DDL_SQL) or {}
+        value = bool(row.get("kind_ok") and row.get("open_ok") and row.get("rule_ok"))
+        if not value:
+            log.warning("remind-only DDL incomplete: %s", row)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("remind-only DDL not readable: %s", exc)
+        value = False
+    _FOLLOWUP_DDL_CACHE.update(at=now, value=value)
+    return value
+
+
 def set_scope_group(proposal_id: str, group_id: str, label: Optional[str]) -> None:
     """Link this proposal to its scope group (see the scope-group block at the end of schema.sql).
 

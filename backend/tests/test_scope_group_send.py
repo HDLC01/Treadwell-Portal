@@ -684,11 +684,44 @@ def test_the_capability_route(monkeypatch):
     assert client.get("/api/admin/capabilities").status_code == 401
     monkeypatch.setattr(main, "_admin_ok", lambda request: True)
     monkeypatch.setattr(main.db, "scope_group_columns_ready", lambda: True)
+    monkeypatch.setattr(main.db, "followup_tasks_ready", lambda: True)
     assert client.get("/api/admin/capabilities").json() == {
         "ok": True, "scope_groups": True, "group_followups": True, "version": 1}
-    # Code without the DDL is not ready for grouped publishes, and says so.
+    # Without the remind-only DDL no task can be written: group follow-ups are not ready
+    # (fix round #29/#30), while grouped publishes still are.
+    monkeypatch.setattr(main.db, "followup_tasks_ready", lambda: False)
+    got = client.get("/api/admin/capabilities").json()
+    assert got["scope_groups"] is True and got["group_followups"] is False
+    # Code without the scope DDL is not ready for grouped publishes, and says so.
+    monkeypatch.setattr(main.db, "followup_tasks_ready", lambda: True)
     monkeypatch.setattr(main.db, "scope_group_columns_ready", lambda: False)
-    assert client.get("/api/admin/capabilities").json()["scope_groups"] is False
+    got = client.get("/api/admin/capabilities").json()
+    assert got["scope_groups"] is False and got["group_followups"] is False
+
+
+def test_the_follow_up_ddl_check_is_cached_and_fails_closed(monkeypatch):
+    calls = []
+
+    def fake_q1(sql, params=()):
+        calls.append(sql)
+        return {"kind_ok": True, "open_ok": True, "rule_ok": True}
+
+    monkeypatch.setattr(db, "q1", fake_q1)
+    monkeypatch.setitem(db._FOLLOWUP_DDL_CACHE, "at", None)
+    assert db.followup_tasks_ready() is True
+    assert db.followup_tasks_ready() is True
+    assert len(calls) == 1, "the catalog was read again inside the cache window"
+    assert db.followup_tasks_ready(max_age=0) is True and len(calls) == 2
+    for missing in ("kind_ok", "open_ok", "rule_ok"):
+        monkeypatch.setattr(db, "q1", lambda sql, params=(), m=missing: {
+            "kind_ok": True, "open_ok": True, "rule_ok": True, m: False})
+        assert db.followup_tasks_ready(max_age=0) is False, missing
+
+    def broken(sql, params=()):
+        raise RuntimeError("no database")
+
+    monkeypatch.setattr(db, "q1", broken)
+    assert db.followup_tasks_ready(max_age=0) is False
 
 
 # ══ 10. the scope's name where money changes hands ═══════════════════════════

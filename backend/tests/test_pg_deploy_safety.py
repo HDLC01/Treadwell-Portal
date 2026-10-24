@@ -262,3 +262,59 @@ def test_the_dry_run_pool_refuses_every_write(clean, pgdb):
     finally:
         db._pool = old
         pool.close()
+
+
+# ── #29 / #30: the capability route reads the follow-up DDL from the catalog ───────
+@pytest.fixture
+def fresh_db():
+    with pg_fixture.scratch_portal_db("pf1ddl") as pool:
+        yield pool
+
+
+def _caps(monkeypatch) -> dict:
+    from fastapi.testclient import TestClient
+
+    import main
+
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    return TestClient(main.app).get("/api/admin/capabilities").json()
+
+
+OLD_KIND_CHECK = ("alter table public.portal_followups add constraint portal_followups_kind_check "
+                  "check (kind in ('auto_email','staff_call','staff_email','staff_text',"
+                  "'staff_note','customer_status'))")
+
+
+@pytest.mark.parametrize("missing", ["nothing", "kind_check", "one_open_task_v2", "rule_v2",
+                                     "scope_columns"])
+def test_group_followups_is_true_only_with_the_remind_only_ddl(fresh_db, monkeypatch, missing):
+    if missing == "kind_check":
+        db.execute("alter table public.portal_followups "
+                   "drop constraint portal_followups_kind_check")
+        db.execute(OLD_KIND_CHECK)
+    elif missing == "one_open_task_v2":
+        db.execute("drop index public.portal_followups_one_open_task_v2_uidx")
+    elif missing == "rule_v2":
+        db.execute("drop index public.portal_followups_rule_v2_uidx")
+    elif missing == "scope_columns":
+        db.execute("alter table public.portal_proposals drop column scope_group, "
+                   "drop column scope_label")
+    tasks_ready = missing in ("nothing", "scope_columns")
+    assert db.followup_tasks_ready(max_age=0) is tasks_ready
+    monkeypatch.setitem(db._FOLLOWUP_DDL_CACHE, "at", None)
+    caps = _caps(monkeypatch)
+    assert caps["scope_groups"] is (missing != "scope_columns")
+    assert caps["group_followups"] is (missing == "nothing"), caps
+    if missing == "kind_check":
+        # What the flag protects: without the widened CHECK a task cannot be written at all.
+        add_proposal("p1")
+        with pytest.raises(Exception, match="kind_check"):
+            db.reserve_followup_task("p1", "k1", {"stage": "pre"})
+    # Applying schema.sql (the hand-applied remind-only block) makes it ready again.
+    pg_fixture.apply_schema()
+    assert db.followup_tasks_ready(max_age=0) is True
+
+
+def test_a_kind_check_with_no_kind_restriction_at_all_still_reads_as_ready(fresh_db):
+    db.execute("alter table public.portal_followups drop constraint portal_followups_kind_check")
+    assert db.followup_tasks_ready(max_age=0) is True

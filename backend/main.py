@@ -2683,11 +2683,17 @@ def admin_capabilities(request: Request) -> JSONResponse:
     `scope_groups` is true only when this database has the scope-group columns as well as this
     code: prod applies its DDL by hand, and a grouped publish against a database without them is
     refused (admin_publish answers 503 scope_groups_not_ready), so saying "yes" there would only
-    move the refusal later. Group follow-ups need no DDL."""
+    move the refusal later.
+
+    `group_followups` is true only when the remind-only DDL is in place too (fix round #29/#30):
+    without the widened kind CHECK no follow-up task can be written, so approving a scope would stop
+    its siblings' chase and file no decision task, with nothing but a log line to show for it."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    return _json({"ok": True, "scope_groups": db.scope_group_columns_ready(),
-                  "group_followups": True, "version": CAPABILITIES_VERSION})
+    scope_groups = db.scope_group_columns_ready()
+    return _json({"ok": True, "scope_groups": scope_groups,
+                  "group_followups": bool(scope_groups and db.followup_tasks_ready()),
+                  "version": CAPABILITIES_VERSION})
 
 
 # Resend accepts 40 MB per message, but a proposal email that big is a bounce waiting to happen
