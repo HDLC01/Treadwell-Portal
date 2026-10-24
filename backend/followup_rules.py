@@ -691,13 +691,20 @@ def _sort_ts(v: Any) -> datetime:
 
 
 def group_home(members: list) -> Optional[dict]:
-    """The STABLE home of a group's task row: the earliest (created_at, proposal_id) live member.
-    Approved members count, so approving the home scope does not move the group's schedule (its
-    interval, stop-after and snooze live on the home row)."""
+    """The STABLE home of a group's task row: the earliest (created_at, proposal_id) OPEN live
+    member, or the earliest live member when none is open.
+
+    Not an approved one while an open scope exists (fix round #17): the group's task, its send
+    touch, its snooze date and its interval are written on the home row, and an approved scope's
+    row also carries its own deposit chase. A home that was approved would mix the two -- its
+    deposit reminders counting toward the siblings' "Stop after N", and a snooze of the group
+    moving its deposit chase. Approving a scope stops the group chase anyway (its open reminder is
+    expired), so the home only moves at a moment when nothing of the group's is pending on it."""
     live = [m for m in members or [] if m and m.get("proposal_id")]
     if not live:
         return None
-    return min(live, key=lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id"))))
+    pool = [m for m in live if is_open(m)] or live
+    return min(pool, key=lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id"))))
 
 
 def _min_ts(vals) -> Optional[datetime]:
@@ -789,15 +796,28 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
     pauses = [as_date(m.get("followup_paused_until")) for m in open_]
     view["followup_paused_until"] = (min(pauses) if pauses and all(pauses) else None)
     live_ids = {m.get("proposal_id") for m in live}
-    folded = live + [h for h in history or [] if h and h.get("proposal_id") not in live_ids]
+    # Fix round #17: the OPEN members and the history rows, NOT an approved member. After 'keep' an
+    # approved scope is chasing its own deposit, and its deposit reminders and calls are not the
+    # siblings' follow-ups: folded in, they re-anchored the siblings' chase and used up their
+    # "Stop after N".
+    folded = ([m for m in live if is_open(m)]
+              + [h for h in history or [] if h and h.get("proposal_id") not in live_ids])
     # A reply, a logged call, a decision on ANY scope re-anchors the whole group -- including one
     # recorded on a scope that has since left the live set (a closed or deleted former home).
     for k in TOUCH_KEYS:
         view[k] = _max_ts(m.get(k) for m in folded)
-    # The cap is per group: every member's counted reminders (db: only sent / called count).
+    # The cap is per group: every member's counted reminders (db: only sent / called count). An
+    # approved member keeps only the reminders from BEFORE its approval: those were the group's
+    # (it may have been the home then), and the group must not get a fresh "Stop after N" back.
     times = []
     for m in folded:
         times.extend(_times_list(m.get("followup_reminder_times")))
+    for m in live:
+        if is_open(m):
+            continue
+        cut = _ts(m.get("approved_at"))
+        times.extend(t for t in _times_list(m.get("followup_reminder_times"))
+                     if cut is not None and _ts(t) is not None and _ts(t) <= cut)
     view["followup_reminder_times"] = times
     # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there).
     for k in ("followup_interval_days", "followup_stop_after", "followup_next_at"):

@@ -902,3 +902,58 @@ def test_the_group_email_lists_this_recipients_scopes_under_the_estimators_text(
     html = out["html"]
     assert "Use the links below when you are ready." in html
     assert html.index("Thanks") < html.index("https://p/x/tok-b")
+
+
+# ══ fix round PF2 (2026-10-25): group correctness ══════════════════════════════
+def _kept(rows, approved_pid, approved_at, kept_at):
+    """`approved_pid` approved at `approved_at`, then 'keep' chosen at `kept_at` (the resume note
+    every member reads, and the anchor keep stamps on the group's home)."""
+    out = []
+    for r in rows:
+        r = dict(r, scope_group_resumed_at=kept_at)
+        if r["proposal_id"] == approved_pid:
+            r.update(proposal_status="approved", approved_at=approved_at)
+        out.append(r)
+    return out
+
+
+def test_after_keep_the_approved_scopes_deposit_reminders_do_not_cap_the_siblings():
+    """#17: stop-after 3, the approved scope (once the home) has 3 deposit reminders since 'keep'.
+    The siblings' chase must not stop on them, nor be re-anchored by its deposit call."""
+    rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
+                  followup_stop_after=3)
+    rows = _kept(rows, "d-break", NOW - 100 * H, NOW - 95 * H)
+    rows[0].update(followup_reminder_times=[(NOW - k * H).isoformat() for k in (90, 80, 70)],
+                   last_staff_followup_at=NOW - 2 * H, customer_touch_at=NOW - 3 * H)
+    rows[1]["followup_anchor_at"] = NOW - 95 * H          # keep re-anchors the (open) home
+    v = rules.group_view(rows, NOW)
+    assert v["proposal_id"] == "d-lab1", "the group's home is still the approved scope"
+    assert v["followup_reminder_times"] == []
+    assert v["last_staff_followup_at"] is None and v["customer_touch_at"] is None
+    assert _customer_due(v) is not None, "the siblings' chase stopped on the deposit reminders"
+
+
+def test_an_approved_scopes_reminders_from_before_its_approval_still_count():
+    """...but what it was sent while it was an open scope of the group stays in the cap."""
+    rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
+                  followup_stop_after=1)
+    rows = _kept(rows, "d-break", NOW - 100 * H, NOW - 95 * H)
+    rows[0]["followup_reminder_times"] = [(NOW - 150 * H).isoformat()]
+    rows[1]["followup_anchor_at"] = NOW - 95 * H
+    v = rules.group_view(rows, NOW)
+    assert v["followup_reminder_times"] == [(NOW - 150 * H).isoformat()]
+    assert _customer_due(v) is None, "the group got a fresh Stop-after-N back"
+
+
+def test_the_group_plan_is_never_written_on_an_approved_scope(fake, admin):
+    """#17: snoozing or re-planning the group from a sibling's drawer moved the approved home's
+    own deposit chase."""
+    rows = _three()
+    rows[0].update(proposal_status="approved", approved_at=NOW - 5 * H)
+    f = fake(rows)
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"next_at": (NOW + timedelta(days=4)).date().isoformat()})
+    assert r.status_code == 200, r.text
+    assert r.json()["home_proposal_id"] == "d-lab1"
+    assert f.rows["d-break"].get("followup_next_at") is None
+    assert f.rows["d-lab1"].get("followup_next_at") is not None
