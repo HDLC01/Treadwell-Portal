@@ -723,7 +723,10 @@ def test_the_dry_run_counts_what_the_next_tick_would_raise_and_writes_nothing(fa
     rows = _three() + [_scope("solo", None, 9, scope_group=None, scope_label=None),
                        _scope("quiet", None, 10, scope_group=None, scope_label=None,
                               followup_enrolled_at=NOW - 2 * H)]
+    rows.append(_scope("emailed", None, 11, scope_group=None, scope_label=None))
     f = fake(rows)
+    # The old automatic ladder already emailed this occurrence: the dedupe index drops it.
+    f.reserve_followup("emailed", "%s:nv1" % rules.cycle_key(ENROLLED), {"audience": "customer"})
     before = copy.deepcopy(f.followups)
     got = fw.dry_run_count(NOW)
     assert f.followups == before, "the dry run wrote something"
@@ -789,3 +792,11 @@ def test_the_group_email_lists_this_recipients_scopes_under_the_estimators_text(
     assert "https://p/x/tok-a" in html and "https://p/x/tok-b" in html
     assert "Breakroom" in html and "Lab 1" in html
     assert "Not moving forward" not in html, "one scope's close button on a whole-project email"
+    assert html.index("Any questions on Acme HQ?") < html.index("https://p/x/tok-a")
+    # {link} written mid-sentence: words, and the buttons still go out, after the text.
+    email_sender.send_scope_group_followup(
+        "dana@acme.com", "", "Acme HQ", [{"label": "Lab 1", "url": "https://p/x/tok-b"}],
+        {"title": "Hi", "body": "Use {link} when you are ready.\n\nThanks"})
+    html = out["html"]
+    assert "Use the links below when you are ready." in html
+    assert html.index("Thanks") < html.index("https://p/x/tok-b")
