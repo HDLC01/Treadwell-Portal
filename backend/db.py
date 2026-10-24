@@ -1657,6 +1657,9 @@ _REMINDER_TIMES_SQL = (
 #   staff_legacy     the old ladder's recurring staff deposit emails (`:depsr@`) - the rows WITHOUT
 #                    the `engine` mark followup_worker now puts on every staff note it reserves.
 #   staff            every staff deposit email of the cycle, old or new (dep_staff/depsr/depst).
+#   *_legacy_last    when the newest row of each old series was reserved: the old ladder froze its
+#                    key at the cap and reserved only the latest occurrence per tick, so a chase it
+#                    finished can hold far fewer than max_recurring rows (prod's first sweep).
 # The old code capped both chases at max_recurring, so a chase that reached it had FINISHED; the
 # deposit's own cap (200) must not start it again. Regex, not LIKE: a `%` here would collide with
 # the driver's parameter markers.
@@ -1668,7 +1671,12 @@ _DEPOSIT_HISTORY_SQL = (
     "                                      and f.detail->>'rule_key' ~ ':depsr@' "
     "                                      and f.detail->>'engine' is null), "
     "   'staff', count(*) filter (where f.detail->>'audience' = 'staff' "
-    "                               and f.detail->>'rule_key' ~ ':(dep_staff$|depsr@|depst@)')) "
+    "                               and f.detail->>'rule_key' ~ ':(dep_staff$|depsr@|depst@)'), "
+    "   'customer_legacy_last', max(f.created_at) filter (where f.detail->>'audience' = 'customer' "
+    "                                         and f.detail->>'rule_key' ~ ':depr@'), "
+    "   'staff_legacy_last', max(f.created_at) filter (where f.detail->>'audience' = 'staff' "
+    "                                      and f.detail->>'rule_key' ~ ':depsr@' "
+    "                                      and f.detail->>'engine' is null)) "
     "   from public.portal_followups f "
     "  where f.proposal_id = {pid} and f.kind = 'auto_email' "
     "    and f.created_at >= coalesce({enrolled}, f.created_at))")

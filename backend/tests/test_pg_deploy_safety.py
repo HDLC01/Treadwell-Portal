@@ -204,9 +204,62 @@ def test_the_deposit_history_signal_counts_only_the_old_ladders_staff_rows(clean
                                                        "engine": followup_worker.ENGINE_MARK})
     db.reserve_followup("mixed", ck + ":v48_staff", {"audience": "staff"})
     sig = db.followup_signals("mixed")["deposit_history"]
-    assert sig == {"customer_legacy": 6, "staff_legacy": 6, "staff": 9}
+    counts = {k: sig[k] for k in ("customer_legacy", "staff_legacy", "staff")}
+    assert counts == {"customer_legacy": 6, "staff_legacy": 6, "staff": 9}
+    # The newest OLD row of each series (approved_job: depr@old06 / depsr@old06), never a new one.
+    for key, days in (("customer_legacy_last", 40 - 1 - 18), ("staff_legacy_last", 40 - 2 - 18)):
+        assert abs(rules._ts(sig[key]) - ago(days)) < timedelta(minutes=5), key
     board = {r["proposal_id"]: r for r in db.list_all_portal_proposals()}
     assert board["mixed"]["deposit_history"] == sig
+
+
+# Review of PF1: prod's REAL history. Automation was off until 2026-08-24 and the old ladder reserved
+# only the LATEST matured occurrence per tick, its index frozen at the cap: a chase it FINISHED can
+# hold one row (approved long before the first sweep) or a partial run ending at n = 20.
+def backlog_job(pid, approved_days, swept_days, stop=None):
+    """The old ladder's history on a job approved `approved_days` ago, with automation first switched
+    on `swept_days` ago and ticking ever since: the latest matured occurrence at the sweep, then
+    every later one up to the frozen n = 20, until the old code's last tick at `stop` (default now). Real
+    old keys, real reservation times."""
+    add_proposal(pid, status="approved", enrolled_days=approved_days + 10,
+                 cycle_viewed_at=ago(approved_days + 9), approved_at=ago(approved_days))
+    row = db.get_proposal(pid)
+    ck, approved, c = cycle(pid), row["approved_at"], rules._Cadence()
+    rows = 0
+    for audience, tag, off, tpl in (("customer", "depr", c.first, "deposit_nudge"),
+                                    ("staff", "depsr", c.staff_personal,
+                                     "staff_deposit_outstanding")):
+        first_n = max(1, int(((approved_days - swept_days) * 86400 - off.total_seconds())
+                             // c.recurring.total_seconds()))
+        for n in range(min(first_n, c.max_recurring), c.max_recurring + 1):
+            due = approved + off + c.recurring * n
+            at = max(due, ago(swept_days))
+            if at > (stop or db_now()):
+                break
+            old_email(pid, "%s:%s@%s" % (ck, tag, rules._stamp(due)), audience=audience,
+                      template=tpl, days_ago=(db_now() - at).total_seconds() / 86400)
+            rows += audience == "customer"
+    return rows
+
+
+def test_deposit_chases_the_old_ladder_finished_with_few_rows_do_not_restart(clean, outbox):
+    assert backlog_job("one150", 150, 57) == 1            # one row: the frozen key itself
+    assert 1 < backlog_job("part100", 100, 57) < 20       # a partial run n = 13..20
+    # Still running, and its next occurrence (every 3 days) matured after the old code's last tick.
+    assert 1 < backlog_job("young", 40, 57, stop=in_window() - timedelta(days=3)) < 20
+    frozen = rules.legacy_frozen_keys(dict(db.get_proposal("one150")), "customer")
+    assert db.followup_rule_key_exists("one150", frozen[0])
+    now = in_window()
+    plan = followup_worker.dry_run_count(now)
+    assert {t["proposal_id"] for t in plan["tasks"]} == {"young"}
+    assert {e["proposal_id"] for e in plan["staff_emails"]} == {"young"}
+    assert plan["deposit_restarts"] == []
+    held = {(h["proposal_id"], h["audience"]) for h in plan["deposit_held"]}
+    assert held == {("one150", "customer"), ("one150", "staff"),
+                    ("part100", "customer"), ("part100", "staff")}
+    followup_worker._tick(now)
+    assert {t["proposal_id"] for t in tasks()} == {"young"}
+    assert {m["to"][0] for m in outbox.sent} <= {KYLE}
 
 
 # ── #12 / #18 / #4: the entry point, run the way Hanz runs it in the container ─────

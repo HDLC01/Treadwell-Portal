@@ -104,7 +104,7 @@ class _Cadence:
     """The seven numbers this module needs, resolved once per call."""
 
     __slots__ = ("first", "second", "recurring", "staff_personal", "max_recurring",
-                 "deposit_max", "legacy_cap", "start_hour", "end_hour")
+                 "deposit_max", "legacy_cap", "legacy_recurring", "start_hour", "end_hour")
 
     def __init__(self, cfg: Optional[dict] = None):
         c = cfg or {}
@@ -133,6 +133,9 @@ class _Cadence:
         # never a per-proposal stop-after (which the old code did not have). effective_cfg keeps it
         # under its own key before laying a stop-after over max_recurring. See deposit_series_done.
         self.legacy_cap = whole("legacy_max_recurring", self.max_recurring, 1, 200)
+        # Likewise the interval the old ladder ran under: the global one, never a per-proposal
+        # "every N days" (the old code did not have one). See deposit_legacy_finished.
+        self.legacy_recurring = hours("legacy_recurring_hours", self.recurring)
         self.start_hour = whole("send_start_hour", SEND_START_HOUR, 0, 23)
         self.end_hour = whole("send_end_hour", SEND_END_HOUR, 1, 24)
         # A window that ends before it opens would silence every customer email. Settings
@@ -457,6 +460,9 @@ def effective_cfg(cfg: Optional[dict], p: dict) -> dict:
     out = dict(cfg or {})
     days = _whole_or_none(p.get("followup_interval_days"), 1, 90)
     if days:
+        # The old ladder's interval is the GLOBAL one; kept before the override replaces it.
+        out.setdefault("legacy_recurring_hours",
+                       _Cadence(cfg).recurring.total_seconds() / 3600)
         out["recurring_hours"] = days * 24
     stop = _whole_or_none(p.get("followup_stop_after"), 1, 60)
     if stop:
@@ -479,7 +485,53 @@ def _deposit_history(p: dict) -> dict:
             out[k] = int(raw.get(k) or 0) if isinstance(raw, dict) else 0
         except (TypeError, ValueError):
             out[k] = 0
+    # When the newest old-ladder row of each series was reserved (None if unknown).
+    for k in ("customer_legacy_last", "staff_legacy_last"):
+        out[k] = _ts(raw.get(k)) if isinstance(raw, dict) else None
     return out
+
+
+def _legacy_deposit_anchor(p: dict, last: datetime, c: "_Cadence") -> Optional[datetime]:
+    """The anchor the OLD ladder used for its deposit occurrence reserved at `last`: approved_at
+    (or the view / enrolment stamp if that is somehow absent), moved to an expired pause's restart
+    only if that restart had happened by then."""
+    anchor = (_aware(p.get("approved_at")) or _aware(p.get("cycle_viewed_at"))
+              or _aware(p.get("followup_enrolled_at")))
+    if anchor is None:
+        return None
+    until = _as_date(p.get("followup_paused_until"))
+    if until:
+        resume = datetime(until.year, until.month, until.day,
+                          c.start_hour, tzinfo=BUSINESS_TZ) + timedelta(days=1)
+        if anchor < resume <= last:
+            anchor = resume
+    return anchor
+
+
+def _legacy_offset(audience: str, c: "_Cadence") -> timedelta:
+    return c.first if audience == "customer" else c.staff_personal
+
+
+def legacy_frozen_keys(p: dict, audience: str, c: Optional["_Cadence"] = None) -> list:
+    """The rule key(s) the OLD ladder froze this deposit series on once its index reached its cap
+    (`_occurrence_key(ck, 'depr'|'depsr', anchor, offset, legacy_cap)`). That key being reserved
+    is the dedupe table's own record that the old chase had finished: the dry run's restart alarm
+    reads it, independently of the time test deposit_legacy_finished makes. Both candidate anchors
+    (approval, and an expired pause's restart) are returned. Pure."""
+    c = c or _Cadence()
+    enrolled = _aware(p.get("followup_enrolled_at"))
+    if enrolled is None:
+        return []
+    ck = cycle_key(enrolled)
+    tag = "depr" if audience == "customer" else "depsr"
+    anchors = []
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    for a in (_legacy_deposit_anchor(p, datetime.min.replace(tzinfo=timezone.utc), c),
+              _legacy_deposit_anchor(p, far, c)):
+        if a is not None and a not in anchors:
+            anchors.append(a)
+    step = _legacy_offset(audience, c) + c.legacy_recurring * c.legacy_cap
+    return ["%s:%s@%s" % (ck, tag, _stamp(a + step)) for a in anchors]
 
 
 def deposit_series_done(p: dict, audience: str, c: Optional["_Cadence"] = None) -> bool:
@@ -509,10 +561,27 @@ def deposit_series_done(p: dict, audience: str, c: Optional["_Cadence"] = None) 
 def deposit_legacy_finished(p: dict, audience: str, c: Optional["_Cadence"] = None) -> bool:
     """Did the OLD automatic ladder already run this deposit series to its cap? The half of
     deposit_series_done that exists only for proposals in flight at deploy (the dry run reports the
-    jobs it holds). Pure."""
+    jobs it holds). Pure.
+
+    Judged by WHEN, not only by how many (review of PF1). The old ladder froze its occurrence index
+    at the cap and reserved only the LATEST matured key on each tick, so a chase the worker was not
+    ticking through (prod ran with automation off until 2026-08-24, then swept once) finished with
+    far fewer than legacy_cap rows: one row for a job approved 150 days before that first sweep. A
+    row reserved at or after anchor + offset + legacy_cap * interval was the frozen key itself, and
+    every later tick of the old code deduped against it: finished. legacy_cap rows still also mean
+    finished, as before."""
     c = c or _Cadence()
     h = _deposit_history(p)
-    return h["customer_legacy" if audience == "customer" else "staff_legacy"] >= c.legacy_cap
+    series = "customer_legacy" if audience == "customer" else "staff_legacy"
+    if h[series] >= c.legacy_cap:
+        return True
+    last = h[series + "_last"]
+    if last is None:
+        return False
+    anchor = _legacy_deposit_anchor(p, last, c)
+    if anchor is None:
+        return False
+    return last >= anchor + _legacy_offset(audience, c) + c.legacy_recurring * c.legacy_cap
 
 
 def customer_stage(p: dict) -> Optional[str]:

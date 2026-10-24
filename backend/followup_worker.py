@@ -944,8 +944,10 @@ def dry_run_count(now: datetime | None = None) -> dict:
           task email, and each decision-task re-nag
       touched_tasks [...]     the tasks in the touched shape: the deploy-day burst itself
       deposit_restarts [...]  deposit reminders (task or estimator email) on a job whose OLD ladder
-                              had already finished that chase. The schedule holds these
-                              (followup_rules.deposit_series_done), so anything here is a bug.
+                              had already finished that chase: by the guard's time test, OR because
+                              the old ladder's frozen key (rules.legacy_frozen_keys) is reserved.
+                              The schedule holds these (followup_rules.deposit_series_done), so
+                              anything here is a bug.
       deposit_held [{proposal_id, audience}]  the finished deposit chases being held, for review.
     """
     now = now or datetime.now(timezone.utc)
@@ -965,7 +967,11 @@ def dry_run_count(now: datetime | None = None) -> dict:
             return
         c = rules._Cadence(rules.effective_cfg(cfg, p))
         audience = "customer" if due.audience == "customer" else "staff"
-        if rules.deposit_legacy_finished(p, audience, c):
+        # Two INDEPENDENT signs the old ladder had finished: the guard's own time test, and the
+        # old ladder's frozen key sitting in the dedupe table. The second is what lets this bucket
+        # name a restart the guard's predicate misses.
+        if rules.deposit_legacy_finished(p, audience, c) or \
+                any(_used(pid, k) for k in rules.legacy_frozen_keys(p, audience, c)):
             out["deposit_restarts"].append({"proposal_id": pid, "rule_key": due.rule_key,
                                             "template": due.template, "scope_group": gid})
 

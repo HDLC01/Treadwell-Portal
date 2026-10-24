@@ -162,6 +162,100 @@ def test_customer_deposit_reminders_already_sent_count_toward_the_deposit_cap():
     assert cust(p, cfg=cfg) is None
 
 
+# Review of PF1: prod's REAL history. Automation was off until 2026-08-24; the old ladder then
+# reserved only the LATEST matured occurrence on each tick and froze its index at the cap, so a
+# chase it finished can hold far fewer than 20 rows. Counting rows alone restarted all of these.
+ENABLED = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+
+
+def _old_ladder_history(approved, *, enable=ENABLED, until=NOW, cfg=None, tick=timedelta(minutes=15)):
+    """Run the OLD (origin/main) deposit rules on `tick` from `enable` to just before `until`, in a
+    0-24 window as on prod, and return what they left in portal_followups: {(audience, key): at}."""
+    c = fr._Cadence(cfg)
+    ck = fr.cycle_key(approved - 10 * D)
+
+    def index(elapsed, first):
+        if elapsed < first + c.recurring:
+            return 0
+        return min(c.max_recurring, int((elapsed - first) // c.recurring))
+
+    def key(tag, first, n):
+        return "%s:%s@%s" % (ck, tag, fr._stamp(approved + first + c.recurring * n))
+
+    rows, t = {}, enable
+    while t < until:
+        elapsed = t - approved
+        if elapsed >= c.first:
+            n = index(elapsed, c.first)
+            rows.setdefault(("customer", key("depr", c.first, n) if n else ck + ":dep1"), t)
+        if elapsed >= c.staff_personal:
+            n = index(elapsed, c.staff_personal)
+            rows.setdefault(("staff", key("depsr", c.staff_personal, n) if n
+                             else ck + ":dep_staff"), t)
+        t += tick
+    return rows
+
+
+def _approved_from_history(days_ago, **over):
+    approved = NOW - days_ago * D
+    rows = _old_ladder_history(approved)
+    cust_rows = sorted(at for (aud, _k), at in rows.items() if aud == "customer")
+    depr = sorted(at for (aud, k), at in rows.items() if aud == "customer" and ":depr@" in k)
+    depsr = sorted(at for (aud, k), at in rows.items() if aud == "staff" and ":depsr@" in k)
+    staff = [at for (aud, _k), at in rows.items() if aud == "staff"]
+    p = _viewed(proposal_status="approved", approved_at=approved, deposit_status="pending",
+                followup_enrolled_at=approved - 10 * D, cycle_viewed_at=approved - 9 * D,
+                followup_reminder_times=[t.isoformat() for t in cust_rows],
+                deposit_history={"customer_legacy": len(depr), "staff_legacy": len(depsr),
+                                 "staff": len(staff),
+                                 "customer_legacy_last": depr[-1].isoformat() if depr else None,
+                                 "staff_legacy_last": depsr[-1].isoformat() if depsr else None})
+    p.update(over)
+    return p, len(depr), len(depsr)
+
+
+@pytest.mark.parametrize("days_ago,expect_rows", [(70, 18), (80, 14), (100, 8), (150, 1), (200, 1)])
+def test_a_chase_the_old_ladder_finished_with_few_rows_does_not_restart(days_ago, expect_rows):
+    p, depr, depsr = _approved_from_history(days_ago)
+    assert depr == expect_rows and depr < 20, "the history is not the enable-backlog shape"
+    assert depsr < 20
+    assert fr.deposit_legacy_finished(p, "customer") and fr.deposit_legacy_finished(p, "staff")
+    assert cust(p) is None, "a finished customer deposit chase raised a new task"
+    assert staff_deposit(p) == [], "a finished staff deposit chase emailed the estimator again"
+    assert fr.next_due_at(p, NOW, ALL_DAY) is None
+
+
+@pytest.mark.parametrize("days_ago", [20, 40])
+def test_a_chase_the_old_ladder_had_not_finished_carries_on(days_ago):
+    p, depr, _depsr = _approved_from_history(days_ago)
+    assert 0 < depr < 20
+    assert not fr.deposit_legacy_finished(p, "customer")
+    assert fr.next_due_at(p, NOW, ALL_DAY) is not None
+    assert len(staff_deposit(p)) == 1
+
+
+def test_a_per_proposal_interval_does_not_move_the_old_ladders_finish_line():
+    """The old ladder had no per-proposal interval; a 10-day one set since must not make a chase it
+    finished look unfinished (anchor + 2d + 20*10d is long after the frozen key was reserved)."""
+    p, _depr, _depsr = _approved_from_history(150, followup_interval_days=10)
+    assert cust(p) is None and staff_deposit(p) == []
+
+
+def test_a_pause_restart_moves_the_old_ladders_anchor():
+    """An expired pause restarted the old clock; the frozen key then fell 62 days after the restart,
+    so a row reserved 62 days after APPROVAL but before the restart's finish line is not the end."""
+    p, _depr, _depsr = _approved_from_history(150)
+    # A pause that ended 30 days ago: the old ladder's anchor for the newest row is the restart.
+    p["followup_paused_until"] = (NOW - 30 * D).date().isoformat()
+    last = fr._ts(p["deposit_history"]["customer_legacy_last"])
+    assert last < NOW - 30 * D and fr.deposit_legacy_finished(p, "customer"), \
+        "a row from before the pause still reads against the approval anchor"
+    p["deposit_history"] = dict(p["deposit_history"], customer_legacy=3,
+                                customer_legacy_last=(NOW - 2 * D).isoformat())
+    assert not fr.deposit_legacy_finished(p, "customer"), \
+        "a row 28 days into the restarted clock is not the frozen key"
+
+
 # ── #12 / #18 / #4: the dry run counts every estimator email, and can run first ───
 import copy as _copy                                                      # noqa: E402
 import json as _json                                                      # noqa: E402
@@ -235,6 +329,46 @@ def test_the_dry_run_names_a_restart_if_the_guard_ever_lets_one_through(fake, mo
     got = fw.dry_run_count(G_NOW)
     assert sorted(r["template"] for r in got["deposit_restarts"]) == \
         ["deposit_nudge", "staff_deposit_outstanding"]
+
+
+def _seed_frozen_keys(f, job):
+    """The old ladder's enable-day sweep on a job approved 100 days before G_NOW: ONE row per
+    series, each the frozen key (n = 20)."""
+    c = fr._Cadence()
+    out = {}
+    for audience in ("customer", "staff"):
+        (k,) = fr.legacy_frozen_keys(job, audience, c)
+        f.reserve_followup("won", k, {"audience": audience, "template": "x"})
+        out[audience] = k
+    return out
+
+
+def test_the_dry_run_holds_a_chase_the_old_ladder_finished_with_one_row(fake):
+    job = _finished_deposit_job()
+    f = fake([job])
+    _seed_frozen_keys(f, job)
+    swept = (G_NOW - 30 * D).isoformat()     # after approval + 2d/48h + 20 * 3d: the frozen key
+    f.signals["won"] = {"deposit_history": {"customer_legacy": 1, "staff_legacy": 1, "staff": 1,
+                                            "customer_legacy_last": swept,
+                                            "staff_legacy_last": swept}}
+    got = fw.dry_run_count(G_NOW)
+    assert got["deposit_restarts"] == [] and got["tasks"] == [] and got["staff_emails"] == []
+    assert sorted(h["audience"] for h in got["deposit_held"]) == ["customer", "staff"]
+
+
+def test_the_restart_alarm_does_not_share_the_guards_predicate(fake, monkeypatch):
+    """Review of PF1 (#12/#18): the alarm used the guard's own predicate, so it could never report a
+    restart the guard missed. With the guard AND its predicate both blind (no history at all), the
+    old ladder's frozen key in the dedupe table still names the restart."""
+    job = _finished_deposit_job()
+    f = fake([job])
+    keys = _seed_frozen_keys(f, job)
+    monkeypatch.setattr(fr, "deposit_series_done", lambda p, audience, c=None: False)
+    monkeypatch.setattr(fr, "deposit_legacy_finished", lambda p, audience, c=None: False)
+    got = fw.dry_run_count(G_NOW)
+    assert sorted(r["template"] for r in got["deposit_restarts"]) == \
+        ["deposit_nudge", "staff_deposit_outstanding"]
+    assert not {r["rule_key"] for r in got["deposit_restarts"]} & set(keys.values())
 
 
 def test_a_group_whose_home_holds_an_open_task_still_counts_its_staff_notes(fake):
