@@ -38,6 +38,7 @@ import inbound
 import invoice
 import proposals
 import ratelimit
+import scope_groups
 import signing
 import uploads
 
@@ -259,15 +260,17 @@ def _active_scope_group(p: dict) -> Optional[str]:
     THE DRAFTS DECIDE MEMBERSHIP, as in the combined send: a scope the tool has taken back out of
     its group keeps a stale scope_group on its portal row, and is an ordinary proposal again. With
     no live draft in the group at all there is nothing to compare against, and the row stands.
+    A PARKED scope (archived, or a Test draft in a real project: scope_groups.split_members) is
+    still in the group, so it is never emailed on its own either.
     Raises _GroupUnreadable when the drafts cannot be read."""
     group = p.get("scope_group")
     if not group:
         return None
     try:
-        expected = db.list_scope_group_drafts(group)
+        live, parked = scope_groups.split_members(db.list_scope_group_draft_states(group))
     except Exception as exc:  # noqa: BLE001
         raise _GroupUnreadable(str(exc)) from exc
-    return group if (not expected or p.get("proposal_id") in expected) else None
+    return group if (not (live or parked) or p.get("proposal_id") in live + parked) else None
 
 
 def _send_scope_links_to_contact(p: dict, group: str, email: str) -> bool:
@@ -279,6 +282,11 @@ def _send_scope_links_to_contact(p: dict, group: str, email: str) -> bool:
     taken out of the group and scopes not yet sent are left out, the same as the combined send.
     Replies land in `p`'s thread, the one they were added to."""
     expected = db.list_scope_group_drafts(group)
+    if expected and p["proposal_id"] not in expected:
+        # A PARKED scope (archived, or a Test draft in a real project): it is in the group, so it
+        # never gets the one-scope email, and it is not a live member, so it gets no group email.
+        log.info("%s is a parked scope of %s: no email to the new contact", p["proposal_id"], group)
+        return False
     mine = []
     for r in db.list_scope_group(group):
         pid = r["proposal_id"]

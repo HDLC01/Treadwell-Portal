@@ -664,6 +664,10 @@ def add_contact(monkeypatch):
                         raising=False)
     monkeypatch.setattr(main.db, "list_scope_group_drafts", lambda gid: list(state["drafts"]),
                         raising=False)
+    # _active_scope_group reads the raw draft states (scope_groups.split_members, 2026-10-24).
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states",
+                        lambda gid: [{"id": d, "archived": False} for d in state["drafts"]],
+                        raising=False)
     monkeypatch.setattr(main, "_proposal_card_files", lambda pid: [])
     monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda tok: "rt-" + tok)
     monkeypatch.setattr(main.email_sender, "send_portal_link",
@@ -765,6 +769,7 @@ def test_a_failing_group_read_sends_no_single_scope_email(add_contact, monkeypat
         raise RuntimeError("db down")
 
     monkeypatch.setattr(main.db, "list_scope_group_drafts", boom, raising=False)
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states", boom, raising=False)
     r = go()
     assert r.status_code == 200, r.text
     assert calls["added"] == [("d-lab1", "pat@acme.com")]

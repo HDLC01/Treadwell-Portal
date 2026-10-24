@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
+import scope_groups
+
 try:                                      # 3.9+ stdlib; the container has it
     from zoneinfo import ZoneInfo
     BUSINESS_TZ = ZoneInfo("America/Chicago")
@@ -523,6 +525,9 @@ def live_members(rows: list, drafts: Optional[list]) -> list:
     compare against and the stored rows stand. Deleted, closed-lost and automation-off rows are
     never live."""
     by_id = {d.get("id"): d for d in (drafts or []) if isinstance(d, dict)}
+    # THE membership rule (scope_groups.split_members): archived drafts and a Test draft in a real
+    # project (or a real one in a Test group) are in the group but not live.
+    live_ids = set(scope_groups.split_members(drafts)[0]) if by_id else set()
     out = []
     for r in rows or []:
         if not r or r.get("deleted_at") or r.get("followup_disabled_at"):
@@ -530,8 +535,7 @@ def live_members(rows: list, drafts: Optional[list]) -> list:
         if (r.get("proposal_status") or "") == "closed_lost":
             continue
         if by_id:
-            d = by_id.get(r.get("proposal_id"))
-            if d is None or d.get("archived"):
+            if r.get("proposal_id") not in live_ids:
                 continue
         out.append(r)
     return out

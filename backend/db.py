@@ -315,26 +315,29 @@ def list_scope_group(group_id: str) -> list[dict[str, Any]]:
 
 
 def list_scope_group_drafts(group_id: str) -> list[str]:
-    """The draft ids the PROPOSAL TOOL says belong to a group, published or not.
+    """The LIVE member draft ids the PROPOSAL TOOL has in a group, published or not.
 
-    The combined send compares this with list_scope_group to refuse a partial send: a scope that
-    has been split off in the tool but not yet published has no portal row, so only the drafts
-    table knows it exists. A trashed draft is not expected."""
-    return [r["id"] for r in qall(
-        "select id from public.drafts "
-        "where deleted_at is null and data -> 'scope_group' ->> 'id' = %s order by id",
-        (group_id,),
-    )]
+    The combined send compares this with list_scope_group to refuse a partial first send: a scope
+    that has been split off in the tool but not yet published has no portal row, so only the drafts
+    table knows it exists. Membership is scope_groups.split_members, the one rule everything uses:
+    a trashed, archived or wrong-kind (Test in a real project) draft is not expected."""
+    import scope_groups
+
+    return scope_groups.split_members(list_scope_group_draft_states(group_id))[0]
 
 
 def list_scope_group_draft_states(group_id: str) -> list[dict[str, Any]]:
-    """`[{"id", "archived"}]` for every non-deleted draft that carries this scope group.
+    """`[{"id", "archived", "is_test", "project_name"}]` for every non-deleted draft that carries
+    this scope group. The raw facts scope_groups.split_members decides membership from.
 
-    The follow-up side's membership read (followup_rules.live_members): an ARCHIVED draft is still
-    in the group but is not a live member, so it must neither be chased with the group nor fall out
-    into a one-scope chase of its own. `archived` lives inside the draft blob (drafts.set_archived)."""
-    return [{"id": r["id"], "archived": bool(r.get("archived"))} for r in qall(
-        "select id, coalesce(data ->> 'archived', '') = 'true' as archived from public.drafts "
+    `archived` and `is_test` live inside the draft blob (the tool's drafts.set_archived and
+    set_test_flag); `is_test` is a tri-state, so it is handed over raw (None = nobody has said, and
+    the project name decides)."""
+    return [{"id": r["id"], "archived": bool(r.get("archived")), "is_test": r.get("is_test"),
+             "project_name": r.get("project_name")} for r in qall(
+        "select id, coalesce(data ->> 'archived', '') = 'true' as archived, "
+        "data ->> 'is_test' as is_test, data ->> 'project_name' as project_name "
+        "from public.drafts "
         "where deleted_at is null and data -> 'scope_group' ->> 'id' = %s order by id",
         (group_id,),
     )]
