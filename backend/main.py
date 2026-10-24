@@ -210,6 +210,98 @@ def _clean_emails(raw):
     return out, None
 
 
+# ── scope groups ──────────────────────────────────────────────────────────────
+# RJ: a project with no single base bid. "Breakroom", "Lab 1" and "Lab 2" are each their own
+# proposal (own document, own approval, own deposit), linked by a shared group id so the customer
+# list, the board, one combined email and the follow-up worker treat them as one project.
+#
+# THE SHAPE the proposal tool writes into the draft blob, and the only one read here:
+#     data["scope_group"] = {"id": "<group id>", "label": "<this scope's name>"}
+# `id` is shared by every scope in the group (a uuid is the obvious choice); `label` is what the
+# customer sees for THIS scope ("Lab 1"). Read from the draft at publish, never from the request.
+_SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_SCOPE_LABEL_MAX = 80
+
+
+def _scope_of(data: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """`(group_id, label, error)` from a draft blob. All None for an ungrouped draft.
+
+    A PRESENT BUT MALFORMED value is an error, not "ungrouped". Treating it as ungrouped would
+    publish this scope as a normal proposal and email it to the customer on its own, which is the
+    exact thing the group exists to prevent."""
+    raw = (data or {}).get("scope_group")
+    if raw is None:
+        return None, None, None
+    if not isinstance(raw, dict):
+        return None, None, "invalid_scope_group"
+    gid, label = raw.get("id"), raw.get("label")
+    if not isinstance(gid, str) or not _SCOPE_ID_RE.match(gid):
+        return None, None, "invalid_scope_group"
+    if label is not None and not isinstance(label, str):
+        return None, None, "invalid_scope_group"
+    return gid, (_cap(label, _SCOPE_LABEL_MAX) or None), None
+
+
+def _scope_name(project: Optional[str], label: Optional[str]) -> str:
+    """"Acme HQ — Lab 1" for a scope, the plain project name for anything else."""
+    project = project or "Your Proposal"
+    return f"{project} — {label}" if label else project
+
+
+class _GroupUnreadable(Exception):
+    """The group's membership could not be read. Callers FAIL CLOSED on this: send nothing,
+    because the fallback they would otherwise take is the one-scope email the group forbids."""
+
+
+def _active_scope_group(p: dict) -> Optional[str]:
+    """The group `p` is a live scope of, or None when it is an ordinary proposal.
+
+    THE DRAFTS DECIDE MEMBERSHIP, as in the combined send: a scope the tool has taken back out of
+    its group keeps a stale scope_group on its portal row, and is an ordinary proposal again. With
+    no live draft in the group at all there is nothing to compare against, and the row stands.
+    Raises _GroupUnreadable when the drafts cannot be read."""
+    group = p.get("scope_group")
+    if not group:
+        return None
+    try:
+        expected = db.list_scope_group_drafts(group)
+    except Exception as exc:  # noqa: BLE001
+        raise _GroupUnreadable(str(exc)) from exc
+    return group if (not expected or p.get("proposal_id") in expected) else None
+
+
+def _send_scope_links_to_contact(p: dict, group: str, email: str) -> bool:
+    """A contact added to one scope AFTER the combined send: the group's email, listing every
+    scope of the group this address is on and that has already gone out. Never the one-scope
+    "your proposal is ready", which is the email the group exists to replace.
+
+    `p` itself is always listed -- staff just put this person on it. Closed-lost scopes, scopes
+    taken out of the group and scopes not yet sent are left out, the same as the combined send.
+    Replies land in `p`'s thread, the one they were added to."""
+    expected = db.list_scope_group_drafts(group)
+    mine = []
+    for r in db.list_scope_group(group):
+        pid = r["proposal_id"]
+        if pid != p["proposal_id"]:
+            if expected and pid not in expected:
+                continue
+            if (r.get("proposal_status") or "") == "closed_lost" or not r.get("last_sent_at"):
+                continue
+            on = [(e or "").strip().lower()
+                  for e in (db.get_recipients(pid) or [r.get("customer_email")])]
+            if email not in on:
+                continue
+        mine.append(r)
+    if not any(r["proposal_id"] == p["proposal_id"] for r in mine):
+        mine.append(p)
+    return email_sender.send_scope_group_links(
+        email, "", p.get("project_name") or "your project",
+        [{"label": r.get("scope_label") or r.get("project_name") or "Proposal",
+          "url": f"{config.PUBLIC_BASE_URL}/p/{r['token']}",
+          "approved": (r.get("proposal_status") or "") == "approved"} for r in mine],
+        reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"])
+
+
 _VALID_CONTACT_ROLES = ("primary", "accounts_payable", "other")
 MAX_CONTACTS = 10
 
@@ -310,9 +402,16 @@ def _staff_link(proposal_id: str) -> str:
 def _proposal_card(row: dict) -> dict:
     """One row in the customer's project list (login page + in-portal switcher)."""
     created = row.get("created_at")
+    group = row.get("scope_group") or None
+    label = (row.get("scope_label") or None) if group else None
     return {
         "token": row["token"],
         "project_name": row.get("project_name") or "Your Proposal",
+        # Three scopes of one project would otherwise read as three identical "Acme HQ" rows.
+        # `project_name` stays the raw name; `display_name` is what a list should print.
+        "scope_group": group,
+        "scope_label": label,
+        "display_name": _scope_name(row.get("project_name"), label),
         "proposal_status": row.get("proposal_status"),
         "deposit_status": row.get("deposit_status"),
         "schedule_status": row.get("schedule_status"),
@@ -322,6 +421,50 @@ def _proposal_card(row: dict) -> dict:
         "deposit_required": row.get("deposit_required") is not False,
         "deposit_requested": bool(row.get("deposit_requested_at")),
     }
+
+
+def _group_cards(cards: list[dict]) -> list[dict]:
+    """Keep a scope group's cards together, in the order its scopes were published.
+
+    The list arrives newest first. A group takes the place of its newest scope and the rest of its
+    scopes follow it, oldest first, so "Breakroom, Lab 1, Lab 2" reads in the order the estimator
+    split them. Ungrouped cards do not move."""
+    members: dict[str, list[dict]] = {}
+    for c in cards:
+        if c.get("scope_group"):
+            members.setdefault(c["scope_group"], []).append(c)
+    out, placed = [], set()
+    for c in cards:
+        g = c.get("scope_group")
+        if not g:
+            out.append(c)
+        elif g not in placed:
+            placed.add(g)
+            out.extend(sorted(members[g], key=lambda m: (m.get("created_at") or "",
+                                                         m.get("scope_label") or "")))
+    return out
+
+
+def _customer_cards(email: str) -> list[dict]:
+    """The signed-in customer's project list. ONE builder for the three routes that return it,
+    and always off list_proposals_by_email, which is what keeps another customer's scope of the
+    same group out of it."""
+    return _group_cards([_proposal_card(r) for r in db.list_proposals_by_email(email)])
+
+
+def _scope_view(p: dict, session_email: str) -> Optional[dict]:
+    """This proposal's scope and its sibling scopes, for the customer's proposal page.
+
+    THE SIBLINGS COME FROM THE SESSION'S OWN LIST (list_proposals_by_email), filtered to this
+    group -- never from db.list_scope_group, which is the whole group regardless of who each scope
+    was sent to. A scope addressed to somebody else must not appear here even by name."""
+    group = p.get("scope_group")
+    if not group:
+        return None
+    sibs = [c for c in _customer_cards(session_email) if c.get("scope_group") == group]
+    for c in sibs:
+        c["current"] = c["token"] == p["token"]
+    return {"group": group, "label": p.get("scope_label") or None, "siblings": sibs}
 
 
 # ── middleware: CSRF/origin backstop + security headers ───────────────────────
@@ -436,7 +579,7 @@ async def auth_verify_code(request: Request) -> JSONResponse:
     ok, reason = ca.verify_code(email, (body.get("code") or "").strip())
     if not ok:
         return _json({"ok": False, "error": reason}, 400)
-    resp = _json({"ok": True, "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(email)]})
+    resp = _json({"ok": True, "proposals": _customer_cards(email)})
     _set_session_cookie(resp, ca.start_session(email))
     return resp
 
@@ -452,7 +595,7 @@ async def auth_google(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "Could not verify your Google sign-in."}, 401)
     if not db.email_has_proposal(email):
         return _json({"ok": False, "error": "no_project", "email": email})  # 200: normal outcome
-    resp = _json({"ok": True, "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(email)]})
+    resp = _json({"ok": True, "proposals": _customer_cards(email)})
     _set_session_cookie(resp, ca.start_session(email))
     return resp
 
@@ -603,7 +746,7 @@ def me_proposals(request: Request) -> JSONResponse:
     if not se:
         return _json({"ok": True, "authed": False, "proposals": []})
     return _json({"ok": True, "authed": True, "email": se,
-                  "proposals": [_proposal_card(r) for r in db.list_proposals_by_email(se)]})
+                  "proposals": _customer_cards(se)})
 
 
 # ── per-proposal (email-scoped access) ────────────────────────────────────────
@@ -682,6 +825,15 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
     # The LATEST send, so a fresh revision doesn't inherit the original send's age — this drives
     # the customer's "not moving forward?" card, which only offers itself after a few quiet days.
     vm["sent_at"] = _iso(p.get("last_sent_at") or p.get("created_at"))
+    # A scope of a multi-scope project: its own name ("Lab 1"), which the page shows where an
+    # ordinary proposal says "Base bid", and the other scopes THIS customer can see. None for
+    # every ungrouped proposal, which the page reads as "render exactly as before".
+    try:
+        vm["scope"] = _scope_view(p, se)
+    except Exception as exc:  # noqa: BLE001 — the sibling strip is not worth the whole page
+        log.warning("scope siblings unavailable for %s: %s", p["proposal_id"], exc)
+        vm["scope"] = ({"group": p["scope_group"], "label": p.get("scope_label") or None,
+                        "siblings": []} if p.get("scope_group") else None)
     base["view"] = vm
     return _json(base)
 
@@ -1142,6 +1294,10 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     sel_txt = "; ".join(f"{o['label']} (${o['total']:,.2f})" for o in chosen)
     db.add_message(p["proposal_id"], "staff", None,
                    f"Approved by {name} — {sel_txt}. Total ${total:,.2f}.", msg_type="system")
+    # One scope of a multi-scope project: the other scopes stay open (RJ), and the estimator
+    # hears that they do. "" for every ungrouped proposal, which leaves the email below
+    # byte-for-byte what it was.
+    scope_note_html = _notice_scope_siblings(p)
 
     # Staff decided at send time whether this job collects a deposit. When it
     # doesn't, every mention of one has to go — promising an invoice that will
@@ -1197,6 +1353,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
            else "<p>No deposit required for this project — the customer has been asked for "
                 "their project contacts.</p>")
         + f"<p>Project: {html.escape(project_name)}.</p>"
+        + scope_note_html
         + staff_contract_html,
         kind="approved",
         reply_link=_staff_link(p["proposal_id"]), proposal_id=p["proposal_id"],
@@ -1252,6 +1409,49 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         log.error("approval automations failed: %s", exc)
     return _json({"ok": True})
+
+
+def _notice_scope_siblings(p: dict) -> str:
+    """After one scope of a group is approved: a card on every OTHER open scope, and a line for
+    the staff approval email. Returns that line, or "" when there is nothing to say.
+
+    RJ's decision: approving one scope closes nothing. The others keep their own status, their
+    own approve button and their own follow-ups -- nothing here writes to them except a thread
+    card -- and staff are told which ones are still waiting.
+
+    The card is `internal`: it is a note for the estimator opening that scope's drawer, not news
+    for the customer, who has just approved it themselves.
+
+    Best-effort and ADDITIVE. An ungrouped proposal returns before any read; a failed read costs
+    the cards and the line, never the approval that has already been recorded."""
+    group = p.get("scope_group")
+    if not group:
+        return ""
+    label = p.get("scope_label") or p.get("project_name") or "Another scope"
+    try:
+        open_sibs = [s for s in db.list_scope_group(group)
+                     if s.get("proposal_id") != p["proposal_id"]
+                     and (s.get("proposal_status") or "") in ("sent", "viewed")]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read scope group %s after approving %s: %s",
+                    group, p["proposal_id"], exc)
+        return ""
+    for s in open_sibs:
+        try:
+            db.add_message(s["proposal_id"], "staff", None,
+                           f"{label} was approved; this scope is still open.",
+                           msg_type="system",
+                           meta={"internal": True, "scope_group": group,
+                                 "approved_scope": p["proposal_id"]})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not post the scope notice on %s: %s", s.get("proposal_id"), exc)
+    if not open_sibs:
+        return (f"<p>This is the <strong>{html.escape(label)}</strong> scope. No other scope "
+                f"in this project is still open.</p>")
+    names = ", ".join(html.escape(s.get("scope_label") or s.get("project_name") or "a scope")
+                      for s in open_sibs)
+    return (f"<p>This is the <strong>{html.escape(label)}</strong> scope. These scopes are "
+            f"still open: <strong>{names}</strong>.</p>")
 
 
 # ── why a bid died, and whether it died at all ────────────────────────────────
@@ -2061,6 +2261,15 @@ async def api_notify(request: Request) -> JSONResponse:
     recipients = db.get_recipients(p["proposal_id"]) or ([primary] if primary else [])
     rt = email_sender.proposal_reply_to(p["token"])
     if kind == "published":
+        # A scope of a group is announced only by the combined send, same as admin_publish.
+        # Unreadable membership counts as grouped: sending nothing is the recoverable mistake.
+        try:
+            grouped = _active_scope_group(p)
+        except _GroupUnreadable as exc:
+            log.error("notify %s: scope group unreadable, sent nothing: %s", p["proposal_id"], exc)
+            grouped = p.get("scope_group")
+        if grouped:
+            return _json({"ok": True, "emailed": [], "awaiting_group_send": True})
         for e in recipients:
             email_sender.send_portal_link(e, p.get("customer_name") or "" if e == primary else "", link, project,
                                           reply_to=rt, token=p["token"])
@@ -2481,6 +2690,12 @@ async def admin_publish(request: Request) -> JSONResponse:
     data = db.get_draft_data(draft_id)
     if data is None:
         return _json({"ok": False, "error": "draft_not_found"}, 404)
+    # One scope of a multi-scope project? Read off the draft itself (the same blob everything
+    # else here comes from), so the tool needs no new request field. Checked before anything is
+    # written: a malformed group must not fall through to an ordinary, individually emailed send.
+    scope_group, scope_label, err = _scope_of(data)
+    if err:
+        return _json({"ok": False, "error": err}, 400)
 
     extras, err = _clean_emails(body.get("emails"))
     if err:
@@ -2583,6 +2798,11 @@ async def admin_publish(request: Request) -> JSONResponse:
         db.add_message(draft_id, "staff", None, "Your proposal is ready to review.",
                        msg_type="proposal_card",
                        meta={"revision_no": rev_no} if rev_no else None)
+
+    # Only when the draft carries a group. A legacy publish writes neither column, so whatever is
+    # stored stays exactly as it was.
+    if scope_group:
+        db.set_scope_group(draft_id, scope_group, scope_label)
 
     # On disk now that there is a proposal to scope them to, and recorded on the newest proposal
     # card so the customer can find them in the thread a week later rather than hunting an inbox.
@@ -2704,16 +2924,25 @@ async def admin_publish(request: Request) -> JSONResponse:
     # One send per recipient (keeps _thread_headers per-recipient; recipients
     # never see each other's addresses). Only the primary gets the name greeting.
     rt = email_sender.proposal_reply_to(token)
-    emailed = [e for e in send_list
-               if email_sender.send_portal_link(e, name if e == primary else "", link, project,
-                                                attachments=mail_atts or None,
-                                                 reply_to=rt, note=note, token=token,
-                                                 revised=revised)]
+    # A SCOPE OF A GROUP SENDS NOTHING HERE. The customer hears about every scope at once, in the
+    # one combined email (POST /api/admin/scope-group/{id}/send), and that send is also what
+    # stamps last_sent_at, starts the follow-up cadence and confirms to staff -- so all three are
+    # skipped below as well. Everything else about the publish (the row, the recipients, the
+    # proposal card, a revision reopening approval) is exactly the ordinary path.
+    if scope_group:
+        emailed = []
+    else:
+        emailed = [e for e in send_list
+                   if email_sender.send_portal_link(e, name if e == primary else "", link, project,
+                                                    attachments=mail_atts or None,
+                                                    reply_to=rt, note=note, token=token,
+                                                    revised=revised)]
 
     # When this publish happened, so a re-sent card shows the re-send date rather than the
     # original. Stamped even when nothing was delivered: somebody pressed send, and the card
     # showing that attempt is how they find out it needs doing again.
-    db.mark_last_sent(draft_id)
+    if not scope_group:
+        db.mark_last_sent(draft_id)
 
     # Enrol (or re-enrol) in follow-up automation. Stamped AFTER the emails go out so
     # the cadence clock starts from the send the customer actually received, and last
@@ -2736,6 +2965,9 @@ async def admin_publish(request: Request) -> JSONResponse:
             db.set_assigned_estimator(draft_id, assigned)   # assignment is not a send
         if emailed:
             db.enroll_followup(draft_id)
+        elif scope_group:
+            log.info("%s is a scope of group %s: enrolled by the combined send, not here",
+                     draft_id, scope_group)
         else:
             log.warning("not enrolling %s in follow-ups: the send reached nobody (%d attempted)",
                         draft_id, len(send_list))
@@ -2766,44 +2998,216 @@ async def admin_publish(request: Request) -> JSONResponse:
     # reciting it back to the roster copies customer contact details into a dozen staff inboxes to
     # support no decision anybody makes from the email. The alternative — keeping the list and only
     # shortening it ("to 2 recipients") — was rejected as still answering a question nobody asked.
-    try:
-        failed = [e for e in send_list if e not in emailed]
-        doc = ("Revision %d" % rev_no) if (rev_no and rev_no > 1) else "The proposal"
-        if not emailed:
-            heading = f"Proposal did NOT send — {project}"
-        elif failed:
-            heading = f"Proposal sent, with failures — {project}"
-        else:
-            heading = f"Proposal sent — {project}"
-        opener = (f"<p><strong>{html.escape(by)}</strong> sent {html.escape(doc.lower())} for "
-                  if by else f"<p>{html.escape(doc)} for ")
-        parts = [opener + f"<strong>{html.escape(project)}</strong>"]
-        if emailed:
-            parts.append(".</p>")
-        else:
-            parts.append(", and <strong>no email was delivered</strong>.</p>")
-        # THIS branch keeps the addresses, and a tidy-up that strips them for consistency with the
-        # line above breaks the email. Its whole purpose is "this one did not arrive, go fix it",
-        # and an address nobody can see is not an address anybody can correct and re-send to. The
-        # instruction above was scoped to the email that says it SENT.
-        if failed:
-            parts.append("<p><strong>Delivery failed for "
-                         + ", ".join(html.escape(e) for e in failed) + ".</strong> "
-                         + ("They have" if len(failed) > 1 else "That customer has")
-                         + " not received the proposal — open the project and send it again.</p>")
-        email_sender.notify_team(
-            heading, "".join(parts), kind="sent",
-            reply_link=_staff_link(draft_id), proposal_id=draft_id,
-            reply_to=rt, token=token, project=project,
-            assigned_estimator=assigned or (existing or {}).get("assigned_estimator"),
-        )
-    except Exception as exc:  # noqa: BLE001 — the proposal is sent; the confirmation is secondary
-        log.warning("send-confirmation email failed for %s: %s", draft_id, exc)
+    # A scope of a group is confirmed once, by the combined send, for every scope together.
+    if not scope_group:
+        try:
+            failed = [e for e in send_list if e not in emailed]
+            doc = ("Revision %d" % rev_no) if (rev_no and rev_no > 1) else "The proposal"
+            if not emailed:
+                heading = f"Proposal did NOT send — {project}"
+            elif failed:
+                heading = f"Proposal sent, with failures — {project}"
+            else:
+                heading = f"Proposal sent — {project}"
+            opener = (f"<p><strong>{html.escape(by)}</strong> sent {html.escape(doc.lower())} for "
+                      if by else f"<p>{html.escape(doc)} for ")
+            parts = [opener + f"<strong>{html.escape(project)}</strong>"]
+            if emailed:
+                parts.append(".</p>")
+            else:
+                parts.append(", and <strong>no email was delivered</strong>.</p>")
+            # THIS branch keeps the addresses, and a tidy-up that strips them for consistency with the
+            # line above breaks the email. Its whole purpose is "this one did not arrive, go fix it",
+            # and an address nobody can see is not an address anybody can correct and re-send to. The
+            # instruction above was scoped to the email that says it SENT.
+            if failed:
+                parts.append("<p><strong>Delivery failed for "
+                             + ", ".join(html.escape(e) for e in failed) + ".</strong> "
+                             + ("They have" if len(failed) > 1 else "That customer has")
+                             + " not received the proposal — open the project and send it again.</p>")
+            email_sender.notify_team(
+                heading, "".join(parts), kind="sent",
+                reply_link=_staff_link(draft_id), proposal_id=draft_id,
+                reply_to=rt, token=token, project=project,
+                assigned_estimator=assigned or (existing or {}).get("assigned_estimator"),
+            )
+        except Exception as exc:  # noqa: BLE001 — the proposal is sent; the confirmation is secondary
+            log.warning("send-confirmation email failed for %s: %s", draft_id, exc)
 
     return _json({"ok": True, "token": token, "url": link, "customer_email": primary,
                   "recipients": send_list, "emailed": emailed,
                   "revision_no": rev_no, "revised": revised,
-                  "assigned_estimator": assigned or None})
+                  "assigned_estimator": assigned or None,
+                  # For a scope of a group: nothing has been emailed yet, and the tool's next step
+                  # is the combined send once every scope is published.
+                  "scope_group": scope_group, "scope_label": scope_label,
+                  "awaiting_group_send": bool(scope_group)})
+
+
+@app.post("/api/admin/scope-group/{group_id}/send")
+async def admin_scope_group_send(group_id: str, request: Request) -> JSONResponse:
+    """Email the customer ONE message with a link to every scope of a multi-scope project.
+
+    RJ: three scopes are three proposals, but one email. Publishing a scope sends nothing (see
+    admin_publish); this is the send. Body, all optional:
+        {"by": "<who pressed send>", "message": "<personal note>", "resend": true}
+
+    ALL OR NOTHING ON READINESS. Every draft the proposal tool has put in the group must already
+    be published, or this refuses with 409 and names the missing drafts -- a customer who gets two
+    scopes now and the third in a separate email later has been sent the thing RJ asked us not to.
+
+    ONCE, UNLESS ASKED AGAIN. A second call is a 200 with `already_sent: true` and sends nothing,
+    so a double click or a retried request cannot mail the customer twice. `resend: true` is the
+    deliberate re-send, e.g. after a scope's revision, and is the only way a second email goes.
+    Claimed BEFORE sending and released only if the email reached nobody, the same at-most-once
+    bias as the follow-up worker.
+
+    PER CONTACT, EACH WITH ONLY THEIR SCOPES. One email per address (recipients never see each
+    other), listing only the scopes that address is on -- the same access rule the portal enforces
+    when they click. Closed-lost scopes are left out.
+
+    Recorded the way a publish is: last_sent_at and the follow-up cadence on each scope that
+    reached somebody, ONE staff confirmation for the whole group, and a staff-only card on each
+    scope's thread."""
+    if not _admin_ok(request):
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not _SCOPE_ID_RE.match(group_id or ""):
+        return _json({"ok": False, "error": "invalid_scope_group"}, 400)
+    body = await _body(request)
+    by = _cap(body.get("by"), 120) or None
+    note = _cap(body.get("message"), 2000) or None
+    resend = body.get("resend") is True
+
+    rows = db.list_scope_group(group_id)
+    expected = db.list_scope_group_drafts(group_id)
+    if not rows and not expected:
+        return _json({"ok": False, "error": "group_not_found"}, 404)
+    published = [r["proposal_id"] for r in rows]
+    missing = [d for d in expected if d not in published]
+    if missing or not rows:
+        return _json({"ok": False, "error": "scopes_not_published",
+                      "missing": missing, "published": published}, 409)
+    # THE DRAFTS DECIDE MEMBERSHIP. A portal row keeps its scope_group when a later publish carries
+    # none (that is the "legacy publish touches nothing" rule), so a scope split back out of the
+    # group in the tool can still be tagged here. It is reported, not emailed. With no live draft
+    # in the group at all there is nothing to compare against, and the portal's rows stand.
+    detached = [pid for pid in published if expected and pid not in expected]
+    live = [r for r in rows if r["proposal_id"] not in detached
+            and (r.get("proposal_status") or "") != "closed_lost"]
+    if not live:
+        return _json({"ok": False, "error": "nothing_to_send"}, 409)
+
+    lead = live[0]                                   # list_scope_group is in publish order
+    project = lead.get("project_name") or "your project"
+    primary = (lead.get("customer_email") or "").strip().lower()
+
+    def _label(r: dict) -> str:
+        return r.get("scope_label") or r.get("project_name") or "Proposal"
+
+    def _url(r: dict) -> str:
+        return f"{config.PUBLIC_BASE_URL}/p/{r['token']}"
+
+    # address -> the scopes that address is on, in publish order. get_recipients is the same list
+    # the portal's access check reads, with the primary as the fallback a publish uses.
+    per: dict[str, list[dict]] = {}
+    for r in live:
+        for e in (db.get_recipients(r["proposal_id"]) or [r.get("customer_email")]):
+            e = (e or "").strip().lower()
+            if e:
+                per.setdefault(e, []).append(r)
+    if not per:
+        return _json({"ok": False, "error": "no_contact_email"}, 400)
+
+    scopes_out = [{"proposal_id": r["proposal_id"], "label": _label(r), "token": r["token"],
+                   "url": _url(r), "status": r.get("proposal_status")} for r in live]
+    send_no = db.claim_scope_group_send(group_id, [r["proposal_id"] for r in live],
+                                        by=by, resend=resend)
+    if send_no is None:
+        return _json({"ok": True, "already_sent": True, "group_id": group_id,
+                      "scopes": scopes_out, "detached": detached, "emailed": []})
+
+    emailed: list[str] = []
+    for e, mine in per.items():
+        try:
+            ok = email_sender.send_scope_group_links(
+                e, (lead.get("customer_name") or "") if e == primary else "", project,
+                [{"label": _label(r), "url": _url(r),
+                  "approved": (r.get("proposal_status") or "") == "approved"} for r in mine],
+                # The first of THEIR scopes, so a reply from a contact on Lab 2 alone lands in
+                # Lab 2's thread rather than in one they cannot open.
+                reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
+                note=note, token=mine[0]["token"])
+        except Exception as exc:  # noqa: BLE001 — one bad address must not stop the others
+            log.warning("scope group %s: send to %s failed: %s", group_id, e, exc)
+            ok = False
+        if ok:
+            emailed.append(e)
+
+    reached = {r["proposal_id"] for e in emailed for r in per[e]}
+    if not emailed:
+        try:
+            db.release_scope_group_send(group_id, send_no)
+        except Exception as exc:  # noqa: BLE001
+            log.error("scope group %s: could not release send %s after a total failure: %s",
+                      group_id, send_no, exc)
+    for r in live:
+        pid = r["proposal_id"]
+        if pid not in reached:
+            continue
+        # Each step guarded on its own: the email is out, and bookkeeping must not undo that.
+        try:
+            db.mark_last_sent(pid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("scope group %s: last_sent on %s failed: %s", group_id, pid, exc)
+        if (r.get("proposal_status") or "") in ("sent", "viewed"):
+            try:
+                db.enroll_followup(pid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("scope group %s: could not enrol %s: %s", group_id, pid, exc)
+        others = [_label(o) for o in live if o["proposal_id"] != pid]
+        try:
+            db.add_message(pid, "staff", None,
+                           ("Sent to the customer together with %s." % ", ".join(others))
+                           if others else "Sent to the customer.",
+                           msg_type="system",
+                           meta={"internal": True, "scope_group": group_id, "send_no": send_no})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("scope group %s: could not post the sent card on %s: %s",
+                        group_id, pid, exc)
+
+    # ONE confirmation for the group. Same rules as a publish's: names nobody when it worked,
+    # names every address that bounced when it did not.
+    try:
+        failed = [e for e in per if e not in emailed]
+        names = ", ".join(html.escape(_label(r)) for r in live)
+        if not emailed:
+            heading = f"Proposals did NOT send — {project}"
+        elif failed:
+            heading = f"Proposals sent, with failures — {project}"
+        else:
+            heading = f"Proposals sent — {project}"
+        opener = (f"<p><strong>{html.escape(by)}</strong> sent " if by else "<p>We sent ")
+        parts = [opener + f"the {len(live)} scope{'s' if len(live) != 1 else ''} of "
+                 f"<strong>{html.escape(project)}</strong> in one email: {names}"]
+        parts.append(".</p>" if emailed else ", and <strong>no email was delivered</strong>.</p>")
+        if failed:
+            parts.append("<p><strong>Delivery failed for "
+                         + ", ".join(html.escape(e) for e in failed) + ".</strong> "
+                         + ("They have" if len(failed) > 1 else "That customer has")
+                         + " not received these proposals — send them again.</p>")
+        email_sender.notify_team(
+            heading, "".join(parts), kind="sent",
+            reply_link=_staff_link(lead["proposal_id"]), proposal_id=lead["proposal_id"],
+            reply_to=email_sender.proposal_reply_to(lead["token"]), token=lead["token"],
+            project=project, assigned_estimator=lead.get("assigned_estimator"),
+        )
+    except Exception as exc:  # noqa: BLE001 — the emails are out; the confirmation is secondary
+        log.warning("scope group %s: send confirmation failed: %s", group_id, exc)
+
+    return _json({"ok": True, "already_sent": False, "group_id": group_id,
+                  "send_no": send_no if emailed else None, "resend": resend,
+                  "scopes": scopes_out, "detached": detached,
+                  "recipients": list(per), "emailed": emailed})
 
 
 @app.get("/api/admin/pipeline")
@@ -2838,6 +3242,14 @@ def admin_pipeline(request: Request) -> JSONResponse:
             "proposal_id": r["proposal_id"], "token": r["token"],
             "customer_email": r["customer_email"], "customer_name": r.get("customer_name"),
             "project_name": r.get("project_name"), "proposal_status": r["proposal_status"],
+            # One scope of a multi-scope project, and its name. The board groups on the id; both
+            # are null for every ungrouped proposal.
+            "scope_group": r.get("scope_group") or None,
+            "scope_label": (r.get("scope_label") or None) if r.get("scope_group") else None,
+            # Published but not yet in a combined email: the row reads 'sent' and sent_at falls
+            # back to created_at, so without this the board would show a scope the customer has
+            # never been told about as sent. Only the combined send stamps last_sent_at on a scope.
+            "scope_send_pending": bool(r.get("scope_group")) and not r.get("last_sent_at"),
             "deposit_status": r["deposit_status"], "schedule_status": r["schedule_status"],
             "contacts_status": r.get("contacts_status") or "pending",
             "approved_total": float(r["approved_total"]) if r.get("approved_total") is not None else None,
@@ -3044,6 +3456,8 @@ def admin_proposal(proposal_id: str, request: Request) -> JSONResponse:
             "url": f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
             "customer_email": p["customer_email"], "customer_name": p.get("customer_name"),
             "project_name": p.get("project_name"), "proposal_status": p["proposal_status"],
+            "scope_group": p.get("scope_group") or None,
+            "scope_label": (p.get("scope_label") or None) if p.get("scope_group") else None,
             "deposit_status": p["deposit_status"], "schedule_status": p["schedule_status"],
             "contacts_status": p.get("contacts_status") or "pending",
             "approved_total": float(p["approved_total"]) if p.get("approved_total") is not None else None,
@@ -4386,29 +4800,52 @@ async def admin_followup_recipient(proposal_id: str, request: Request) -> JSONRe
     by = _cap(body.get("by"), 120) or None
 
     existing = [e.strip().lower() for e in (db.get_recipients(proposal_id) or [])]
+    awaiting_group_send = False
     if add and email not in existing:
         if len(existing) >= MAX_RECIPIENTS:
             return _json({"ok": False, "error": "too_many_recipients"}, 400)
         db.add_recipient(proposal_id, email, by)
-        # They cannot reach the portal without the link, so adding somebody and not sending it
-        # would put a contact on the list who can never open the thing they are a contact for.
+        # A SCOPE OF A GROUP NEVER SENDS THE ONE-SCOPE EMAIL. Before the combined send, nothing
+        # goes: that send reads this recipients list, so the new contact is in it. After it, the
+        # contact gets the group's email for the scopes they are on. Unreadable membership sends
+        # nothing at all rather than falling through to the single-scope link below.
         try:
-            # WITH THE FILES THE OTHERS GOT. The same omission as the reply path, wearing a
-            # different hat: without this, a contact added after the send is the only recipient
-            # who has to ask what the photo was.
-            email_sender.send_portal_link(
-                email, "", f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
-                p.get("project_name") or "your project",
-                reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"],
-                attachments=_proposal_card_files(proposal_id) or None)
-        except Exception as exc:  # noqa: BLE001 — they are on the list; the link can be re-sent
-            log.error("could not send the portal link to a newly added contact: %s", exc)
+            group = _active_scope_group(p)
+        except _GroupUnreadable as exc:
+            log.error("followup-recipient %s: scope group unreadable, sent nothing: %s",
+                      proposal_id, exc)
+            group, awaiting_group_send = p.get("scope_group"), True
+        if group and not awaiting_group_send:
+            if not p.get("last_sent_at"):
+                awaiting_group_send = True
+            else:
+                try:
+                    _send_scope_links_to_contact(p, group, email)
+                except Exception as exc:  # noqa: BLE001 — they are on the list; resend covers it
+                    log.error("could not send the scope links to a newly added contact: %s", exc)
+        elif not group:
+            # They cannot reach the portal without the link, so adding somebody and not sending it
+            # would put a contact on the list who can never open the thing they are a contact for.
+            try:
+                # WITH THE FILES THE OTHERS GOT. The same omission as the reply path, wearing a
+                # different hat: without this, a contact added after the send is the only recipient
+                # who has to ask what the photo was.
+                email_sender.send_portal_link(
+                    email, "", f"{config.PUBLIC_BASE_URL}/p/{p['token']}",
+                    p.get("project_name") or "your project",
+                    reply_to=email_sender.proposal_reply_to(p["token"]), token=p["token"],
+                    attachments=_proposal_card_files(proposal_id) or None)
+            except Exception as exc:  # noqa: BLE001 — they are on the list; the link can be re-sent
+                log.error("could not send the portal link to a newly added contact: %s", exc)
     elif email not in existing:
         return _json({"ok": False, "error": "not_a_recipient"}, 404)
 
     if not db.set_followup_recipient(proposal_id, email, enabled):
         return _json({"ok": False, "error": "not_a_recipient"}, 404)
-    return _json({"ok": True, "email": email, "followups": enabled})
+    out = {"ok": True, "email": email, "followups": enabled}
+    if awaiting_group_send:
+        out["awaiting_group_send"] = True
+    return _json(out)
 
 
 @app.get("/api/admin/signed-contract.pdf")

@@ -289,6 +289,96 @@ def update_portal_proposal(proposal_id, customer_email, customer_name, project_n
     )
 
 
+def set_scope_group(proposal_id: str, group_id: str, label: Optional[str]) -> None:
+    """Link this proposal to its scope group (see the scope-group block at the end of schema.sql).
+
+    Only ever called when the draft CARRIES a scope_group, so a legacy publish never reaches it and
+    the columns of an ungrouped row are never written, not even with NULL. Named directly rather
+    than through to_jsonb: a write to a column that is not there must fail loudly, because a scope
+    that silently failed to join its group would be emailed nowhere at all."""
+    execute("update public.portal_proposals set scope_group=%s, scope_label=%s, updated_at=now() "
+            "where proposal_id=%s", (group_id, label or None, proposal_id))
+
+
+def list_scope_group(group_id: str) -> list[dict[str, Any]]:
+    """Every live (not deleted) proposal in one scope group, in the order they were published.
+
+    STAFF / SERVER USE ONLY. This is the whole group regardless of who each scope was sent to, so
+    it must never be what a customer's sibling list is built from -- that list comes from
+    list_proposals_by_email, which applies the customer's own primary-OR-recipient scoping."""
+    return qall(
+        "select * from public.portal_proposals "
+        "where scope_group = %s and (to_jsonb(portal_proposals) ->> 'deleted_at') is null "
+        "order by created_at, proposal_id",
+        (group_id,),
+    )
+
+
+def list_scope_group_drafts(group_id: str) -> list[str]:
+    """The draft ids the PROPOSAL TOOL says belong to a group, published or not.
+
+    The combined send compares this with list_scope_group to refuse a partial send: a scope that
+    has been split off in the tool but not yet published has no portal row, so only the drafts
+    table knows it exists. A trashed draft is not expected."""
+    return [r["id"] for r in qall(
+        "select id from public.drafts "
+        "where deleted_at is null and data -> 'scope_group' ->> 'id' = %s order by id",
+        (group_id,),
+    )]
+
+
+_SCOPE_SENT = "scope_group_sent"
+
+
+def claim_scope_group_send(group_id: str, proposal_ids: list[str], by: Optional[str] = None,
+                           resend: bool = False) -> Optional[int]:
+    """Claim the right to send the combined "all your scopes" email. Returns the send number
+    (1 for the first send, 2 for the first resend, ...) or None when it has already gone out and
+    this is not an explicit resend.
+
+    RESERVE FIRST, SEND SECOND, exactly as the follow-up worker does: a crash between the two costs
+    one email the caller can resend, while sending first could mail the customer twice.
+
+    The record is a `staff_note` row with `detail.action = 'scope_group_sent'` on EVERY scope, so
+    each scope's follow-up history says when it went out (a row with an `action` is bookkeeping and
+    is not counted as an estimator's outreach). Kept as rows rather than a column: no DDL.
+
+    TWO SIMULTANEOUS CALLS CANNOT BOTH WIN. The scope rows are locked `for update` in a fixed order
+    before the check, so a second caller blocks until the first commits and then reads its rows
+    (READ COMMITTED takes a fresh snapshot per statement)."""
+    ids = sorted({p for p in proposal_ids if p})
+    if not ids:
+        return None
+    with pool().connection() as conn:
+        conn.execute("select proposal_id from public.portal_proposals "
+                     "where proposal_id = any(%s) order by proposal_id for update", (ids,))
+        row = conn.execute(
+            "select coalesce(max((detail ->> 'send_no')::int), 0) as n "
+            "from public.portal_followups "
+            "where proposal_id = any(%s) and kind = 'staff_note' "
+            "  and detail ->> 'action' = %s and detail ->> 'scope_group' = %s",
+            (ids, _SCOPE_SENT, group_id)).fetchone()
+        n = int((row or {}).get("n") or 0)
+        if n and not resend:
+            return None
+        n += 1
+        for pid in ids:
+            conn.execute(
+                "insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+                "values (%s, 'staff_note', %s, %s)",
+                (pid, Jsonb({"action": _SCOPE_SENT, "scope_group": group_id, "send_no": n,
+                             "scopes": ids}), by))
+    return n
+
+
+def release_scope_group_send(group_id: str, send_no: int) -> None:
+    """Undo a claim whose send reached nobody, so the next call can try again."""
+    execute("delete from public.portal_followups "
+            "where kind = 'staff_note' and detail ->> 'action' = %s "
+            "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s",
+            (_SCOPE_SENT, group_id, int(send_no)))
+
+
 def list_all_portal_proposals() -> list[dict[str, Any]]:
     """Every proposal for the staff CRM board, with its estimator and milestones.
 
@@ -330,6 +420,10 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "(to_jsonb(p) ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
         # When THIS send went out, for the same to_jsonb reason as the click columns above.
         "(to_jsonb(p) ->> 'last_sent_at')::timestamptz as last_sent_at, "
+        # Which scope group this proposal belongs to, and its scope's name. to_jsonb for the
+        # same reason: prod gets the code before the ALTER, and NULL just means "ungrouped".
+        "(to_jsonb(p) ->> 'scope_group') as scope_group, "
+        "(to_jsonb(p) ->> 'scope_label') as scope_label, "
         # Follow-up automation state.
         "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
         "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "

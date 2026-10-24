@@ -697,6 +697,20 @@ input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var
 .proj-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 4px; border-top: 1px solid var(--surface-highest); text-decoration: none; color: var(--fg); }
 .proj-row:hover { background: var(--surface-low); }
 .proj-row .pname { font-weight: 700; }
+/* Scopes of one multi-scope project sit together in the list; indent the run so it reads as one
+   project with several proposals rather than several unrelated projects. */
+.proj-row.is-scope { padding-left: 14px; }
+
+/* The other scopes of a multi-scope project, under the proposal heading. */
+.scope-strip { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--surface-highest); }
+.scope-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.scope-chip {
+  display: inline-block; padding: 6px 12px; border-radius: 999px; font-size: .85rem; font-weight: 700;
+  border: 1px solid var(--outline); color: var(--fg); text-decoration: none; background: var(--surface-low);
+}
+a.scope-chip:hover { border-color: var(--primary); color: var(--primary); }
+.scope-chip.is-current { background: var(--primary-tint); color: var(--primary); border-color: var(--primary); }
+.scope-chip.is-done { color: var(--success); }
 
 .hidden { display: none !important; }
 
