@@ -3791,6 +3791,12 @@ def _apply_group_schedules(rows: list, out: list, followup_cfg: dict) -> None:
                 # pending (a second press would mail them twice); the send's `resend_unknown`
                 # is a person's call to send them again.
                 "unknown_scope_ids": list(s["plan"].get("unknown") or []),
+                # Fix round #22: what each pending scope IS to the customer, from the same plan the
+                # combined email is written from -- 'revised' when they have had an earlier version,
+                # 'new' otherwise (a first send's scopes are all new to them). The tool's "Email
+                # again: N new, M revised" reads this; the board rows carry no last_sent_at.
+                "kinds": {pid: ("revised" if k == "revised" else "new")
+                          for pid, k in (s["plan"].get("kinds") or {}).items()},
             }
         g = groups.get(r.get("scope_group") or "")
         if not g or r["proposal_id"] not in g["ids"] or not followup_rules.is_open(r):

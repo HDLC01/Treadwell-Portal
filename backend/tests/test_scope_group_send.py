@@ -589,7 +589,7 @@ def test_the_pipeline_exposes_scope_send_state(monkeypatch):
     out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
     assert out["d-break"]["scope_send_state"] == {
         "announced": True, "pending_scope_ids": ["d-lab1"], "not_included": ["d-lab2"],
-        "unknown_scope_ids": []}
+        "unknown_scope_ids": [], "kinds": {"d-lab1": "revised"}}
     # Lab 1 went out at revision 1 and is now at 2: not announced, and pending.
     assert out["d-lab1"]["scope_send_state"]["announced"] is False
     assert "scope_send_state" not in out["d-solo"], "an ungrouped row changed shape"
@@ -619,7 +619,45 @@ def test_the_board_names_a_send_whose_result_was_lost(monkeypatch):
     out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
     assert out["d-break"]["scope_send_state"] == {
         "announced": False, "pending_scope_ids": [], "not_included": [],
-        "unknown_scope_ids": ["d-break", "d-lab1"]}
+        "unknown_scope_ids": ["d-break", "d-lab1"], "kinds": {}}
+
+
+def test_the_send_state_names_each_pending_scope_new_or_revised(monkeypatch):
+    """#22: the tool's "Email again: 1 new, 1 revised" comes from the portal's own plan. Before
+    this it read last_sent_at, which no board row carries, so every pending scope read as new."""
+    rows = [_row("d-break", "Breakroom", last_sent_at=T0),
+            _row("d-lab1", "Lab 1", current_revision_no=2, last_sent_at=T0,
+                 created_at=T0 + timedelta(seconds=1)),
+            _row("d-lab2", "Lab 2", created_at=T0 + timedelta(seconds=2))]
+    marks = [{"id": i, "proposal_id": p, "created_at": T0,
+              "detail": {"action": "scope_group_sent", "scope_group": GID, "send_no": 1,
+                         "revision_no": 1, "kind": "first",
+                         "delivery": {"delivered": ["cust@acme.com"], "failed": []}}}
+             for i, p in enumerate(("d-break", "d-lab1"), 1)]
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "get_settings", lambda key: None)
+    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states",
+                        lambda gid: [_st("d-break"), _st("d-lab1"), _st("d-lab2")])
+    monkeypatch.setattr(main.db, "scope_group_resumed_at", lambda gid: None)
+    got = {"marks": marks}
+    monkeypatch.setattr(main.db, "list_scope_group_marks", lambda gids: got["marks"])
+    for r in rows:
+        r.setdefault("deposit_status", "pending")
+        r.setdefault("schedule_status", "pending")
+
+    def state():
+        out = client.get("/api/admin/pipeline").json()["proposals"]
+        return {r["proposal_id"]: r for r in out}["d-break"]["scope_send_state"]
+    s = state()
+    assert s["pending_scope_ids"] == ["d-lab1", "d-lab2"]
+    assert s["kinds"] == {"d-lab1": "revised", "d-lab2": "new"}
+    # Nothing has gone yet: the first send's scopes are all new to the customer.
+    for r in rows:
+        r.pop("last_sent_at", None)
+    got["marks"] = []
+    assert state()["kinds"] == {"d-break": "new", "d-lab1": "new", "d-lab2": "new"}
 
 
 # ══ 8. publish safety on a database without the DDL ══════════════════════════
