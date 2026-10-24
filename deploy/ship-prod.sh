@@ -12,8 +12,16 @@
 # Prereqs: local Docker engine running; a `Host treadwell-vps` entry in your SSH config
 #          (the address, login, port and key live there, not in this public repo); the
 #          VPS already has $APP_DIR/.env in place.
-# Usage:   bash deploy/ship-prod.sh
+# Usage:   bash deploy/ship-prod.sh [--allow-not-main] [--allow-missing-ddl]
 #          VPS_HOST, VPS_USER and SSH_KEY still override it (another box, another key).
+#
+# Refuses to build unless the tree is clean AND HEAD is origin/main (--allow-not-main overrides
+# the second, loudly). The image is tagged with its commit; the previous image is kept on the box
+# as treadwell-portal:pre-<sha>-<date>. After the restart it checks /healthz, the container log
+# ('startup ok' and the follow-up worker line) and GET /api/admin/capabilities (asked from inside
+# the container, so the service token never leaves it). A failed check exits non-zero and prints
+# the rollback command. --allow-missing-ddl downgrades "a DDL block is missing" to a warning.
+# See deploy/ship-checks.sh.
 set -euo pipefail
 
 VPS_HOST="${VPS_HOST:-treadwell-vps}"
@@ -29,27 +37,56 @@ if [ -n "$SSH_KEY" ]; then SSH+=(-i "$SSH_KEY"); SCP+=(-i "$SSH_KEY"); fi
 SSH+=("$TARGET")
 
 cd "$(dirname "$0")/.."
+# shellcheck source=deploy/ship-checks.sh
+. deploy/ship-checks.sh
 
-echo "==> Building $IMAGE locally (off the prod box)…"
-docker build --platform linux/amd64 -t "$IMAGE" .
+ALLOW_NOT_MAIN=0
+ALLOW_MISSING_DDL=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-not-main) ALLOW_NOT_MAIN=1 ;;
+    --allow-missing-ddl) ALLOW_MISSING_DDL=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+CONTAINER="treadwell-portal"
+
+echo "==> Checking the tree…"
+refuse_unless_clean
+refuse_unless_origin_main "$ALLOW_NOT_MAIN"
+SHA="$(git rev-parse --short=12 HEAD)"
+FULL_SHA="$(git rev-parse HEAD)"
+SHA_TAG="${IMAGE%:*}:$SHA"
+PREV_TAG="${IMAGE%:*}:pre-$SHA-$(date -u +%Y%m%dT%H%M)"
+
+echo "==> Building $IMAGE ($SHA) locally (off the prod box)…"
+docker build --platform linux/amd64 --label "org.opencontainers.image.revision=$FULL_SHA"   -t "$IMAGE" -t "$SHA_TAG" .
 
 echo "==> Shipping image + compose over SSH…"
-docker save "$IMAGE" | gzip | "${SSH[@]}" "cat > /tmp/portal-prod.tar.gz"
+docker save "$IMAGE" "$SHA_TAG" | gzip | "${SSH[@]}" "cat > /tmp/portal-prod.tar.gz"
 "${SCP[@]}" "$COMPOSE" "$TARGET:$APP_DIR/$COMPOSE.new"
 
+ROLLBACK="${SSH[*]} 'cd $APP_DIR && cp -f $COMPOSE.bak $COMPOSE && docker tag $PREV_TAG $IMAGE && docker compose -f $COMPOSE up -d'"
 echo "==> Load + restart on the VPS (NO build)…"
-"${SSH[@]}" "set -euo pipefail
+if ! "${SSH[@]}" "set -euo pipefail
   cd $APP_DIR
   if [ ! -f .env ]; then echo '   ERROR: $APP_DIR/.env is missing — create it first'; exit 1; fi
   cp -f $COMPOSE $COMPOSE.bak 2>/dev/null || true
   mv -f $COMPOSE.new $COMPOSE
+  if docker image inspect $IMAGE >/dev/null 2>&1; then
+    docker tag $IMAGE $PREV_TAG
+    echo '   previous image kept as $PREV_TAG'
+  else
+    echo '   no previous image to keep'
+  fi
   gunzip -c /tmp/portal-prod.tar.gz | docker load
   rm -f /tmp/portal-prod.tar.gz
   docker compose -f $COMPOSE up -d
-  for i in \$(seq 1 24); do
-    if curl -fsS http://localhost:8898/healthz >/dev/null; then echo '   portal-prod healthy'; exit 0; fi
-    sleep 5
-  done
-  echo '   post-deploy healthcheck failed'; exit 1
-"
-echo "==> Done — portal.wetreadwell.com is on the freshly-shipped image."
+$(post_check_script "$CONTAINER" 8898 "$ALLOW_MISSING_DDL")
+"; then
+  echo "==> POST-DEPLOY CHECK FAILED on $SHA. To roll back to the previous image:" >&2
+  echo "    $ROLLBACK" >&2
+  exit 1
+fi
+echo "==> Done — portal.wetreadwell.com is on $SHA. Rollback, if ever needed:"
+echo "    $ROLLBACK"
