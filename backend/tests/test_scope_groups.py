@@ -555,6 +555,14 @@ def approve(monkeypatch, tmp_path):
         return [dict(r) for r in state["group"]]
 
     monkeypatch.setattr(main.db, "list_scope_group", _group, raising=False)
+    # The decision task approving a scope now raises (test_group_followups.py covers it). Stubbed
+    # here so these tests stay about the cards and the email, without a database.
+    calls["decision_tasks"] = []
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states", lambda gid: [], raising=False)
+    monkeypatch.setattr(main.db, "list_open_group_tasks", lambda gid: [], raising=False)
+    monkeypatch.setattr(main.db, "reserve_followup_task",
+                        lambda pid, key, detail: calls["decision_tasks"].append(
+                            (pid, key, detail)) or 1)
 
     def go():
         return client.post("/api/portal/tok-d-lab1/approve",
@@ -567,11 +575,14 @@ def test_approving_one_scope_posts_a_card_on_each_other_open_scope(approve):
     go, calls, _ = approve
     r = go()
     assert r.status_code == 200, r.text
-    notes = [m for m in calls["messages"] if "still open" in m["body"]]
+    # Reworded 2026-10-24 (decision 2): approving one scope STOPS the chase on the others until
+    # somebody decides, so the card says so instead of "this scope is still open".
+    notes = [m for m in calls["messages"] if "reminders for this scope have stopped" in m["body"]]
     assert sorted(m["pid"] for m in notes) == ["d-break", "d-lab2"], (
         "only the OTHER scopes that are still open get the card")
     for m in notes:
-        assert m["body"] == "Lab 1 was approved; this scope is still open."
+        assert m["body"] == ("Lab 1 was approved; follow-up reminders for this scope have "
+                             "stopped until somebody decides what to do with it.")
         assert m["type"] == "system" and m["meta"]["internal"] is True
 
 
@@ -584,9 +595,9 @@ def test_approving_one_scope_never_touches_the_others_status(approve):
 def test_the_staff_approval_email_says_which_scopes_are_still_open(approve):
     go, calls, _ = approve
     go()
-    body = calls["team"][0]["body"]
+    body = calls["team"][-1]["body"]
     assert "Lab 1" in body and "Breakroom" in body and "Lab 2" in body
-    assert "still open" in body
+    assert "reminders have stopped" in body and "Nothing has been closed" in body
 
 
 def test_an_ungrouped_approval_is_unchanged(approve):
@@ -594,8 +605,10 @@ def test_an_ungrouped_approval_is_unchanged(approve):
     state["proposal"] = dict(state["proposal"], scope_group=None, scope_label=None)
     go()
     assert calls["scope_reads"] == [], "an ungrouped approval read a scope group"
-    assert not any("still open" in m["body"] for m in calls["messages"])
+    assert not any("still open" in m["body"] or "have stopped" in m["body"]
+                   for m in calls["messages"])
     assert "still open" not in calls["team"][0]["body"]
+    assert "have stopped" not in calls["team"][0]["body"]
 
 
 def test_a_failing_group_read_never_fails_the_approval(approve, monkeypatch):
