@@ -453,3 +453,108 @@ def test_the_capability_route(monkeypatch):
     # Code without the DDL is not ready for grouped publishes, and says so.
     monkeypatch.setattr(main.db, "scope_group_columns_ready", lambda: False)
     assert client.get("/api/admin/capabilities").json()["scope_groups"] is False
+
+
+# ══ 10. the scope's name where money changes hands ═══════════════════════════
+SCOPED = {"proposal_id": "d-lab1", "project_name": "Acme HQ", "scope_group": GID,
+          "scope_label": "Lab 1", "customer_name": "Dana", "approved_total": 10000}
+PLAIN = {"proposal_id": "d-solo", "project_name": "Warehouse", "scope_group": None,
+         "scope_label": None, "customer_name": "Dana", "approved_total": 10000}
+
+
+def test_display_project_name():
+    assert scope_groups.display_project_name(SCOPED) == "Acme HQ - Lab 1"
+    assert scope_groups.display_project_name(PLAIN) == "Warehouse"
+    # A stale label without a group is an ordinary proposal.
+    assert scope_groups.display_project_name(dict(PLAIN, scope_label="Lab 9")) == "Warehouse"
+
+
+def test_the_contract_sentence_and_file_name_name_the_scope():
+    import signing
+    name = signing.signing_project_name(SCOPED, {"project_name": "Acme HQ"})
+    assert name == "Acme HQ - Lab 1"
+    assert "Acme HQ - Lab 1" in signing.consent_text(name)
+    assert signing.contract_filename(name) == "Acme HQ - Lab 1 - Signed Contract.pdf"
+    assert signing.signing_project_name(PLAIN, {"project_name": "Warehouse"}) == "Warehouse"
+
+
+def test_the_invoice_job_name_names_the_scope():
+    import invoice
+    assert invoice.invoice_payload(SCOPED, 2500.0)["job_name"] == "Acme HQ - Lab 1"
+    assert invoice.invoice_payload(PLAIN, 2500.0)["job_name"] == "Warehouse"
+
+
+def test_the_customer_page_carries_the_payment_reference(monkeypatch):
+    row = dict(SCOPED, token="tok-d-lab1", customer_email="cust@acme.com",
+               proposal_status="approved", deposit_status="pending", schedule_status="pending")
+    monkeypatch.setattr(main, "_session_email", lambda request: "cust@acme.com")
+    monkeypatch.setattr(main.db, "get_proposal_by_token", lambda tok: dict(row))
+    monkeypatch.setattr(main.db, "list_proposals_by_email", lambda e: [dict(row)])
+    monkeypatch.setattr(main.db, "get_pinned_draft_data", lambda p: {})
+    monkeypatch.setattr(main.proposals, "build_view_model",
+                        lambda p, data: {"project_name": p.get("project_name"),
+                                         "status": {"proposal": p.get("proposal_status")}})
+    for name in ("list_questions", "list_contacts", "list_deposits"):
+        monkeypatch.setattr(main.db, name, lambda pid: [])
+    monkeypatch.setattr(main.db, "list_messages", lambda pid, *a, **k: [])
+    vm = client.get("/api/portal/tok-d-lab1").json()["view"]
+    assert vm["payment_reference"] == "Acme HQ - Lab 1"
+
+
+def test_the_deposit_step_shows_the_scope_reference():
+    """Executed through the real app.js setupDeposit (tests/js/deposit-reference-harness.js)."""
+    import json
+    import pathlib
+    import shutil
+    import subprocess
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    here = pathlib.Path(__file__).resolve()
+    proc = subprocess.run(["node", str(here.parent / "js" / "deposit-reference-harness.js"),
+                           str(here.parents[2] / "frontend")],
+                          capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["scoped"]["check"] == "Acme HQ - Lab 1"
+    assert out["scoped"]["line"].endswith("Reference: Acme HQ - Lab 1")
+    assert out["plain"]["check"] == "Warehouse"
+    assert out["older"]["check"] == "Old portal payload"
+
+
+def test_the_approval_emails_name_the_scope(monkeypatch, tmp_path):
+    calls = {"team": [], "customer": []}
+    p = _row("d-lab1", "Lab 1", proposal_status="viewed", approved_at=None,
+             current_revision_no=None, deposit_required=True)
+    monkeypatch.setattr(main.config, "UPLOAD_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(main, "_require", lambda request, token: dict(p))
+    monkeypatch.setattr(main, "_session_email", lambda request: "cust@acme.com")
+    monkeypatch.setattr(main.db, "get_pinned_draft_data",
+                        lambda p: {"project_name": "Acme HQ", "work_type": "epoxy",
+                                   "proposal_lump_sum": 10000.0})
+    monkeypatch.setattr(main.signing, "signing_block",
+                        lambda p, data: {"required": False, "blocked_reason": None})
+    monkeypatch.setattr(main.db, "add_approval", lambda *a, **k: 1)
+    monkeypatch.setattr(main.db, "set_approved", lambda *a, **k: None)
+    monkeypatch.setattr(main.db, "add_message", lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(main.db, "get_recipients", lambda pid: ["cust@acme.com"])
+    monkeypatch.setattr(main.email_sender, "proposal_reply_to", lambda t: None)
+    monkeypatch.setattr(main.email_sender, "notify_team",
+                        lambda subject, body, **k: calls["team"].append((subject, body, k)))
+    monkeypatch.setattr(main, "_notify_customer",
+                        lambda p, heading, body, **k: calls["customer"].append((body, k)))
+    monkeypatch.setattr(main, "_notice_scope_siblings", lambda p: "")
+    monkeypatch.setattr(main, "_raise_scope_decision", lambda p: None)
+    seen = {}
+    monkeypatch.setattr(main.automations, "run_on_approval",
+                        lambda p, project: seen.update(project=project))
+    r = client.post("/api/portal/tok-d-lab1/approve", json={"name": "Dana Reed"})
+    assert r.status_code == 200, r.text
+    subject, body, k = calls["team"][-1]
+    assert subject == "Proposal APPROVED — Acme HQ - Lab 1"
+    assert "Project: Acme HQ - Lab 1." in body
+    assert k["project"] == "Acme HQ", "the staff thread key moved off the project"
+    cbody, ck = calls["customer"][-1]
+    assert "approval of <strong>Acme HQ - Lab 1</strong>" in cbody
+    assert "approved <strong>Acme HQ - Lab 1</strong>" in ck["peer_body_html"]
+    # The approval automations (Dropbox folder, deposit request) keep the project's own name.
+    assert seen["project"] == "Acme HQ"

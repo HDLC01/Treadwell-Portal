@@ -1358,8 +1358,10 @@ function startPolling() {
 function setupDeposit() {
   const dep = (STATE && STATE.deposit) || {};
   const due = dep.due != null ? money(dep.due) : null;
-  // Customer-facing reference = the project name (the internal TW-… ref is staff-only).
-  const ref = (STATE && STATE.project_name) || "";
+  // Customer-facing reference = the project name (the internal TW-… ref is staff-only). For one
+  // scope of a multi-scope project the server names the scope too ("Acme HQ - Lab 1"): three
+  // deposits for one project otherwise carry one reference for three amounts.
+  const ref = (STATE && (STATE.payment_reference || STATE.project_name)) || "";
   $("deposit-due-line").textContent = due
     ? `Deposit due: ${due} (25% of your total). Reference: ${ref}`
     : (ref ? `Reference: ${ref}` : "");

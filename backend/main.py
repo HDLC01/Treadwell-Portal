@@ -842,6 +842,11 @@ def api_get_portal(token: str, request: Request) -> JSONResponse:
         log.warning("scope siblings unavailable for %s: %s", p["proposal_id"], exc)
         vm["scope"] = ({"group": p["scope_group"], "label": p.get("scope_label") or None,
                         "siblings": []} if p.get("scope_group") else None)
+    # What the customer writes on a cheque or a transfer for THIS proposal's deposit: the project
+    # name, plus the scope for one scope of a multi-scope project ("Acme HQ - Lab 1", finding #21).
+    # The same helper names the invoice, the contract and the approval emails.
+    vm["payment_reference"] = scope_groups.display_project_name(
+        p, vm.get("project_name") or p.get("project_name"))
     base["view"] = vm
     return _json(base)
 
@@ -1298,6 +1303,10 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
                     options=label_list, deposit_amount=deposit)
 
     project_name = p.get("project_name") or "proposal"
+    # "Acme HQ - Lab 1" for one scope of a multi-scope project, in every approval email (finding
+    # #21): three approvals of one project must say which scope each one is. project_name itself
+    # stays the project's, for the staff thread key and the approval automations.
+    shown_name = scope_groups.display_project_name(p) or project_name
     # A system line in the chat thread records the approval for both sides.
     sel_txt = "; ".join(f"{o['label']} (${o['total']:,.2f})" for o in chosen)
     db.add_message(p["proposal_id"], "staff", None,
@@ -1355,14 +1364,14 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
 
     deposit_due = p.get("deposit_required") is not False
     email_sender.notify_team(
-        f"Proposal APPROVED — {project_name}",
+        f"Proposal APPROVED — {shown_name}",
         f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''} approved "
         f"<strong>{html.escape(option_summary)}</strong> at <strong>${total:,.2f}</strong> on {approved_date}"
         f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}.</p>"
         + (f"<p>Auto-calculated deposit (25%): <strong>${deposit:,.2f}</strong>.</p>" if deposit_due
            else "<p>No deposit required for this project — the customer has been asked for "
                 "their project contacts.</p>")
-        + f"<p>Project: {html.escape(project_name)}.</p>"
+        + f"<p>Project: {html.escape(shown_name)}.</p>"
         + scope_note_html
         + staff_contract_html,
         kind="approved",
@@ -1375,7 +1384,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     # price and heard nothing back except (later) an invoice.
     _notify_customer(
         p, "Thank you — your proposal is approved",
-        f"<p>We've recorded your approval of <strong>{html.escape(project_name)}</strong>"
+        f"<p>We've recorded your approval of <strong>{html.escape(shown_name)}</strong>"
         f"{(' by ' + html.escape(name)) if name else ''} on {approved_date}.</p>"
         f"<p>Approved: <strong>{html.escape(option_summary)}</strong> — "
         f"<strong>${total:,.2f}</strong>.</p>"
@@ -1395,7 +1404,7 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
         peer_heading="This proposal has been approved",
         peer_body_html=(
             f"<p><strong>{html.escape(name or _first_name_of(approver) or 'Someone on your team')}"
-            f"</strong> approved <strong>{html.escape(project_name)}</strong> on {approved_date}.</p>"
+            f"</strong> approved <strong>{html.escape(shown_name)}</strong> on {approved_date}.</p>"
             f"<p>Approved: <strong>{html.escape(option_summary)}</strong> — "
             f"<strong>${total:,.2f}</strong>.</p>"
             + (f"<p>A deposit of <strong>${deposit:,.2f}</strong> (25%) reserves the schedule; "
