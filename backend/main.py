@@ -3706,20 +3706,23 @@ def _confirm_scope_group_send(lead: dict, project: str, by: Optional[str], per: 
 
 def _pipeline_groups(rows: list, now: datetime) -> dict:
     """{group id: {"ids", "view", "home"}} for every scope group on the board, built from the
-    board's own rows. Two guarded reads per GROUP (not per row): which drafts are live members, and
-    the group's last 'keep chasing' decision. An unreadable read degrades to the stored rows, which
+    board's own rows. Guarded reads: which drafts are live members (ONE read for every group), and
+    per group its last 'keep chasing' decision. An unreadable read degrades to the stored rows, which
     only affects the dates shown -- the worker fails closed on its own read."""
     by: dict = {}
     for r in rows or []:
         if r.get("scope_group"):
             by.setdefault(r["scope_group"], []).append(r)
     out: dict = {}
+    # Every group's drafts in ONE read (fix round #20): each read of the drafts table detoasts all
+    # of it, and the board is polled every 25 seconds per open tab.
+    try:
+        states = db.list_scope_group_draft_states_many(list(by)) if by else {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[pipeline] scope group drafts unreadable: %s", exc)
+        states = {}
     for gid, grows in by.items():
-        try:
-            drafts = db.list_scope_group_draft_states(gid)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("[pipeline] scope group %s drafts unreadable: %s", gid, exc)
-            drafts = []
+        drafts = states.get(gid) or []
         try:
             resumed = db.scope_group_resumed_at(gid)
         except Exception as exc:  # noqa: BLE001

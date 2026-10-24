@@ -853,6 +853,17 @@ def test_a_test_draft_never_joins_a_real_group(clean):
     assert db.list_scope_group_drafts(gid) == ["cleared", "real"]
 
 
+def test_the_boards_batched_draft_read_matches_the_per_group_read(clean):
+    """#20: one query for every group on the board, the same states as one query per group."""
+    g1, ids1 = group_of_three(sent=True, archived_b=True, deleted_c=True)
+    g2, ids2 = group_of_three(sent=True)
+    add_draft("flagged", g2, "Lab 9", is_test=True)
+    got = db.list_scope_group_draft_states_many([g1, g2, "g-nobody"])
+    assert got == {g1: db.list_scope_group_draft_states(g1),
+                   g2: db.list_scope_group_draft_states(g2), "g-nobody": []}
+    assert db.list_scope_group_draft_states_many([]) == {}
+
+
 def test_the_group_task_shows_on_every_member_row(clean):
     gid, ids = group_of_three(sent=True)
     a, b, c = ids

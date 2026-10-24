@@ -412,6 +412,30 @@ def list_scope_group_draft_states(group_id: str) -> list[dict[str, Any]]:
     )]
 
 
+def list_scope_group_draft_states_many(group_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """list_scope_group_draft_states for several groups in ONE query: {group id: states}, every
+    asked-for group present (an empty list when no draft carries it).
+
+    For the board (fix round #20): the drafts table has no index the portal can use on
+    data->'scope_group'->>'id' (portal_app may only SELECT it), so each read detoasts every draft.
+    Once per board request, not once per group per request."""
+    gids = sorted({g for g in group_ids or [] if g})
+    out: dict[str, list[dict[str, Any]]] = {g: [] for g in gids}
+    if not gids:
+        return out
+    for r in qall(
+            "select data -> 'scope_group' ->> 'id' as gid, id, "
+            "coalesce(data ->> 'archived', '') = 'true' as archived, "
+            "data ->> 'is_test' as is_test, data ->> 'project_name' as project_name "
+            "from public.drafts "
+            "where deleted_at is null and data -> 'scope_group' ->> 'id' = any(%s) order by id",
+            (gids,)):
+        out.setdefault(r["gid"], []).append(
+            {"id": r["id"], "archived": bool(r.get("archived")), "is_test": r.get("is_test"),
+             "project_name": r.get("project_name")})
+    return out
+
+
 def list_scope_group_history(group_id: str) -> list[dict[str, Any]]:
     """Every proposal that is or was part of one scope group's follow-up, DELETED ones included:
     the rows that carry the group, plus any row a group follow-up row was filed on (a former home
@@ -728,14 +752,14 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # lookup returns NULL for an absent key instead, so the board simply shows no click
         # badge, and it starts working the moment the column lands — no restart, no cache.
         # Verified against the prod database: absent key -> NULL, present key -> identical value.
-        "(to_jsonb(p) ->> 'link_clicked_at')::timestamptz as link_clicked_at, "
-        "(to_jsonb(p) ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
+        "(pj.j ->> 'link_clicked_at')::timestamptz as link_clicked_at, "
+        "(pj.j ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
         # When THIS send went out, for the same to_jsonb reason as the click columns above.
-        "(to_jsonb(p) ->> 'last_sent_at')::timestamptz as last_sent_at, "
+        "(pj.j ->> 'last_sent_at')::timestamptz as last_sent_at, "
         # Which scope group this proposal belongs to, and its scope's name. to_jsonb for the
         # same reason: prod gets the code before the ALTER, and NULL just means "ungrouped".
-        "(to_jsonb(p) ->> 'scope_group') as scope_group, "
-        "(to_jsonb(p) ->> 'scope_label') as scope_label, "
+        "(pj.j ->> 'scope_group') as scope_group, "
+        "(pj.j ->> 'scope_label') as scope_label, "
         # Which revision the customer link points at: a scope is "announced" only at the revision
         # its combined email named (scope_groups.scope_states), so the board's send state needs it.
         "p.current_revision_no, "
@@ -798,11 +822,11 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # Remind-only (2026-10-23): the per-proposal schedule and the explicit decision stamp.
         # Through to_jsonb for the reason the click columns above give — prod gets the code before
         # the ALTER, and a missing column must read as NULL here, not take the board down.
-        "(to_jsonb(p) ->> 'followup_anchor_at')::timestamptz as followup_anchor_at, "
-        "(to_jsonb(p) ->> 'followup_next_at')::timestamptz as followup_next_at, "
-        "(to_jsonb(p) ->> 'followup_interval_days')::int as followup_interval_days, "
-        "(to_jsonb(p) ->> 'followup_stop_after')::int as followup_stop_after, "
-        "(to_jsonb(p) ->> 'followup_mode') as followup_mode, "
+        "(pj.j ->> 'followup_anchor_at')::timestamptz as followup_anchor_at, "
+        "(pj.j ->> 'followup_next_at')::timestamptz as followup_next_at, "
+        "(pj.j ->> 'followup_interval_days')::int as followup_interval_days, "
+        "(pj.j ->> 'followup_stop_after')::int as followup_stop_after, "
+        "(pj.j ->> 'followup_mode') as followup_mode, "
         # The touches and the reminder count, with the SAME predicates the worker reads them
         # with (db.followup_signals). customer_replied_at above stays as it was for the board;
         # this one leaves out auto-replies, which must not reset a reminder count.
@@ -816,7 +840,14 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # second request.
         + _ROW_OPEN_TASK_SQL + " as pending_task "
         "from public.portal_proposals p "
+        # Fix round #26: the row's jsonb, worked out ONCE (every optional column above is read
+        # from it). `offset 0` stops Postgres inlining the lateral, which would bring back one
+        # whole-row serialisation per column; measured 3x slower on the board without it.
+        "cross join lateral (select to_jsonb(p) as j offset 0) pj "
         "left join public.drafts d on d.id = p.proposal_id "
+        # The newest open group-tagged task of each scope group, once for the whole board
+        # (_ROW_OPEN_TASK_SQL's group arm reads gt.id).
+        "left join " + _GROUP_OPEN_TASKS_SQL + " gt on gt.gid = (pj.j ->> 'scope_group') "
         # A DELETED project is off the board (2026-08-24). The ONE reader of
         # portal_proposals that has to forget a row exists, together with
         # list_followup_candidates below -- see delete_proposal.
@@ -827,7 +858,7 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # the board and the Follow-ups page down together. An absent key is NULL, and NULL
         # here means live, so the board keeps working and starts filtering the moment the
         # column lands.
-        "where (to_jsonb(p) ->> 'deleted_at') is null "
+        "where (pj.j ->> 'deleted_at') is null "
         "order by p.created_at desc"
     )
 
@@ -1692,18 +1723,28 @@ _PENDING_TASK_SQL = (
     "                   and f2.detail->>'status' in ('pending','sending'))) t)")
 # The board's version for ONE ROW: a scope of a group also shows the GROUP's open task, which lives
 # on the group's home scope, so every scope's drawer shows it. An ungrouped row takes the first
-# branch, which is exactly _PENDING_TASK_SQL. scope_group is read through to_jsonb for the reason
-# every pipeline column is: prod may get this code before its ALTER.
+# branch, which is exactly _PENDING_TASK_SQL. scope_group is read through the row's jsonb for the
+# reason every pipeline column is: prod may get this code before its ALTER.
+#
+# Written for list_all_portal_proposals ONLY: `pj.j` is that query's to_jsonb(p), worked out once per
+# row, and `gt` its join of the newest open group-tagged task per scope group (fix round #26). The
+# group arm used to be an OR over every open task in the table, a bitmap scan per grouped row.
+_GROUP_OPEN_TASKS_SQL = (
+    "(select f.detail->>'scope_group' as gid, max(f.id) as id "
+    "   from public.portal_followups f "
+    "  where f.kind = 'followup_task' and f.detail->>'status' in ('pending','sending') "
+    "    and f.detail->>'scope_group' is not null "
+    "  group by f.detail->>'scope_group')")
 _ROW_OPEN_TASK_SQL = (
-    "(case when (to_jsonb(p) ->> 'scope_group') is null then "
+    "(case when (pj.j ->> 'scope_group') is null then "
     + _PENDING_TASK_SQL.format(pid="p.proposal_id") +
     " else (select to_jsonb(t) from (select f.id, f.proposal_id, f.detail, f.created_at "
     "   from public.portal_followups f "
-    "  where f.id = (select max(f2.id) from public.portal_followups f2 "
-    "                 where f2.kind = 'followup_task' "
-    "                   and f2.detail->>'status' in ('pending','sending') "
-    "                   and (f2.proposal_id = p.proposal_id "
-    "                        or f2.detail->>'scope_group' = (to_jsonb(p) ->> 'scope_group')))) t)"
+    "  where f.id = greatest("
+    "      (select max(f2.id) from public.portal_followups f2 "
+    "        where f2.proposal_id = p.proposal_id and f2.kind = 'followup_task' "
+    "          and f2.detail->>'status' in ('pending','sending')), "
+    "      gt.id)) t)"
     " end)")
 
 

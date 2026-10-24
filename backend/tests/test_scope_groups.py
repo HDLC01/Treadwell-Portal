@@ -514,8 +514,10 @@ def test_the_pipeline_query_reads_the_columns_ddl_safely(monkeypatch):
     monkeypatch.setattr(main.db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
     main.db.list_all_portal_proposals()
     sql = " ".join(seen["sql"].split())
-    assert "(to_jsonb(p) ->> 'scope_group') as scope_group" in sql
-    assert "(to_jsonb(p) ->> 'scope_label') as scope_label" in sql
+    # pj.j is the row's to_jsonb, worked out once per row (fix round #26).
+    assert "cross join lateral (select to_jsonb(p) as j offset 0) pj" in sql
+    assert "(pj.j ->> 'scope_group') as scope_group" in sql
+    assert "(pj.j ->> 'scope_label') as scope_label" in sql
 
 
 # ══ F. approve ═══════════════════════════════════════════════════════════════

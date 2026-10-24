@@ -41,6 +41,9 @@ class FakeSendDB:
     def list_scope_group_draft_states(self, gid):
         return [dict(d) for d in self.drafts]
 
+    def list_scope_group_draft_states_many(self, gids):
+        return {g: self.list_scope_group_draft_states(g) for g in gids or []}
+
     def list_scope_group_drafts(self, gid):
         return scope_groups.split_members(self.list_scope_group_draft_states(gid))[0]
 
@@ -176,7 +179,8 @@ class FakeSendDB:
         r["proposal_status"] = "sent"
 
     def install(self, monkeypatch, main):
-        for name in ("list_scope_group", "list_scope_group_draft_states", "list_scope_group_drafts",
+        for name in ("list_scope_group", "list_scope_group_draft_states",
+                     "list_scope_group_draft_states_many", "list_scope_group_drafts",
                      "list_scope_group_marks", "get_proposal", "get_draft_data", "get_recipients",
                      "claim_scope_group_send", "settle_scope_group_send",
                      "mark_scope_group_attempt", "release_scope_group_send",

@@ -581,6 +581,8 @@ def test_the_pipeline_exposes_scope_send_state(monkeypatch):
     monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
     monkeypatch.setattr(main.db, "list_scope_group_draft_states",
                         lambda gid: [_st("d-break"), _st("d-lab1"), _st("d-lab2")])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states_many",
+                        lambda gids: {g: [_st("d-break"), _st("d-lab1"), _st("d-lab2")] for g in gids})
     monkeypatch.setattr(main.db, "scope_group_resumed_at", lambda gid: None)
     monkeypatch.setattr(main.db, "list_scope_group_marks", lambda gids: marks)
     for r in rows:
@@ -611,6 +613,8 @@ def test_the_board_names_a_send_whose_result_was_lost(monkeypatch):
     monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
     monkeypatch.setattr(main.db, "list_scope_group_draft_states",
                         lambda gid: [_st("d-break"), _st("d-lab1")])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states_many",
+                        lambda gids: {g: [_st("d-break"), _st("d-lab1")] for g in gids})
     monkeypatch.setattr(main.db, "scope_group_resumed_at", lambda gid: None)
     monkeypatch.setattr(main.db, "list_scope_group_marks", lambda gids: marks)
     for r in rows:
@@ -640,6 +644,8 @@ def test_the_send_state_names_each_pending_scope_new_or_revised(monkeypatch):
     monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
     monkeypatch.setattr(main.db, "list_scope_group_draft_states",
                         lambda gid: [_st("d-break"), _st("d-lab1"), _st("d-lab2")])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states_many",
+                        lambda gids: {g: [_st("d-break"), _st("d-lab1"), _st("d-lab2")] for g in gids})
     monkeypatch.setattr(main.db, "scope_group_resumed_at", lambda gid: None)
     got = {"marks": marks}
     monkeypatch.setattr(main.db, "list_scope_group_marks", lambda gids: got["marks"])

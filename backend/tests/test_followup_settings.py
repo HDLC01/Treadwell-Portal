@@ -796,7 +796,9 @@ def test_the_pipeline_reads_the_new_columns_so_a_pre_DDL_prod_survives():
         assert "p.%s" % col not in sql, (
             "%s is named directly; a prod that has not had the ALTER applied will 500 the whole "
             "staff board on this one query" % col)
-        assert "to_jsonb(p) ->> '%s'" % col in sql, "%s is not read at all any more" % col
+        # Through the row's jsonb, worked out once per row (fix round #26: `pj.j`).
+        assert "pj.j ->> '%s'" % col in sql, "%s is not read at all any more" % col
+    assert "cross join lateral (select to_jsonb(p) as j offset 0) pj" in sql
     # The columns that have always existed stay direct — the indirection is only for the new ones,
     # and turning the whole select into jsonb lookups would hide a genuine typo.
     assert "p.proposal_status" in sql and "p.viewed_at" in sql

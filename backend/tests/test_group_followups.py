@@ -106,6 +106,11 @@ class FakeDB:
         self.reads.append(("drafts", gid))
         return [dict(d) for d in self.drafts]
 
+    def list_scope_group_draft_states_many(self, gids):
+        # The board's one read for every group (fix round #20).
+        self.reads.append(("drafts_many", tuple(gids)))
+        return {g: [dict(d) for d in self.drafts] for g in gids}
+
     def list_scope_group_drafts(self, gid):
         return [d["id"] for d in self.drafts]
 
@@ -814,10 +819,21 @@ def test_the_pipeline_keeps_a_closed_former_homes_touch_in_the_groups_date(fake,
 
 
 def test_the_pipeline_query_shows_a_groups_task_on_every_member_row():
+    """The group arm reads the board's one join of open group tasks (`gt`, fix round #26), not an
+    OR over every open task per row. Executed against Postgres in test_pg_scope_groups.py."""
     sql = " ".join(db._ROW_OPEN_TASK_SQL.split())
-    assert "f2.detail->>'scope_group' = (to_jsonb(p) ->> 'scope_group')" in sql
-    assert sql.startswith("(case when (to_jsonb(p) ->> 'scope_group') is null then "
+    assert "gt.id" in sql and " or " not in sql
+    assert sql.startswith("(case when (pj.j ->> 'scope_group') is null then "
                           + " ".join(db._PENDING_TASK_SQL.format(pid="p.proposal_id").split()))
+    seen = {}
+    db_qall = db.qall
+    try:
+        db.qall = lambda q, params=(): seen.update(sql=q) or []
+        db.list_all_portal_proposals()
+    finally:
+        db.qall = db_qall
+    board = " ".join(seen["sql"].split())
+    assert "left join " + " ".join(db._GROUP_OPEN_TASKS_SQL.split()) +         " gt on gt.gid = (pj.j ->> 'scope_group')" in board
 
 
 # ══ H. the deploy-day dry run ════════════════════════════════════════════════
@@ -1131,3 +1147,16 @@ def test_a_logged_call_never_resolves_a_decision_task_or_a_detached_scopes_group
     f.drafts = [{"id": "d-break", "archived": False}, {"id": "d-lab1", "archived": False}]
     _log("d-lab2")                                   # d-lab2 has left the group in the tool
     assert f.get_followup_task(rem)["detail"]["status"] == "pending"
+
+
+def test_the_board_reads_every_groups_drafts_in_one_query(fake, admin, monkeypatch):
+    """#20: each read of the drafts table detoasts all of it; the board polled it once per group."""
+    rows = _three() + [_scope("d-x1", "X 1", 5, scope_group="grp-other"),
+                       _scope("d-x2", "X 2", 6, scope_group="grp-other")]
+    f = fake(rows)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    assert TestClient(main.app).get("/api/admin/pipeline").status_code == 200
+    drafts = [r for r in f.reads if r[0] in ("drafts", "drafts_many")]
+    assert drafts == [("drafts_many", (GID, "grp-other"))], drafts
