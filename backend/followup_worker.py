@@ -229,13 +229,22 @@ _TASK_SITUATION = {
 }
 
 
+def _scope_names(scopes) -> str:
+    return ", ".join(email_sender._esc(s.get("label") or "a scope")
+                     for s in (scopes or []) if isinstance(s, dict))
+
+
 def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
-    """`for_template` is the CUSTOMER template a staff_followup_due email is about."""
+    """`for_template` is the CUSTOMER template a staff_followup_due email is about.
+
+    `p` may be a scope group's synthetic proposal (followup_rules.group_view): it then carries
+    `scopes`, which the email lists, and `link_proposal_id`, an OPEN scope for the CRM button."""
     to = _staff_recipients(p)
     if not to:
         log.info("[followup] no staff recipient for %s", p["proposal_id"])
         return False
     pid = p["proposal_id"]
+    link_pid = p.get("link_proposal_id") or pid
     project = p.get("project_name") or "this project"
     token = p.get("token")
     # NO CUSTOMER LINK IN A STAFF EMAIL. Hanz, 2026-08-24: "can we remove the Proposal link in
@@ -248,7 +257,7 @@ def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
     #
     # `token` is still read above because the CUSTOMER emails need it. If you are adding a link
     # to a staff email, link the CRM, not the portal.
-    crm_url = f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={pid}"
+    crm_url = f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={link_pid}"
     who = p.get("customer_name") or p.get("customer_email") or "the customer"
     # For a deposit chase the figure that matters is the DEPOSIT, not the whole job — the estimator
     # is about to ask for one specific number, and quoting the contract value would have them
@@ -307,6 +316,18 @@ def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
                    if submitted else
                    "<p>You'll keep getting reminders to chase it. Dates aren't held until the "
                    "deposit is in, so a call is worth more than the next email.</p>"))
+    elif due.template == "staff_scope_decision":
+        # Scope groups (Hanz's decision 2): one scope was approved, the chase on the others has
+        # stopped, and somebody has to decide what happens to them. Never auto-closed.
+        dec = p.get("_decision") or {}
+        subject = f"Decide the other scopes — {project}"
+        body = (f"<p><strong>{email_sender._esc(who)}</strong> approved the "
+                f"<strong>{email_sender._esc(dec.get('approved_label') or 'one')}</strong> scope "
+                f"of <strong>{email_sender._esc(project)}</strong>.</p>"
+                f"<p>Follow-up reminders for the other scopes have stopped: "
+                f"<strong>{_scope_names(dec.get('scopes'))}</strong>.</p>"
+                f"<p>Open it in the CRM to close them as lost, keep following up on them, or "
+                f"leave them as they are. Nothing has been closed.</p>")
     else:   # staff_personal_followup
         subject = f"Time for a personal follow-up — {project}"
         body = (f"<p><strong>{email_sender._esc(who)}</strong> has read the proposal for "
@@ -317,13 +338,17 @@ def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
                 f"<li>Amount: {amount_txt}</li>"
                 f"</ul>"
                 f"<p>Reminders continue, but this one is worth a call.</p>")
+    if p.get("scopes") and due.template != "staff_scope_decision":
+        # A scope group's reminder is about the PROJECT: say which scopes it covers.
+        body += (f"<p>This project has several proposals. Still open: "
+                 f"<strong>{_scope_names(p.get('scopes'))}</strong>.</p>")
     try:
         # notify_team returns the addresses it DELIVERED to (one send per person), so `bool()`
         # asks the only question the caller has: did anything land? Falsy means the sweep releases
         # the reservation and retries next tick, which is what a False meant before the loop —
         # same branch, same meaning. `_send_customer` above answers it the same way.
         return bool(email_sender.notify_team(
-            subject, body, recipients=to, reply_link=crm_url, proposal_id=pid,
+            subject, body, recipients=to, reply_link=crm_url, proposal_id=link_pid,
             reply_to=email_sender.proposal_reply_to(token)))
     except Exception as exc:  # noqa: BLE001
         log.warning("[followup] staff note failed for %s: %s", pid, exc)
@@ -376,6 +401,11 @@ _ECHO_STAFF = {
     "staff_followup_due": ("Follow-up due — a reminder for the customer is ready to review and "
                            "send from the CRM. Nothing has gone to them yet; the estimator has "
                            "been emailed."),
+    # Scope groups: one scope was approved, so the chase on the others stopped and a decision task
+    # was raised. Nothing was closed; the estimator decides.
+    "staff_scope_decision": ("Decision needed — a scope of this project was approved, so the "
+                             "follow-up reminders for the other scopes have stopped. Nothing has "
+                             "been closed; the estimator has been emailed to decide."),
 }
 
 
@@ -437,6 +467,42 @@ def send_task_email(p: dict, template: str, include_status_ask: bool, tpl: dict,
     return _send_customer(p, due, {template: tpl})
 
 
+def send_group_task_email(view: dict, tpl: dict) -> dict:
+    """Send a scope group's reviewed follow-up: ONE email PER RECIPIENT, listing only the open
+    scopes that recipient is chased on, with the estimator's edited text. Returns
+    {email: [proposal_id, ...]} for every address it was DELIVERED to (empty = nothing went).
+
+    Recipients per scope are the chase list (`_customer_recipients`: per-contact opt-outs
+    honoured), merged across the group's open scopes in group order."""
+    members = view.get("_open_members") or []
+    per: dict[str, list[dict]] = {}
+    for m in members:
+        for e in _customer_recipients(m):
+            e = (e or "").strip().lower()
+            if e:
+                per.setdefault(e, []).append(m)
+    primary = (view.get("customer_email") or "").strip().lower()
+    project = view.get("project_name") or "your project"
+    delivered: dict[str, list[str]] = {}
+    for e, mine in per.items():
+        try:
+            ok = email_sender.send_scope_group_followup(
+                e, (view.get("customer_name") or "") if e == primary else "", project,
+                [{"label": m.get("scope_label") or m.get("project_name") or "Proposal",
+                  "url": f"{config.PUBLIC_BASE_URL}/p/{m.get('token')}", "approved": False}
+                 for m in mine],
+                tpl, deposit_required=view.get("deposit_required") is not False,
+                # A reply lands in the thread of the first scope THEY are on.
+                reply_to=email_sender.proposal_reply_to(mine[0].get("token")),
+                token=mine[0].get("token"))
+        except Exception as exc:  # noqa: BLE001 — one bad address must not stop the others
+            log.warning("[followup] group send to %s failed: %s", e, exc)
+            ok = False
+        if ok:
+            delivered[e] = [m["proposal_id"] for m in mine]
+    return delivered
+
+
 # The two pre-decision staff notes that say the same thing as a follow-up-due email. When both fall
 # due in one tick (the 24h not-opened step always does), the task email is the one that goes out
 # and the note is consumed without a second email. Deposit and pause-expired notes are different
@@ -457,13 +523,134 @@ def _expire_stale_tasks(now: datetime) -> None:
         return
     for t in pending or []:
         try:
-            p = db.get_proposal(t["proposal_id"])
-            ok, why = rules.task_is_live(t.get("detail") or {}, p, now)
+            if is_group_task(t.get("detail")):
+                # A scope group's task is judged against the GROUP (group_view), and a decision
+                # task against its siblings — never against the proposal it is filed on, which for
+                # the decision task is the approved scope and would read as "moved on" at once.
+                ok, why, _subject = judge_task(t, now)
+            else:
+                p = db.get_proposal(t["proposal_id"])
+                ok, why = rules.task_is_live(t.get("detail") or {}, p, now)
             if not ok:
                 db.decide_followup_task(t["id"], "expired", None, {"reason": why})
                 log.info("[followup] task %s on %s expired (%s)", t["id"], t["proposal_id"], why)
+            elif (t.get("detail") or {}).get("stage") == rules.DECISION_STAGE:
+                _renag_decision(t, now)
         except Exception as exc:  # noqa: BLE001
             log.warning("[followup] could not check task %s: %s", t.get("id"), exc)
+
+
+# ── scope groups (2026-10-24) ─────────────────────────────────────────────────
+# RJ's "one project, many proposals": a project priced as several separately approved scopes is
+# chased as ONE project. The group's live OPEN scopes are folded into one synthetic proposal
+# (followup_rules.group_view) filed on a stable HOME scope; it raises one task per due occurrence and
+# one estimator email per moment. An APPROVED scope leaves the group pass and keeps its own ordinary
+# deposit chase. Approving any scope stops the group chase and raises ONE "decide what to do with the
+# other scopes" task (main.api_approve); nothing is ever closed automatically.
+
+# How often an unresolved decision task re-emails the estimator, and how many times at most.
+# Ignoring it would leave the other scopes un-chased and un-closed for ever, so it nags; capped so
+# it cannot nag for ever either.
+DECISION_RENAG_DAYS = 3
+DECISION_RENAG_MAX = 5
+
+
+def is_group_task(detail) -> bool:
+    d = detail or {}
+    return bool(d.get("scope_group")) or d.get("stage") == rules.DECISION_STAGE
+
+
+def group_members(group_id: str, strict: bool = True) -> list[dict]:
+    """The LIVE members of one scope group (followup_rules.live_members), freshly read.
+
+    Raises when the drafts cannot be read and `strict` (the worker: fail closed, chase nothing
+    rather than guess). `strict=False` falls back to the portal rows as stored, for callers whose
+    worst case is a staff task rather than a customer email."""
+    rows = db.list_scope_group(group_id)
+    try:
+        drafts = db.list_scope_group_draft_states(group_id)
+    except Exception:  # noqa: BLE001
+        if strict:
+            raise
+        drafts = []
+    return rules.live_members(rows, drafts)
+
+
+def _with_signals(members: list[dict], group_id: str) -> list[dict]:
+    """Each member with what group_view reads beyond the row: its touches and counted reminders
+    (db.followup_signals) and the group's last 'keep chasing' decision. Unguarded, like the single
+    path's read: without the touches the schedule would be guessed."""
+    resumed = db.scope_group_resumed_at(group_id)
+    out = []
+    for m in members:
+        sig = db.followup_signals(m["proposal_id"]) or {}
+        row = dict(m, **{k: v for k, v in sig.items() if k != "pending_task"})
+        row["scope_group_resumed_at"] = resumed
+        out.append(row)
+    return out
+
+
+def group_state_for(group_id: str, now: datetime) -> tuple:
+    """(view, reason, members) for one group, read fresh. Raises if it cannot be read."""
+    members = _with_signals(group_members(group_id), group_id)
+    view, why = rules.group_state(members, now)
+    return view, why, members
+
+
+def judge_task(task: dict, now: datetime) -> tuple:
+    """(ok, reason, subject): may this open task still be acted on, and against what?
+
+    `subject` is the proposal for an ordinary task, the group's synthetic proposal for a group
+    reminder, and `{"scope_members": [...]}` for a decision task. The ONE judgement for the
+    worker's housekeeping and every task endpoint, so the two cannot disagree."""
+    d = task.get("detail") or {}
+    gid = d.get("scope_group")
+    if d.get("stage") == rules.DECISION_STAGE:
+        if not gid:
+            return False, "missing", None
+        subject = {"scope_members": group_members(gid, strict=False)}
+        ok, why = rules.task_is_live(d, subject, now)
+        return ok, why, subject
+    if gid:
+        view, why, _members = group_state_for(gid, now)
+        if view is None:
+            return False, why or "finished", None
+        if view.get("proposal_id") != task.get("proposal_id"):
+            return False, "rehomed", view
+        ok, why = rules.task_is_live(d, view, now)
+        return ok, why, view
+    p = db.get_proposal(task["proposal_id"])
+    ok, why = rules.task_is_live(d, p, now)
+    return ok, why, p
+
+
+def _renag_decision(task: dict, now: datetime) -> None:
+    """Re-email the estimator about an unresolved decision task every DECISION_RENAG_DAYS, at most
+    DECISION_RENAG_MAX times. Reserved like every staff note (rule key per task per occurrence), so
+    the twin container and a re-run tick send it once. Never raises."""
+    try:
+        created = rules._ts(task.get("created_at"))
+        if created is None:
+            return
+        n = int((now - created).total_seconds() // (DECISION_RENAG_DAYS * 86400))
+        if n < 1:
+            return
+        n = min(n, DECISION_RENAG_MAX)
+        pid = task["proposal_id"]
+        key = "sdn:%s:%d" % (task["id"], n)
+        rid = db.reserve_followup(pid, key, {"audience": "staff",
+                                             "template": "staff_scope_decision"})
+        if rid is None:
+            return
+        p = db.get_proposal(pid) or {"proposal_id": pid}
+        d = task.get("detail") or {}
+        p = dict(p, _decision={"approved_label": (d.get("approved_scope") or {}).get("label"),
+                               "scopes": d.get("scopes") or []})
+        due = rules.Due(key, "staff", "staff_scope_decision")
+        if not _send_staff(p, due):
+            db.delete_followup(rid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] decision task %s re-nag failed: %s", task.get("id"), exc)
 
 
 # How long a `sending` claim may stand before the tick decides the send is not in flight any more.
@@ -505,7 +692,7 @@ def _recover_stuck_sends() -> None:
             log.warning("[followup] could not settle task %s: %s", tid, exc)
 
 
-def _raise_task(p: dict, due, cfg: dict) -> bool:
+def _raise_task(p: dict, due, cfg: dict, extra: dict | None = None) -> bool:
     """Reserve a follow-up task for a matured customer reminder and tell the estimator.
 
     Returns True only when THIS call created the task. The reservation goes through the same
@@ -519,7 +706,7 @@ def _raise_task(p: dict, due, cfg: dict) -> bool:
     pid = p["proposal_id"]
     enrolled = rules._aware(p.get("followup_enrolled_at"))
     draft = followup_draft.default_draft(due.template, cfg)
-    rid = db.reserve_followup_task(pid, due.rule_key, {
+    detail = {
         "audience": "customer", "template": due.template, "status": "pending",
         "stage": rules.task_stage(due.template),
         "cycle": rules.cycle_key(enrolled) if enrolled else None,
@@ -528,7 +715,11 @@ def _raise_task(p: dict, due, cfg: dict) -> bool:
         # The plain starting point, stored so the compose box opens instantly. The AI draft is
         # fetched on demand when the estimator opens the task — see followup_draft.
         "draft": {"title": draft["title"], "body": draft["body"], "source": "default"},
-    })
+    }
+    if extra:
+        # A scope group's task: scope_group and scopes [{proposal_id, label, status}].
+        detail.update(extra)
+    rid = db.reserve_followup_task(pid, due.rule_key, detail)
     if rid is None:
         return False
     log.info("[followup] %s %s -> task %s (remind)", pid, due.rule_key, rid)
@@ -560,7 +751,10 @@ def _tick(now: datetime | None = None) -> None:
     # longer blocks the fresh task that proposal may be owed in this same tick.
     _expire_stale_tasks(now)
 
-    for row in candidates:
+    # Ordinary proposals, plus scopes that are not OPEN live members of a group (an approved scope
+    # chasing its deposit, a scope taken out of its group): the tick as it was before scope groups.
+    singles, groups = _partition(candidates)
+    for row in singles:
         pid = row.get("proposal_id")
         try:
             # Re-read before acting. The list may be minutes old by the time we reach
@@ -575,36 +769,187 @@ def _tick(now: datetime | None = None) -> None:
             signals = db.followup_signals(pid) or {}
             fresh = dict(fresh, **{k: v for k, v in signals.items() if k != "pending_task"})
             pending = signals.get("pending_task")
-            dues = rules.due_now(fresh, now, cfg)
-            # Customer first, so the staff notes below know whether a task went out this tick.
-            dues = sorted(dues, key=lambda d: d.audience != "customer")
-            task_raised = False
-            for due in dues:
-                if due.audience == "customer":
-                    # REMIND-ONLY. Never _send_customer from here (decisions 1 and 2).
-                    if pending:
-                        continue            # one open task per proposal; the human resolves it
-                    task_raised = _raise_task(fresh, due, cfg) or task_raised
-                    continue
-                rid = db.reserve_followup(pid, due.rule_key, {
-                    "audience": due.audience, "template": due.template,
-                })
-                if rid is None:
-                    continue        # already sent — a prior tick, or the twin container
-                if task_raised and due.template in _FOLDED_INTO_TASK:
-                    # Consumed, not sent: the follow-up-due email that just went out covers it,
-                    # and the reservation stops it firing on its own next tick.
-                    log.info("[followup] %s %s folded into the task email", pid, due.rule_key)
-                    continue
-                if not _send_staff(fresh, due):
-                    # Nothing went out, so release the claim and let the next tick try.
-                    # A systemic outage therefore retries at tick cadence rather than
-                    # silently swallowing the whole cadence step.
-                    db.delete_followup(rid)
-                    log.info("[followup] %s %s not sent — reservation released",
-                             pid, due.rule_key)
-                else:
-                    log.info("[followup] %s %s -> %s", pid, due.rule_key, due.audience)
-                    _echo_to_thread(pid, due)
+            if pending and is_group_task((pending or {}).get("detail")):
+                # A scope group's task (or a decision task) filed on this scope is not THIS
+                # scope's own reminder and must not hold its slot: an approved scope keeps its
+                # deposit chase. The one-open-task-per-stage index still stops a duplicate.
+                pending = None
+            _act_on_dues(fresh, pid, rules.due_now(fresh, now, cfg), pending, cfg)
         except Exception as exc:  # noqa: BLE001 — never let one row end the sweep
             log.warning("[followup] skipped %s: %s", pid, exc)
+    # One pass per scope group: one task per due occurrence, on the group's home scope.
+    for gid in groups:
+        try:
+            _process_group(gid, now, cfg)
+        except Exception as exc:  # noqa: BLE001 — never let one group end the sweep
+            log.warning("[followup] skipped scope group %s: %s", gid, exc)
+
+
+def _partition(candidates: list) -> tuple:
+    """(singles, group ids). PARTITIONED ON LIVE OPEN MEMBERS, not on scope_group alone.
+
+    A candidate is a group candidate only while it is an OPEN (sent/viewed) live member of its
+    group: an approved scope with a deposit outstanding keeps its own ordinary deposit chase as a
+    single, and a scope the tool has taken out of the group is an ordinary proposal again. An
+    archived scope is in the group but not live, so it is chased neither way. A group whose
+    membership cannot be read is skipped this tick (fail closed) rather than chased per scope."""
+    singles, groups, by_gid = [], [], {}
+    for row in candidates or []:
+        gid = row.get("scope_group")
+        if gid and rules.is_open(row):
+            by_gid.setdefault(gid, []).append(row)
+        else:
+            singles.append(row)
+    for gid, rows in by_gid.items():
+        try:
+            all_rows = db.list_scope_group(gid)
+            drafts = db.list_scope_group_draft_states(gid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[followup] scope group %s unreadable, skipped this tick: %s", gid, exc)
+            continue
+        detached = rules.detached_ids(all_rows, drafts)
+        live = {m["proposal_id"] for m in rules.live_members(all_rows, drafts)}
+        grouped = False
+        for r in rows:
+            if r.get("proposal_id") in detached:
+                singles.append(r)
+            elif r.get("proposal_id") in live:
+                grouped = True
+        if grouped:
+            groups.append(gid)
+    return singles, groups
+
+
+def _act_on_dues(p: dict, pid: str, dues: list, pending, cfg: dict,
+                 task_extra: dict | None = None) -> None:
+    """Raise the customer task and send the staff notes `dues` asks for: the tick's own body,
+    shared by an ordinary proposal and a scope group's synthetic one (filed under `pid`)."""
+    # Customer first, so the staff notes below know whether a task went out this tick.
+    dues = sorted(dues, key=lambda d: d.audience != "customer")
+    task_raised = False
+    for due in dues:
+        if due.audience == "customer":
+            # REMIND-ONLY. Never _send_customer from here (decisions 1 and 2).
+            if pending:
+                continue            # one open task per proposal; the human resolves it
+            task_raised = _raise_task(p, due, cfg, task_extra) or task_raised
+            continue
+        rid = db.reserve_followup(pid, due.rule_key, {
+            "audience": due.audience, "template": due.template,
+        })
+        if rid is None:
+            continue        # already sent — a prior tick, or the twin container
+        if task_raised and due.template in _FOLDED_INTO_TASK:
+            # Consumed, not sent: the follow-up-due email that just went out covers it,
+            # and the reservation stops it firing on its own next tick.
+            log.info("[followup] %s %s folded into the task email", pid, due.rule_key)
+            continue
+        if not _send_staff(p, due):
+            # Nothing went out, so release the claim and let the next tick try.
+            # A systemic outage therefore retries at tick cadence rather than
+            # silently swallowing the whole cadence step.
+            db.delete_followup(rid)
+            log.info("[followup] %s %s not sent — reservation released",
+                     pid, due.rule_key)
+        else:
+            log.info("[followup] %s %s -> %s", pid, due.rule_key, due.audience)
+            _echo_to_thread(pid, due)
+
+
+def _process_group(gid: str, now: datetime, cfg: dict) -> None:
+    """One scope group's pass: ONE task per due occurrence, filed on the group's HOME scope, and
+    one estimator email per moment (the staff notes run through the same synthetic proposal).
+
+    Re-homing: an open group task that is not on the current home (the home was deleted, taken out
+    of the group, closed) is expired here, and the next due occurrence is raised on the new home.
+    A group whose chase has stopped (a scope approved) has its open reminder task expired too."""
+    view, why, _members = group_state_for(gid, now)
+    home = view.get("proposal_id") if view else None
+    pending = None
+    for t in db.list_open_group_tasks(gid) or []:
+        d = t.get("detail") or {}
+        if d.get("stage") == rules.DECISION_STAGE:
+            continue                    # judged and re-nagged by the housekeeping pass
+        if view is None or t.get("proposal_id") != home:
+            if (d.get("status") or "pending") == "pending":
+                reason = (why or "finished") if view is None else "rehomed"
+                db.decide_followup_task(t["id"], "expired", None, {"reason": reason})
+                log.info("[followup] group task %s on %s expired (%s)",
+                         t["id"], t.get("proposal_id"), reason)
+                continue
+        pending = pending or t      # still open (or `sending`): it holds the group's slot
+    if view is None:
+        return
+    dues = rules.due_now(view, now, cfg)
+    _act_on_dues(view, home, dues, pending, cfg,
+                 {"scope_group": gid, "scopes": view.get("scopes") or []})
+
+
+# ── the deploy-day dry run ────────────────────────────────────────────────────
+def dry_run_count(now: datetime | None = None) -> dict:
+    """How many follow-up tasks the NEXT tick would raise, and for which proposals. READ-ONLY.
+
+    Why it exists (critic finding, 2026-10-24): the TOUCHED shape of the schedule keys its
+    occurrences on time ('vrt@<stamp>'), a key no old automatic email ever used, so any live
+    proposal with a prior reply, chat message or logged call that has been quiet for more than one
+    interval matures on the first tick after deploy. Hanz runs this before switching automation on,
+    to see that burst before the estimators do.
+
+    It evaluates exactly what the tick evaluates (the same candidates, the same single/group
+    partition, the same signals, the same schedule) and reserves, sends, expires and writes
+    NOTHING. It runs whatever FOLLOWUP_AUTOMATION_ENABLED says, because it is the check you make
+    before turning that on. An occurrence whose rule key is already reserved (an old automatic
+    email, a task already raised) is left out, as the dedupe index would leave it out; a proposal
+    whose open task the housekeeping would expire first is still counted as blocked.
+
+    Returns {"count", "tasks": [{proposal_id, rule_key, template, scope_group}], "skipped": [...]}.
+    """
+    now = now or datetime.now(timezone.utc)
+    cfg = _settings()
+    out: dict = {"count": 0, "tasks": [], "skipped": [], "at": now.isoformat()}
+
+    def _would_raise(pid: str, due, gid=None) -> None:
+        try:
+            used = db.followup_rule_key_exists(pid, due.rule_key)
+        except Exception:  # noqa: BLE001 — unknown counts as new: over-reporting is the safe side
+            used = False
+        if used:
+            return
+        out["tasks"].append({"proposal_id": pid, "rule_key": due.rule_key,
+                             "template": due.template, "scope_group": gid})
+
+    candidates = db.list_followup_candidates()
+    singles, groups = _partition(candidates)
+    for row in singles:
+        pid = row.get("proposal_id")
+        try:
+            fresh = db.get_proposal(pid) or row
+            if fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
+                continue
+            signals = db.followup_signals(pid) or {}
+            fresh = dict(fresh, **{k: v for k, v in signals.items() if k != "pending_task"})
+            pending = signals.get("pending_task")
+            if pending and is_group_task((pending or {}).get("detail")):
+                pending = None
+            for due in rules.due_now(fresh, now, cfg):
+                if due.audience == "customer" and not pending:
+                    _would_raise(pid, due)
+        except Exception as exc:  # noqa: BLE001
+            out["skipped"].append({"proposal_id": pid, "error": str(exc)})
+    for gid in groups:
+        try:
+            view, _why, _m = group_state_for(gid, now)
+            if view is None:
+                continue
+            open_tasks = [t for t in db.list_open_group_tasks(gid) or []
+                          if (t.get("detail") or {}).get("stage") != rules.DECISION_STAGE
+                          and t.get("proposal_id") == view["proposal_id"]]
+            if open_tasks:
+                continue
+            for due in rules.due_now(view, now, cfg):
+                if due.audience == "customer":
+                    _would_raise(view["proposal_id"], due, gid)
+        except Exception as exc:  # noqa: BLE001
+            out["skipped"].append({"scope_group": gid, "error": str(exc)})
+    out["count"] = len(out["tasks"])
+    return out

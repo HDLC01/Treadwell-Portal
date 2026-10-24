@@ -452,6 +452,44 @@ def send_scope_group_links(email: str, name: str, project_name: str, scopes: lis
                  _thread_headers(email, token), reply_to=reply_to)
 
 
+def send_scope_group_followup(email: str, name: str, project_name: str, scopes: list[dict],
+                              template: dict, *, deposit_required: bool = True,
+                              reply_to: str | None = None, token: str | None = None) -> bool:
+    """A follow-up the estimator reviewed, for a project priced as several scopes: ONE email to
+    this address, listing only the scopes THIS address is on (the caller narrows `scopes`).
+
+    `template` is the estimator's edited {title, body, cta}, already validated like any customer
+    template. Its text is the email: the `{link}` block becomes this recipient's scope buttons
+    (built like send_scope_group_links), and a `{link}` written mid-sentence reads "the links
+    below". No "Not moving forward" block: on a group it would close one scope of several."""
+    scopes = [s for s in (scopes or []) if s and s.get("url")]
+    if not scopes or not isinstance(template, dict) or not template.get("body"):
+        return False
+    need = ("your signed approval and the deposit" if deposit_required
+            else "your signed approval")
+    rendered = followup_settings.render(template, first_name=_first_name(name) or "there",
+                                        project=project_name, need=need, link_html=_LINK_MARK)
+    rows = "".join(
+        f'<p style="margin:10px 0"><a href="{_esc(s["url"])}" style="display:inline-block;'
+        f'background:{_BRAND_RED};color:#fff;padding:10px 16px;border-radius:8px;'
+        f'text-decoration:none;font-weight:700">{_esc(s.get("label") or "Proposal")} — '
+        f'{"view" if s.get("approved") else "view &amp; approve"}</a></p>' for s in scopes)
+    html_blocks, placed = [], False
+    for block in [b.strip() for b in rendered["body"].split("\n\n") if b.strip()]:
+        if block == _LINK_MARK:
+            if not placed:
+                html_blocks.append(rows)
+                placed = True
+            continue
+        html = _esc(block).replace("\n", "<br>").replace(_LINK_MARK, "the links below")
+        html_blocks.append(f"<p>{html}</p>")
+    if not placed:
+        html_blocks.append(rows)
+    return _send([email], customer_thread_subject(project_name),
+                 _wrap(rendered["title"], "".join(html_blocks)),
+                 _thread_headers(email, token), reply_to=reply_to)
+
+
 _SENT_TPL_TTL = 60.0
 _sent_tpl_cache: tuple[float, dict] | None = None
 
