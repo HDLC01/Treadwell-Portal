@@ -509,6 +509,9 @@ def send_group_task_email(view: dict, tpl: dict) -> dict:
 # news and are never folded.
 _FOLDED_INTO_TASK = ("staff_not_viewed", "staff_personal_followup")
 
+# detail.engine on every staff note this worker reserves (see _act_on_dues).
+ENGINE_MARK = "remind-only"
+
 
 def _expire_stale_tasks(now: datetime) -> None:
     """Housekeeping: a pending task whose proposal has moved on is marked expired.
@@ -853,6 +856,10 @@ def _act_on_dues(p: dict, pid: str, dues: list, pending, cfg: dict,
             continue
         rid = db.reserve_followup(pid, due.rule_key, {
             "audience": due.audience, "template": due.template,
+            # Tells this engine's staff notes from the old automatic ladder's, which carried no
+            # mark: the deposit chase's legacy cap counts only the old ones
+            # (db._DEPOSIT_HISTORY_SQL, followup_rules.deposit_series_done).
+            "engine": ENGINE_MARK,
         })
         if rid is None:
             continue        # already sent — a prior tick, or the twin container

@@ -104,7 +104,7 @@ class _Cadence:
     """The seven numbers this module needs, resolved once per call."""
 
     __slots__ = ("first", "second", "recurring", "staff_personal", "max_recurring",
-                 "deposit_max", "start_hour", "end_hour")
+                 "deposit_max", "legacy_cap", "start_hour", "end_hour")
 
     def __init__(self, cfg: Optional[dict] = None):
         c = cfg or {}
@@ -129,6 +129,10 @@ class _Cadence:
         # Its own key and its own default — see DEPOSIT_MAX_RECURRING. Nothing that lowers
         # max_recurring (the settings page, a per-proposal stop-after) reaches this.
         self.deposit_max = whole("deposit_max_recurring", DEPOSIT_MAX_RECURRING, 1, 1000)
+        # The cap the OLD automatic ladder ran the deposit chase under: the global max_recurring,
+        # never a per-proposal stop-after (which the old code did not have). effective_cfg keeps it
+        # under its own key before laying a stop-after over max_recurring. See deposit_series_done.
+        self.legacy_cap = whole("legacy_max_recurring", self.max_recurring, 1, 200)
         self.start_hour = whole("send_start_hour", SEND_START_HOUR, 0, 23)
         self.end_hour = whole("send_end_hour", SEND_END_HOUR, 1, 24)
         # A window that ends before it opens would silence every customer email. Settings
@@ -355,8 +359,8 @@ TOUCH_KEYS = ("followup_anchor_at", "customer_touch_at",
 INPUT_KEYS = ("proposal_status", "followup_enrolled_at", "followup_disabled_at",
               "followup_paused_until", "cycle_viewed_at", "approved_at", "deposit_status",
               "deposit_required", "deposit_requested_at", "followup_next_at",
-              "followup_interval_days", "followup_stop_after", "followup_reminder_times"
-              ) + TOUCH_KEYS
+              "followup_interval_days", "followup_stop_after", "followup_reminder_times",
+              "deposit_history") + TOUCH_KEYS
 
 
 def _ts(v: Any) -> Optional[datetime]:
@@ -410,6 +414,18 @@ def _reminders_since(p: dict, since: datetime) -> int:
     return n
 
 
+def _newest_reminder(p: dict) -> Optional[datetime]:
+    """The newest COUNTED reminder (`followup_reminder_times`: sent or called tasks, and the old
+    ladder's automatic customer emails), or None. The touched shape never starts its interval
+    before it."""
+    best = None
+    for v in _times_list(p.get("followup_reminder_times")):
+        t = _ts(v)
+        if t is not None and (best is None or t > best):
+            best = t
+    return best
+
+
 def _whole_or_none(v: Any, lo: int, hi: int) -> Optional[int]:
     if isinstance(v, bool) or v is None or v == "":
         return None
@@ -444,8 +460,59 @@ def effective_cfg(cfg: Optional[dict], p: dict) -> dict:
         out["recurring_hours"] = days * 24
     stop = _whole_or_none(p.get("followup_stop_after"), 1, 60)
     if stop:
+        # The old ladder's cap is the GLOBAL one; kept before the stop-after replaces it.
+        out.setdefault("legacy_max_recurring", _Cadence(cfg).max_recurring)
         out["max_recurring"] = stop
     return out
+
+
+def _deposit_history(p: dict) -> dict:
+    raw = p.get("deposit_history")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    out = {}
+    for k in ("customer_legacy", "staff_legacy", "staff"):
+        try:
+            out[k] = int(raw.get(k) or 0) if isinstance(raw, dict) else 0
+        except (TypeError, ValueError):
+            out[k] = 0
+    return out
+
+
+def deposit_series_done(p: dict, audience: str, c: Optional["_Cadence"] = None) -> bool:
+    """Has this approved job's deposit chase for `audience` ('customer' | 'staff') run out? Pure.
+
+    Fix round #11/#3. The OLD automatic ladder capped both deposit chases at max_recurring: once
+    the recurring index reached it the rule key stopped changing and the dedupe ended the chase.
+    The deposit stage now has its own, much larger cap (deposit_max, decision 5), so for a job the
+    old ladder had already finished the index moves again, the keys are new, and the chase would
+    restart on the first tick after deploy, every 3 days for months. So:
+
+      * a series whose OLD recurring emails (`p["deposit_history"]`, db._DEPOSIT_HISTORY_SQL)
+        reached the cap the old ladder ran under (`c.legacy_cap`, the global max_recurring) is
+        finished and stays finished;
+      * otherwise every deposit reminder already sent counts toward deposit_max: the customer's
+        through followup_reminder_times (its auto_email rows and sent/called tasks, the capped
+        shape in _customer_plan), the estimator's through `deposit_history.staff` here.
+
+    Absent history (a stubbed row, a pre-change caller) reads as none sent, which is exactly how
+    the schedule behaved before this check existed."""
+    c = c or _Cadence()
+    if deposit_legacy_finished(p, audience, c):
+        return True
+    return audience != "customer" and _deposit_history(p)["staff"] >= c.deposit_max
+
+
+def deposit_legacy_finished(p: dict, audience: str, c: Optional["_Cadence"] = None) -> bool:
+    """Did the OLD automatic ladder already run this deposit series to its cap? The half of
+    deposit_series_done that exists only for proposals in flight at deploy (the dry run reports the
+    jobs it holds). Pure."""
+    c = c or _Cadence()
+    h = _deposit_history(p)
+    return h["customer_legacy" if audience == "customer" else "staff_legacy"] >= c.legacy_cap
 
 
 def customer_stage(p: dict) -> Optional[str]:
@@ -769,6 +836,8 @@ def _customer_plan(p: dict, now: datetime, c: "_Cadence") -> tuple:
         # been invoiced for is the worst button we could send them.
         rec = ("depr", "deposit_nudge", False)
         cap = c.deposit_max
+        if deposit_series_done(p, "customer", c):
+            return None, None
     elif viewed is None:
         oneshots = ((c.first, "nv1", "not_viewed", False),)
         # Still unopened days later. This is exactly the proposal that needs the "delayed / not
@@ -794,7 +863,13 @@ def _customer_plan(p: dict, now: datetime, c: "_Cadence") -> tuple:
     if touch is not None:
         step = c.recurring
         snooze = _ts(p.get("followup_next_at"))
-        start = snooze if (snooze is not None and snooze > touch) else touch + step
+        # The interval runs from the touch OR from the newest counted reminder, whichever is later
+        # (fix round #10). The old automatic ladder emailed customers without leaving a touch, so a
+        # proposal with a reply weeks ago and an automatic email two days ago would otherwise come
+        # due on the first tick after deploy: two reminders inside one interval.
+        floor = _newest_reminder(p)
+        since = floor if (floor is not None and floor > touch) else touch
+        start = snooze if (snooze is not None and snooze > touch) else since + step
         if now < start:
             return None, start
         k = min(cap, int((now - start) // step))
@@ -910,7 +985,7 @@ def due_now(p: dict, now: datetime, cfg: Optional[dict] = None) -> list[Due]:
         # the customer's stops, which is the case Hanz asked for: a cheque that never arrives. Its
         # cap is deposit_max, NOT max_recurring (decision 5).
         elapsed = now - staff_anchor
-        if elapsed >= c.staff_personal:
+        if elapsed >= c.staff_personal and not deposit_series_done(p, "staff", c):
             n = _recurring_index(elapsed, c.staff_personal, c, c.deposit_max)
             if touch is None:
                 key = (_occurrence_key(ck, "depsr", staff_anchor, c.staff_personal, n, c) if n

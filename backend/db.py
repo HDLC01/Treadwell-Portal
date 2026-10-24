@@ -769,6 +769,8 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         + _STAFF_MESSAGE_SQL.format(pid="p.proposal_id") + " as last_staff_message_at, "
         + _REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
         + " as followup_reminder_times, "
+        + _DEPOSIT_HISTORY_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " as deposit_history, "
         # The open follow-up task, if any, so the board (polled every 25s) can show it without a
         # second request.
         + _ROW_OPEN_TASK_SQL + " as pending_task "
@@ -1607,6 +1609,28 @@ _REMINDER_TIMES_SQL = (
     "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
     "    and ((f.kind = 'followup_task' and f.detail->>'status' in ('sent','called')) "
     "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
+# The deposit chase's own history in this send cycle (fix round #11/#3), for
+# followup_rules.deposit_series_done:
+#   customer_legacy  the old ladder's recurring customer deposit emails (`:depr@`). Every customer
+#                    auto_email row is the old ladder's: remind-only never writes one.
+#   staff_legacy     the old ladder's recurring staff deposit emails (`:depsr@`) - the rows WITHOUT
+#                    the `engine` mark followup_worker now puts on every staff note it reserves.
+#   staff            every staff deposit email of the cycle, old or new (dep_staff/depsr/depst).
+# The old code capped both chases at max_recurring, so a chase that reached it had FINISHED; the
+# deposit's own cap (200) must not start it again. Regex, not LIKE: a `%` here would collide with
+# the driver's parameter markers.
+_DEPOSIT_HISTORY_SQL = (
+    "(select jsonb_build_object("
+    "   'customer_legacy', count(*) filter (where f.detail->>'audience' = 'customer' "
+    "                                         and f.detail->>'rule_key' ~ ':depr@'), "
+    "   'staff_legacy', count(*) filter (where f.detail->>'audience' = 'staff' "
+    "                                      and f.detail->>'rule_key' ~ ':depsr@' "
+    "                                      and f.detail->>'engine' is null), "
+    "   'staff', count(*) filter (where f.detail->>'audience' = 'staff' "
+    "                               and f.detail->>'rule_key' ~ ':(dep_staff$|depsr@|depst@)')) "
+    "   from public.portal_followups f "
+    "  where f.proposal_id = {pid} and f.kind = 'auto_email' "
+    "    and f.created_at >= coalesce({enrolled}, f.created_at))")
 # The newest OPEN task (there is at most one: portal_followups_one_open_task_uidx). Open means
 # pending, or `sending` — claimed by the send endpoint and not yet confirmed. A `sending` task must
 # hold the slot: if it did not, a tick during the send would raise a second task, and putting the
@@ -1649,8 +1673,9 @@ def followup_signals(proposal_id: str) -> dict[str, Any]:
            + _STAFF_MESSAGE_SQL.format(pid="%s") + " as last_staff_message_at, "
            + _REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
            + " as followup_reminder_times, "
+           + _DEPOSIT_HISTORY_SQL.format(pid="%s", enrolled=enrolled) + " as deposit_history, "
            + _PENDING_TASK_SQL.format(pid="%s") + " as pending_task")
-    return q1(sql, (proposal_id,) * 6) or {}
+    return q1(sql, (proposal_id,) * 8) or {}
 
 
 def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Optional[int]:
