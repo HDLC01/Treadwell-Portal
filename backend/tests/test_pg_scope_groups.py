@@ -79,6 +79,18 @@ def ago(days: float) -> datetime:
     return db_now() - timedelta(days=days)
 
 
+def in_window() -> datetime:
+    """The latest noon (Central) at or before the database's now. followup_rules.due_now drops every
+    CUSTOMER reminder outside the 8am-6pm Central send window, so a test that expects a task to be
+    due must not depend on the hour the suite happens to run at. Rows here are dated days back, so
+    a tick up to 24 hours before now still finds them due."""
+    local = db_now().astimezone(rules.BUSINESS_TZ)
+    noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+    if noon > local:
+        noon -= timedelta(days=1)
+    return noon.astimezone(timezone.utc)
+
+
 def gid_new() -> str:
     return "g-" + uuid.uuid4().hex[:8]
 
@@ -476,6 +488,92 @@ def test_stashed_publish_notes_round_trip(clean):
     assert marks_for(gid) == [], "a stash must never read as a send mark"
 
 
+# ── a SECOND send in the same group: the send_no filter is what protects the first ──
+# Every test above settles, releases or stamps a group's ONLY send, so there is no older mark for
+# the `(detail ->> 'send_no')::int = %s` filter to protect. Here send 1 announced all three scopes,
+# Lab 1 is revised, and send 2 is about Lab 1 alone: whatever happens to send 2 must leave send 1's
+# marks exactly as they were, or Lab 1 (or the whole project) reads as never announced and the next
+# email tells the customer it is NEW.
+def _announce_everything(gid, ids):
+    claim = db.claim_scope_group_send(gid, ids)
+    assert claim["send_no"] == 1
+    db.mark_scope_group_attempt(gid, 1, {i: {"note": "first note", "files": [{"id": "f1"}]}
+                                         for i in ids})
+    db.settle_scope_group_send(gid, 1, {i: {"delivered": [f"buyer{n}@customer.example"],
+                                            "failed": []} for n, i in enumerate(ids)})
+    return {m["proposal_id"]: m for m in marks_for(gid)}
+
+
+def _revise_and_claim(gid, ids, pid):
+    set_cols(pid, current_revision_no=2)
+    claim = db.claim_scope_group_send(gid, ids)
+    assert claim["send_no"] == 2 and claim["pending"] == [pid]
+    assert claim["kinds"] == {pid: "revised"}
+    return claim
+
+
+def _send_one_marks(gid):
+    return {m["id"]: m for m in marks_for(gid) if m["detail"]["send_no"] == 1}
+
+
+def test_settling_a_second_send_that_reached_nobody_keeps_the_first_sends_marks(clean):
+    gid, ids = group_of_three()
+    a, b, c = ids
+    first = _announce_everything(gid, ids)
+    _revise_and_claim(gid, ids, b)
+    db.mark_scope_group_attempt(gid, 2, {b: {"note": "revision note", "files": []}})
+    db.settle_scope_group_send(gid, 2, {b: {"delivered": [], "failed": ["buyer1@customer.example"]}})
+
+    assert _send_one_marks(gid) == {m["id"]: m for m in first.values()}
+    assert len(marks_for(gid)) == 3
+    # Lab 1 is still announced at revision 1, so the next email calls revision 2 REVISED, not new.
+    again = db.claim_scope_group_send(gid, ids)
+    assert again["pending"] == [b] and again["kinds"] == {b: "revised"}
+
+
+def test_settling_a_second_send_that_was_delivered_writes_only_its_own_mark(clean):
+    gid, ids = group_of_three()
+    a, b, c = ids
+    first = _announce_everything(gid, ids)
+    _revise_and_claim(gid, ids, b)
+    db.settle_scope_group_send(gid, 2, {b: {"delivered": ["new-buyer@customer.example"],
+                                            "failed": []}})
+    assert _send_one_marks(gid) == {m["id"]: m for m in first.values()}
+    second = [m for m in marks_for(gid) if m["detail"]["send_no"] == 2]
+    assert [m["proposal_id"] for m in second] == [b]
+    assert second[0]["detail"]["delivery"]["delivered"] == ["new-buyer@customer.example"]
+    assert db.claim_scope_group_send(gid, ids) is None
+
+
+def test_releasing_a_second_send_leaves_the_first_sends_marks(clean):
+    gid, ids = group_of_three()
+    a, b, c = ids
+    first = _announce_everything(gid, ids)
+    _revise_and_claim(gid, ids, b)
+    db.release_scope_group_send(gid, 2)
+
+    assert {m["id"] for m in marks_for(gid)} == {m["id"] for m in first.values()}
+    again = db.claim_scope_group_send(gid, ids)
+    assert again["pending"] == [b] and again["kinds"] == {b: "revised"}
+    assert again["first"] is False
+
+
+def test_stamping_a_second_send_does_not_touch_the_first_sends_mark(clean):
+    gid, ids = group_of_three()
+    a, b, c = ids
+    first = _announce_everything(gid, ids)
+    _revise_and_claim(gid, ids, b)
+    db.mark_scope_group_attempt(gid, 2, {b: {"note": "revision note",
+                                             "files": [{"id": "f9", "name": "rev2.pdf"}]}})
+
+    # Send 1's mark on Lab 1 keeps its own note, files and attempt time: a retry of send 1's
+    # failed addresses must carry what send 1 carried.
+    assert _send_one_marks(gid) == {m["id"]: m for m in first.values()}
+    second = next(m for m in marks_for(gid) if m["detail"]["send_no"] == 2)
+    assert second["proposal_id"] == b and second["detail"]["note"] == "revision note"
+    assert second["detail"]["files"] == [{"id": "f9", "name": "rev2.pdf"}]
+
+
 # ══ e. concurrency: two real connections ══════════════════════════════════════
 def _race(fn, n=2):
     barrier = threading.Barrier(n)
@@ -654,7 +752,16 @@ def test_reminder_times_count_only_sent_and_called_tasks(clean):
     assert rules._reminders_since(dict(board), since) == 3
 
 
+def about(ts, days: float, slack=timedelta(minutes=5)) -> None:
+    """`ts` is `days` before the database's now (a row written `now() - interval`)."""
+    assert ts is not None
+    assert abs((db_now() - ts) - timedelta(days=days)) < slack, (ts, days)
+
+
 def test_followup_signals_reads_every_touch(clean):
+    """Every touch is NEWER noise that the predicates must ignore, so a dropped predicate moves the
+    value: an out-of-office now (customer, meta.auto_reply), the signed-contract row now (staff
+    TEXT, meta.system_doc), a staff card now (msg_type 'system'), a bookkeeping note now."""
     add_proposal("p1", enrolled=20, days_ago=20)
     db.execute("insert into public.portal_questions (proposal_id, author_kind, author_email, body, "
                "created_at) values ('p1', 'customer', 'dana@customer.example', 'Any update?', "
@@ -664,14 +771,23 @@ def test_followup_signals_reads_every_touch(clean):
                "'{\"auto_reply\": true}'::jsonb, now())")
     db.execute("insert into public.portal_questions (proposal_id, author_kind, body, msg_type, "
                "created_at) values ('p1', 'staff', 'Following up', 'text', now() - interval '2 days')")
+    # Written exactly as main._post_signed_contract writes it: staff, msg_type 'text'.
+    db.add_message("p1", "staff", None, "Your signed contract is attached.", msg_type="text",
+                   meta={"attachments": [], "system_doc": True})
+    db.add_message("p1", "staff", None, "Kyle logged a call.", msg_type="system",
+                   meta={"crm": "followup", "internal": True})
     add_followup("p1", "staff_call", {"note": "left a voicemail"}, days_ago=3)
     add_followup("p1", "staff_note", {"action": "reassigned"}, days_ago=0)   # bookkeeping
     sig = db.followup_signals("p1")
     assert set(sig) >= {"customer_touch_at", "last_staff_followup_at", "last_staff_message_at",
                         "followup_reminder_times", "pending_task"}
-    assert sig["customer_touch_at"] is not None
-    assert sig["last_staff_message_at"] is not None
-    assert (db_now() - sig["last_staff_followup_at"]) > timedelta(days=2)   # the call, not the note
+    about(sig["customer_touch_at"], 1)              # the reply, not the out-of-office
+    about(sig["last_staff_message_at"], 2)          # the message, not the contract or the card
+    about(sig["last_staff_followup_at"], 3)         # the call, not the note
+    # The board reads the same predicates (one copy of each, in db.py).
+    board = next(r for r in db.list_all_portal_proposals() if r["proposal_id"] == "p1")
+    assert board["customer_touch_at"] == sig["customer_touch_at"]
+    assert board["last_staff_message_at"] == sig["last_staff_message_at"]
     assert sig["pending_task"] is None
     tid = db.reserve_followup_task("p1", "k", {"stage": "pre"})
     assert db.followup_signals("p1")["pending_task"]["id"] == tid
@@ -804,7 +920,7 @@ def test_the_dry_run_reads_real_rows_and_writes_nothing(clean):
     add_draft("solo")
     add_proposal("solo", enrolled=30, days_ago=30)
     before = db.q1("select count(*) as n from public.portal_followups")["n"]
-    out = followup_worker.dry_run_count(db_now())
+    out = followup_worker.dry_run_count(in_window())
     after = db.q1("select count(*) as n from public.portal_followups")["n"]
     assert out["skipped"] == [], out["skipped"]
     assert before == after, "the dry run wrote a row"
@@ -914,3 +1030,594 @@ def test_the_hand_applied_blocks_apply_alone_and_twice(fresh_db):
     assert index_def("portal_followups_one_open_task_v2_uidx") is not None
     assert index_def("portal_followups_one_open_task_uidx") is None
     assert index_def("portal_followups_rule_v2_uidx") is not None
+
+
+# ══ the remaining follow-up SQL: the plan, the anchor, the draft, unsettled sends ══
+KYLE = "kyle@estimator.example"
+
+
+def all_tasks() -> list:
+    return db.qall("select id, proposal_id, detail, created_at from public.portal_followups "
+                   "where kind = 'followup_task' order by id")
+
+
+def age_group(ids, days=30):
+    """Published, emailed and enrolled `days` back, owned by Kyle: every reminder is due."""
+    for pid in ids:
+        set_cols(pid, followup_enrolled_at=ago(days), created_at=ago(days),
+                 last_sent_at=ago(days), assigned_estimator=KYLE)
+
+
+def test_the_followup_plan_checks_refuse_what_the_plan_endpoint_refuses(clean):
+    """The three CHECKs schema.sql adds (and re-adds on every boot) actually refuse: the endpoint's
+    1-90 / 1-60 validation is not the only thing between a typo and the worker."""
+    add_proposal("p1")
+    for col, bad in (("followup_mode", "ladder"), ("followup_mode", ""),
+                     ("followup_interval_days", 0), ("followup_interval_days", 91),
+                     ("followup_stop_after", 0), ("followup_stop_after", 61)):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            set_cols("p1", **{col: bad})
+    for col, good in (("followup_mode", "remind"), ("followup_mode", "approve"),
+                      ("followup_mode", "auto"), ("followup_mode", None),
+                      ("followup_interval_days", 1), ("followup_interval_days", 90),
+                      ("followup_stop_after", 1), ("followup_stop_after", 60)):
+        set_cols("p1", **{col: good})
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db.set_followup_plan("p1", interval_days=91)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db.set_followup_plan("p1", stop_after=0)
+
+
+def test_reapplying_the_schema_restores_a_missing_plan_check(fresh_db):
+    """The drop-then-add pairs: a database that lost (or never had) a CHECK gets it back on the
+    next apply, and an apply over a database that has them is a no-op that keeps them."""
+    for name in ("portal_proposals_followup_mode_check",
+                 "portal_proposals_followup_interval_days_check",
+                 "portal_proposals_followup_stop_after_check"):
+        db.execute("alter table public.portal_proposals drop constraint " + name)
+    add_proposal("p1")
+    set_cols("p1", followup_mode="ladder")              # nothing refuses it now
+    set_cols("p1", followup_mode=None)
+    pg_fixture.apply_schema()
+    pg_fixture.apply_schema()
+    for col, bad in (("followup_mode", "ladder"), ("followup_interval_days", 0),
+                     ("followup_stop_after", 61)):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            set_cols("p1", **{col: bad})
+
+
+def test_reapplying_over_the_old_rule_index_drops_it_and_keeps_the_dedupe(fresh_db):
+    """`drop index if exists public.portal_followups_rule_uidx` against an index that EXISTS (every
+    other test only ever runs it as a no-op): a database from before remind-only, with the old
+    auto_email-only index and live reservations, ends with the widened index alone, its rows kept,
+    and a task refused for an occurrence the old ladder already emailed."""
+    db.execute("drop index public.portal_followups_rule_v2_uidx")
+    db.execute("create unique index portal_followups_rule_uidx "
+               "on public.portal_followups (proposal_id, (detail->>'rule_key')) "
+               "where kind = 'auto_email' and (detail->>'rule_key') is not null")
+    add_proposal("p1")
+    assert isinstance(db.reserve_followup("p1", "vnv:1", {"audience": "customer"}), int)
+    assert db.reserve_followup("p1", "vnv:1", {"audience": "customer"}) is None   # old guard
+
+    pg_fixture.apply_schema()
+
+    assert index_def("portal_followups_rule_uidx") is None
+    assert index_def("portal_followups_rule_v2_uidx") is not None
+    assert db.q1("select count(*) as n from public.portal_followups")["n"] == 1
+    assert db.reserve_followup_task("p1", "vnv:1", {"stage": "pre"}) is None
+    assert db.reserve_followup("p1", "vnv:1", {"audience": "customer"}) is None
+    assert isinstance(db.reserve_followup_task("p1", "vnv:2", {"stage": "pre"}), int)
+
+
+def test_the_plan_writes_only_what_it_is_given_and_the_anchor_stamps_now(clean):
+    add_proposal("p1")
+    snooze = datetime(2030, 3, 4, 8, 0, tzinfo=rules.BUSINESS_TZ)
+    set_cols("p1", updated_at=ago(5))
+    db.set_followup_plan("p1", next_at=snooze)
+    row = db.get_proposal("p1")
+    assert row["followup_next_at"] == snooze
+    assert row["followup_interval_days"] is None and row["followup_stop_after"] is None
+    about(row["updated_at"], 0)
+    db.set_followup_plan("p1", interval_days=7, stop_after=3)
+    row = db.get_proposal("p1")
+    assert (row["followup_interval_days"], row["followup_stop_after"]) == (7, 3)
+    assert row["followup_next_at"] == snooze                    # not passed, not touched
+    db.set_followup_plan("p1", stop_after=None)                 # None clears one field
+    row = db.get_proposal("p1")
+    assert row["followup_stop_after"] is None and row["followup_interval_days"] == 7
+    db.set_followup_plan("p1")                                  # nothing passed: no write at all
+
+    # A snooze keeps its date; any other decision drops it.
+    db.stamp_followup_anchor("p1", clear_next=False)
+    row = db.get_proposal("p1")
+    about(row["followup_anchor_at"], 0)
+    assert row["followup_next_at"] == snooze
+    set_cols("p1", followup_anchor_at=ago(4))
+    db.stamp_followup_anchor("p1")
+    row = db.get_proposal("p1")
+    about(row["followup_anchor_at"], 0)
+    assert row["followup_next_at"] is None
+    assert row["followup_interval_days"] == 7, "the anchor must not touch the plan"
+    # Only this proposal.
+    add_proposal("p2")
+    db.stamp_followup_anchor("p1")
+    assert db.get_proposal("p2")["followup_anchor_at"] is None
+
+
+def test_the_plan_and_the_anchor_fail_loudly_without_their_columns(fresh_db):
+    """Both are WRITES named directly (not through to_jsonb), so before the owner's ALTER they must
+    raise rather than pretend; main._stamp_touch is the guard that keeps a decision recorded."""
+    add_proposal("p1")
+    db.execute("alter table public.portal_proposals drop column followup_anchor_at, "
+               "drop column followup_next_at")
+    with pytest.raises(psycopg.errors.UndefinedColumn):
+        db.stamp_followup_anchor("p1")
+    with pytest.raises(psycopg.errors.UndefinedColumn):
+        db.set_followup_plan("p1", next_at=None)
+
+
+def test_a_draft_is_stored_as_an_object_on_a_pending_task_only(clean):
+    add_proposal("p1")
+    tid = db.reserve_followup_task("p1", "k1", {"stage": "pre", "template": "checkin",
+                                                "draft": {"title": "Default", "body": "{link}",
+                                                          "source": "default"}})
+    ai = {"title": "Quick check-in", "body": "Hi Dana,\n\n{link}", "cta": "Open",
+          "source": "ai"}
+    db.set_followup_task_draft(tid, ai)
+    d = db.get_followup_task(tid)["detail"]
+    assert d["draft"] == ai
+    assert d["rule_key"] == "k1" and d["status"] == "pending" and d["template"] == "checkin"
+    kind = db.q1("select jsonb_typeof(detail -> 'draft') as t from public.portal_followups "
+                 "where id = %s", (tid,))["t"]
+    assert kind == "object", "the draft must be a jsonb object, not a quoted string"
+    db.decide_followup_task(tid, "skipped", KYLE)
+    db.set_followup_task_draft(tid, {"title": "Too late", "body": "{link}", "source": "ai"})
+    assert db.get_followup_task(tid)["detail"]["draft"] == ai
+    # Never a row of another kind.
+    note = add_followup("p1", "staff_note", {"action": "x"})
+    db.set_followup_task_draft(note, ai)
+    assert "draft" not in db.q1("select detail from public.portal_followups where id = %s",
+                                (note,))["detail"]
+
+
+def test_unsettled_sends_are_found_and_settled_on_the_evidence(clean):
+    """list_stale_sending_tasks + followup_task_send_recorded, and the worker's recovery that reads
+    them (_recover_stuck_sends), on real rows."""
+    names = ("went", "lost", "fresh", "legacy", "open")
+    for pid in names:
+        add_proposal(pid)
+    ids = {pid: db.reserve_followup_task(pid, "k-" + pid, {"stage": "pre"}) for pid in names}
+    stale = (db_now() - timedelta(minutes=20)).isoformat()
+    db.decide_followup_task(ids["went"], "sending", KYLE, {"sending_at": stale})
+    db.decide_followup_task(ids["lost"], "sending", KYLE, {"sending_at": stale})
+    # Raised long ago but claimed a moment ago: sending_at wins over created_at.
+    db.decide_followup_task(ids["fresh"], "sending", KYLE,
+                            {"sending_at": db_now().isoformat()})
+    # Claimed by code that wrote no sending_at: dated by the row.
+    db.decide_followup_task(ids["legacy"], "sending", KYLE)
+    db.execute("update public.portal_followups set created_at = now() - interval '20 minutes' "
+               "where id = any(%s)", ([ids["fresh"], ids["legacy"], ids["open"]],))
+    # The evidence main.admin_followup_task_send writes after a real send (task_id as an int)...
+    db.add_followup("went", "staff_email", {"note": "Checking in", "task_id": ids["went"],
+                                            "followup_task": True}, KYLE)
+    # ...and rows that are NOT evidence: another kind carrying the id, and another task's email.
+    db.add_followup("lost", "staff_note", {"action": "followup_skipped", "task_id": ids["lost"]})
+    db.add_followup("lost", "staff_email", {"task_id": ids["open"]})
+
+    assert [t["id"] for t in db.list_stale_sending_tasks(15)] == sorted(
+        [ids["went"], ids["lost"], ids["legacy"]])
+    assert db.list_stale_sending_tasks(30) == []
+    assert db.followup_task_send_recorded(ids["went"]) is True
+    assert db.followup_task_send_recorded(ids["lost"]) is False
+    assert db.followup_task_send_recorded(ids["legacy"]) is False
+
+    followup_worker._recover_stuck_sends()
+
+    went = db.get_followup_task(ids["went"])["detail"]
+    assert went["status"] == "sent" and went["recovered"] is True and went["decided_by"] == KYLE
+    for pid in ("lost", "legacy"):
+        d = db.get_followup_task(ids[pid])["detail"]
+        assert d["status"] == "pending" and d["send_unconfirmed"] is True, pid
+        assert d["sending_at"] is None and d["decided_by"] is None
+    assert db.get_followup_task(ids["fresh"])["detail"]["status"] == "sending"
+    assert db.get_followup_task(ids["open"])["detail"]["status"] == "pending"
+    assert db.list_stale_sending_tasks(15) == []
+    # The reopened task holds its slot again: no second task for that stage.
+    assert db.reserve_followup_task("lost", "k-lost-2", {"stage": "pre"}) is None
+
+
+# ══ the worker's tick, group pass and re-nag, on real rows ═════════════════════
+@pytest.fixture
+def outbox(monkeypatch):
+    """Every email the code tries to send, recorded at email_sender._send (the one function that
+    calls Resend), with no network: Resend is replaced by a recorder and httpx.post by a tripwire.
+    Addresses in `fail` bounce."""
+    import types
+
+    import email_sender
+
+    box = types.SimpleNamespace(sent=[], fail=set())
+
+    def fake_send(to, subject, html, headers=None, reply_to=None, attachments=None):
+        to = [t for t in to if t]
+        if not to:
+            return False
+        ok = not any(t in box.fail for t in to)
+        box.sent.append({"to": list(to), "subject": subject, "html": html, "ok": ok})
+        return ok
+
+    def no_network(*a, **k):
+        raise AssertionError("a test reached for Resend")
+
+    monkeypatch.setattr(email_sender, "_send", fake_send)
+    monkeypatch.setattr(email_sender.httpx, "post", no_network)
+    box.to = lambda: [t for m in box.sent if m["ok"] for t in m["to"]]
+    box.customers = lambda: [t for t in box.to() if t.endswith("@customer.example")]
+    return box
+
+
+@pytest.fixture
+def automation_on(monkeypatch):
+    monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "true")
+
+
+def test_a_tick_raises_what_the_dry_run_promised_and_a_second_tick_raises_nothing(
+        clean, outbox, automation_on):
+    gid, ids = group_of_three(sent=True)
+    age_group(ids)
+    add_draft("solo")
+    add_proposal("solo")
+    age_group(["solo"])
+    now = in_window()
+    planned = {(t["proposal_id"], t["rule_key"])
+               for t in followup_worker.dry_run_count(now)["tasks"]}
+    assert {pid for pid, _ in planned} == {ids[0], "solo"}
+
+    followup_worker._tick(now)
+
+    raised = all_tasks()
+    assert {(t["proposal_id"], t["detail"]["rule_key"]) for t in raised} == planned
+    by = {t["proposal_id"]: t["detail"] for t in raised}
+    g = by[ids[0]]
+    assert g["scope_group"] == gid and [s["proposal_id"] for s in g["scopes"]] == ids
+    assert g["status"] == "pending" and g["stage"] == "pre" and g["mode"] == "remind"
+    assert g["cycle"] and g["draft"]["source"] == "default" and g["draft"]["title"]
+    assert by["solo"].get("scope_group") is None
+    # REMIND-ONLY: no customer was emailed and no customer email was even reserved.
+    assert outbox.customers() == []
+    assert db.q1("select count(*) as n from public.portal_followups where kind = 'auto_email' "
+                 "and detail ->> 'audience' = 'customer'")["n"] == 0
+    # The estimator was told, and each task is echoed into its thread as an INTERNAL row.
+    assert set(outbox.to()) == {KYLE}
+    for t in raised:
+        echo = db.q1("select meta from public.portal_questions where proposal_id = %s "
+                     "and (meta ->> 'task_id')::bigint = %s", (t["proposal_id"], t["id"]))
+        assert echo and echo["meta"]["internal"] is True, t["proposal_id"]
+
+    sent_before = len(outbox.sent)
+    followup_worker._tick(now)
+    assert len(all_tasks()) == len(raised)
+    assert len(outbox.sent) == sent_before
+    assert followup_worker.dry_run_count(now)["tasks"] == []
+
+
+def test_a_tick_does_nothing_with_automation_off(clean, outbox, monkeypatch):
+    monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "false")
+    add_proposal("solo")
+    age_group(["solo"])
+    followup_worker._tick(in_window())
+    assert all_tasks() == [] and outbox.sent == []
+
+
+def test_the_group_pass_rehomes_a_stray_task_and_a_sending_one_holds_the_slot(clean, outbox):
+    cfg = followup_worker._settings()
+    now = in_window()
+    # A pending group task on a scope that is not the home: expired, and raised on the home.
+    gid, ids = group_of_three(sent=True)
+    age_group(ids)
+    a, b, c = ids
+    stray = db.reserve_followup_task(b, "grp:stray", {
+        "template": "followup_not_viewed", "stage": "pre", "scope_group": gid,
+        "scopes": [{"proposal_id": i} for i in ids]})
+    followup_worker._process_group(gid, now, cfg)
+    s = db.get_followup_task(stray)["detail"]
+    assert s["status"] == "expired" and s["reason"] == "rehomed"
+    assert [t["proposal_id"] for t in db.list_open_group_tasks(gid)] == [a]
+
+    # A `sending` one is mid-send: never expired under the estimator, and it holds the slot.
+    gid2, ids2 = group_of_three(sent=True)
+    age_group(ids2)
+    busy = db.reserve_followup_task(ids2[1], "grp:busy", {
+        "template": "followup_not_viewed", "stage": "pre", "scope_group": gid2,
+        "scopes": [{"proposal_id": i} for i in ids2]})
+    db.decide_followup_task(busy, "sending", KYLE)
+    followup_worker._process_group(gid2, now, cfg)
+    assert db.get_followup_task(busy)["detail"]["status"] == "sending"
+    assert [t["id"] for t in db.list_open_group_tasks(gid2)] == [busy]
+
+    # The chase stops when a scope is approved: the home's open reminder is expired.
+    set_cols(c, proposal_status="approved", approved_at=ago(0))
+    followup_worker._process_group(gid, now, cfg)
+    assert db.list_open_group_tasks(gid) == []
+    assert outbox.customers() == []
+
+
+def test_an_unanswered_decision_task_renags_once_per_period(clean, outbox):
+    gid, ids = group_of_three(sent=True)
+    a, b, c = ids
+    for pid in ids:
+        set_cols(pid, assigned_estimator=KYLE)
+    set_cols(c, proposal_status="approved", approved_at=ago(7))
+    dec = db.reserve_followup_task(c, f"sd:{gid}:{c}", {
+        "audience": "staff", "template": rules.GROUP_TASK_TEMPLATE_DECISION,
+        "stage": rules.DECISION_STAGE, "scope_group": gid,
+        "approved_scope": {"proposal_id": c, "label": "Lab 2"},
+        "scopes": [{"proposal_id": a, "label": "Breakroom"}, {"proposal_id": b, "label": "Lab 1"}]})
+    db.execute("update public.portal_followups set created_at = now() - interval '7 days' "
+               "where id = %s", (dec,))
+    task = db.get_followup_task(dec)
+    now = db_now()
+    key = f"sdn:{dec}:2"                          # 7 days = the second 3-day period
+
+    outbox.fail.add(KYLE)                         # the email bounces: the reservation is released
+    followup_worker._renag_decision(task, now)
+    assert db.followup_rule_key_exists(c, key) is False
+    outbox.fail.clear()
+    followup_worker._renag_decision(task, now)
+    assert db.followup_rule_key_exists(c, key) is True
+    delivered = [m for m in outbox.sent if m["ok"]]
+    assert len(delivered) == 1 and delivered[0]["to"] == [KYLE]
+    assert "Breakroom" in delivered[0]["html"] and "Lab 1" in delivered[0]["html"]
+    followup_worker._renag_decision(task, now)    # the same period again (the twin container)
+    assert len([m for m in outbox.sent if m["ok"]]) == 1
+    followup_worker._renag_decision(task, now + timedelta(days=60))
+    assert db.followup_rule_key_exists(c, f"sdn:{dec}:{followup_worker.DECISION_RENAG_MAX}")
+    assert not db.followup_rule_key_exists(c, f"sdn:{dec}:20")
+    # Younger than one period: nothing at all.
+    young = dict(task, created_at=db_now() - timedelta(days=1))
+    before = len(outbox.sent)
+    followup_worker._renag_decision(young, db_now())
+    assert len(outbox.sent) == before
+    assert outbox.customers() == []
+
+
+# ══ the endpoints, end to end over real rows ═══════════════════════════════════
+if pg_fixture.PG_URL:
+    import main  # noqa: E402 — only when the tests will run
+
+GOOD = {"title": "Checking in", "body": "Hi {first_name},\n\nAny questions on {project}?\n\n{link}",
+        "by": KYLE}
+
+
+@pytest.fixture
+def client(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    return TestClient(main.app)
+
+
+def _raise_tasks() -> dict:
+    followup_worker._tick(in_window())
+    return {t["proposal_id"]: t for t in all_tasks() if t["detail"]["status"] == "pending"}
+
+
+def _echo_of(pid, tid, internal=False):
+    return db.q1("select id from public.portal_questions where proposal_id = %s "
+                 "and (meta ->> 'task_id')::bigint = %s "
+                 "and (coalesce(meta ->> 'internal', 'false') = 'true') = %s",
+                 (pid, tid, internal))
+
+
+def test_sending_a_task_emails_the_customer_once_and_records_the_touch(
+        clean, outbox, automation_on, client):
+    add_draft("p1")
+    add_proposal("p1")
+    age_group(["p1"])
+    tid = _raise_tasks()["p1"]["id"]
+    got = client.get(f"/api/admin/followup-task/{tid}").json()
+    assert got["live"] is True and got["recipients"] == ["p1@customer.example"]
+    outbox.sent.clear()
+
+    # A bounce: nothing went, so the task is back to pending and nothing was recorded.
+    outbox.fail.add("p1@customer.example")
+    r = client.post(f"/api/admin/followup-task/{tid}/send", json=GOOD)
+    assert r.status_code == 502 and r.json()["error"] == "send_failed"
+    assert db.get_followup_task(tid)["detail"]["status"] == "pending"
+    assert db.followup_task_send_recorded(tid) is False
+    outbox.fail.clear()
+
+    r = client.post(f"/api/admin/followup-task/{tid}/send", json=GOOD)
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "sent" and "warnings" not in r.json()
+    assert outbox.customers() == ["p1@customer.example"]
+    d = db.get_followup_task(tid)["detail"]
+    assert d["status"] == "sent" and d["decided_by"] == KYLE and d["sent"]["title"] == "Checking in"
+    assert db.followup_task_send_recorded(tid) is True
+    about(db.get_proposal("p1")["followup_anchor_at"], 0)
+    sig = db.followup_signals("p1")
+    about(sig["last_staff_followup_at"], 0)
+    assert len(sig["followup_reminder_times"]) == 1          # a SENT task counts toward the cap
+    assert sig["pending_task"] is None
+    assert _echo_of("p1", tid, internal=False), "the customer's thread shows the reminder"
+    assert db.list_stale_sending_tasks(0) == []
+
+    r = client.post(f"/api/admin/followup-task/{tid}/send", json=GOOD)    # the second press
+    assert r.status_code == 409
+    assert outbox.customers() == ["p1@customer.example"]
+
+
+def test_skip_called_snooze_and_the_ai_draft_on_real_rows(clean, outbox, automation_on, client):
+    for pid in ("p-skip", "p-call", "p-snooze"):
+        add_draft(pid)
+        add_proposal(pid)
+    age_group(["p-skip", "p-call", "p-snooze"])
+    tasks = _raise_tasks()
+    assert set(tasks) == {"p-skip", "p-call", "p-snooze"}
+    later = db_now() + timedelta(days=40)
+    set_cols("p-skip", followup_next_at=later)
+    outbox.sent.clear()
+
+    # The AI draft the tool posts back is stored on the task (set_followup_task_draft).
+    tid = tasks["p-skip"]["id"]
+    r = client.post(f"/api/admin/followup-task/{tid}/draft", json={"model_output": {
+        "title": "Quick check-in", "body": "Hi Dana,\n\nAny questions on the floor?\n\n{link}"}})
+    assert r.status_code == 200 and r.json()["fallback"] is False, r.text
+    assert db.get_followup_task(tid)["detail"]["draft"]["source"] == "ai"
+    assert client.get(f"/api/admin/followup-task/{tid}").json()["task"]["draft"]["title"] == \
+        "Quick check-in"
+
+    r = client.post(f"/api/admin/followup-task/{tid}/skip", json={"by": KYLE, "note": "on holiday"})
+    assert r.status_code == 200 and "warnings" not in r.json(), r.text
+    d = db.get_followup_task(tid)["detail"]
+    assert d["status"] == "skipped" and d["note"] == "on holiday"
+    row = db.get_proposal("p-skip")
+    about(row["followup_anchor_at"], 0)
+    assert row["followup_next_at"] is None, "a decision drops an earlier snooze date"
+    assert db.q1("select count(*) as n from public.portal_followups where proposal_id = 'p-skip' "
+                 "and kind = 'staff_note' and detail ->> 'action' = 'followup_skipped' "
+                 "and (detail ->> 'task_id')::bigint = %s", (tid,))["n"] == 1
+    sig = db.followup_signals("p-skip")
+    assert sig["followup_reminder_times"] == [], "a skipped task never counts toward the cap"
+    assert sig["last_staff_followup_at"] is None, "a skip is bookkeeping, not outreach"
+
+    tid = tasks["p-call"]["id"]
+    r = client.post(f"/api/admin/followup-task/{tid}/called",
+                    json={"by": KYLE, "kind": "text", "note": "texted Dana"})
+    assert r.status_code == 200 and "warnings" not in r.json(), r.text
+    assert db.get_followup_task(tid)["detail"]["status"] == "called"
+    assert db.q1("select count(*) as n from public.portal_followups where proposal_id = 'p-call' "
+                 "and kind = 'staff_text' and (detail ->> 'task_id')::bigint = %s",
+                 (tid,))["n"] == 1
+    sig = db.followup_signals("p-call")
+    about(sig["last_staff_followup_at"], 0)
+    assert len(sig["followup_reminder_times"]) == 1, "a CALLED task counts toward the cap"
+    about(db.get_proposal("p-call")["followup_anchor_at"], 0)
+
+    tid = tasks["p-snooze"]["id"]
+    day = db_now().astimezone(rules.BUSINESS_TZ).date() + timedelta(days=10)
+    r = client.post(f"/api/admin/followup-task/{tid}/snooze",
+                    json={"by": KYLE, "until": day.isoformat()})
+    assert r.status_code == 200 and "warnings" not in r.json(), r.text
+    row = db.get_proposal("p-snooze")
+    assert row["followup_next_at"] == datetime(day.year, day.month, day.day,
+                                               rules.SEND_START_HOUR, tzinfo=rules.BUSINESS_TZ)
+    about(row["followup_anchor_at"], 0)
+    assert db.get_followup_task(tid)["detail"]["status"] == "snoozed"
+    assert db.q1("select count(*) as n from public.portal_followups where proposal_id = "
+                 "'p-snooze' and detail ->> 'action' = 'followup_snoozed'")["n"] == 1
+
+    assert outbox.customers() == [], "none of the three emails a customer"
+    assert db.list_pending_followup_tasks() == []
+
+
+def test_sending_the_group_task_mails_each_buyer_their_own_scope(
+        clean, outbox, automation_on, client):
+    gid, ids = group_of_three(sent=True)
+    age_group(ids)
+    a, b, c = ids
+    tid = _raise_tasks()[a]["id"]
+    buyers = [f"buyer{n}@customer.example" for n in range(3)]
+    got = client.get(f"/api/admin/followup-task/{tid}").json()
+    assert got["live"] is True and sorted(got["recipients"]) == buyers
+    outbox.sent.clear()
+
+    r = client.post(f"/api/admin/followup-task/{tid}/send", json=GOOD)
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["emailed"]) == buyers and "warnings" not in r.json()
+    assert sorted(outbox.customers()) == buyers               # one email each
+    mail = {m["to"][0]: m["html"] for m in outbox.sent if m["ok"]}
+    assert "Lab 1" in mail["buyer1@customer.example"]
+    assert "Breakroom" not in mail["buyer1@customer.example"]
+    d = db.get_followup_task(tid)["detail"]
+    assert d["status"] == "sent" and d["delivered"] == buyers
+    touch = db.q1("select proposal_id, detail from public.portal_followups "
+                  "where kind = 'staff_email' and (detail ->> 'task_id')::bigint = %s", (tid,))
+    assert touch["proposal_id"] == a and touch["detail"]["scope_group"] == gid
+    about(db.get_proposal(a)["followup_anchor_at"], 0)
+    assert db.get_proposal(b)["followup_anchor_at"] is None
+    for pid in ids:
+        assert _echo_of(pid, tid, internal=False), pid
+
+
+def test_the_decision_task_closes_the_open_scopes_or_restarts_their_chase(clean, outbox, client):
+    def decided_group():
+        gid, ids = group_of_three(sent=True)
+        a, b, c = ids
+        set_cols(c, proposal_status="approved", approved_at=ago(0))
+        dec = db.reserve_followup_task(c, f"sd:{gid}:{c}", {
+            "audience": "staff", "template": rules.GROUP_TASK_TEMPLATE_DECISION,
+            "stage": rules.DECISION_STAGE, "scope_group": gid,
+            "approved_scope": {"proposal_id": c, "label": "Lab 2"},
+            "scopes": [{"proposal_id": a, "label": "Breakroom"},
+                       {"proposal_id": b, "label": "Lab 1"}]})
+        return gid, ids, dec
+
+    gid, (a, b, c), dec = decided_group()
+    # A decision task is not a reminder: skip refuses it.
+    assert client.post(f"/api/admin/followup-task/{dec}/skip",
+                       json={"by": KYLE}).status_code == 409
+    r = client.post(f"/api/admin/followup-task/{dec}/scope-decision", json={
+        "action": "close", "reason": "not_low_bid", "note": "12% over", "by": KYLE})
+    assert r.status_code == 200, r.text
+    assert r.json()["closed"] == [a, b] and r.json()["failed"] == []
+    for pid in (a, b):
+        row = db.get_proposal(pid)
+        assert row["proposal_status"] == "closed_lost"
+        assert row["closed_lost_reason"] == "not_low_bid"
+        assert db.q1("select count(*) as n from public.portal_followups where proposal_id = %s "
+                     "and kind = 'staff_note' and detail ->> 'action' = 'closed_lost'",
+                     (pid,))["n"] == 1
+    assert db.get_proposal(c)["proposal_status"] == "approved"
+    d = db.get_followup_task(dec)["detail"]
+    assert d["status"] == "decided" and d["outcome"] == "close" and d["scope_ids"] == [a, b]
+    again = client.post(f"/api/admin/followup-task/{dec}/scope-decision",
+                        json={"action": "leave", "by": KYLE})
+    assert again.status_code == 409
+
+    gid, (a, b, c), dec = decided_group()
+    assert followup_worker.group_state_for(gid, db_now())[0] is None      # the chase is stopped
+    r = client.post(f"/api/admin/followup-task/{dec}/scope-decision",
+                    json={"action": "keep", "by": KYLE})
+    assert r.status_code == 200 and "warnings" not in r.json(), r.text
+    about(db.scope_group_resumed_at(gid), 0)
+    about(db.get_proposal(a)["followup_anchor_at"], 0)                    # the home, re-anchored
+    view = followup_worker.group_state_for(gid, db_now())[0]
+    assert view is not None and view["proposal_id"] == a
+    assert [db.get_proposal(p)["proposal_status"] for p in (a, b)] == ["sent", "sent"]
+    assert outbox.customers() == []
+
+
+def test_the_combined_send_end_to_end_and_a_failed_revision_unannounces_nothing(
+        clean, outbox, client):
+    gid, ids = group_of_three()                       # published, never emailed
+    a, b, c = ids
+    buyers = [f"buyer{n}@customer.example" for n in range(3)]
+    url = f"/api/admin/scope-group/{gid}/send"
+
+    r = client.post(url, json={"by": KYLE, "message": "Three scopes, one email"})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["first"] is True and out["recorded"] is True and sorted(out["emailed"]) == buyers
+    assert sorted(outbox.customers()) == buyers
+    first = {m["id"]: m for m in marks_for(gid)}
+    assert len(first) == 3 and all(m["detail"]["delivery"]["delivered"] for m in first.values())
+    for pid in ids:
+        assert portal_rows([pid])[0]["last_sent_at"] is not None, pid
+        about(db.get_proposal(pid)["followup_enrolled_at"], 0)
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 409 and r.json()["error"] == "nothing_to_send"
+
+    # Lab 1 is revised and its only buyer bounces: send 2 reached nobody.
+    set_cols(b, current_revision_no=2)
+    outbox.fail.add("buyer1@customer.example")
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 502 and r.json()["error"] == "delivery_failed", r.text
+    assert [(s["proposal_id"], s["kind"]) for s in r.json()["scopes"]] == [(b, "revised")]
+    assert {m["id"]: m for m in marks_for(gid)} == first, "send 1's marks must survive send 2"
+
+    outbox.fail.clear()
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 200, r.text
+    assert [(s["proposal_id"], s["kind"]) for s in r.json()["scopes"]] == [(b, "revised")]
+    assert r.json()["emailed"] == ["buyer1@customer.example"]
