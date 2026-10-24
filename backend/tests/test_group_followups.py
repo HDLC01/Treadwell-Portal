@@ -1095,3 +1095,39 @@ def test_a_scope_approved_again_after_keep_raises_a_new_decision_task(approve, a
     f.clock = NOW + 3 * H
     assert _decide({"action": "keep"}, decs[1]["id"]).status_code == 200
     assert fw.group_state_for(GID, NOW + 3 * H)[0] is not None
+
+
+def _log(pid, kind="call"):
+    return TestClient(main.app).post("/api/admin/proposal/%s/followups" % pid,
+                                     json={"kind": kind, "note": "Rang Dana", "by": "kyle"})
+
+
+def test_a_call_logged_on_any_open_scope_resolves_the_groups_task(fake, admin):
+    """#14: the group's task lives on the home; a call logged from Lab 1's drawer left it open, so
+    the card asking for a reminder email stayed on the bell after the phone call."""
+    f = fake(_three())
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert t["proposal_id"] == "d-break"
+    assert _log("d-lab1", "note").status_code == 200
+    assert t["detail"]["status"] == "pending", "a note is not contact with the customer"
+    assert _log("d-lab1").status_code == 200
+    assert t["detail"]["status"] == "called" and t["detail"]["logged_on"] == "d-lab1"
+    assert f.rows["d-break"].get("followup_anchor_at") == NOW, "the home was not re-anchored"
+
+
+def test_a_logged_call_never_resolves_a_decision_task_or_a_detached_scopes_group(fake, admin):
+    rows = _three()
+    rows[2]["proposal_status"] = "approved"
+    f = fake(rows, drafts=[{"id": "d-break", "archived": False}, {"id": "d-lab1", "archived": False},
+                           {"id": "d-lab2", "archived": False}])
+    dec = f.reserve_followup_task("d-lab2", "sd:%s:d-lab2:1" % GID, {
+        "stage": "decision", "template": "scope_decision", "scope_group": GID,
+        "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab1"}]})
+    _log("d-lab1")
+    assert f.get_followup_task(dec)["detail"]["status"] == "pending"
+    f.rows["d-lab2"]["proposal_status"] = "sent"
+    rem = f.reserve_followup_task("d-break", "grp:1", {"stage": "pre", "scope_group": GID})
+    f.drafts = [{"id": "d-break", "archived": False}, {"id": "d-lab1", "archived": False}]
+    _log("d-lab2")                                   # d-lab2 has left the group in the tool
+    assert f.get_followup_task(rem)["detail"]["status"] == "pending"

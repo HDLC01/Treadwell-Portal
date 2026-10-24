@@ -4430,7 +4430,8 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
     absence is what "no follow-up logged in 9 days" means."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
-    if not db.get_proposal(proposal_id):
+    p = db.get_proposal(proposal_id)
+    if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     body = await _body(request)
     kind = str(body.get("kind") or "").strip().lower()
@@ -4446,6 +4447,7 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
     # open task, block every later reminder on this proposal. A NOTE is not contact with the
     # customer and leaves the task alone. Guarded: the log is recorded either way.
     if kind in ("staff_call", "staff_email", "staff_text"):
+        tid = None
         try:
             tid = db.pending_followup_task_id(proposal_id)
             if tid is not None:
@@ -4454,9 +4456,40 @@ async def admin_log_followup(proposal_id: str, request: Request) -> JSONResponse
                 _stamp_touch(proposal_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("[followup] could not resolve the open task on %s: %s", proposal_id, exc)
+        _resolve_group_task_on_log(p, kind, note, by, tid)
     return _json({"ok": True, "followup": {
         "kind": row["kind"], "detail": row.get("detail") or {},
         "by": row.get("created_by"), "created_at": _iso(row.get("created_at"))}})
+
+
+def _resolve_group_task_on_log(p: dict, kind: str, note: Optional[str], by: Optional[str],
+                               done_id: Optional[int]) -> None:
+    """Fix round #14: a call, email or text logged on ANY open member's drawer is the follow-up the
+    GROUP's task asks for, so the group's open reminder task (filed on its home scope, shown on
+    every member's drawer) is resolved as 'called' too, and the home re-anchored -- exactly what the
+    same log from the home's own drawer already did. Never a decision task: a call is not the
+    answer to "what about the other scopes?". Only for an OPEN live member; guarded, the log is
+    recorded either way."""
+    gid = p.get("scope_group")
+    if not gid or not followup_rules.is_open(p):
+        return
+    pid = p.get("proposal_id")
+    try:
+        members = followup_worker.group_members(gid, strict=False)
+        if not any(m.get("proposal_id") == pid for m in members):
+            return                  # taken out of the group: its own task is all it has
+        for t in db.list_open_group_tasks(gid) or []:
+            d = t.get("detail") or {}
+            if (t.get("id") == done_id or d.get("stage") == followup_rules.DECISION_STAGE
+                    or (d.get("status") or "pending") != "pending"):
+                continue
+            if db.decide_followup_task(t["id"], "called", by,
+                                       {"kind": kind, "note": note, "via": "drawer_log",
+                                        "logged_on": pid}):
+                _stamp_touch(t["proposal_id"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not resolve scope group %s's task after a log on %s: %s",
+                    gid, pid, exc)
 
 
 def _log_staff_followup(proposal_id: str, kind: str, note: Optional[str], by: Optional[str],
