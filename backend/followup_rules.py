@@ -596,8 +596,29 @@ def group_chase_stopped(members: list) -> bool:
     return latest is not None and resumed < latest
 
 
-def group_state(members: list, now: datetime) -> tuple:
-    """(view, reason). See group_view; `reason` names why there is no view ('' when there is)."""
+def history_rows(rows: list, drafts: Optional[list], live_ids) -> list:
+    """The group rows that are NOT live members but still hold the group's follow-up history:
+    closed, automation-off, archived and deleted scopes, and a former home that has been taken out
+    of the group (`group_tagged`: a group follow-up row was filed on it). A scope taken out of the
+    group that never held the group's task is an ordinary proposal again and is left out. Pure."""
+    detached = detached_ids(rows, drafts)
+    out = []
+    for r in rows or []:
+        if not r or r.get("proposal_id") in live_ids:
+            continue
+        if r.get("proposal_id") in detached and not r.get("group_tagged"):
+            continue
+        out.append(r)
+    return out
+
+
+def group_state(members: list, now: datetime, history: Optional[list] = None) -> tuple:
+    """(view, reason). See group_view; `reason` names why there is no view ('' when there is).
+
+    `history`: rows of the group that are not live (history_rows), carrying the same signals. They
+    never chase and never pick the home, but their touches and counted reminders still belong to
+    the group: a group send is recorded on the HOME row, so when the home is closed or deleted the
+    group must not forget it was just emailed, or that it has used its "Stop after N"."""
     live = [m for m in members or [] if m and not m.get("deleted_at")
             and not m.get("followup_disabled_at")
             and (m.get("proposal_status") or "") != "closed_lost"]
@@ -627,12 +648,15 @@ def group_state(members: list, now: datetime) -> tuple:
     # the first of them does, which is also where an expired pause restarts the clock.
     pauses = [as_date(m.get("followup_paused_until")) for m in open_]
     view["followup_paused_until"] = (min(pauses) if pauses and all(pauses) else None)
-    # A reply, a logged call, a decision on ANY scope re-anchors the whole group.
+    live_ids = {m.get("proposal_id") for m in live}
+    folded = live + [h for h in history or [] if h and h.get("proposal_id") not in live_ids]
+    # A reply, a logged call, a decision on ANY scope re-anchors the whole group -- including one
+    # recorded on a scope that has since left the live set (a closed or deleted former home).
     for k in TOUCH_KEYS:
-        view[k] = _max_ts(m.get(k) for m in live)
+        view[k] = _max_ts(m.get(k) for m in folded)
     # The cap is per group: every member's counted reminders (db: only sent / called count).
     times = []
-    for m in live:
+    for m in folded:
         times.extend(_times_list(m.get("followup_reminder_times")))
     view["followup_reminder_times"] = times
     # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there).
@@ -650,15 +674,15 @@ def group_state(members: list, now: datetime) -> tuple:
     return view, ""
 
 
-def group_view(members: list, now: datetime) -> Optional[dict]:
+def group_view(members: list, now: datetime, history: Optional[list] = None) -> Optional[dict]:
     """One synthetic proposal for a scope group's customer chase, or None when there is none.
 
     Input: the LIVE members of one group (see live_members), each carrying its follow-up signals
     (TOUCH_KEYS, followup_reminder_times) and `scope_group_resumed_at`. Output: a dict `due_now`,
     `next_due_at`, `_customer_plan` and `task_is_live` already understand, filed under the HOME
     scope's proposal_id. None when any live member is approved (and nobody has said "keep
-    chasing the others" since), or when no scope is open. Pure."""
-    return group_state(members, now)[0]
+    chasing the others" since), or when no scope is open. `history`: see group_state. Pure."""
+    return group_state(members, now, history)[0]
 
 
 def decision_task_is_live(detail: Optional[dict], members: Optional[list]) -> tuple:

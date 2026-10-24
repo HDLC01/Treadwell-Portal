@@ -590,10 +590,27 @@ def _with_signals(members: list[dict], group_id: str) -> list[dict]:
     return out
 
 
+def _group_history(group_id: str, members: list[dict]) -> list[dict]:
+    """The group's NON-live rows (rules.history_rows), each with its signals: where a closed,
+    deleted or detached former home keeps the group's last send (staff_email + anchor) and its
+    counted reminders. Unguarded like _with_signals: without them a re-homed group would be
+    chased again a day after it was emailed, past its "Stop after N"."""
+    rows = db.list_scope_group_history(group_id)
+    live_ids = {m.get("proposal_id") for m in members}
+    if not any(r.get("proposal_id") not in live_ids for r in rows or []):
+        return []
+    drafts = db.list_scope_group_draft_states(group_id)
+    out = []
+    for r in rules.history_rows(rows, drafts, live_ids):
+        sig = db.followup_signals(r["proposal_id"]) or {}
+        out.append(dict(r, **{k: v for k, v in sig.items() if k != "pending_task"}))
+    return out
+
+
 def group_state_for(group_id: str, now: datetime) -> tuple:
     """(view, reason, members) for one group, read fresh. Raises if it cannot be read."""
     members = _with_signals(group_members(group_id), group_id)
-    view, why = rules.group_state(members, now)
+    view, why = rules.group_state(members, now, _group_history(group_id, members))
     return view, why, members
 
 

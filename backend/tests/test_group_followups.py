@@ -94,6 +94,14 @@ class FakeDB:
                 if r.get("scope_group") == gid and not r.get("deleted_at")]
         return sorted(rows, key=lambda r: (r["created_at"], r["proposal_id"]))
 
+    def list_scope_group_history(self, gid):
+        self.reads.append(("history", gid))
+        tagged = {f["proposal_id"] for f in self.followups
+                  if f["detail"].get("scope_group") == gid}
+        rows = [dict(r, group_tagged=r["proposal_id"] in tagged) for r in self.rows.values()
+                if r.get("scope_group") == gid or r["proposal_id"] in tagged]
+        return sorted(rows, key=lambda r: (r["created_at"], r["proposal_id"]))
+
     def list_scope_group_draft_states(self, gid):
         self.reads.append(("drafts", gid))
         return [dict(d) for d in self.drafts]
@@ -478,6 +486,45 @@ def test_a_closed_home_rehomes_the_task(fake):
         ["d-lab1"]
 
 
+@pytest.mark.parametrize("gone", ["closed", "deleted"])
+def test_a_rehomed_group_keeps_its_last_send_and_its_counted_reminders(fake, admin, gone):
+    """Review finding: the group's send is recorded on the HOME row (staff_email + anchor stamp)
+    and its sent task is filed there. Closing or deleting that home must not make the group forget
+    it was emailed yesterday, nor the reminders it has used of its "Stop after N"."""
+    f = fake(_three(proposal_status="viewed", cycle_viewed_at=NOW - 30 * H))
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert t["proposal_id"] == "d-break"
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
+        "title": "Checking in", "body": "Hi {first_name},\n\n{link}",
+        "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    if gone == "closed":
+        f.rows["d-break"]["proposal_status"] = "closed_lost"
+    else:
+        f.rows["d-break"]["deleted_at"] = NOW + H
+    later = NOW + timedelta(days=1)
+    f.clock = later
+    fw._tick(later)
+    assert [x["proposal_id"] for x in f.tasks() if x["detail"]["status"] == "pending"] == [], \
+        "the re-homed group was chased again a day after it was emailed"
+    assert [s["subject"] for s in f.sent["staff"]].count("Follow-up due — Acme HQ") == 1
+    view, _why, _m = fw.group_state_for(GID, later)
+    assert view["proposal_id"] == "d-lab1"
+    assert len(view["followup_reminder_times"]) == 1, "the sent reminder left the group's cap"
+    assert view["followup_anchor_at"] == NOW
+
+
+def test_history_rows_leave_out_a_detached_scope_that_never_held_the_groups_task():
+    rows = _three()
+    rows[0]["proposal_status"] = "closed_lost"
+    drafts = [{"id": "d-break"}, {"id": "d-lab1"}]           # d-lab2 left the group
+    assert [r["proposal_id"] for r in rules.history_rows(rows, drafts, {"d-lab1"})] == ["d-break"]
+    rows[2]["group_tagged"] = True                           # ...but it was the home once
+    assert [r["proposal_id"] for r in rules.history_rows(rows, drafts, {"d-lab1"})] == \
+        ["d-break", "d-lab2"]
+
+
 def test_a_scope_taken_out_of_the_group_is_chased_on_its_own(fake):
     rows = _three()
     f = fake(rows, drafts=[{"id": "d-break", "archived": False},
@@ -610,6 +657,37 @@ def test_close_closes_only_the_chosen_scopes_through_the_staff_path(approve, adm
     assert again.status_code == 409
 
 
+def test_close_never_closes_a_scope_approved_since_the_task_was_raised(approve, admin):
+    """Review finding: the task's scope list is frozen when it is raised. Lab 2 signs AFTER the
+    decision task about Lab 1 went up; answering that task with 'close the others' must not file a
+    signed job as lost (it would stop its deposit chase)."""
+    f, go = approve
+    tid = _decision(f, go)                          # lists d-break and d-lab2
+    assert go("d-lab2").status_code == 200           # the customer signs Lab 2 too
+    assert f.rows["d-lab2"]["proposal_status"] == "approved"
+    named = _decide({"action": "close", "scope_ids": ["d-lab2"], "reason": "price",
+                     "note": "x"}, tid)
+    assert named.status_code == 409 and named.json()["error"] == "scope_not_open"
+    assert named.json()["scope_ids"] == ["d-lab2"]
+    task = [t for t in f.tasks(stage="decision") if t["id"] == tid][0]
+    assert task["detail"]["status"] == "pending", "a refused answer claimed the task"
+    r = _decide({"action": "close", "reason": "price", "note": "Went elsewhere"}, tid)
+    assert r.status_code == 200, r.text
+    assert r.json()["closed"] == ["d-break"] and r.json()["skipped"] == ["d-lab2"]
+    assert f.rows["d-lab2"]["proposal_status"] == "approved"
+    assert f.rows["d-break"]["proposal_status"] == "closed_lost"
+
+
+def test_close_is_refused_when_no_listed_scope_is_open_any_more(approve, admin):
+    f, go = approve
+    tid = _decision(f, go)
+    f.rows["d-break"]["proposal_status"] = "approved"
+    f.rows["d-lab2"]["proposal_status"] = "approved"
+    r = _decide({"action": "close", "reason": "price", "note": "x"}, tid)
+    assert r.status_code == 409 and r.json()["error"] == "scope_not_open"
+    assert [f.rows[p]["proposal_status"] for p in ("d-break", "d-lab2")] == ["approved"] * 2
+
+
 def test_keep_resumes_the_group_chase_for_the_remaining_scopes(approve, admin):
     f, go = approve
     tid = _decision(f, go)
@@ -709,6 +787,24 @@ def test_the_pipeline_shows_the_groups_schedule_on_every_open_scope(fake, admin,
     assert len(nexts) == 1, nexts
     assert {out[p]["followup_plan"]["interval_days"] for p in out} == {9}
     assert {out[p]["followup_home_id"] for p in out} == {"d-break"}
+
+
+def test_the_pipeline_keeps_a_closed_former_homes_touch_in_the_groups_date(fake, admin,
+                                                                         monkeypatch):
+    """The board's mirror of the re-home fix: the group's last send was stamped on a home that
+    has since been closed, so the open scopes' date runs from that touch, as the worker's does."""
+    rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
+    rows[0].update(proposal_status="closed_lost", followup_anchor_at=NOW - H)
+    f = fake(rows)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    view, _why, _m = fw.group_state_for(GID, NOW)
+    assert view["followup_anchor_at"] == NOW - H
+    want = main._iso(rules.next_due_at(view, NOW, main._followup_cfg()))
+    assert out["d-lab1"]["next_followup_at"] == out["d-lab2"]["next_followup_at"] == want
 
 
 def test_the_pipeline_query_shows_a_groups_task_on_every_member_row():

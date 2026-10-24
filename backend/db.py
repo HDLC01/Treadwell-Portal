@@ -340,6 +340,27 @@ def list_scope_group_draft_states(group_id: str) -> list[dict[str, Any]]:
     )]
 
 
+def list_scope_group_history(group_id: str) -> list[dict[str, Any]]:
+    """Every proposal that is or was part of one scope group's follow-up, DELETED ones included:
+    the rows that carry the group, plus any row a group follow-up row was filed on (a former home
+    keeps the group's sent tasks, its staff_email touch and its anchor stamp after it is closed,
+    deleted or taken out of the group). `group_tagged` says whether the row holds such a follow-up.
+
+    Read by followup_worker.group_state_for so the group's last estimator touch and its counted
+    reminders survive a re-home (followup_rules.group_state's `history`). Read only."""
+    return qall(
+        "select p.*, exists(select 1 from public.portal_followups f "
+        "                   where f.proposal_id = p.proposal_id "
+        "                     and f.detail->>'scope_group' = %s) as group_tagged "
+        "from public.portal_proposals p "
+        "where p.scope_group = %s or p.proposal_id in ("
+        "  select f2.proposal_id from public.portal_followups f2 "
+        "   where f2.detail->>'scope_group' = %s) "
+        "order by p.created_at, p.proposal_id",
+        (group_id, group_id, group_id),
+    )
+
+
 def list_open_group_tasks(group_id: str) -> list[dict[str, Any]]:
     """Every OPEN (pending/sending) follow-up task filed for one scope group, on any proposal --
     the group's reminder task on its home scope, and any "decide the other scopes" task. Not

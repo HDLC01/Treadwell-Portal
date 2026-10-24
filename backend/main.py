@@ -3301,8 +3301,12 @@ def _pipeline_groups(rows: list, now: datetime) -> dict:
             resumed = None
         members = [dict(m, scope_group_resumed_at=resumed)
                    for m in followup_rules.live_members(grows, drafts)]
-        out[gid] = {"ids": {m["proposal_id"] for m in members},
-                    "view": followup_rules.group_view(members, now),
+        ids = {m["proposal_id"] for m in members}
+        # The board's own non-live rows of the group (a closed former home) keep the group's last
+        # send and counted reminders, as the worker's view does (followup_worker._group_history).
+        out[gid] = {"ids": ids,
+                    "view": followup_rules.group_view(
+                        members, now, followup_rules.history_rows(grows, drafts, ids)),
                     "home": followup_rules.group_home(members)}
     return out
 
@@ -4703,6 +4707,7 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
     if any(x not in listed for x in chosen):
         return _json({"ok": False, "error": "unknown_scope"}, 400)
     reason = note = None
+    skipped: list = []
     if action == "close":
         reason = str(body.get("reason") or "").strip().lower() or None
         note = _cap(str(body.get("note") or "").strip(), _NOTE_MAX) or None
@@ -4712,6 +4717,19 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
             return _json({"ok": False, "error": "invalid_reason"}, 400)
         if not note:
             return _json({"ok": False, "error": "note_required"}, 400)
+        # The task's scope list was frozen when it was raised. A listed scope may have been
+        # APPROVED (signed) or closed since, and closing a signed job as lost from here would stop
+        # its deposit chase. So 'close' only ever touches scopes that are STILL OPEN right now: the
+        # default drops the others (and reports them as skipped), naming one explicitly is refused.
+        not_open = []
+        for sid in chosen:
+            row = db.get_proposal(sid)
+            if not row or row.get("deleted_at") or not followup_rules.is_open(row):
+                not_open.append(sid)
+        if not_open and (raw_ids is not None or len(not_open) == len(chosen)):
+            return _json({"ok": False, "error": "scope_not_open", "scope_ids": not_open}, 409)
+        skipped = not_open
+        chosen = [x for x in chosen if x not in not_open]
 
     claimed = db.decide_followup_task(task["id"], "decided", by,
                                       {"outcome": action, "scope_ids": chosen,
@@ -4729,6 +4747,9 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
                 if not row:
                     failed.append(sid)
                     continue
+                if row.get("deleted_at") or not followup_rules.is_open(row):
+                    skipped.append(sid)         # approved or closed since the check above
+                    continue
                 if _staff_close_lost(sid, row, reason, note, by) is None:
                     closed.append(sid)
                 else:
@@ -4737,7 +4758,7 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
                 log.warning("[followup] scope decision %s: closing %s failed: %s",
                             task["id"], sid, exc)
                 failed.append(sid)
-        out.update({"closed": closed, "failed": failed})
+        out.update({"closed": closed, "failed": failed, "skipped": skipped})
         _crm_card(pid, ("%s closed the other scopes as lost." % who) if who
                   else "The other scopes were closed as lost.", "scope_decision")
     elif action == "keep":
