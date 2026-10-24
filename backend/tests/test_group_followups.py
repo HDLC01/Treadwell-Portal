@@ -957,3 +957,47 @@ def test_the_group_plan_is_never_written_on_an_approved_scope(fake, admin):
     assert r.json()["home_proposal_id"] == "d-lab1"
     assert f.rows["d-break"].get("followup_next_at") is None
     assert f.rows["d-lab1"].get("followup_next_at") is not None
+
+
+def _with_unannounced(**over):
+    """Three emailed scopes, and Lab 3: published into the group since, not yet emailed (a grouped
+    publish emails nobody and enrols nothing)."""
+    return _three(**over) + [_scope("d-lab3", "Lab 3", 3, followup_enrolled_at=None,
+                                    **{k: v for k, v in over.items()
+                                       if k != "followup_enrolled_at"})]
+
+
+def test_an_unannounced_scope_is_not_in_the_group_reminder():
+    """#1: the reminder's scope list and its recipients' links are the scopes the customer has
+    been told about."""
+    v = rules.group_view(_with_unannounced(), NOW)
+    assert [s["proposal_id"] for s in v["scopes"]] == ["d-break", "d-lab1", "d-lab2"]
+    assert [m["proposal_id"] for m in v["_open_members"]] == ["d-break", "d-lab1", "d-lab2"]
+
+
+def test_an_unannounced_scope_does_not_unpause_a_paused_group():
+    """#1, second case: the customer paused every scope they know about."""
+    later = (NOW + timedelta(days=30)).date()
+    rows = _three(followup_paused_until=later) + [
+        _scope("d-lab3", "Lab 3", 3, followup_enrolled_at=None)]
+    v = rules.group_view(rows, NOW)
+    assert rules.is_paused(v, NOW) and rules.due_now(v, NOW) == []
+
+
+def test_the_group_reminder_never_mails_an_unannounced_scope_so_email_again_sends_it_once(
+        fake, admin):
+    import scope_groups
+    f = fake(_with_unannounced())
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert [s["proposal_id"] for s in t["detail"]["scopes"]] == ["d-break", "d-lab1", "d-lab2"]
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
+        "title": "Checking in", "body": "Hi {first_name},\n\n{link}", "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    assert [g["scopes"] for g in f.sent["group"]] == [["Breakroom", "Lab 1", "Lab 2"]]
+    assert not [m for m in f.messages if m["pid"] == "d-lab3"], "a 'Reminder sent' row on Lab 3"
+    # The next combined send is Lab 3's FIRST email, so 'new' is the truth.
+    marks = [{"proposal_id": p, "detail": {"scope_group": GID}, "created_at": NOW}
+             for p in ("d-break", "d-lab1", "d-lab2")]
+    plan = scope_groups.plan_send(list(f.rows.values()), marks, NOW)
+    assert plan["pending"] == ["d-lab3"] and plan["kinds"] == {"d-lab3": "new"}

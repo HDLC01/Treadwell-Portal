@@ -773,12 +773,17 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
         return None, "no_members"
     if group_chase_stopped(live):
         return None, "scope_approved"
-    open_ = [m for m in live if is_open(m)]
-    if not open_:
+    if not any(is_open(m) for m in live):
         return None, "no_open_scope"
-    enrolled = _min_ts(m.get("followup_enrolled_at") for m in open_)
-    if enrolled is None:
+    # Fix round #1: only scopes the customer has been TOLD about. A grouped publish emails nobody
+    # and enrols nothing; the combined send's enrolment is the announcement. A scope published
+    # since is not in the reminder, its scope list or the pause test -- a reminder carrying its
+    # link would be the customer's first sight of it, and "Email again" would then send it a
+    # second time as "new".
+    open_ = [m for m in live if is_open(m) and m.get("followup_enrolled_at")]
+    if not open_:
         return None, "not_enrolled"
+    enrolled = _min_ts(m.get("followup_enrolled_at") for m in open_)
     home = group_home(live)
     opened = [m for m in open_ if m.get("cycle_viewed_at") or
               (m.get("proposal_status") or "") == "viewed"]
@@ -828,7 +833,7 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
                        "status": m.get("proposal_status")} for m in open_]
     view["home_proposal_id"] = home.get("proposal_id")
     # Where a staff link should land: an OPEN scope, never a possibly-approved home.
-    view["link_proposal_id"] = (home.get("proposal_id") if is_open(home)
+    view["link_proposal_id"] = (home.get("proposal_id") if any(m is home for m in open_)
                                 else open_[0].get("proposal_id"))
     view["_open_members"] = open_
     return view, ""
