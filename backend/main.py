@@ -3737,6 +3737,8 @@ def _pipeline_groups(rows: list, now: datetime) -> dict:
                     "view": followup_rules.group_view(
                         members, now, followup_rules.history_rows(grows, drafts, ids)),
                     "home": followup_rules.group_home(members),
+                    # The schedule the chase runs on (round 3 #2): the home's, else a member's.
+                    "schedule": followup_rules.group_schedule(members),
                     "rows": grows, "drafts": drafts}
     return out
 
@@ -3823,7 +3825,7 @@ def _apply_group_schedules(rows: list, out: list, followup_cfg: dict) -> None:
             continue
         o["next_followup_at"] = _iso(followup_rules.next_due_at(g["view"], now, followup_cfg)
                                      if g["view"] else None)
-        o["followup_plan"] = _followup_plan(g["home"] or r)
+        o["followup_plan"] = _followup_plan(dict(g["home"] or r, **(g.get("schedule") or {})))
         o["followup_home_id"] = (g["home"] or {}).get("proposal_id")
 
 

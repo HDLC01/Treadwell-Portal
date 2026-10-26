@@ -707,6 +707,28 @@ def group_home(members: list) -> Optional[dict]:
     return min(pool, key=lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id"))))
 
 
+GROUP_SCHEDULE_KEYS = ("followup_interval_days", "followup_stop_after", "followup_next_at")
+
+
+def group_schedule(members: list, home: Optional[dict] = None) -> dict:
+    """The group's interval / stop-after / snooze date: each from the HOME, else from the first
+    member (home first, then created_at order) that has one. Pure.
+
+    Round 3 #2: the plan is written on the home row, and the home moves off a scope when it is
+    approved (group_home). After 'keep' the new home has none of it, so without this the group
+    would quietly drop back to the global cadence -- "every 14 days, stop after 2" lost because
+    the scope that held it was the one the customer took. Admin plan writes still go to the home."""
+    live = [m for m in members or [] if m and m.get("proposal_id")]
+    home = home if home is not None else group_home(live)
+    order = sorted(live, key=lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id"))))
+    if home is not None:
+        order = [home] + [m for m in order if m.get("proposal_id") != home.get("proposal_id")]
+    out = {}
+    for k in GROUP_SCHEDULE_KEYS:
+        out[k] = next((m.get(k) for m in order if m.get(k) is not None), None)
+    return out
+
+
 def _min_ts(vals) -> Optional[datetime]:
     got = [t for t in (_ts(v) for v in vals) if t is not None]
     return min(got) if got else None
@@ -824,9 +846,9 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
         times.extend(t for t in _times_list(m.get("followup_reminder_times"))
                      if cut is not None and _ts(t) is not None and _ts(t) <= cut)
     view["followup_reminder_times"] = times
-    # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there).
-    for k in ("followup_interval_days", "followup_stop_after", "followup_next_at"):
-        view[k] = home.get(k)
+    # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there),
+    # else a member's that has one -- the home moves off an approved scope (round 3 #2).
+    view.update(group_schedule(live, home))
     view["scope_group"] = home.get("scope_group")
     # Fix round #15: a scope the customer paused ("delayed, 2 months" on its page) is left out of
     # the reminder while the others are chased -- it is not emailed, and not listed on the task. Only

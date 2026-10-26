@@ -1113,6 +1113,49 @@ def test_a_scope_approved_again_after_keep_raises_a_new_decision_task(approve, a
     assert fw.group_state_for(GID, NOW + 3 * H)[0] is not None
 
 
+def test_group_schedule_takes_each_key_from_the_home_else_the_first_member_that_has_one():
+    rows = _three()
+    rows[0].update(proposal_status="approved", followup_interval_days=14, followup_stop_after=2)
+    rows[2].update(followup_stop_after=5, followup_next_at=NOW + 24 * H)
+    rows[1].update(followup_interval_days=None)
+    got = rules.group_schedule(rows)          # home = d-lab1 (earliest OPEN), which has none
+    assert got == {"followup_interval_days": 14, "followup_stop_after": 2,
+                   "followup_next_at": NOW + 24 * H}
+    rows[1].update(followup_stop_after=3)     # the home's own value wins
+    assert rules.group_schedule(rows)["followup_stop_after"] == 3
+
+
+def test_keep_after_the_home_is_approved_keeps_the_groups_schedule(approve, admin, monkeypatch):
+    """Round 3 #2 (Hanz's question 6: copy over). The plan lives on the home; approving the home
+    moves the home to the next open scope, which has no plan. After 'keep' the group must still
+    run every 14 days and stop after 2, on the worker AND on the board."""
+    f, go = approve
+    f.rows["d-break"].update(followup_interval_days=14, followup_stop_after=2)
+    assert go("d-break").status_code == 200
+    dec, = f.tasks(stage="decision")
+    f.clock = NOW + H
+    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, dec["id"]).status_code == 200
+    view = fw.group_state_for(GID, NOW + H)[0]
+    assert view is not None and view["proposal_id"] == "d-lab1", "the home moved off d-break"
+    assert view["followup_interval_days"] == 14
+    assert view["followup_stop_after"] == 2
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-lab2"]["followup_plan"]["interval_days"] == 14
+    assert out["d-lab2"]["followup_plan"]["stop_after"] == 2
+    # Admin plan writes still go to the (new) home.
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"interval_days": 7})
+    assert r.status_code == 200 and r.json()["home_proposal_id"] == "d-lab1"
+    assert f.rows["d-lab1"]["followup_interval_days"] == 7
+    assert f.rows["d-break"]["followup_interval_days"] == 14
+    view = fw.group_state_for(GID, NOW + H)[0]
+    assert (view["followup_interval_days"], view["followup_stop_after"]) == (7, 2)
+
+
 def _log(pid, kind="call"):
     return TestClient(main.app).post("/api/admin/proposal/%s/followups" % pid,
                                      json={"kind": kind, "note": "Rang Dana", "by": "kyle"})
