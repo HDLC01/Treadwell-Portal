@@ -3800,6 +3800,15 @@ def _apply_group_schedules(rows: list, out: list, followup_cfg: dict) -> None:
                 # again: N new, M revised" reads this; the board rows carry no last_sent_at.
                 "kinds": {pid: ("revised" if k == "revised" else "new")
                           for pid, k in (s["plan"].get("kinds") or {}).items()},
+                # Round 3 contract: True only while NOTHING of this project has ever been
+                # announced (the planner's own `first`). False after the first announce, even when
+                # every live scope is pending again -- the tool words its button on this ("Send
+                # every scope in one email" vs "Email again").
+                "first": bool(s["plan"].get("first")),
+                # Scopes whose send is in flight right now (a claim younger than INFLIGHT_TTL with
+                # no result yet): neither pending nor unknown, so the tool can say "being sent".
+                "inflight_scope_ids": [pid for pid, st in (s["plan"].get("states") or {}).items()
+                                       if (st or {}).get("inflight")],
             }
         g = groups.get(r.get("scope_group") or "")
         pt = r.get("pending_task")

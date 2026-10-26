@@ -591,7 +591,8 @@ def test_the_pipeline_exposes_scope_send_state(monkeypatch):
     out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
     assert out["d-break"]["scope_send_state"] == {
         "announced": True, "pending_scope_ids": ["d-lab1"], "not_included": ["d-lab2"],
-        "unknown_scope_ids": [], "kinds": {"d-lab1": "revised"}}
+        "unknown_scope_ids": [], "kinds": {"d-lab1": "revised"},
+        "first": False, "inflight_scope_ids": []}
     # Lab 1 went out at revision 1 and is now at 2: not announced, and pending.
     assert out["d-lab1"]["scope_send_state"]["announced"] is False
     assert "scope_send_state" not in out["d-solo"], "an ungrouped row changed shape"
@@ -623,7 +624,8 @@ def test_the_board_names_a_send_whose_result_was_lost(monkeypatch):
     out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
     assert out["d-break"]["scope_send_state"] == {
         "announced": False, "pending_scope_ids": [], "not_included": [],
-        "unknown_scope_ids": ["d-break", "d-lab1"], "kinds": {}}
+        "unknown_scope_ids": ["d-break", "d-lab1"], "kinds": {},
+        "first": True, "inflight_scope_ids": []}
 
 
 def test_the_send_state_names_each_pending_scope_new_or_revised(monkeypatch):
@@ -664,6 +666,81 @@ def test_the_send_state_names_each_pending_scope_new_or_revised(monkeypatch):
         r.pop("last_sent_at", None)
     got["marks"] = []
     assert state()["kinds"] == {"d-break": "new", "d-lab1": "new", "d-lab2": "new"}
+
+
+# ── round 3 contract: `first` and `inflight_scope_ids` on the board's real route ──
+def _board_send_state(monkeypatch, rows, marks):
+    """scope_send_state of every row, through GET /api/admin/pipeline with these rows and marks."""
+    ids = [r["proposal_id"] for r in rows]
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "get_settings", lambda key: None)
+    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states",
+                        lambda gid: [_st(i) for i in ids])
+    monkeypatch.setattr(main.db, "list_scope_group_draft_states_many",
+                        lambda gids: {g: [_st(i) for i in ids] for g in gids})
+    monkeypatch.setattr(main.db, "scope_group_resumed_at", lambda gid: None)
+    monkeypatch.setattr(main.db, "list_scope_group_marks", lambda gids: marks)
+    for r in rows:
+        r.setdefault("deposit_status", "pending")
+        r.setdefault("schedule_status", "pending")
+    out = client.get("/api/admin/pipeline").json()["proposals"]
+    return {r["proposal_id"]: r.get("scope_send_state") for r in out}
+
+
+def _sent_mark(i, pid, rev=1, created_at=T0, delivered=True):
+    d = {"action": "scope_group_sent", "scope_group": GID, "send_no": 1, "revision_no": rev,
+         "kind": "first"}
+    if delivered:
+        d["delivery"] = {"delivered": ["cust@acme.com"], "failed": []}
+    return {"id": i, "proposal_id": pid, "created_at": created_at, "detail": d}
+
+
+def test_send_state_first_is_true_while_nothing_has_been_announced(monkeypatch):
+    rows = [_row("d-break", "Breakroom"),
+            _row("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1))]
+    s = _board_send_state(monkeypatch, rows, [])
+    for pid in ("d-break", "d-lab1"):
+        assert s[pid]["first"] is True
+        assert s[pid]["pending_scope_ids"] == ["d-break", "d-lab1"]
+        assert s[pid]["inflight_scope_ids"] == []
+
+
+def test_send_state_first_is_false_when_every_scope_is_revised(monkeypatch):
+    """Every live scope pending again, but the customer has had all of them: not a first send."""
+    rows = [_row("d-break", "Breakroom", current_revision_no=2, last_sent_at=T0),
+            _row("d-lab1", "Lab 1", current_revision_no=2, last_sent_at=T0,
+                 created_at=T0 + timedelta(seconds=1))]
+    marks = [_sent_mark(1, "d-break"), _sent_mark(2, "d-lab1")]
+    s = _board_send_state(monkeypatch, rows, marks)["d-break"]
+    assert s["pending_scope_ids"] == ["d-break", "d-lab1"]
+    assert s["kinds"] == {"d-break": "revised", "d-lab1": "revised"}
+    assert s["first"] is False
+    assert s["inflight_scope_ids"] == []
+
+
+def test_send_state_first_is_false_for_revised_plus_new(monkeypatch):
+    rows = [_row("d-break", "Breakroom", current_revision_no=2, last_sent_at=T0),
+            _row("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1))]
+    s = _board_send_state(monkeypatch, rows, [_sent_mark(1, "d-break")])["d-lab1"]
+    assert s["kinds"] == {"d-break": "revised", "d-lab1": "new"}
+    assert s["first"] is False
+
+
+def test_send_state_names_a_scope_whose_send_is_in_flight(monkeypatch):
+    """A claim younger than INFLIGHT_TTL with no result: not pending, not unknown, in flight."""
+    fresh = datetime.now(timezone.utc) - timedelta(minutes=1)
+    rows = [_row("d-break", "Breakroom", last_sent_at=T0),
+            _row("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1)),
+            _row("d-lab2", "Lab 2", created_at=T0 + timedelta(seconds=2))]
+    marks = [_sent_mark(1, "d-break"),
+             _sent_mark(2, "d-lab1", created_at=fresh, delivered=False)]
+    s = _board_send_state(monkeypatch, rows, marks)["d-break"]
+    assert s["inflight_scope_ids"] == ["d-lab1"]
+    assert s["pending_scope_ids"] == ["d-lab2"]
+    assert s["unknown_scope_ids"] == []
+    assert s["first"] is False
 
 
 # ══ 8. publish safety on a database without the DDL ══════════════════════════
