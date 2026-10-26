@@ -877,6 +877,16 @@ def group_view(members: list, now: datetime, history: Optional[list] = None) -> 
     return group_state(members, now, history)[0]
 
 
+def decision_link(listed_ids: list, status_of, fallback: Optional[str]) -> Optional[str]:
+    """Where a decision task's link opens (round 3 contract): the first sibling it lists that is
+    STILL open by `status_of(proposal_id)` (the current status, read fresh by the caller), else
+    `fallback` (the approved scope). Pure apart from `status_of`, whose errors propagate."""
+    for pid in listed_ids or []:
+        if pid and (status_of(pid) or "") in OPEN_STATUSES:
+            return pid
+    return fallback
+
+
 def decision_task_is_live(detail: Optional[dict], members: Optional[list]) -> tuple:
     """A decision task is live while at least one sibling it lists is still open. (ok, reason)."""
     if members is None:

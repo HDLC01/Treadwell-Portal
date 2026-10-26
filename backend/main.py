@@ -1541,8 +1541,11 @@ def _raise_scope_decision(p: dict) -> None:
     due = followup_rules.Due(key, "staff", "staff_scope_decision")
     try:
         followup_worker._send_staff(
+            # The CRM button opens the first sibling (open by construction here), where the board
+            # shows the decision card -- not the approved scope, whose drawer shows its own
+            # deposit task first (round 3 #3).
             dict(p, _decision={"approved_label": label, "scopes": scopes},
-                 link_proposal_id=pid), due)
+                 link_proposal_id=scopes[0]["proposal_id"]), due)
     except Exception as exc:  # noqa: BLE001 — the task is on the bell either way
         log.warning("[followup] scope decision email for %s failed: %s", pid, exc)
     followup_worker._echo_to_thread(pid, due, {"task_id": rid})
@@ -3857,7 +3860,11 @@ def admin_pipeline(request: Request) -> JSONResponse:
     recips = db.recipients_by_proposal()
     out = []
     rows = []                       # the raw rows, for the scope-group pass below
-    for r in db.list_all_portal_proposals():
+    board = list(db.list_all_portal_proposals())
+    # Every row's CURRENT status, so a decision task's link is worked out fresh (round 3 #3)
+    # without a read per task. A deleted row is not on the board: not open.
+    status_now = {b.get("proposal_id"): b.get("proposal_status") for b in board}
+    for r in board:
         rows.append(r)
         out.append({
             "proposal_id": r["proposal_id"], "token": r["token"],
@@ -3919,7 +3926,7 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # it here off the poll it already makes ({id, status, template, label, stage, due_at}
             # or null; full detail at GET /api/admin/followup-task/{id}) — and this proposal's own
             # schedule ({mode, interval_days, stop_after, next_at, anchor_at}; nulls = global).
-            "followup_task": _task_summary(r.get("pending_task")),
+            "followup_task": _task_summary(r.get("pending_task"), status_now.get),
             "followup_plan": _followup_plan(r),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
             # Who owns it, and the milestones the board dates a card by. The
@@ -4594,12 +4601,38 @@ def _task_draft(detail: dict) -> dict:
 _DECISION_LABEL = "Decide the other scopes"
 
 
-def _task_group_fields(row: dict) -> dict:
+def _fresh_scope_status(pid: str) -> Optional[str]:
+    """A scope's CURRENT proposal_status, None for a missing or deleted row. Raises on a failed
+    read (the caller falls back)."""
+    p = db.get_proposal(pid)
+    if not p or p.get("deleted_at"):
+        return None
+    return p.get("proposal_status")
+
+
+def _decision_link(row: dict, d: dict, ids: list, status_of=None) -> Optional[str]:
+    """Round 3 contract: a decision task's link, worked out FRESH at view time -- the first
+    sibling it lists that is STILL OPEN (sent or viewed) by the current rows, else the approved
+    scope. The listed statuses are a snapshot of when the task was raised: a sibling closed lost
+    since must not be where the bell sends the estimator. `status_of(pid)` reads the current
+    status (the board passes its own rows; default: a read per listed scope). An unreadable
+    database keeps the old answer, the first listed sibling."""
+    try:
+        return followup_rules.decision_link(
+            ids, status_of or _fresh_scope_status,
+            (d.get("approved_scope") or {}).get("proposal_id") or row.get("proposal_id"))
+    except Exception as exc:  # noqa: BLE001 — a link, never worth failing the view over
+        log.warning("[followup] decision task %s: scope statuses unreadable: %s", row.get("id"), exc)
+        return ids[0] if ids else row.get("proposal_id")
+
+
+def _task_group_fields(row: dict, status_of=None) -> dict:
     """Scope groups: which group a task belongs to, the scopes it covers, and the proposal a staff
     link should OPEN. A group reminder lives on the group's home scope, which may since have been
     approved, so the link goes to the first scope it covers that was open when it was raised; a
-    decision task opens the first sibling it lists (its approved scope's drawer shows that scope's
-    own deposit task). {} -> nulls for every other task."""
+    decision task opens the first sibling it lists that is STILL open (_decision_link; its
+    approved scope's drawer shows that scope's own deposit task). {} -> nulls for every other
+    task."""
     d = row.get("detail") or {}
     scopes = [s for s in (d.get("scopes") or []) if isinstance(s, dict)]
     link = row.get("proposal_id")
@@ -4608,7 +4641,7 @@ def _task_group_fields(row: dict) -> dict:
         # task opens on a scope it is about (the board shows the group's task on an open member).
         ids = [s.get("proposal_id") for s in scopes if s.get("proposal_id")]
         if ids:
-            link = ids[0]
+            link = _decision_link(row, d, ids, status_of)
     elif d.get("scope_group"):
         ids = [s.get("proposal_id") for s in scopes
                if (s.get("status") or "") in followup_rules.OPEN_STATUSES]
@@ -4646,8 +4679,9 @@ def _task_view(row: dict) -> dict:
     return out
 
 
-def _task_summary(raw) -> Optional[dict]:
-    """The pipeline's compact form of the open task (the jsonb pending_task column)."""
+def _task_summary(raw, status_of=None) -> Optional[dict]:
+    """The pipeline's compact form of the open task (the jsonb pending_task column). `status_of`:
+    the board's current status per proposal, for a decision task's fresh link."""
     if not isinstance(raw, dict) or not raw.get("id"):
         return None
     d = raw.get("detail") or {}
@@ -4660,7 +4694,7 @@ def _task_summary(raw) -> Optional[dict]:
            "due_at": _iso(raw.get("created_at"))}
     if d.get("scope_group"):
         # Only for a group's task, so an ordinary proposal's summary keeps its exact shape.
-        out.update(_task_group_fields(raw))
+        out.update(_task_group_fields(raw, status_of))
         out["proposal_id"] = raw.get("proposal_id")
     return out
 

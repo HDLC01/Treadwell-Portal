@@ -645,6 +645,12 @@ def judge_task(task: dict, now: datetime) -> tuple:
     return ok, why, p
 
 
+def _current_status(pid: str) -> str | None:
+    """A proposal's status now; None for a missing or deleted row."""
+    p = db.get_proposal(pid)
+    return None if not p or p.get("deleted_at") else p.get("proposal_status")
+
+
 def _renag_decision(task: dict, now: datetime) -> None:
     """Re-email the estimator about an unresolved decision task every DECISION_RENAG_DAYS, at most
     DECISION_RENAG_MAX times. Reserved like every staff note (rule key per task per occurrence), so
@@ -667,6 +673,17 @@ def _renag_decision(task: dict, now: datetime) -> None:
         d = task.get("detail") or {}
         p = dict(p, _decision={"approved_label": (d.get("approved_scope") or {}).get("label"),
                                "scopes": d.get("scopes") or []})
+        # The CRM button: the first listed sibling STILL open, read fresh (round 3 #3).
+        ids = [s.get("proposal_id") for s in d.get("scopes") or []
+               if isinstance(s, dict) and s.get("proposal_id")]
+        try:
+            p["link_proposal_id"] = rules.decision_link(
+                ids, _current_status,
+                (d.get("approved_scope") or {}).get("proposal_id") or pid)
+        except Exception as exc:  # noqa: BLE001 — the link only
+            log.warning("[followup] decision task %s: scope statuses unreadable: %s",
+                        task.get("id"), exc)
+            p["link_proposal_id"] = ids[0] if ids else pid
         due = rules.Due(key, "staff", "staff_scope_decision")
         if not _send_staff(p, due):
             db.delete_followup(rid)

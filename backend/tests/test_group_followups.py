@@ -473,6 +473,21 @@ def test_an_unresolved_decision_task_renags_the_estimator(fake):
     assert len(nags) == 1, nags
 
 
+def test_the_decision_emails_open_the_first_sibling_still_open(approve, monkeypatch):
+    """Round 3 #3, the e-mailed button too: raised -> the first sibling; re-nagged after that
+    sibling was closed lost -> the next one still open, never the approved scope's own drawer."""
+    f, go = approve
+    assert go().status_code == 200                                     # d-lab1 approved
+    raised, = [s for s in f.sent["staff"] if s["subject"].startswith("Decide the other scopes")]
+    assert raised["link"].endswith("open=d-break"), raised["link"]
+    f.rows["d-break"]["proposal_status"] = "closed_lost"
+    dec, = f.tasks(stage="decision")
+    f.sent["staff"].clear()
+    fw._renag_decision(dict(dec), NOW + timedelta(days=4))
+    nag, = [s for s in f.sent["staff"] if s["subject"].startswith("Decide the other scopes")]
+    assert nag["link"].endswith("open=d-lab2"), nag["link"]
+
+
 def test_a_deleted_home_rehomes_the_task(fake):
     f = fake(_three())
     fw._tick(NOW)
@@ -762,7 +777,9 @@ def test_a_group_task_send_is_refused_once_a_scope_is_approved(fake, admin):
     assert f.sent["group"] == []
 
 
-def test_the_task_view_links_an_open_scope_and_lists_the_scopes():
+def test_the_task_view_links_an_open_scope_and_lists_the_scopes(monkeypatch):
+    monkeypatch.setattr(main.db, "get_proposal",
+                        lambda pid: {"proposal_id": pid, "proposal_status": "sent"})
     row = {"id": 5, "proposal_id": "d-break", "created_at": NOW,
            "detail": {"status": "pending", "template": "checkin", "stage": "pre",
                       "scope_group": GID,
@@ -1223,11 +1240,49 @@ def test_an_open_scope_out_of_the_group_never_shows_the_groups_task(fake, admin,
     assert out["d-lab2"]["followup_task"] is None
 
 
-def test_a_decision_tasks_link_opens_a_scope_it_is_about():
+def test_a_decision_tasks_link_opens_a_scope_it_is_about(fake):
     """#8: the approved scope's drawer shows its own deposit task, so the bell's decision entry
     opens the first sibling it lists, where the board shows the decision card."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW)
+    fake(rows)
     row = {"id": 9, "proposal_id": "d-lab1", "created_at": NOW,
            "detail": {"status": "pending", "template": "scope_decision", "stage": "decision",
                       "scope_group": GID,
                       "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab2"}]}}
     assert main._task_view(row)["link_proposal_id"] == "d-break"
+
+
+def _decision_row():
+    return {"id": 9, "proposal_id": "d-lab1", "created_at": NOW,
+            "detail": {"status": "pending", "template": "scope_decision", "stage": "decision",
+                       "scope_group": GID,
+                       "approved_scope": {"proposal_id": "d-lab1", "label": "Lab 1"},
+                       "scopes": [{"proposal_id": "d-break", "status": "sent"},
+                                  {"proposal_id": "d-lab2", "status": "sent"}]}}
+
+
+def test_a_decision_tasks_link_is_the_first_sibling_still_open(fake, admin, monkeypatch):
+    """Round 3 #3: [A, B] listed, A closed lost since the task was raised -> the link is B, on the
+    bell's feed, the task endpoint and the board. The statuses stored on the task are a snapshot."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW)
+    rows[0].update(proposal_status="closed_lost")
+    f = fake(rows)
+    dec = _decision_row()
+    f.followups.append(dec)
+    f.followups[-1]["kind"] = "followup_task"
+    assert main._task_view(dec)["link_proposal_id"] == "d-lab2"
+    client = TestClient(main.app)
+    feed = client.get("/api/admin/followup-tasks").json()["tasks"]
+    assert [t["link_proposal_id"] for t in feed if t["id"] == 9] == ["d-lab2"]
+    assert client.get("/api/admin/followup-task/9").json()["task"]["link_proposal_id"] == "d-lab2"
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r, pending_task=dec if r["proposal_id"] == "d-lab1" else None)
+                                 for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-lab1"]["followup_task"]["link_proposal_id"] == "d-lab2"
+    # Every sibling it lists closed: the link falls back to the approved scope.
+    f.rows["d-lab2"]["proposal_status"] = "closed_lost"
+    assert main._task_view(dec)["link_proposal_id"] == "d-lab1"
