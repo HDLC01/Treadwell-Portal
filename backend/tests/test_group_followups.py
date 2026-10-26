@@ -1161,6 +1161,22 @@ def test_group_schedule_takes_each_key_from_the_home_else_the_first_member_that_
     assert rules.group_schedule(rows)["followup_stop_after"] == 3
 
 
+def test_the_fallback_decision_key_has_full_precision(fake):
+    """Round 3 #6: with no approval id the key is the approval time at full precision. At hour
+    precision two approvals of one scope 20 minutes apart (approve, revise, approve) shared a key,
+    so the second raised no task and the siblings' chase stayed stopped with nothing on the bell."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW + timedelta(microseconds=7))
+    f = fake(rows)
+    main._raise_scope_decision(f.get_proposal("d-lab1"))
+    first, = f.tasks(stage="decision")
+    assert first["detail"]["rule_key"] == "sd:%s:d-lab1:2026-08-04T15:00:00.000007+00:00" % GID
+    f.decide_followup_task(first["id"], "decided", "kyle", {"outcome": "keep"})
+    f.rows["d-lab1"]["approved_at"] = NOW + timedelta(minutes=20)
+    main._raise_scope_decision(f.get_proposal("d-lab1"))
+    assert [t["detail"]["status"] for t in f.tasks(stage="decision")] == ["decided", "pending"]
+
+
 def test_keep_after_the_home_is_approved_keeps_the_groups_schedule(approve, admin, monkeypatch):
     """Round 3 #2 (Hanz's question 6: copy over). The plan lives on the home; approving the home
     moves the home to the next open scope, which has no plan. After 'keep' the group must still

@@ -1524,8 +1524,11 @@ def _raise_scope_decision(p: dict) -> None:
     # row's id, or the approval time when there is no id.
     ref = p.get("_approval_id")
     if ref is None:
+        # Full precision (round 3 #6): an hour-precision stamp made two approvals of the same
+        # scope within one hour share a key, so the second raised nothing.
         at = followup_rules._ts(p.get("approved_at"))
-        ref = followup_rules._stamp(at) if at else "0"
+        ref = (at.astimezone(timezone.utc).isoformat(timespec="microseconds")
+               if at else "0")
     key = "sd:%s:%s:%s" % (group, pid, ref)
     try:
         rid = db.reserve_followup_task(pid, key, {
