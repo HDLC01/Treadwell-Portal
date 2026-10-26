@@ -279,12 +279,17 @@ def test_the_dry_run_script_runs_against_the_database_and_writes_nothing(clean, 
     before = db.q1(count)
     backend = pathlib.Path(__file__).resolve().parents[1]
     env = dict(os.environ, DATABASE_URL=pgdb.conninfo, FOLLOWUP_AUTOMATION_ENABLED="false")
-    proc = subprocess.run([sys.executable, "ops/followup_dry_run.py", "--json"], cwd=str(backend),
-                          env=env, capture_output=True, timeout=120)
+    # Round 3 #5: evaluated at a moment INSIDE the Central send window, so the customer reminders
+    # this expects are due whatever the time of day the suite runs at.
+    when = in_window()
+    at = ["--now", when.isoformat()]
+    proc = subprocess.run([sys.executable, "ops/followup_dry_run.py", "--json"] + at,
+                          cwd=str(backend), env=env, capture_output=True, timeout=120)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     result = json.loads(proc.stdout.decode("utf-8"))
     assert db.q1(count) == before, "the dry run wrote a row"
     assert result["skipped"] == []
+    assert result["at"] == when.isoformat(), "the dry run did not evaluate at --now"
     assert {t["proposal_id"] for t in result["tasks"]} == {"young", "chat"}
     assert [t["proposal_id"] for t in result["touched_tasks"]] == ["chat"]
     assert sorted(e["template"] for e in result["staff_emails"]) == \
@@ -292,8 +297,8 @@ def test_the_dry_run_script_runs_against_the_database_and_writes_nothing(clean, 
     assert result["deposit_restarts"] == []
     assert {h["proposal_id"] for h in result["deposit_held"]} == {"done"}
     # The table form runs too.
-    proc = subprocess.run([sys.executable, "ops/followup_dry_run.py"], cwd=str(backend), env=env,
-                          capture_output=True, timeout=120)
+    proc = subprocess.run([sys.executable, "ops/followup_dry_run.py"] + at, cwd=str(backend),
+                          env=env, capture_output=True, timeout=120)
     assert proc.returncode == 0 and b"estimator emails it would send .... 3" in proc.stdout
 
 

@@ -7,7 +7,8 @@ tick has run, its tasks are reserved and this reports nothing. So:
   1. deploy with FOLLOWUP_AUTOMATION_ENABLED=false in the box's .env;
   2. inside the running container (WORKDIR is /app/backend):
          docker exec <container> python ops/followup_dry_run.py
-     add --json for the JSON alone;
+     add --json for the JSON alone, and --now <ISO datetime> to evaluate the tick at another
+     moment (default: the real clock; customer reminders only fall due 8am-6pm Central);
   3. read the counts; when they look right, set the flag to true and restart the container.
 
 READ-ONLY, three ways: followup_worker.dry_run_count reserves, sends and writes nothing; this
@@ -74,14 +75,45 @@ def table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def parse_now(argv: list):
+    """The `--now <ISO datetime>` (or `--now=<ISO>`) option: the moment to evaluate the tick at,
+    default None = the real clock. A value without an offset is read as Central time (the business
+    timezone every user-facing date uses). Raises ValueError on a missing or unreadable value."""
+    from datetime import datetime
+
+    raw = None
+    for i, a in enumerate(argv):
+        if a == "--now":
+            if i + 1 >= len(argv):
+                raise ValueError("--now needs an ISO datetime, e.g. 2026-10-27T12:00:00-05:00")
+            raw = argv[i + 1]
+        elif a.startswith("--now="):
+            raw = a[len("--now="):]
+    if raw is None:
+        return None
+    try:
+        when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("--now %r is not an ISO datetime" % raw) from None
+    if when.tzinfo is None:
+        import followup_rules
+        when = when.replace(tzinfo=followup_rules.BUSINESS_TZ)
+    return when
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        now = parse_now(argv)
+    except ValueError as exc:
+        print("followup_dry_run: %s" % exc, file=sys.stderr)
+        return 2
     import config
     import followup_worker
 
     install_read_only_pool(config.DATABASE_URL)
     refuse_email()
-    result = followup_worker.dry_run_count()
+    result = followup_worker.dry_run_count(now)
     print(json.dumps(result, default=str, indent=2))
     if "--json" not in argv:
         print()

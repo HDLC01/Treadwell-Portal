@@ -412,6 +412,27 @@ def test_the_dry_run_entry_point_prints_json_and_a_table_and_cannot_send(monkeyp
     assert _json.loads(capsys.readouterr().out) == result
 
 
+def test_the_entry_point_evaluates_the_tick_at_now(monkeypatch, capsys):
+    """Round 3 #5: `--now <ISO>` is the moment dry_run_count evaluates at; without it, the real
+    clock (None). An offset-less value is Central time; a bad one exits 2 before any database."""
+    seen = []
+    monkeypatch.setattr(followup_dry_run, "install_read_only_pool", lambda url: None)
+    monkeypatch.setattr(followup_dry_run, "refuse_email", lambda: None)
+    monkeypatch.setattr(fw, "dry_run_count", lambda now=None: seen.append(now) or {
+        "at": str(now), "tasks": []})
+    assert followup_dry_run.main(["--json", "--now", "2026-10-27T12:00:00-05:00"]) == 0
+    assert followup_dry_run.main(["--now=2026-10-27T17:00:00Z", "--json"]) == 0
+    assert followup_dry_run.main(["--json", "--now", "2026-10-27T12:00:00"]) == 0
+    assert followup_dry_run.main(["--json"]) == 0
+    noon = datetime(2026, 10, 27, 17, 0, tzinfo=timezone.utc)
+    assert seen[:3] == [noon, noon, noon] and seen[3] is None
+    capsys.readouterr()
+    assert followup_dry_run.main(["--now", "yesterday"]) == 2
+    assert followup_dry_run.main(["--now"]) == 2
+    assert len(seen) == 4, "a bad --now reached the database"
+    assert "--now" in capsys.readouterr().err
+
+
 def test_the_entry_point_opens_a_read_only_pool():
     assert followup_dry_run.READ_ONLY == "-c default_transaction_read_only=on"
 
