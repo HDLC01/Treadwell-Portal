@@ -76,7 +76,9 @@ class FakeSendDB:
         self.calls["claims"].append(list(pids))
         order = [p for p in dict.fromkeys(pids) if p]
         rows = [self.row(p) for p in order if self.row(p)]
-        plan = scope_groups.plan_send(rows, self._marks_for(gid, set(order)), self.now,
+        # Like db.claim_scope_group_send: the whole group's marks (they decide `first`).
+        all_ids = {m["proposal_id"] for m in self.marks}
+        plan = scope_groups.plan_send(rows, self._marks_for(gid, all_ids), self.now,
                                       include_unknown=include_unknown)
         if not plan["pending"]:
             return None

@@ -545,9 +545,10 @@ def claim_scope_group_send(group_id: str, proposal_ids: list[str],
     with pool().connection() as conn:
         locked = {r["proposal_id"]: r for r in _lock_scope_rows(conn, ids)}
         now = conn.execute("select now() as now").fetchone()["now"]
-        marks = conn.execute(_MARKS_SQL + "and detail ->> 'scope_group' = %s "
-                             "and proposal_id = any(%s) order by id",
-                             (_SCOPE_SENT, group_id, ids)).fetchall()
+        # The WHOLE group's marks: plan_send reads only the claimed scopes' marks for what is
+        # pending, and every mark for `first` (a closed scope's earlier send still counts).
+        marks = conn.execute(_MARKS_SQL + "and detail ->> 'scope_group' = %s order by id",
+                             (_SCOPE_SENT, group_id)).fetchall()
         rows = [locked[p] for p in order if p in locked]
         plan = scope_groups.plan_send(rows, marks, now, include_unknown=include_unknown)
         if not plan["pending"]:

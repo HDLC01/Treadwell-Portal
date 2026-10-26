@@ -558,6 +558,19 @@ def test_releasing_a_second_send_leaves_the_first_sends_marks(clean):
     assert again["first"] is False
 
 
+def test_a_claim_after_the_announced_scope_closed_is_not_a_first_send(clean):
+    """PF4 review: the claim read only the claimed scopes' marks, so with Breakroom (the only
+    scope ever emailed) closed lost, the send of Lab 1 was planned as a FIRST send again."""
+    gid, ids = group_of_three()
+    a, b, c = ids
+    _announce_everything(gid, [a])
+    set_cols(a, proposal_status="closed_lost")
+    claim = db.claim_scope_group_send(gid, [b])
+    assert claim["pending"] == [b]
+    assert claim["first"] is False and claim["kinds"] == {b: "new"}
+    assert db.claim_scope_group_send(gid, [b]) is None, "the wider read changed what is pending"
+
+
 def test_stamping_a_second_send_does_not_touch_the_first_sends_mark(clean):
     gid, ids = group_of_three()
     a, b, c = ids

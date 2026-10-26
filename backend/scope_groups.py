@@ -158,9 +158,14 @@ def plan_send(rows: list, marks: list, now: datetime, include_unknown: bool = Fa
     `pending`: not announced and not already being sent, in `rows` order. `first`: nothing in the
     group has ever reached the customer. `kinds`: per pending scope, 'first' on the first send,
     otherwise 'new' or 'revised'. `unknown`: scopes whose last send lost its result (mark_status);
-    they are left out of `pending` unless `include_unknown` (a person said send them again)."""
+    they are left out of `pending` unless `include_unknown` (a person said send them again).
+
+    `first` also reads the marks of scopes NOT in `rows` (closed lost, deleted, taken out of the
+    group since): once anything of the project has reached the customer, no later send is the
+    first one again, even when every scope it announced has gone (round 3 contract)."""
     st = scope_states(rows, marks, now)
-    first = not any(s["ever"] for s in st.values())
+    first = (not any(s["ever"] for s in st.values())
+             and not any(mark_status(m, now) == "counts" for m in marks or []))
     pending, kinds, unknown = [], {}, []
     for r in rows or []:
         pid = r.get("proposal_id")

@@ -743,6 +743,43 @@ def test_send_state_names_a_scope_whose_send_is_in_flight(monkeypatch):
     assert s["first"] is False
 
 
+@pytest.mark.parametrize("gone", ["closed_lost", "deleted", "removed"])
+def test_send_state_first_stays_false_after_the_announced_scope_has_gone(monkeypatch, gone):
+    """PF4 review (contract: false after the first announce, for ever). Breakroom was emailed,
+    then closed lost / deleted / taken out of the group; Lab 1 is published since. send_rows left
+    Breakroom out before the planner decided `first`, so the board said first=true again."""
+    rows = [_row("d-break", "Breakroom", last_sent_at=T0),
+            _row("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1))]
+    if gone == "closed_lost":
+        rows[0]["proposal_status"] = "closed_lost"
+    elif gone == "deleted":
+        rows = rows[1:]                       # the board never lists a deleted row
+    else:
+        rows[0]["scope_group"] = None         # no longer the group's on the portal either
+    s = _board_send_state(monkeypatch, rows, [_sent_mark(1, "d-break")])["d-lab1"]
+    assert s["pending_scope_ids"] == ["d-lab1"]
+    assert s["kinds"] == {"d-lab1": "new"}
+    assert s["first"] is False
+
+
+def test_the_send_after_the_announced_scope_closed_is_not_a_first_send(send):
+    """The same on the send itself: the email names Lab 1 as NEW, and an unpublished sibling no
+    longer blocks it (it blocks only the first send)."""
+    go, calls, f = send
+    f.rows = [r for r in f.rows if r["proposal_id"] == "d-break"]
+    f.drafts = [d for d in f.drafts if d["id"] == "d-break"]
+    assert go().status_code == 200                     # Breakroom alone, the first email
+    f.row("d-break")["proposal_status"] = "closed_lost"
+    f.rows.append(_row("d-lab1", "Lab 1", created_at=T0 + timedelta(seconds=1)))
+    f.drafts += [{"id": "d-lab1", "archived": False}, {"id": "d-lab2", "archived": False}]
+    r = go()
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["first"] is False and [s["kind"] for s in j["scopes"]] == ["new"]
+    assert [s["change"] for s in calls["emails"][-1]["scopes"]] == ["new"]
+    assert j["not_included"] == ["d-lab2"]
+
+
 # ══ 8. publish safety on a database without the DDL ══════════════════════════
 @pytest.fixture
 def publish(monkeypatch):
