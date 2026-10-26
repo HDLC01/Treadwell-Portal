@@ -323,6 +323,25 @@ def test_the_cap_is_per_group_and_counts_every_members_reminders():
     assert _customer_due(rules.group_view(under, NOW)) is not None
 
 
+def test_a_retired_approvals_deposit_reminders_never_count_toward_the_groups_cap():
+    """Round 3 #4 (residual #17): Lab 1 was approved, chased for its deposit twice, then revised
+    back to an open scope. Its two SENT deposit tasks are in its own count (followup_reminder_times)
+    but not in the group's (group_reminder_times, db: deposit-stage tasks left out), so they do not
+    use up the siblings' stop-after-2."""
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H)
+    viewed[0]["followup_stop_after"] = 2
+    deposit = [(NOW - 290 * H).isoformat(), (NOW - 200 * H).isoformat()]
+    members = _members(viewed, **{"d-lab1": {"followup_reminder_times": deposit,
+                                             "group_reminder_times": []}})
+    view = rules.group_view(members, NOW)
+    assert view["followup_reminder_times"] == []
+    assert _customer_due(view) is not None
+    # The control: the same reminders as ordinary ones (in the group count) do cap it.
+    capped = _members(viewed, **{"d-lab1": {"followup_reminder_times": deposit,
+                                            "group_reminder_times": deposit}})
+    assert _customer_due(rules.group_view(capped, NOW)) is None
+
+
 def _customer_due(view):
     got = [d for d in rules.due_now(view, NOW, ALL_DAY) if d.audience == "customer"]
     return got[0] if got else None

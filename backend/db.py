@@ -834,6 +834,11 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         + _STAFF_MESSAGE_SQL.format(pid="p.proposal_id") + " as last_staff_message_at, "
         + _REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
         + " as followup_reminder_times, "
+        # What a scope GROUP folds (round 3 #4): only on grouped rows, so an ungrouped row costs
+        # nothing more.
+        "(case when (pj.j ->> 'scope_group') is not null then "
+        + _GROUP_REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " end) as group_reminder_times, "
         + _DEPOSIT_HISTORY_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
         + " as deposit_history, "
         # The open follow-up task, if any, so the board (polled every 25s) can show it without a
@@ -1681,6 +1686,18 @@ _REMINDER_TIMES_SQL = (
     "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
     "    and ((f.kind = 'followup_task' and f.detail->>'status' in ('sent','called')) "
     "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
+# The same count as a scope GROUP folds it (round 3 #4, residual #17): without the member's
+# DEPOSIT-stage tasks. A scope whose approval was retired (a revision put it back to sent) still
+# holds the deposit reminders of that approval; they were never the siblings' follow-ups and must
+# not count toward the group's "Stop after N". The single chase keeps reading the full count above
+# (its deposit cap counts them, fix round #11). Derived from the predicate above, not a copy of it.
+_REMINDER_TASK_PRED = "f.detail->>'status' in ('sent','called'))"
+if _REMINDER_TIMES_SQL.count(_REMINDER_TASK_PRED) != 1:  # the derivation below must apply
+    raise RuntimeError("_REMINDER_TIMES_SQL changed: update _GROUP_REMINDER_TIMES_SQL")
+_GROUP_REMINDER_TIMES_SQL = _REMINDER_TIMES_SQL.replace(
+    _REMINDER_TASK_PRED,
+    "f.detail->>'status' in ('sent','called') "
+    "and coalesce(f.detail->>'stage', '') <> 'deposit')")
 # The deposit chase's own history in this send cycle (fix round #11/#3), for
 # followup_rules.deposit_series_done:
 #   customer_legacy  the old ladder's recurring customer deposit emails (`:depr@`). Every customer
@@ -1774,9 +1791,11 @@ def followup_signals(proposal_id: str) -> dict[str, Any]:
            + _STAFF_MESSAGE_SQL.format(pid="%s") + " as last_staff_message_at, "
            + _REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
            + " as followup_reminder_times, "
+           + _GROUP_REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
+           + " as group_reminder_times, "
            + _DEPOSIT_HISTORY_SQL.format(pid="%s", enrolled=enrolled) + " as deposit_history, "
            + _PENDING_TASK_SQL.format(pid="%s") + " as pending_task")
-    return q1(sql, (proposal_id,) * 8) or {}
+    return q1(sql, (proposal_id,) * 10) or {}
 
 
 def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Optional[int]:

@@ -1697,3 +1697,26 @@ def test_a_scope_published_since_the_email_is_not_in_the_group_reminder(clean):
     assert why == "" and f"{gid}-d" in [m["proposal_id"] for m in members]
     assert [s["proposal_id"] for s in view["scopes"]] == ids
     assert [m["proposal_id"] for m in view["_open_members"]] == ids
+
+
+def test_a_retired_approvals_deposit_tasks_leave_the_groups_reminder_count(clean):
+    """Round 3 #4 (residual #17) on real rows: B was approved, its deposit reminders went out (SENT
+    deposit-stage tasks), then a revision put it back to sent. Its own count keeps them (the single
+    chase's deposit cap counts them); the GROUP's count -- worker and board -- leaves them out, so
+    they never use up the siblings' "Stop after N"."""
+    gid, (a, b, c) = group_of_three(sent=True)
+    for age in (6, 5):
+        add_followup(b, "followup_task", task(b, status="sent", stage="deposit",
+                                              template="deposit_nudge"), days_ago=age)
+    add_followup(b, "followup_task", task(b, status="sent", stage="pre", scope_group=gid),
+                 days_ago=4)
+    sig = db.followup_signals(b)
+    assert len(sig["followup_reminder_times"]) == 3
+    assert len(sig["group_reminder_times"]) == 1
+    board = _board()
+    assert sorted(board[b]["group_reminder_times"]) == sorted(sig["group_reminder_times"])
+    add_draft("solo")
+    add_proposal("solo")
+    assert _board()["solo"]["group_reminder_times"] is None, "an ungrouped row pays nothing"
+    view, why, _ = followup_worker.group_state_for(gid, db_now())
+    assert why == "" and len(view["followup_reminder_times"]) == 1

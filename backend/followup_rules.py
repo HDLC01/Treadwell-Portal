@@ -748,6 +748,16 @@ def _times_list(raw: Any) -> list:
     return list(raw) if isinstance(raw, (list, tuple)) else []
 
 
+def _group_times(m: dict) -> list:
+    """A member's counted reminders as the GROUP folds them (round 3 #4, residual #17): the
+    `group_reminder_times` signal (db: without the member's deposit-stage tasks, so a retired
+    approval's deposit reminders never use up the siblings' "Stop after N"), else -- a caller that
+    did not read it -- the full `followup_reminder_times`."""
+    if m.get("group_reminder_times") is not None:
+        return _times_list(m.get("group_reminder_times"))
+    return _times_list(m.get("followup_reminder_times"))
+
+
 def group_chase_stopped(members: list) -> bool:
     """Has a live member been approved since the last "keep chasing the others" decision?
 
@@ -838,12 +848,12 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
     # (it may have been the home then), and the group must not get a fresh "Stop after N" back.
     times = []
     for m in folded:
-        times.extend(_times_list(m.get("followup_reminder_times")))
+        times.extend(_group_times(m))
     for m in live:
         if is_open(m):
             continue
         cut = _ts(m.get("approved_at"))
-        times.extend(t for t in _times_list(m.get("followup_reminder_times"))
+        times.extend(t for t in _group_times(m)
                      if cut is not None and _ts(t) is not None and _ts(t) <= cut)
     view["followup_reminder_times"] = times
     # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there),
