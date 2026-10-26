@@ -1149,16 +1149,25 @@ def test_a_scope_approved_again_after_keep_raises_a_new_decision_task(approve, a
     assert fw.group_state_for(GID, NOW + 3 * H)[0] is not None
 
 
-def test_group_schedule_takes_each_key_from_the_home_else_the_first_member_that_has_one():
+def test_group_schedule_is_the_homes_alone_and_keep_carries_the_former_homes_over():
+    """PF4 review: a null on the home is the STANDARD cadence, never "inherit from a member" --
+    or "reset to standard" written on the new home changes nothing. The former home's plan is
+    copied over once instead (schedule_carry), and only from a scope that really was the home."""
     rows = _three()
     rows[0].update(proposal_status="approved", followup_interval_days=14, followup_stop_after=2)
     rows[2].update(followup_stop_after=5, followup_next_at=NOW + 24 * H)
     rows[1].update(followup_interval_days=None)
     got = rules.group_schedule(rows)          # home = d-lab1 (earliest OPEN), which has none
-    assert got == {"followup_interval_days": 14, "followup_stop_after": 2,
-                   "followup_next_at": NOW + 24 * H}
-    rows[1].update(followup_stop_after=3)     # the home's own value wins
+    assert got == {"followup_interval_days": None, "followup_stop_after": None,
+                   "followup_next_at": None}
+    rows[1].update(followup_stop_after=3)
     assert rules.group_schedule(rows)["followup_stop_after"] == 3
+    # The approved d-break was the home (it sorts first): its interval comes over; the new home's
+    # own stop-after is kept; the snooze date is not carried.
+    assert rules.schedule_carry(rows[0], rows[1]) == {"followup_interval_days": 14}
+    # d-lab2 sorts after the home: it never held the group's plan, so nothing of it comes over.
+    assert rules.schedule_carry(rows[2], rows[1]) == {}
+    assert rules.schedule_carry(rows[1], rows[1]) == {}
 
 
 def test_the_fallback_decision_key_has_full_precision(fake):
@@ -1206,6 +1215,38 @@ def test_keep_after_the_home_is_approved_keeps_the_groups_schedule(approve, admi
     assert f.rows["d-break"]["followup_interval_days"] == 14
     view = fw.group_state_for(GID, NOW + H)[0]
     assert (view["followup_interval_days"], view["followup_stop_after"]) == (7, 2)
+    # The response is the schedule the group really runs on (it was stop_after None here).
+    assert r.json()["followup_plan"]["stop_after"] == 2
+
+
+def test_reset_to_standard_after_the_home_moved_really_resets_the_group(approve, admin,
+                                                                       monkeypatch):
+    """PF4 review: home Breakroom (14 days, stop after 2) approved, 'keep', home -> Lab 1. "The
+    standard interval, the standard reminder limit" from Lab 2's drawer answered 200 and posted
+    the card, while the worker and the board went on with Breakroom's 14 / 2 for ever."""
+    f, go = approve
+    f.rows["d-break"].update(followup_interval_days=14, followup_stop_after=2)
+    assert go("d-break").status_code == 200
+    dec, = f.tasks(stage="decision")
+    f.clock = NOW + H
+    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, dec["id"]).status_code == 200
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"interval_days": None, "stop_after": None})
+    assert r.status_code == 200
+    assert (r.json()["followup_plan"]["interval_days"],
+            r.json()["followup_plan"]["stop_after"]) == (None, None)
+    view = fw.group_state_for(GID, NOW + H)[0]
+    assert (view["followup_interval_days"], view["followup_stop_after"]) == (None, None)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    for pid in ("d-lab1", "d-lab2"):
+        assert (out[pid]["followup_plan"]["interval_days"],
+                out[pid]["followup_plan"]["stop_after"]) == (None, None), pid
+    # The approved scope's own row is untouched: it is its own deposit chase now.
+    assert f.rows["d-break"]["followup_interval_days"] == 14
 
 
 def _log(pid, kind="call"):

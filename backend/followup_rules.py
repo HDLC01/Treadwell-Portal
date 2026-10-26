@@ -711,22 +711,35 @@ GROUP_SCHEDULE_KEYS = ("followup_interval_days", "followup_stop_after", "followu
 
 
 def group_schedule(members: list, home: Optional[dict] = None) -> dict:
-    """The group's interval / stop-after / snooze date: each from the HOME, else from the first
-    member (home first, then created_at order) that has one. Pure.
+    """The group's interval / stop-after / snooze date: the HOME row's, and only the home's. Pure.
 
-    Round 3 #2: the plan is written on the home row, and the home moves off a scope when it is
-    approved (group_home). After 'keep' the new home has none of it, so without this the group
-    would quietly drop back to the global cadence -- "every 14 days, stop after 2" lost because
-    the scope that held it was the one the customer took. Admin plan writes still go to the home."""
+    A null on the home means the standard cadence. It used to mean "inherit from another member"
+    (round 3 #2), and then "reset to standard" written on the home after it had moved changed
+    nothing: the approved former home's values went on running the group. The plan is now COPIED
+    onto the new home once, when 'keep' restarts the chase (schedule_carry), and read from the
+    home alone, which is also where admin plan writes go."""
     live = [m for m in members or [] if m and m.get("proposal_id")]
     home = home if home is not None else group_home(live)
-    order = sorted(live, key=lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id"))))
-    if home is not None:
-        order = [home] + [m for m in order if m.get("proposal_id") != home.get("proposal_id")]
-    out = {}
-    for k in GROUP_SCHEDULE_KEYS:
-        out[k] = next((m.get(k) for m in order if m.get(k) is not None), None)
-    return out
+    return {k: (home or {}).get(k) for k in GROUP_SCHEDULE_KEYS}
+
+
+CARRIED_SCHEDULE_KEYS = ("followup_interval_days", "followup_stop_after")
+
+
+def schedule_carry(former: Optional[dict], home: Optional[dict]) -> dict:
+    """What 'keep' copies onto the group's NEW home (round 3 #2, Hanz's question 6: copy over):
+    the interval and stop-after the former home holds that the new home does not. Pure.
+
+    Only when `former` (the approved scope) really was the home -- it sorts before the new home,
+    which group_home picked as the earliest open scope -- so a non-home scope's own leftovers never
+    become the group's. Not the snooze date: 'keep' re-anchors the home and clears it anyway."""
+    if not former or not home or former.get("proposal_id") == home.get("proposal_id"):
+        return {}
+    key = lambda m: (_sort_ts(m.get("created_at")), str(m.get("proposal_id")))  # noqa: E731
+    if key(former) >= key(home):
+        return {}
+    return {k: former.get(k) for k in CARRIED_SCHEDULE_KEYS
+            if former.get(k) is not None and home.get(k) is None}
 
 
 def _min_ts(vals) -> Optional[datetime]:
@@ -856,8 +869,8 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
         times.extend(t for t in _group_times(m)
                      if cut is not None and _ts(t) is not None and _ts(t) <= cut)
     view["followup_reminder_times"] = times
-    # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there),
-    # else a member's that has one -- the home moves off an approved scope (round 3 #2).
+    # interval / stop-after / snooze: the home row's own schedule (followup-plan writes there; a
+    # 'keep' copies it over when the home moves off an approved scope, round 3 #2).
     view.update(group_schedule(live, home))
     view["scope_group"] = home.get("scope_group")
     # Fix round #15: a scope the customer paused ("delayed, 2 months" on its page) is left out of

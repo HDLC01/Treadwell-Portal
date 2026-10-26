@@ -3743,7 +3743,7 @@ def _pipeline_groups(rows: list, now: datetime) -> dict:
                     "view": followup_rules.group_view(
                         members, now, followup_rules.history_rows(grows, drafts, ids)),
                     "home": followup_rules.group_home(members),
-                    # The schedule the chase runs on (round 3 #2): the home's, else a member's.
+                    # The schedule the chase runs on: the home's (round 3 #2).
                     "schedule": followup_rules.group_schedule(members),
                     "rows": grows, "drafts": drafts}
     return out
@@ -5343,8 +5343,17 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
             log.error("[followup] scope decision %s: the resume note failed: %s", task["id"], exc)
             out["warnings"] = ["resume_not_recorded"]
         try:
-            home = followup_rules.group_home(followup_worker.group_members(gid, strict=False))
+            members = followup_worker.group_members(gid, strict=False)
+            home = followup_rules.group_home(members)
             if home:
+                # Round 3 #2: the group's plan lives on its home, and approving the home moved
+                # it. Copy the approved scope's interval / stop-after onto the new home once, so
+                # "every 14 days, stop after 2" carries on and a later "standard" really resets it.
+                former = next((m for m in members if m.get("proposal_id") == pid), p)
+                carry = followup_rules.schedule_carry(former, home)
+                if carry:
+                    db.set_followup_plan(home["proposal_id"],
+                                         **{k[len("followup_"):]: v for k, v in carry.items()})
                 _stamp_touch(home["proposal_id"])
         except Exception as exc:  # noqa: BLE001
             log.warning("[followup] scope decision %s: could not re-anchor: %s", task["id"], exc)
