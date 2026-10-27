@@ -6,9 +6,9 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-  /** The single most useful thing to say about where a project stands.
+  /** The single most useful thing to say about where ONE proposal stands.
    *  Checked latest-stage-first so a scheduled job doesn't read "Approved". */
-  function status(p) {
+  function proposalStatus(p) {
     if (p.schedule_status === "scheduled") return { label: "Scheduled", cls: "done" };
     if (p.deposit_status === "received") return { label: "Deposit received", cls: "done" };
     // Between paying and staff confirming it landed — telling them "Deposit due"
@@ -23,19 +23,47 @@
     return { label: "New proposal", cls: "pending" };
   }
 
-  /** `.proj-row` anchors for a list of proposal cards. `currentToken` marks the
-   *  one you're already looking at so the switcher can show it as current. */
+  /** Where a PROJECT stands. One row of the list is one project, and a project priced as several
+   *  proposals (the server folds them into one card, `scopes` listing each) is approved one
+   *  proposal at a time, so a single proposal's badge would misstate it. When they all agree, that
+   *  is the answer; once some are approved, "1 of 3 approved"; when all are approved, whatever is
+   *  still outstanding on one of them. */
+  function status(p) {
+    const scopes = (p && p.scopes) || [];
+    if (scopes.length < 2) return proposalStatus(p);
+    const each = scopes.map(proposalStatus);
+    if (each.every((s) => s.label === each[0].label)) return each[0];
+    const approved = scopes.filter((s) => s.proposal_status === "approved").length;
+    if (approved === scopes.length) return each.find((s) => s.cls !== "done") || each[0];
+    if (approved) return { label: `${approved} of ${scopes.length} approved`, cls: "warn" };
+    return each.find((s) => s.label === "Awaiting approval") || each[0];
+  }
+
+  /** Is `token` this project (any of its proposals)? */
+  function holds(p, token) {
+    if (!p || !token) return false;
+    return p.token === token || ((p.scopes || []).some((s) => s.token === token));
+  }
+
+  /** The project row for the page at `token`, or undefined. */
+  function find(proposals, token) {
+    return (proposals || []).find((p) => holds(p, token));
+  }
+
+  /** `.proj-row` anchors for a list of project cards. `currentToken` marks the
+   *  one you're already looking at so the switcher can show it as current — on
+   *  any proposal of a project priced as several. */
   function rowsHtml(proposals, currentToken) {
     return (proposals || []).map((p) => {
       const st = status(p);
-      const here = currentToken && p.token === currentToken;
-      // `display_name` is "Acme HQ — Lab 1" for one scope of a multi-scope project (the server
-      // also keeps a group's scopes next to each other), and the plain project name otherwise.
-      return `<a class="proj-row${here ? " current" : ""}${p.scope_group ? " is-scope" : ""}"` +
+      const here = holds(p, currentToken);
+      // `display_name` is the project name: a project priced as several proposals is ONE row
+      // (the server folds it), opening its first proposal, whose page has a tab for each.
+      return `<a class="proj-row${here ? " current" : ""}"` +
         ` href="/p/${encodeURIComponent(p.token)}"` +
         `${here ? ' aria-current="page"' : ""}>` +
         `<span class="pname">${esc(p.display_name || p.project_name)}</span>` +
-        `<span class="badge ${st.cls}">${st.label}</span></a>`;
+        `<span class="badge ${st.cls}">${esc(st.label)}</span></a>`;
     }).join("");
   }
 
@@ -47,5 +75,5 @@
       .catch(() => []);
   }
 
-  window.TWProjects = { status, rowsHtml, load, esc };
+  window.TWProjects = { status, rowsHtml, load, esc, find };
 })();

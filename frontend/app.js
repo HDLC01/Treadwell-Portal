@@ -193,6 +193,7 @@ function renderPortal(vm) {
   LAST_STATUS = statusKey(pollShapedStatus(vm));
   applyHashView(false);   // re-render (incl. poll-triggered) must not scroll the reader
   applyStepPanel();       // keep the active tab showing only its own cards
+  jumpToDocument();       // arrived from a proposal tab: back at the document card (once)
   mountSwitcher();        // once per session; no-op on poll re-renders
   startPolling();
 }
@@ -212,12 +213,15 @@ async function mountSwitcher() {
   const menu = $("proj-switch-menu");
   if (!wrap || !btn || !menu) return;
 
+  // ONE ROW PER PROJECT: the server folds a project priced as several proposals into one card, so
+  // its proposals are tabs of the document card below, never rows here.
   const proposals = await TWProjects.load();
   if (proposals.length < 2) return;   // nothing to switch between
   menu.innerHTML = TWProjects.rowsHtml(proposals, TOKEN);
-  // Label the button with the project you're actually looking at, so it matches
-  // the title below it instead of reading a generic "My projects".
-  const here = proposals.find((p) => p.token === TOKEN);
+  // Label the button with the project you're actually looking at -- the project name alone, on
+  // whichever of its proposals this page is.
+  const here = TWProjects.find ? TWProjects.find(proposals, TOKEN)
+    : proposals.find((p) => p.token === TOKEN);
   const label = $("proj-switch-label");
   if (label && here && here.project_name) label.textContent = here.display_name || here.project_name;
   wrap.classList.remove("hidden");
@@ -240,7 +244,8 @@ function setHeader(vm, approved) {
   const sub = vm.city_state || "";
   $("p-title").textContent = title; $("pv-title").textContent = title;
   $("p-sub").textContent = sub; $("pv-sub").textContent = sub;
-  renderScopeStrip(vm.scope);
+  renderScopeTabs(vm.scope);
+  labelScopeCards(vm.scope);
   for (const id of ["p-status-badge", "pv-status-badge"]) {
     const b = $(id);
     if (approved) { b.className = "badge done"; b.textContent = "Approved"; }
@@ -248,29 +253,62 @@ function setHeader(vm, approved) {
   }
 }
 
-/** The other scopes of a multi-scope project, as links, under the proposal heading.
+/** The proposals of a project priced as several, as TABS above the official proposal document.
  *
- *  RJ: a project can be several separately priced scopes ("Breakroom", "Lab 1", "Lab 2"), each
- *  its own proposal that is approved on its own. The server sends only the scopes THIS signed-in
- *  customer can open (it builds the list from their own project list), so nothing here filters.
- *  Hidden for every ordinary proposal, which has no `scope`. */
-function renderScopeStrip(scope) {
-  const el = $("pv-scopes");
+ *  RJ: a project can be several separately priced proposals ("Breakroom", "Lab 1", "Lab 2"), each
+ *  approved on its own. Hanz, 2026-10-27: "ONE PROJECT in the customer side ... then we just have
+ *  multiple tabs of the Official proposal document that shows each proposal". The server sends
+ *  only the proposals THIS signed-in customer can open (it builds the list from their own project
+ *  list), so nothing here filters.
+ *
+ *  A TAB IS A PLAIN NAVIGATION to that proposal's own page, /p/<token>, landing back on this card
+ *  (DOC_HASH). Every proposal approves, pays and talks on its own, and all of that hangs off the
+ *  page's one TOKEN and a dozen pieces of per-page state (the selection, the signature latch, the
+ *  mounted PDFs, the chat, the poll); a fresh load of the page renders all of it through the one
+ *  path that already exists, so the Status card and the Approve button can only ever be the
+ *  selected tab's. Hidden for every ordinary proposal (no `scope`) and when this customer can see
+ *  only one proposal of the project. */
+function renderScopeTabs(scope) {
+  const el = $("pv-scope-tabs");
   if (!el) return;
   const sibs = (scope && scope.siblings) || [];
   if (sibs.length < 2) { el.classList.add("hidden"); el.innerHTML = ""; return; }
   el.innerHTML =
-    `<p class="muted small" style="margin:0 0 8px">This project is priced as ${sibs.length} ` +
-    `separate scopes. Each one is its own proposal, approved on its own.</p>` +
-    `<div class="scope-chips">` + sibs.map((s) => {
+    `<nav class="scope-tablist" aria-label="Proposals in this project">` + sibs.map((s) => {
       const name = esc(s.scope_label || s.display_name || s.project_name || "Proposal");
-      const done = s.proposal_status === "approved";
+      const flag = s.proposal_status === "approved"
+        ? ` <span class="scope-tab-flag">Approved</span>` : "";
       return s.current
-        ? `<span class="scope-chip is-current" aria-current="page">${name}</span>`
-        : `<a class="scope-chip${done ? " is-done" : ""}" href="/p/${encodeURIComponent(s.token)}">` +
-          `${name}${done ? " · approved" : ""}</a>`;
-    }).join("") + `</div>`;
+        ? `<span class="scope-tab is-current" aria-current="page">${name}${flag}</span>`
+        : `<a class="scope-tab" href="/p/${encodeURIComponent(s.token)}${DOC_HASH}">${name}${flag}</a>`;
+    }).join("") + `</nav>` +
+    `<p class="muted small scope-tabs-note">Each proposal is approved on its own.</p>`;
   el.classList.remove("hidden");
+}
+
+/** Say WHICH proposal the Status card and the Approve card are for, on a project priced as
+ *  several: "Status: Lab 1", "Approve Lab 1". Restored to the plain headings otherwise, and
+ *  written as text, so an estimator-typed label can never become markup. */
+function labelScopeCards(scope) {
+  const label = (scope && scope.label) || "";
+  const st = $("status-title");
+  if (st) st.textContent = label ? `Status: ${label}` : "Status";
+  const ap = $("approve-title");
+  if (ap) ap.textContent = label ? `Approve ${label}` : "Approve this proposal";
+}
+
+/** Where a proposal tab lands: the proposal step, at the document card (jumpToDocument). */
+const DOC_HASH = "#proposal/proposal/document";
+
+/** Land on the document card after arriving from a proposal tab, so switching tabs keeps the
+ *  reader where they were. Once per page load: a poll re-render must never move the page. */
+let DOC_JUMPED = false;
+function jumpToDocument() {
+  if (DOC_JUMPED) return;
+  DOC_JUMPED = true;
+  if (location.hash.replace("#", "").split("/")[2] !== "document") return;
+  const card = $("pdf-card");
+  if (card && !card.classList.contains("hidden")) card.scrollIntoView({ block: "start" });
 }
 
 /** Does this project involve a deposit at all?
@@ -769,9 +807,12 @@ function renderSigning() {
   if (note) note.classList.toggle("hidden", required);
   // "Sign" is a claim about the document. Budget Pricing has no Terms and Conditions attached,
   // so the button must not make it there.
+  // On a project priced as several proposals the button names the one it approves ("Sign and
+  // approve Lab 1"): each is approved on its own, and the tabs above make the others one click away.
   const btn = $("approve-btn");
   if (btn && !btn.dataset.locked) {
-    btn.textContent = required ? "Sign and approve proposal" : "Approve proposal";
+    const forScope = (STATE && STATE.scope && STATE.scope.label) || "proposal";
+    btn.textContent = (required ? "Sign and approve " : "Approve ") + forScope;
   }
   renderSignaturePreview();
   updateApproveGate();

@@ -6,6 +6,7 @@ scope added later, a scope revised, a contact whose address bounced, a double cl
 one membership rule, the capability handshake, publish safety on a database without the DDL, and
 the scope's name on the customer's money pages.
 """
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -550,6 +551,9 @@ def test_the_email_renderer_names_new_and_revised_and_attaches(monkeypatch):
     assert ok
     h = sent[0]["html"]
     assert "Lab 3 (new)" in h and "Lab 1 (revised)" in h
+    # "Email again": ONE button, to the first proposal it names; the names are text.
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', h) == ["https://p/x/p/tok-c"]
+    assert '<li style="margin:4px 0">Lab 1 (revised)</li>' in h
     assert "1 new proposal and 1 revised proposal" in h
     assert "Your proposals have been updated" in h
     assert "Call me Monday" in h

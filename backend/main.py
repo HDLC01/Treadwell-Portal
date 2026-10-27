@@ -453,11 +453,44 @@ def _group_cards(cards: list[dict]) -> list[dict]:
     return out
 
 
-def _customer_cards(email: str) -> list[dict]:
-    """The signed-in customer's project list. ONE builder for the three routes that return it,
-    and always off list_proposals_by_email, which is what keeps another customer's scope of the
-    same group out of it."""
+def _customer_scope_cards(email: str) -> list[dict]:
+    """Every proposal the signed-in customer can open, ONE card each, a group's kept together.
+    Always off list_proposals_by_email, which is what keeps another customer's scope of the same
+    group out of it. The proposal page's tabs read this; the project list reads _customer_cards."""
     return _group_cards([_proposal_card(r) for r in db.list_proposals_by_email(email)])
+
+
+def _project_cards(cards: list[dict]) -> list[dict]:
+    """ONE card per PROJECT: a scope group's cards fold into one, named by the project.
+
+    Hanz, 2026-10-27, on two proposals of one job listed as "Multiple proposals — Base Bid 2" and
+    "Multiple proposals — Base Bid 1": "ONE PROJECT in the customer side ... because it is still
+    two projects in the portal side". The folded card opens the group's FIRST proposal (the
+    _group_cards order, which is also the order the combined email lists them in), and carries
+    every proposal of it this customer can open in `scopes`, so the list can say how far the
+    project has got and the switcher knows the project is the one being looked at from any of its
+    tabs. Ungrouped cards pass through untouched."""
+    out, at = [], {}
+    for c in cards:
+        g = c.get("scope_group")
+        if not g:
+            out.append(c)
+            continue
+        member = {k: c.get(k) for k in ("token", "scope_label", "proposal_status",
+                                        "deposit_status", "schedule_status",
+                                        "deposit_required", "deposit_requested")}
+        if g in at:
+            at[g]["scopes"].append(member)
+            continue
+        at[g] = dict(c, display_name=c.get("project_name") or "Your Proposal", scopes=[member])
+        out.append(at[g])
+    return out
+
+
+def _customer_cards(email: str) -> list[dict]:
+    """The signed-in customer's project list: ONE builder for the three routes that return it,
+    ONE row per project (_project_cards)."""
+    return _project_cards(_customer_scope_cards(email))
 
 
 def _scope_view(p: dict, session_email: str) -> Optional[dict]:
@@ -469,7 +502,7 @@ def _scope_view(p: dict, session_email: str) -> Optional[dict]:
     group = p.get("scope_group")
     if not group:
         return None
-    sibs = [c for c in _customer_cards(session_email) if c.get("scope_group") == group]
+    sibs = [c for c in _customer_scope_cards(session_email) if c.get("scope_group") == group]
     for c in sibs:
         c["current"] = c["token"] == p["token"]
     return {"group": group, "label": p.get("scope_label") or None, "siblings": sibs}

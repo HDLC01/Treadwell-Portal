@@ -943,16 +943,19 @@ def test_the_group_email_lists_this_recipients_scopes_under_the_estimators_text(
     assert ok and out["to"] == ["dana@acme.com"]
     html = out["html"]
     assert "Checking in" in html and "Hi Dana," in html and "Any questions on Acme HQ?" in html
-    assert "https://p/x/tok-a" in html and "https://p/x/tok-b" in html
-    assert "Breakroom" in html and "Lab 1" in html
+    # ONE button, to the first proposal this recipient is on; the proposals named as text.
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', html) == ["https://p/x/tok-a"]
+    assert ">View &amp; approve your proposals</a>" in html
+    assert '<li style="margin:4px 0">Breakroom</li>' in html
+    assert '<li style="margin:4px 0">Lab 1</li>' in html
     assert "Not moving forward" not in html, "one scope's close button on a whole-project email"
     assert html.index("Any questions on Acme HQ?") < html.index("https://p/x/tok-a")
-    # {link} written mid-sentence: words, and the buttons still go out, after the text.
+    # {link} written mid-sentence: words, and the button still goes out, after the text.
     email_sender.send_scope_group_followup(
         "dana@acme.com", "", "Acme HQ", [{"label": "Lab 1", "url": "https://p/x/tok-b"}],
         {"title": "Hi", "body": "Use {link} when you are ready.\n\nThanks"})
     html = out["html"]
-    assert "Use the links below when you are ready." in html
+    assert "Use the link below when you are ready." in html
     assert html.index("Thanks") < html.index("https://p/x/tok-b")
 
 

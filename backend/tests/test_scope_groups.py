@@ -18,6 +18,8 @@ THE DATA SHAPE, which the proposal tool has to match: the draft blob carries
     data["scope_group"] = {"id": "<group id>", "label": "<this scope's name>"}
 and the portal reads it straight out of the shared drafts table at publish time.
 """
+import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -349,8 +351,14 @@ def test_unknown_or_malformed_group(group):
     assert go().status_code == 404
 
 
-def test_the_combined_email_has_one_labelled_button_per_scope(monkeypatch):
-    """The real renderer, with only the network call stubbed."""
+def _anchors(h):
+    return re.findall(r'<a\b[^>]*href="([^"]*)"', h)
+
+
+def test_the_combined_email_has_one_button_and_names_the_proposals_as_text(monkeypatch):
+    """The real renderer, with only the network call stubbed. Hanz, 2026-10-27: "ONE BUTTON only
+    and ONE PROJECT in the customer side" -- one link, to the first proposal listed (the project
+    page, which has a tab per proposal); the proposals are named under it, not linked."""
     import email_sender
     sent = []
     monkeypatch.setattr(email_sender, "_send",
@@ -365,15 +373,48 @@ def test_the_combined_email_has_one_labelled_button_per_scope(monkeypatch):
         note="See you Tuesday", token="tok-a")
     assert ok and len(sent) == 1
     h = sent[0]["html"]
-    for tok in ("tok-a", "tok-b", "tok-c"):
-        assert h.count('href="https://p/x/p/%s"' % tok) == 1
-    assert "Breakroom — view &amp; approve" in h
-    assert "Lab &lt;1&gt; — view &amp; approve" in h, "a scope label went out unescaped"
-    assert "Lab 2 — view<" in h, "an approved scope still says approve"
+    assert _anchors(h) == ["https://p/x/p/tok-a"], "exactly one button, to the first proposal"
+    assert "tok-b" not in h and "tok-c" not in h, "a second proposal still has its own link"
+    assert ">View &amp; approve your proposals</a>" in h
+    assert "<li" in h and h.index("View &amp; approve your proposals") < h.index("<li")
+    assert '<li style="margin:4px 0">Breakroom</li>' in h
+    assert '<li style="margin:4px 0">Lab &lt;1&gt;</li>' in h, "a label went out unescaped"
+    assert '<li style="margin:4px 0">Lab 2 &mdash; approved</li>' in h
+    assert "view &amp; approve</a>" not in h, "a per-proposal button survived"
     assert "Hi Dana" in h and "See you Tuesday" in h
     assert sent[0]["to"] == ["cust@acme.com"]
     assert sent[0]["subject"] == email_sender.customer_thread_subject("Acme HQ")
     assert sent[0]["headers"] == email_sender._thread_headers("cust@acme.com", "tok-a")
+
+
+def test_a_group_email_for_one_proposal_or_all_approved_words_its_button(monkeypatch):
+    import email_sender
+    sent = []
+    monkeypatch.setattr(email_sender, "_send",
+                        lambda to, subject, html, headers=None, **k: sent.append(html) or True)
+    email_sender.send_scope_group_links("c@a.com", "", "Acme HQ",
+                                        [{"label": "Lab 1", "url": "https://p/x/p/tok-b"}])
+    assert _anchors(sent[-1]) == ["https://p/x/p/tok-b"]
+    assert ">View &amp; approve your proposal</a>" in sent[-1]
+    email_sender.send_scope_group_links(
+        "c@a.com", "", "Acme HQ",
+        [{"label": "Lab 1", "url": "https://p/x/p/tok-b", "approved": True},
+         {"label": "Lab 2", "url": "https://p/x/p/tok-c", "approved": True}])
+    assert ">View your proposals</a>" in sent[-1], "an all-approved project still says approve"
+
+
+def test_an_ungrouped_proposal_email_is_unchanged(monkeypatch):
+    """send_portal_link is the single-proposal email; it keeps its one button and its words."""
+    import email_sender
+    sent = []
+    monkeypatch.setattr(email_sender, "_send",
+                        lambda to, subject, html, headers=None, **k: sent.append(html) or True)
+    monkeypatch.setattr(email_sender, "_sent_template", lambda: None)
+    email_sender.send_portal_link("c@a.com", "Dana", "https://p/x/p/tok-solo", "Warehouse")
+    h = sent[-1]
+    assert _anchors(h) == ["https://p/x/p/tok-solo"]
+    assert ">View your proposal</a>" in h and "Your proposal for <strong>Warehouse</strong>" in h
+    assert "<li" not in h
 
 
 def test_the_combined_send_needs_the_service_token():
@@ -418,21 +459,38 @@ def customer(monkeypatch):
                         raising=False)
 
 
-def test_siblings_are_grouped_and_labelled(customer):
+def test_a_project_of_several_proposals_is_listed_once(customer):
+    """Hanz, 2026-10-27: ONE PROJECT in the customer side. The group is one card, named by the
+    project (no " — Breakroom"), opening its FIRST proposal, and carrying the proposals of it this
+    customer can open."""
     cards = client.get("/api/me/proposals").json()["proposals"]
-    assert [c["display_name"] for c in cards] == [
-        "Warehouse", "Acme HQ — Breakroom", "Acme HQ — Lab 1", "Old job"]
-    lab1 = cards[2]
-    assert lab1["scope_group"] == GID and lab1["scope_label"] == "Lab 1"
-    assert lab1["project_name"] == "Acme HQ"        # the raw name is unchanged
+    assert [c["display_name"] for c in cards] == ["Warehouse", "Acme HQ", "Old job"]
+    acme = cards[1]
+    assert acme["token"] == "tok-d-break", "the project opens its first proposal"
+    assert acme["scope_group"] == GID and acme["project_name"] == "Acme HQ"
+    assert [s["token"] for s in acme["scopes"]] == ["tok-d-break", "tok-d-lab1"]
+    assert [s["scope_label"] for s in acme["scopes"]] == ["Breakroom", "Lab 1"]
     solo = cards[0]
     assert solo["scope_group"] is None and solo["scope_label"] is None
+    assert solo["display_name"] == "Warehouse" and "scopes" not in solo, "ungrouped changed"
 
 
 def test_LEAK_a_sibling_sent_to_another_email_never_appears_in_the_list(customer):
     cards = client.get("/api/me/proposals").json()["proposals"]
-    assert "tok-d-lab2" not in [c["token"] for c in cards]
-    assert all("Lab 2" not in (c["display_name"] or "") for c in cards)
+    toks = [c["token"] for c in cards] + [s["token"] for c in cards for s in c.get("scopes", [])]
+    assert "tok-d-lab2" not in toks
+    assert "Lab 2" not in json.dumps(cards), "another customer's proposal named in the list"
+
+
+def test_LEAK_an_added_recipient_sees_the_sibling_in_the_one_project_row(customer):
+    RECIPIENTS["d-lab2"] = ["cust@acme.com"]
+    try:
+        cards = client.get("/api/me/proposals").json()["proposals"]
+        acme = [c for c in cards if c.get("scope_group") == GID]
+        assert len(acme) == 1, "the project is listed more than once"
+        assert [s["scope_label"] for s in acme[0]["scopes"]] == ["Breakroom", "Lab 1", "Lab 2"]
+    finally:
+        RECIPIENTS.clear()
 
 
 @pytest.fixture

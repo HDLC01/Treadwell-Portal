@@ -697,20 +697,29 @@ input.ach-bad { border-color: var(--error) !important; box-shadow: 0 0 0 1px var
 .proj-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 4px; border-top: 1px solid var(--surface-highest); text-decoration: none; color: var(--fg); }
 .proj-row:hover { background: var(--surface-low); }
 .proj-row .pname { font-weight: 700; }
-/* Scopes of one multi-scope project sit together in the list; indent the run so it reads as one
-   project with several proposals rather than several unrelated projects. */
-.proj-row.is-scope { padding-left: 14px; }
-
-/* The other scopes of a multi-scope project, under the proposal heading. */
-.scope-strip { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--surface-highest); }
-.scope-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-.scope-chip {
-  display: inline-block; padding: 6px 12px; border-radius: 999px; font-size: .85rem; font-weight: 700;
-  border: 1px solid var(--outline); color: var(--fg); text-decoration: none; background: var(--surface-low);
+/* One tab per proposal of a project priced as several, above the official proposal document
+   (app.js renderScopeTabs). The row scrolls sideways INSIDE the card on a phone: a long list of
+   estimator-typed names must never widen the page. */
+.scope-tabs { margin: 4px 0 12px; min-width: 0; }
+.scope-tablist {
+  display: flex; gap: 4px; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch; scrollbar-width: thin;
+  box-shadow: inset 0 -1px 0 var(--surface-highest);   /* the rail, drawn inside: no y-overflow */
 }
-a.scope-chip:hover { border-color: var(--primary); color: var(--primary); }
-.scope-chip.is-current { background: var(--primary-tint); color: var(--primary); border-color: var(--primary); }
-.scope-chip.is-done { color: var(--success); }
+/* Whole names, never cut: a long one widens its tab and the row scrolls, so "Approved" stays read. */
+.scope-tab {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  padding: 10px 14px; font-size: .9rem; font-weight: 700;
+  color: var(--secondary); text-decoration: none; border-bottom: 2px solid transparent;
+}
+a.scope-tab:hover { color: var(--primary); }
+a.scope-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.scope-tab.is-current { color: var(--primary); border-bottom-color: var(--primary); }
+.scope-tab-flag {
+  font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--success);
+}
+.scope-tabs-note { margin: 8px 0 0; }
 
 .hidden { display: none !important; }
 
