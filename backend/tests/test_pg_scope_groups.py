@@ -1733,3 +1733,21 @@ def test_a_retired_approvals_deposit_tasks_leave_the_groups_reminder_count(clean
     assert _board()["solo"]["group_reminder_times"] is None, "an ungrouped row pays nothing"
     view, why, _ = followup_worker.group_state_for(gid, db_now())
     assert why == "" and len(view["followup_reminder_times"]) == 1
+
+
+# ── a deleted proposal is not on the customer's list (Hanz, 2026-10-28) ────────
+def test_the_customers_list_leaves_out_a_deleted_proposal(clean):
+    """A project sent as Epoxy + Polish, plus an old proposal deleted after it was sent: the
+    customer's list (the document card's tabs, the project list, the read badge, inbound sender
+    match) holds the two live ones, never the deleted third."""
+    gid = gid_new()
+    who = "dana@customer.example"
+    for pid, label in ((f"{gid}-epoxy", "Epoxy"), (f"{gid}-polish", "Polish"), (f"{gid}-old", "Base Bid 2")):
+        add_proposal(pid, gid, label, email=who)
+    db.delete_proposal(f"{gid}-old")
+    got = sorted(r["proposal_id"] for r in db.list_proposals_by_email(who))
+    assert got == sorted([f"{gid}-epoxy", f"{gid}-polish"]), got
+    # An added recipient's view (the second leg of the union) leaves it out too.
+    db.add_recipient(f"{gid}-old", "pat@customer.example")
+    db.add_recipient(f"{gid}-epoxy", "pat@customer.example")
+    assert [r["proposal_id"] for r in db.list_proposals_by_email("pat@customer.example")] == [f"{gid}-epoxy"]

@@ -111,13 +111,18 @@ def list_proposals_by_email(email: str) -> list[dict[str, Any]]:
     """All proposals tied to a (verified) email — the account/dashboard view.
     Matches the primary customer_email OR any added recipient, so a person sent
     several proposals (as primary on some, extra recipient on others) sees them
-    all. Both legs are index-served (customer_email idx + recipients email idx)."""
+    all. Both legs are index-served (customer_email idx + recipients email idx).
+
+    A DELETED proposal (staff took it off the board, or a proposal tab's x in the tool) is not
+    one of them. Hanz, 2026-10-28: a project sent as two proposals showed THREE tabs on the
+    customer's document card, the third a proposal deleted after it was sent. Read through
+    to_jsonb, like the other readers here, so a database without the column reads every row."""
     return qall(
-        "select * from public.portal_proposals where proposal_id in ("
+        "select p.* from public.portal_proposals p where p.proposal_id in ("
         "  select proposal_id from public.portal_proposals where lower(customer_email) = lower(%s)"
         "  union"
         "  select proposal_id from public.portal_proposal_recipients where lower(email) = lower(%s)"
-        ") order by created_at desc",
+        ") and (to_jsonb(p) ->> 'deleted_at') is null order by p.created_at desc",
         (email, email),
     )
 
