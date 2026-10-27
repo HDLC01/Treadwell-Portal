@@ -401,6 +401,118 @@ def send_portal_link(email: str, name: str, url: str, project_name: str,
                  _thread_headers(email, token), reply_to=reply_to, attachments=attachments)
 
 
+def send_scope_group_links(email: str, name: str, project_name: str, scopes: list[dict],
+                           reply_to: str | None = None, note: str | None = None,
+                           token: str | None = None,
+                           attachments: list[tuple[str, bytes]] | None = None) -> bool:
+    """ONE email for a project priced as several separate scopes, with a link per scope.
+
+    RJ, 2026-10: a client gets "Breakroom", "Lab 1" and "Lab 2" as three separate proposals they
+    can approve independently, and hears about them in one email rather than three. `scopes` is
+    `[{"label", "url", "approved", "change"}]` in the order to list them, and is already narrowed
+    by the caller to the scopes THIS recipient is on.
+
+    `change` is None on the first email of a project ("your proposals are ready"). A LATER email
+    names only scopes the customer has not seen yet, each marked 'new' or 'revised' (Hanz's
+    decision 3), and says so: a customer who gets "your proposals are ready" twice cannot tell
+    which one is different.
+
+    Same conventions as send_portal_link: the project's one thread subject, first-name greeting,
+    the estimator's optional note and attachments, the red button style. `token` is the scope
+    whose thread a reply lands in (the first one listed); every scope's own page is one click away.
+
+    Fixed wording rather than the editable "Proposal sent" template, because that template has one
+    {link} and this email's whole point is several."""
+    scopes = [s for s in (scopes or []) if s and s.get("url")]
+    if not scopes:
+        return False
+    note_html = ""
+    if note and str(note).strip():
+        note_html = (
+            f'<p style="margin:16px 0;padding:12px 14px;background:#f8fafc;'
+            f'border-left:3px solid {_BRAND_RED};white-space:pre-wrap">{_esc(note)}</p>'
+        )
+    update = any(s.get("change") in ("new", "revised") for s in scopes)
+    rows = []
+    for s in scopes:
+        label = _esc(s.get("label") or "Proposal")
+        if s.get("change") in ("new", "revised"):
+            label += " (%s)" % s["change"]
+        action = "view" if s.get("approved") else "view &amp; approve"
+        rows.append(
+            f'<p style="margin:10px 0"><a href="{_esc(s["url"])}" style="display:inline-block;'
+            f'background:{_BRAND_RED};color:#fff;padding:10px 16px;border-radius:8px;'
+            f'text-decoration:none;font-weight:700">{label} — {action}</a></p>')
+    many = len(scopes) > 1
+    if update:
+        n_new = sum(1 for s in scopes if s.get("change") == "new")
+        n_rev = sum(1 for s in scopes if s.get("change") == "revised")
+        what = " and ".join(x for x in (
+            ("%d new proposal%s" % (n_new, "s" if n_new != 1 else "")) if n_new else "",
+            ("%d revised proposal%s" % (n_rev, "s" if n_rev != 1 else "")) if n_rev else "") if x)
+        lead = (f"We have {what} for <strong>{_esc(project_name)}</strong>. "
+                f"The proposals you already have are unchanged.")
+        if n_rev:
+            lead += (" A revised proposal replaces the earlier version of that scope, so please "
+                     "review it again before you approve.")
+        heading = "Your proposals have been updated" if many else "Your proposal has been updated"
+    else:
+        lead = (f"Your proposals for <strong>{_esc(project_name)}</strong> are ready to review. "
+                f"Each scope below is its own proposal, and you can approve any of them on its own."
+                if many else
+                f"Your proposal for <strong>{_esc(project_name)}</strong> is ready to review.")
+        heading = "Your proposals are ready" if many else "Your proposal is ready"
+    body = (
+        f'<p>Hi {_esc(_first_name(name) or "there")},</p>'
+        f'<p>{lead}</p>'
+        f'{note_html}'
+        + "".join(rows)
+        + '<p style="color:#64748b">You can view each one, ask questions, and approve it right '
+          'on the page.</p>'
+    )
+    return _send([email], customer_thread_subject(project_name), _wrap(heading, body),
+                 _thread_headers(email, token), reply_to=reply_to,
+                 attachments=attachments or None)
+
+
+def send_scope_group_followup(email: str, name: str, project_name: str, scopes: list[dict],
+                              template: dict, *, deposit_required: bool = True,
+                              reply_to: str | None = None, token: str | None = None) -> bool:
+    """A follow-up the estimator reviewed, for a project priced as several scopes: ONE email to
+    this address, listing only the scopes THIS address is on (the caller narrows `scopes`).
+
+    `template` is the estimator's edited {title, body, cta}, already validated like any customer
+    template. Its text is the email: the `{link}` block becomes this recipient's scope buttons
+    (built like send_scope_group_links), and a `{link}` written mid-sentence reads "the links
+    below". No "Not moving forward" block: on a group it would close one scope of several."""
+    scopes = [s for s in (scopes or []) if s and s.get("url")]
+    if not scopes or not isinstance(template, dict) or not template.get("body"):
+        return False
+    need = ("your signed approval and the deposit" if deposit_required
+            else "your signed approval")
+    rendered = followup_settings.render(template, first_name=_first_name(name) or "there",
+                                        project=project_name, need=need, link_html=_LINK_MARK)
+    rows = "".join(
+        f'<p style="margin:10px 0"><a href="{_esc(s["url"])}" style="display:inline-block;'
+        f'background:{_BRAND_RED};color:#fff;padding:10px 16px;border-radius:8px;'
+        f'text-decoration:none;font-weight:700">{_esc(s.get("label") or "Proposal")} — '
+        f'{"view" if s.get("approved") else "view &amp; approve"}</a></p>' for s in scopes)
+    html_blocks, placed = [], False
+    for block in [b.strip() for b in rendered["body"].split("\n\n") if b.strip()]:
+        if block == _LINK_MARK:
+            if not placed:
+                html_blocks.append(rows)
+                placed = True
+            continue
+        html = _esc(block).replace("\n", "<br>").replace(_LINK_MARK, "the links below")
+        html_blocks.append(f"<p>{html}</p>")
+    if not placed:
+        html_blocks.append(rows)
+    return _send([email], customer_thread_subject(project_name),
+                 _wrap(rendered["title"], "".join(html_blocks)),
+                 _thread_headers(email, token), reply_to=reply_to)
+
+
 _SENT_TPL_TTL = 60.0
 _sent_tpl_cache: tuple[float, dict] | None = None
 
@@ -661,7 +773,7 @@ def send_digest(email: str, items: list[dict], *, name: str = "",
         f'{rows}'
         f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 14px">'
         f'<p style="color:#64748b;font-size:13px">Logging a call or a text in the CRM takes it '
-        f'off tomorrow\'s list. Automatic customer follow-ups keep running either way.</p>'
+        f'off tomorrow\'s list and pushes back its next follow-up reminder.</p>'
     )
     subject = f"{n} proposal{'' if n == 1 else 's'} to follow up today"
     return _send([email], subject, _wrap("Your follow-ups for today", body),

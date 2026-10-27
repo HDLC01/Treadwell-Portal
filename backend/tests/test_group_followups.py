@@ -1,0 +1,1364 @@
+"""Per-project (scope group) follow-ups, 2026-10-24 (build spec P1).
+
+RJ's "one project, many proposals": a project priced as several separately approved scopes is
+chased as ONE project. These pin the properties Hanz settled:
+
+  * a group raises ONE task per due occurrence, filed on a stable HOME scope, listing its scopes;
+  * a touch on ANY scope re-anchors the group; only sent/called reminders count toward the cap;
+  * the group is paused only while EVERY open scope is (decision 7);
+  * approving one scope stops the group chase and raises ONE "decide the other scopes" task,
+    never closing a sibling (decisions 2 and 9), and that task survives the housekeeping;
+  * the approved scope still raises its own deposit reminder;
+  * a deleted or closed home re-homes the task;
+  * the deploy-day dry run counts without writing anything.
+
+The ungrouped path is covered by the existing remind-only files, which run unchanged.
+"""
+import copy
+import re
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+
+import db
+import followup_rules as rules
+import followup_worker as fw
+import main
+
+NOW = datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc)     # 10am Chicago, inside the send window
+ENROLLED = NOW - timedelta(hours=30)                       # the 24h not-opened step is due
+T0 = NOW - timedelta(days=5)
+GID = "grp-acme-0001"
+H = timedelta(hours=1)
+ALL_DAY = {"send_start_hour": 0, "send_end_hour": 24}
+
+
+def _scope(pid, label, minutes, **over):
+    row = {"proposal_id": pid, "token": "tok-" + pid, "customer_email": "dana@acme.com",
+           "customer_name": "Dana Reed", "project_name": "Acme HQ", "scope_group": GID,
+           "scope_label": label, "proposal_status": "sent", "deposit_status": "pending",
+           "deposit_required": True, "assigned_estimator": "kyle@wetreadwell.com",
+           "schedule_status": "pending", "contacts_status": "pending",
+           "created_at": T0 + timedelta(minutes=minutes), "followup_enrolled_at": ENROLLED,
+           "followup_disabled_at": None, "followup_paused_until": None,
+           "cycle_viewed_at": None, "deleted_at": None, "approved_at": None}
+    row.update(over)
+    return row
+
+
+def _three(**over):
+    return [_scope("d-break", "Breakroom", 0, **over), _scope("d-lab1", "Lab 1", 1, **over),
+            _scope("d-lab2", "Lab 2", 2, **over)]
+
+
+# ══ a fake database: the db functions the worker and the endpoints call ════════
+class FakeDB:
+    def __init__(self, rows, drafts=None):
+        self.rows = {r["proposal_id"]: dict(r) for r in rows}
+        self.drafts = drafts if drafts is not None else [
+            {"id": r["proposal_id"], "archived": False} for r in rows]
+        self.followups = []
+        self.signals = {}
+        self.messages = []
+        self.clock = NOW
+        self._id = 100
+        self.reads = []
+
+    def _new(self, pid, kind, detail, by=None):
+        self._id += 1
+        f = {"id": self._id, "proposal_id": pid, "kind": kind, "detail": dict(detail or {}),
+             "created_by": by, "created_at": self.clock}
+        self.followups.append(f)
+        return f
+
+    # ── proposals ──
+    def get_proposal(self, pid):
+        r = self.rows.get(pid)
+        return dict(r) if r else None
+
+    def list_followup_candidates(self):
+        out = []
+        for r in self.rows.values():
+            if r.get("deleted_at") or not r.get("followup_enrolled_at") or \
+                    r.get("followup_disabled_at"):
+                continue
+            if rules.in_scope(r):
+                out.append(dict(r))
+        return out
+
+    def list_scope_group(self, gid):
+        self.reads.append(("list_scope_group", gid))
+        rows = [dict(r) for r in self.rows.values()
+                if r.get("scope_group") == gid and not r.get("deleted_at")]
+        return sorted(rows, key=lambda r: (r["created_at"], r["proposal_id"]))
+
+    def list_scope_group_history(self, gid):
+        self.reads.append(("history", gid))
+        tagged = {f["proposal_id"] for f in self.followups
+                  if f["detail"].get("scope_group") == gid}
+        rows = [dict(r, group_tagged=r["proposal_id"] in tagged) for r in self.rows.values()
+                if r.get("scope_group") == gid or r["proposal_id"] in tagged]
+        return sorted(rows, key=lambda r: (r["created_at"], r["proposal_id"]))
+
+    def list_scope_group_draft_states(self, gid):
+        self.reads.append(("drafts", gid))
+        return [dict(d) for d in self.drafts]
+
+    def list_scope_group_draft_states_many(self, gids):
+        # The board's one read for every group (fix round #20).
+        self.reads.append(("drafts_many", tuple(gids)))
+        return {g: [dict(d) for d in self.drafts] for g in gids}
+
+    def list_scope_group_drafts(self, gid):
+        return [d["id"] for d in self.drafts]
+
+    def list_scope_group_marks(self, gids):
+        # The board's combined-send state read (P2, 2026-10-24).
+        return [dict(f) for f in self.followups if f["kind"] == "staff_note"
+                and f["detail"].get("action") == "scope_group_sent"
+                and f["detail"].get("scope_group") in set(gids or [])]
+
+    def close_lost(self, pid, reason):
+        if pid not in self.rows:
+            return False
+        self.rows[pid].update(proposal_status="closed_lost", closed_lost_reason=reason)
+        return True
+
+    def set_approved(self, pid, *a, **k):
+        self.rows[pid].update(proposal_status="approved", approved_at=self.clock)
+
+    def stamp_followup_anchor(self, pid, clear_next=True):
+        self.rows[pid]["followup_anchor_at"] = self.clock
+
+    def set_followup_plan(self, pid, **kw):
+        for k, v in kw.items():
+            self.rows[pid]["followup_" + k] = v
+
+    # ── follow-up rows ──
+    def _open(self, f):
+        return f["kind"] == "followup_task" and f["detail"].get("status") in ("pending", "sending")
+
+    def followup_signals(self, pid):
+        out = dict(self.signals.get(pid, {}))
+        if "followup_reminder_times" not in out:
+            out["followup_reminder_times"] = [
+                f["created_at"].isoformat() for f in self.followups
+                if f["proposal_id"] == pid and f["kind"] == "followup_task"
+                and f["detail"].get("status") in ("sent", "called")]
+        mine = [f for f in self.followups if f["proposal_id"] == pid and self._open(f)]
+        out["pending_task"] = ({"id": mine[-1]["id"], "detail": dict(mine[-1]["detail"]),
+                                "created_at": mine[-1]["created_at"]} if mine else None)
+        return out
+
+    def reserve_followup_task(self, pid, key, detail):
+        for f in self.followups:
+            if f["proposal_id"] == pid and f["kind"] in ("auto_email", "followup_task") \
+                    and f["detail"].get("rule_key") == key:
+                return None                                     # portal_followups_rule_v2_uidx
+        stage = detail.get("stage") or "pre"
+        for f in self.followups:
+            if f["proposal_id"] == pid and self._open(f) \
+                    and (f["detail"].get("stage") or "pre") == stage:
+                return None                                     # one_open_task_v2_uidx
+        d = dict(detail, rule_key=key)
+        d.setdefault("status", "pending")
+        return self._new(pid, "followup_task", d)["id"]
+
+    def reserve_followup(self, pid, key, detail):
+        for f in self.followups:
+            if f["proposal_id"] == pid and f["kind"] in ("auto_email", "followup_task") \
+                    and f["detail"].get("rule_key") == key:
+                return None
+        return self._new(pid, "auto_email", dict(detail, rule_key=key))["id"]
+
+    def delete_followup(self, fid):
+        self.followups = [f for f in self.followups if f["id"] != fid]
+
+    def tasks(self, **match):
+        out = [f for f in self.followups if f["kind"] == "followup_task"]
+        for k, v in match.items():
+            out = [f for f in out if f["detail"].get(k) == v]
+        return out
+
+    def get_followup_task(self, tid):
+        for f in self.followups:
+            if f["id"] == int(tid) and f["kind"] == "followup_task":
+                return copy.deepcopy(f)
+        return None
+
+    def list_pending_followup_tasks(self, limit=500):
+        return [dict(copy.deepcopy(f), project_name="Acme HQ", estimator_email="kyle@x")
+                for f in self.followups if f["kind"] == "followup_task"
+                and f["detail"].get("status") == "pending"
+                and not (self.rows.get(f["proposal_id"]) or {}).get("deleted_at")]
+
+    def list_open_group_tasks(self, gid):
+        return [copy.deepcopy(f) for f in self.followups
+                if self._open(f) and f["detail"].get("scope_group") == gid]
+
+    def decide_followup_task(self, tid, status, by, extra=None, from_status="pending"):
+        for f in self.followups:
+            if f["id"] == int(tid) and f["kind"] == "followup_task":
+                if f["detail"].get("status") != from_status:
+                    return None
+                f["detail"].update(dict(extra or {}, status=status, decided_by=by))
+                return copy.deepcopy(f)
+        return None
+
+    def reopen_followup_task(self, tid, extra=None):
+        return bool(self.decide_followup_task(tid, "pending", None, extra, "sending"))
+
+    def list_stale_sending_tasks(self, minutes):
+        return []
+
+    def followup_task_send_recorded(self, tid):
+        return False
+
+    def scope_group_resumed_at(self, gid):
+        got = [f["created_at"] for f in self.followups if f["kind"] == "staff_note"
+               and f["detail"].get("action") == "scope_group_resume"
+               and f["detail"].get("scope_group") == gid]
+        return max(got) if got else None
+
+    def followup_rule_key_exists(self, pid, key):
+        return any(f["proposal_id"] == pid and f["kind"] in ("auto_email", "followup_task")
+                   and f["detail"].get("rule_key") == key for f in self.followups)
+
+    def pending_followup_task_id(self, pid):
+        return None
+
+    def add_followup(self, pid, kind, detail=None, created_by=None):
+        f = self._new(pid, kind, detail, created_by)
+        return {"kind": kind, "detail": f["detail"], "created_by": created_by,
+                "created_at": f["created_at"]}
+
+    def add_message(self, pid, kind, who, body, msg_type="text", meta=None):
+        self.messages.append({"pid": pid, "body": body, "meta": meta or {}})
+        return {"id": len(self.messages)}
+
+    def get_recipients(self, pid):
+        r = self.rows.get(pid) or {}
+        return [r["customer_email"]] if r.get("customer_email") else []
+
+    get_followup_recipients = get_recipients
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    """Install a FakeDB (call it with the rows) and record every email that would leave."""
+    sent = {"staff": [], "customer": [], "group": []}
+    holder = {}
+
+    def install(rows, drafts=None):
+        f = FakeDB(rows, drafts)
+        holder["db"] = f
+        for name in dir(FakeDB):
+            if not name.startswith("_") and name not in ("tasks",):
+                monkeypatch.setattr(db, name, getattr(f, name), raising=False)
+        monkeypatch.setattr(db, "get_settings", lambda key: None)
+        f.sent = sent
+        return f
+
+    monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "true")
+    monkeypatch.setattr(fw.email_sender, "notify_team",
+                        lambda subject, body, **k: sent["staff"].append(
+                            {"subject": subject, "body": body, "to": k.get("recipients"),
+                             "proposal_id": k.get("proposal_id"),
+                             "link": k.get("reply_link")}) or ["kyle@wetreadwell.com"])
+    monkeypatch.setattr(fw.email_sender, "send_followup",
+                        lambda *a, **k: sent["customer"].append(a) or True)
+    monkeypatch.setattr(fw.email_sender, "send_scope_group_followup",
+                        lambda email, name, project, scopes, tpl, **k: sent["group"].append(
+                            {"to": email, "scopes": [s["label"] for s in scopes],
+                             "body": tpl["body"]}) or True)
+    monkeypatch.setattr(fw.email_sender, "proposal_reply_to", lambda t: None)
+    monkeypatch.setattr(fw.email_sender, "_resolve_notify", lambda kind, pid=None: [])
+    monkeypatch.setattr(fw.email_sender, "send_customer_update", lambda *a, **k: True,
+                        raising=False)
+    monkeypatch.setattr(main, "_now_utc", lambda: NOW)
+    return install
+
+
+def _members(rows, **sig):
+    """Rows as group_view's input: signals laid over, as the worker's _with_signals does."""
+    return [dict(r, **sig.get(r["proposal_id"], {})) for r in rows]
+
+
+# ══ B. group_view — pure ═══════════════════════════════════════════════════════
+def test_group_view_folds_the_open_scopes_into_one_proposal_on_the_home_scope():
+    rows = _three()
+    rows[1].update(cycle_viewed_at=NOW - 10 * H, followup_enrolled_at=ENROLLED - 2 * H)
+    rows[2].update(cycle_viewed_at=NOW - 20 * H)
+    v = rules.group_view(rows, NOW)
+    assert v["proposal_id"] == "d-break", "home = earliest (created_at, proposal_id)"
+    assert v["proposal_status"] == "viewed"
+    assert v["followup_enrolled_at"] == ENROLLED - 2 * H
+    assert v["cycle_viewed_at"] == NOW - 20 * H
+    assert [s["label"] for s in v["scopes"]] == ["Breakroom", "Lab 1", "Lab 2"]
+
+
+def test_a_touch_on_any_scope_reanchors_the_whole_group():
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
+    due = [d for d in rules.due_now(rules.group_view(viewed, NOW), NOW, ALL_DAY)
+           if d.audience == "customer"]
+    assert due, "the control case is not due, so this proves nothing"
+    touched = _members(viewed, **{"d-lab2": {"customer_touch_at": NOW - H}})
+    view = rules.group_view(touched, NOW)
+    assert view["customer_touch_at"] == NOW - H
+    assert [d for d in rules.due_now(view, NOW, ALL_DAY) if d.audience == "customer"] == []
+    assert rules.next_due_at(view, NOW, ALL_DAY) == NOW - H + rules.RECURRING
+
+
+def test_the_cap_is_per_group_and_counts_every_members_reminders():
+    """One counted reminder on Lab 1 and one on Lab 2 make two for the GROUP's stop-after-2."""
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H)
+    viewed[0]["followup_stop_after"] = 2
+    one = [(NOW - 290 * H).isoformat()]
+    capped = _members(viewed, **{"d-lab1": {"followup_reminder_times": one},
+                                 "d-lab2": {"followup_reminder_times": one}})
+    assert _customer_due(rules.group_view(capped, NOW)) is None
+    under = _members(viewed, **{"d-lab1": {"followup_reminder_times": one}})
+    assert _customer_due(rules.group_view(under, NOW)) is not None
+
+
+def test_a_retired_approvals_deposit_reminders_never_count_toward_the_groups_cap():
+    """Round 3 #4 (residual #17): Lab 1 was approved, chased for its deposit twice, then revised
+    back to an open scope. Its two SENT deposit tasks are in its own count (followup_reminder_times)
+    but not in the group's (group_reminder_times, db: deposit-stage tasks left out), so they do not
+    use up the siblings' stop-after-2."""
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H)
+    viewed[0]["followup_stop_after"] = 2
+    deposit = [(NOW - 290 * H).isoformat(), (NOW - 200 * H).isoformat()]
+    members = _members(viewed, **{"d-lab1": {"followup_reminder_times": deposit,
+                                             "group_reminder_times": []}})
+    view = rules.group_view(members, NOW)
+    assert view["followup_reminder_times"] == []
+    assert _customer_due(view) is not None
+    # The control: the same reminders as ordinary ones (in the group count) do cap it.
+    capped = _members(viewed, **{"d-lab1": {"followup_reminder_times": deposit,
+                                            "group_reminder_times": deposit}})
+    assert _customer_due(rules.group_view(capped, NOW)) is None
+
+
+def _customer_due(view):
+    got = [d for d in rules.due_now(view, NOW, ALL_DAY) if d.audience == "customer"]
+    return got[0] if got else None
+
+
+def _reminder_times_admitted(statuses):
+    """Which follow-up rows the REAL _REMINDER_TIMES_SQL predicate counts, run by SQLite."""
+    sql = db._REMINDER_TIMES_SQL.format(pid="'p1'", enrolled="null")
+    pred = sql[sql.index(" where ") + len(" where "):-1]
+    con = sqlite3.connect(":memory:")
+    con.execute("attach database ':memory:' as public")
+    con.execute("create table public.portal_followups (id int, proposal_id text, kind text, "
+                "detail text, created_at text)")
+    for i, st in enumerate(statuses):
+        con.execute("insert into public.portal_followups values (?,?,?,?,?)",
+                    (i, "p1", "followup_task", '{"status": "%s"}' % st, "2026-08-01"))
+    con.execute("insert into public.portal_followups values (99,'p1','auto_email',"
+                "'{\"audience\": \"customer\"}','2026-08-01')")
+    got = con.execute("select f.id from public.portal_followups f where " + pred).fetchall()
+    return {statuses[i] if i < len(statuses) else "auto_email" for (i,) in got}
+
+
+def test_only_sent_and_called_reminders_count_toward_the_cap():
+    """Decision 6, run through the SQL the worker and the board both read."""
+    got = _reminder_times_admitted(
+        ["sent", "called", "skipped", "snoozed", "expired", "pending", "decided"])
+    assert got == {"sent", "called", "auto_email"}, got
+
+
+def test_one_paused_scope_does_not_pause_the_group_but_all_paused_does():
+    later = (NOW + timedelta(days=30)).date()
+    one = _three()
+    one[1]["followup_paused_until"] = later
+    v = rules.group_view(one, NOW)
+    assert not rules.is_paused(v, NOW)
+    assert [d for d in rules.due_now(v, NOW) if d.audience == "customer"]
+    all_paused = _three(followup_paused_until=later)
+    all_paused[2]["followup_paused_until"] = later + timedelta(days=9)
+    v = rules.group_view(all_paused, NOW)
+    assert rules.is_paused(v, NOW) and rules.due_now(v, NOW) == []
+    assert v["followup_paused_until"] == later, "the group resumes when the FIRST pause ends"
+
+
+def test_an_approved_member_stops_the_group_until_keep_is_chosen():
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW - 5 * H)
+    assert rules.group_state(rows, NOW) == (None, "scope_approved")
+    resumed = [dict(r, scope_group_resumed_at=NOW - H) for r in rows]
+    v = rules.group_view(resumed, NOW)
+    assert v is not None and [s["proposal_id"] for s in v["scopes"]] == ["d-break", "d-lab2"]
+    stale = [dict(r, scope_group_resumed_at=NOW - 9 * H) for r in rows]
+    assert rules.group_view(stale, NOW) is None, "a keep from BEFORE the approval does not count"
+
+
+def test_the_decision_task_is_live_while_a_listed_sibling_is_open():
+    d = {"stage": "decision", "scopes": [{"proposal_id": "d-lab1"}, {"proposal_id": "d-lab2"}]}
+    rows = _three()
+    assert rules.task_is_live(d, {"scope_members": rows}, NOW) == (True, "")
+    rows[1]["proposal_status"] = rows[2]["proposal_status"] = "closed_lost"
+    assert rules.task_is_live(d, {"scope_members": rows}, NOW) == (False, "decision_moot")
+
+
+# ══ C. the worker: one task per group ══════════════════════════════════════════
+def test_a_group_of_three_raises_exactly_one_task_listing_all_three(fake):
+    f = fake(_three())
+    fw._tick(NOW)
+    tasks = f.tasks()
+    assert len(tasks) == 1, tasks
+    t = tasks[0]
+    assert t["proposal_id"] == "d-break", "filed on the home scope"
+    assert t["detail"]["scope_group"] == GID
+    assert [s["label"] for s in t["detail"]["scopes"]] == ["Breakroom", "Lab 1", "Lab 2"]
+    assert t["detail"]["rule_key"] == "%s:nv1" % rules.cycle_key(ENROLLED)
+    # One estimator email for the moment, naming the scopes, with the 24h note folded into it.
+    assert [s["subject"] for s in f.sent["staff"]] == ["Follow-up due — Acme HQ"]
+    assert "Breakroom, Lab 1, Lab 2" in f.sent["staff"][0]["body"]
+    assert f.sent["customer"] == [] and f.sent["group"] == []
+
+
+def test_two_ticks_and_the_twin_container_raise_it_once(fake):
+    f = fake(_three())
+    fw._tick(NOW)
+    fw._tick(NOW + timedelta(minutes=15))
+    fw._tick(NOW + timedelta(minutes=15))      # the twin, same moment
+    assert len(f.tasks()) == 1
+    assert len(f.sent["staff"]) == 1
+
+
+def test_a_reply_on_any_scope_holds_the_groups_next_task(fake):
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
+    f = fake(viewed)
+    f.signals["d-lab2"] = {"customer_touch_at": NOW - H}
+    fw._tick(NOW)
+    assert f.tasks() == []
+    f = fake(viewed)
+    fw._tick(NOW)
+    assert len(f.tasks()) == 1, "the control case raised nothing, so this proved nothing"
+
+
+def test_an_approved_scope_still_raises_its_own_deposit_task(fake):
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW - 30 * H,
+                   cycle_viewed_at=NOW - 40 * H)
+    f = fake(rows)
+    # Its decision task is open on the same scope: it must not hold the deposit chase's slot.
+    f.reserve_followup_task("d-lab1", "sd:%s:d-lab1" % GID, {
+        "stage": "decision", "template": "scope_decision", "scope_group": GID,
+        "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab2"}]})
+    fw._tick(NOW)
+    dep = [t for t in f.tasks(template="deposit_nudge")]
+    assert [t["proposal_id"] for t in dep] == ["d-lab1"]
+    assert not f.tasks(scope_group=GID, stage="pre"), "the stopped group raised a reminder"
+    assert f.tasks(stage="decision")[0]["detail"]["status"] == "pending"
+
+
+def test_the_decision_task_survives_housekeeping(fake):
+    """task_is_live(approved scope) would say 'customer_done' / 'stage_changed' and expire it on
+    the next tick; it is judged against its siblings instead."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW - 30 * H, deposit_status="received")
+    f = fake(rows)
+    f.reserve_followup_task("d-lab1", "sd:%s:d-lab1" % GID, {
+        "stage": "decision", "template": "scope_decision", "scope_group": GID,
+        "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab2"}]})
+    fw._tick(NOW)
+    fw._tick(NOW + H)
+    assert f.tasks(stage="decision")[0]["detail"]["status"] == "pending"
+    # ...and it goes once every sibling it lists has been dealt with.
+    f.rows["d-break"]["proposal_status"] = f.rows["d-lab2"]["proposal_status"] = "closed_lost"
+    fw._tick(NOW + 2 * H)
+    t = f.tasks(stage="decision")[0]["detail"]
+    assert t["status"] == "expired" and t["reason"] == "decision_moot"
+
+
+def test_an_unresolved_decision_task_renags_the_estimator(fake):
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW - 30 * H, deposit_status="received")
+    f = fake(rows)
+    f.clock = NOW - timedelta(days=4)
+    f.reserve_followup_task("d-lab1", "sd:%s:d-lab1" % GID, {
+        "stage": "decision", "template": "scope_decision", "scope_group": GID,
+        "approved_scope": {"proposal_id": "d-lab1", "label": "Lab 1"},
+        "scopes": [{"proposal_id": "d-break", "label": "Breakroom"}]})
+    f.clock = NOW
+    fw._tick(NOW)
+    fw._tick(NOW + H)
+    nags = [s for s in f.sent["staff"] if s["subject"].startswith("Decide the other scopes")]
+    assert len(nags) == 1, nags
+
+
+def test_the_decision_emails_open_the_first_sibling_still_open(approve, monkeypatch):
+    """Round 3 #3, the e-mailed button too: raised -> the first sibling; re-nagged after that
+    sibling was closed lost -> the next one still open, never the approved scope's own drawer."""
+    f, go = approve
+    assert go().status_code == 200                                     # d-lab1 approved
+    raised, = [s for s in f.sent["staff"] if s["subject"].startswith("Decide the other scopes")]
+    assert raised["link"].endswith("open=d-break"), raised["link"]
+    f.rows["d-break"]["proposal_status"] = "closed_lost"
+    dec, = f.tasks(stage="decision")
+    f.sent["staff"].clear()
+    fw._renag_decision(dict(dec), NOW + timedelta(days=4))
+    nag, = [s for s in f.sent["staff"] if s["subject"].startswith("Decide the other scopes")]
+    assert nag["link"].endswith("open=d-lab2"), nag["link"]
+
+
+def test_a_deleted_home_rehomes_the_task(fake):
+    f = fake(_three())
+    fw._tick(NOW)
+    first, = f.tasks()
+    assert first["proposal_id"] == "d-break"
+    f.rows["d-break"]["deleted_at"] = NOW
+    fw._tick(NOW + H)
+    assert first["detail"]["status"] == "expired" and first["detail"]["reason"] == "rehomed"
+    live = [t for t in f.tasks() if t["detail"]["status"] == "pending"]
+    assert [t["proposal_id"] for t in live] == ["d-lab1"], "not re-raised on the new home"
+    assert [s["label"] for s in live[0]["detail"]["scopes"]] == ["Lab 1", "Lab 2"]
+
+
+def test_a_closed_home_rehomes_the_task(fake):
+    f = fake(_three())
+    fw._tick(NOW)
+    first, = f.tasks()
+    f.rows["d-break"]["proposal_status"] = "closed_lost"
+    fw._tick(NOW + H)
+    assert first["detail"]["status"] == "expired"
+    assert [t["proposal_id"] for t in f.tasks() if t["detail"]["status"] == "pending"] == \
+        ["d-lab1"]
+
+
+@pytest.mark.parametrize("gone", ["closed", "deleted"])
+def test_a_rehomed_group_keeps_its_last_send_and_its_counted_reminders(fake, admin, gone):
+    """Review finding: the group's send is recorded on the HOME row (staff_email + anchor stamp)
+    and its sent task is filed there. Closing or deleting that home must not make the group forget
+    it was emailed yesterday, nor the reminders it has used of its "Stop after N"."""
+    f = fake(_three(proposal_status="viewed", cycle_viewed_at=NOW - 30 * H))
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert t["proposal_id"] == "d-break"
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
+        "title": "Checking in", "body": "Hi {first_name},\n\n{link}",
+        "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    if gone == "closed":
+        f.rows["d-break"]["proposal_status"] = "closed_lost"
+    else:
+        f.rows["d-break"]["deleted_at"] = NOW + H
+    later = NOW + timedelta(days=1)
+    f.clock = later
+    fw._tick(later)
+    assert [x["proposal_id"] for x in f.tasks() if x["detail"]["status"] == "pending"] == [], \
+        "the re-homed group was chased again a day after it was emailed"
+    assert [s["subject"] for s in f.sent["staff"]].count("Follow-up due — Acme HQ") == 1
+    view, _why, _m = fw.group_state_for(GID, later)
+    assert view["proposal_id"] == "d-lab1"
+    assert len(view["followup_reminder_times"]) == 1, "the sent reminder left the group's cap"
+    assert view["followup_anchor_at"] == NOW
+
+
+def test_history_rows_leave_out_a_detached_scope_that_never_held_the_groups_task():
+    rows = _three()
+    rows[0]["proposal_status"] = "closed_lost"
+    drafts = [{"id": "d-break"}, {"id": "d-lab1"}]           # d-lab2 left the group
+    assert [r["proposal_id"] for r in rules.history_rows(rows, drafts, {"d-lab1"})] == ["d-break"]
+    rows[2]["group_tagged"] = True                           # ...but it was the home once
+    assert [r["proposal_id"] for r in rules.history_rows(rows, drafts, {"d-lab1"})] == \
+        ["d-break", "d-lab2"]
+
+
+def test_a_scope_taken_out_of_the_group_is_chased_on_its_own(fake):
+    rows = _three()
+    f = fake(rows, drafts=[{"id": "d-break", "archived": False},
+                           {"id": "d-lab1", "archived": False}])
+    fw._tick(NOW)
+    owners = sorted(t["proposal_id"] for t in f.tasks())
+    assert owners == ["d-break", "d-lab2"], owners
+    solo = [t for t in f.tasks() if t["proposal_id"] == "d-lab2"][0]
+    assert "scope_group" not in solo["detail"], "the detached scope got a group task"
+
+
+def test_an_archived_scope_is_chased_neither_way(fake):
+    f = fake(_three(), drafts=[{"id": "d-break", "archived": False},
+                               {"id": "d-lab1", "archived": False},
+                               {"id": "d-lab2", "archived": True}])
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert [s["proposal_id"] for s in t["detail"]["scopes"]] == ["d-break", "d-lab1"]
+
+
+def test_an_unreadable_group_is_skipped_not_chased_per_scope(fake, monkeypatch):
+    f = fake(_three())
+    monkeypatch.setattr(db, "list_scope_group_draft_states",
+                        lambda gid: (_ for _ in ()).throw(RuntimeError("db blip")))
+    fw._tick(NOW)
+    assert f.tasks() == []
+
+
+def test_an_ungrouped_tick_never_reads_a_scope_group(fake):
+    f = fake([_scope("solo", None, 0, scope_group=None, scope_label=None)])
+    fw._tick(NOW)
+    assert f.reads == []
+    t, = f.tasks()
+    assert "scope_group" not in t["detail"] and "scopes" not in t["detail"]
+
+
+# ══ D. approving one scope ═══════════════════════════════════════════════════
+@pytest.fixture
+def approve(fake, monkeypatch, tmp_path):
+    f = fake(_three(proposal_status="viewed", cycle_viewed_at=NOW - 30 * H))
+    monkeypatch.setattr(main.config, "UPLOAD_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(main, "_require",
+                        lambda request, token: f.get_proposal(token.replace("tok-", "")))
+    monkeypatch.setattr(main, "_session_email", lambda request: "dana@acme.com")
+    monkeypatch.setattr(main.db, "get_pinned_draft_data",
+                        lambda p: {"project_name": "Acme HQ", "work_type": "epoxy",
+                                   "proposal_lump_sum": 10000.0})
+    monkeypatch.setattr(main.signing, "signing_block",
+                        lambda p, data: {"required": False, "blocked_reason": None})
+    monkeypatch.setattr(main.db, "add_approval", lambda *a, **k: 1)
+    monkeypatch.setattr(main.automations, "run_on_approval", lambda p, project: None)
+    client = TestClient(main.app)
+
+    def go(pid="d-lab1"):
+        return client.post("/api/portal/tok-%s/approve" % pid,
+                           json={"name": "Dana Reed", "date": "2026-08-04"})
+
+    return f, go
+
+
+def test_approving_one_scope_raises_one_decision_task_and_stops_the_group(approve):
+    f, go = approve
+    fw._tick(NOW)                                   # the group's reminder is open on the home
+    reminder, = f.tasks()
+    assert reminder["detail"]["status"] == "pending"
+    assert go().status_code == 200
+    assert reminder["detail"]["status"] == "expired"
+    assert reminder["detail"]["reason"] == "scope_approved"
+    dec, = f.tasks(stage="decision")
+    assert dec["proposal_id"] == "d-lab1"
+    assert dec["detail"]["rule_key"] == "sd:%s:d-lab1:1" % GID, "keyed on the approval (#2)"
+    assert [s["proposal_id"] for s in dec["detail"]["scopes"]] == ["d-break", "d-lab2"]
+    assert [s["subject"] for s in f.sent["staff"]].count("Decide the other scopes — Acme HQ") == 1
+    # NEVER auto-closed.
+    assert [f.rows[p]["proposal_status"] for p in ("d-break", "d-lab2")] == ["viewed", "viewed"]
+    # The chase has stopped: a later tick raises no reminder for the group.
+    fw._tick(NOW + timedelta(days=5))
+    assert [t for t in f.tasks(scope_group=GID) if t["detail"]["status"] == "pending"] == [dec]
+    # A double submit raises nothing more.
+    go()
+    assert len(f.tasks(stage="decision")) == 1
+
+
+def _decision(f, go):
+    go()
+    dec, = f.tasks(stage="decision")
+    return dec["id"]
+
+
+def _decide(body, tid):
+    return TestClient(main.app).post("/api/admin/followup-task/%s/scope-decision" % tid,
+                                     json=body)
+
+
+@pytest.fixture
+def admin(monkeypatch):
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+
+
+@pytest.mark.parametrize("body,error", [
+    ({"action": "close", "note": "went elsewhere"}, "invalid_reason"),
+    ({"action": "close", "reason": "price"}, "note_required"),
+    ({"action": "close", "reason": "made_up", "note": "x"}, "invalid_reason"),
+    ({"action": "explode"}, "invalid_action"),
+    ({"action": "close", "reason": "price", "note": "x", "scope_ids": ["nope"]}, "unknown_scope"),
+])
+def test_close_without_reason_and_note_is_refused(approve, admin, body, error):
+    f, go = approve
+    tid = _decision(f, go)
+    r = _decide(body, tid)
+    assert r.status_code == 400 and r.json()["error"] == error
+    assert f.tasks(stage="decision")[0]["detail"]["status"] == "pending"
+    assert [f.rows[p]["proposal_status"] for p in ("d-break", "d-lab2")] == ["viewed", "viewed"]
+
+
+def test_close_closes_only_the_chosen_scopes_through_the_staff_path(approve, admin):
+    f, go = approve
+    tid = _decision(f, go)
+    r = _decide({"action": "close", "scope_ids": ["d-lab2"], "reason": "price",
+                 "note": "Went with the cheaper quote", "by": "kyle@wetreadwell.com"}, tid)
+    assert r.status_code == 200, r.text
+    assert r.json()["closed"] == ["d-lab2"]
+    assert f.rows["d-lab2"]["proposal_status"] == "closed_lost"
+    assert f.rows["d-break"]["proposal_status"] == "viewed"
+    note = [x for x in f.followups if x["kind"] == "staff_note"
+            and x["detail"].get("action") == "closed_lost"]
+    assert note and note[0]["detail"]["reason"] == "price"
+    assert f.tasks(stage="decision")[0]["detail"]["outcome"] == "close"
+    again = _decide({"action": "leave"}, tid)
+    assert again.status_code == 409
+
+
+def test_close_never_closes_a_scope_approved_since_the_task_was_raised(approve, admin):
+    """Review finding: the task's scope list is frozen when it is raised. Lab 2 signs AFTER the
+    decision task about Lab 1 went up; answering that task with 'close the others' must not file a
+    signed job as lost (it would stop its deposit chase)."""
+    f, go = approve
+    tid = _decision(f, go)                          # lists d-break and d-lab2
+    assert go("d-lab2").status_code == 200           # the customer signs Lab 2 too
+    assert f.rows["d-lab2"]["proposal_status"] == "approved"
+    named = _decide({"action": "close", "scope_ids": ["d-lab2"], "reason": "price",
+                     "note": "x"}, tid)
+    assert named.status_code == 409 and named.json()["error"] == "scope_not_open"
+    assert named.json()["scope_ids"] == ["d-lab2"]
+    task = [t for t in f.tasks(stage="decision") if t["id"] == tid][0]
+    assert task["detail"]["status"] == "pending", "a refused answer claimed the task"
+    r = _decide({"action": "close", "reason": "price", "note": "Went elsewhere"}, tid)
+    assert r.status_code == 200, r.text
+    assert r.json()["closed"] == ["d-break"] and r.json()["skipped"] == ["d-lab2"]
+    assert f.rows["d-lab2"]["proposal_status"] == "approved"
+    assert f.rows["d-break"]["proposal_status"] == "closed_lost"
+
+
+def test_close_is_refused_when_no_listed_scope_is_open_any_more(approve, admin):
+    f, go = approve
+    tid = _decision(f, go)
+    f.rows["d-break"]["proposal_status"] = "approved"
+    f.rows["d-lab2"]["proposal_status"] = "approved"
+    r = _decide({"action": "close", "reason": "price", "note": "x"}, tid)
+    assert r.status_code == 409 and r.json()["error"] == "scope_not_open"
+    assert [f.rows[p]["proposal_status"] for p in ("d-break", "d-lab2")] == ["approved"] * 2
+
+
+def test_keep_resumes_the_group_chase_for_the_remaining_scopes(approve, admin):
+    f, go = approve
+    tid = _decision(f, go)
+    f.clock = NOW + H
+    r = _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, tid)
+    assert r.status_code == 200, r.text
+    assert f.scope_group_resumed_at(GID) == NOW + H
+    assert f.rows["d-break"]["followup_anchor_at"] == NOW + H, "keep did not re-anchor the home"
+    members = fw._with_signals(fw.group_members(GID), GID)
+    v = rules.group_view(members, NOW + 2 * H)
+    assert v is not None and [s["proposal_id"] for s in v["scopes"]] == ["d-break", "d-lab2"]
+
+
+def test_leave_only_resolves_the_task(approve, admin):
+    f, go = approve
+    tid = _decision(f, go)
+    assert _decide({"action": "leave"}, tid).status_code == 200
+    assert f.tasks(stage="decision")[0]["detail"]["status"] == "decided"
+    assert f.scope_group_resumed_at(GID) is None
+    assert [f.rows[p]["proposal_status"] for p in ("d-break", "d-lab2")] == ["viewed", "viewed"]
+
+
+@pytest.mark.parametrize("path", ["send", "skip", "called", "snooze"])
+def test_a_decision_task_is_not_a_reminder(approve, admin, path):
+    f, go = approve
+    tid = _decision(f, go)
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/%s" % (tid, path), json={
+        "title": "Hi", "body": "Hello {link}",
+        "until": (NOW + timedelta(days=3)).date().isoformat()})
+    assert r.status_code == 409 and r.json()["error"] == "decision_task"
+    assert f.tasks(stage="decision")[0]["detail"]["status"] == "pending"
+
+
+# ══ E. the task endpoints for a group task ═════════════════════════════════════
+def test_sending_a_group_task_emails_each_recipient_only_their_scopes(fake, admin):
+    rows = _three()
+    rows[2]["customer_email"] = "pat@acme.com"          # Lab 2 went to somebody else
+    f = fake(rows)
+    fw._tick(NOW)
+    t, = f.tasks()
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
+        "title": "Checking in", "body": "Hi {first_name},\n\nAny questions?\n\n{link}",
+        "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    got = {g["to"]: g["scopes"] for g in f.sent["group"]}
+    assert got == {"dana@acme.com": ["Breakroom", "Lab 1"], "pat@acme.com": ["Lab 2"]}
+    assert all("Any questions?" in g["body"] for g in f.sent["group"])
+    assert t["detail"]["status"] == "sent"
+    touch = [x for x in f.followups if x["kind"] == "staff_email"]
+    assert [x["proposal_id"] for x in touch] == ["d-break"], "the touch is on the home row"
+
+
+def test_a_group_task_send_is_refused_once_a_scope_is_approved(fake, admin):
+    f = fake(_three())
+    fw._tick(NOW)
+    t, = f.tasks()
+    f.rows["d-lab1"].update(proposal_status="approved", approved_at=NOW)
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
+        "title": "Checking in", "body": "Hi\n\n{link}"})
+    assert r.status_code == 409 and r.json()["reason"] == "scope_approved"
+    assert f.sent["group"] == []
+
+
+def test_the_task_view_links_an_open_scope_and_lists_the_scopes(monkeypatch):
+    monkeypatch.setattr(main.db, "get_proposal",
+                        lambda pid: {"proposal_id": pid, "proposal_status": "sent"})
+    row = {"id": 5, "proposal_id": "d-break", "created_at": NOW,
+           "detail": {"status": "pending", "template": "checkin", "stage": "pre",
+                      "scope_group": GID,
+                      "scopes": [{"proposal_id": "d-lab1", "label": "Lab 1", "status": "sent"}]}}
+    v = main._task_view(row)
+    assert v["scope_group"] == GID and v["link_proposal_id"] == "d-lab1"
+    assert [s["label"] for s in v["scopes"]] == ["Lab 1"]
+    dec = dict(row, detail=dict(row["detail"], stage="decision", template="scope_decision"))
+    assert main._task_view(dec)["label"] == "Decide the other scopes"
+    assert main._task_summary(dec)["stage"] == "decision"
+
+
+def test_the_plan_is_written_to_the_home_scope(fake, admin):
+    f = fake(_three())
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"interval_days": 5})
+    assert r.status_code == 200, r.text
+    assert r.json()["home_proposal_id"] == "d-break"
+    assert f.rows["d-break"].get("followup_interval_days") == 5
+    assert "followup_interval_days" not in f.rows["d-lab2"]
+
+
+def test_the_pipeline_shows_the_groups_schedule_on_every_open_scope(fake, admin, monkeypatch):
+    rows = _three()
+    rows[0]["followup_interval_days"] = 9
+    f = fake(rows)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    nexts = {out[p]["next_followup_at"] for p in ("d-break", "d-lab1", "d-lab2")}
+    assert len(nexts) == 1, nexts
+    assert {out[p]["followup_plan"]["interval_days"] for p in out} == {9}
+    assert {out[p]["followup_home_id"] for p in out} == {"d-break"}
+
+
+def test_the_pipeline_keeps_a_closed_former_homes_touch_in_the_groups_date(fake, admin,
+                                                                         monkeypatch):
+    """The board's mirror of the re-home fix: the group's last send was stamped on a home that
+    has since been closed, so the open scopes' date runs from that touch, as the worker's does."""
+    rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
+    rows[0].update(proposal_status="closed_lost", followup_anchor_at=NOW - H)
+    f = fake(rows)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    view, _why, _m = fw.group_state_for(GID, NOW)
+    assert view["followup_anchor_at"] == NOW - H
+    want = main._iso(rules.next_due_at(view, NOW, main._followup_cfg()))
+    assert out["d-lab1"]["next_followup_at"] == out["d-lab2"]["next_followup_at"] == want
+
+
+def test_the_pipeline_query_shows_a_groups_task_on_every_member_row():
+    """The group arm reads the board's one join of open group tasks (`gt`, fix round #26), not an
+    OR over every open task per row. Executed against Postgres in test_pg_scope_groups.py."""
+    sql = " ".join(db._ROW_OPEN_TASK_SQL.split())
+    assert "gt.id" in sql and " or " not in sql
+    assert sql.startswith("(case when (pj.j ->> 'scope_group') is null then "
+                          + " ".join(db._PENDING_TASK_SQL.format(pid="p.proposal_id").split()))
+    seen = {}
+    db_qall = db.qall
+    try:
+        db.qall = lambda q, params=(): seen.update(sql=q) or []
+        db.list_all_portal_proposals()
+    finally:
+        db.qall = db_qall
+    board = " ".join(seen["sql"].split())
+    assert "left join " + " ".join(db._GROUP_OPEN_TASKS_SQL.split()) +         " gt on gt.gid = (pj.j ->> 'scope_group')" in board
+
+
+# ══ H. the deploy-day dry run ════════════════════════════════════════════════
+def test_the_dry_run_counts_what_the_next_tick_would_raise_and_writes_nothing(fake):
+    rows = _three() + [_scope("solo", None, 9, scope_group=None, scope_label=None),
+                       _scope("quiet", None, 10, scope_group=None, scope_label=None,
+                              followup_enrolled_at=NOW - 2 * H)]
+    rows.append(_scope("emailed", None, 11, scope_group=None, scope_label=None))
+    f = fake(rows)
+    # The old automatic ladder already emailed this occurrence: the dedupe index drops it.
+    f.reserve_followup("emailed", "%s:nv1" % rules.cycle_key(ENROLLED), {"audience": "customer"})
+    before = copy.deepcopy(f.followups)
+    got = fw.dry_run_count(NOW)
+    assert f.followups == before, "the dry run wrote something"
+    assert f.sent["staff"] == [] and f.sent["customer"] == []
+    assert got["count"] == 2
+    assert sorted((t["proposal_id"], t["scope_group"]) for t in got["tasks"]) == \
+        [("d-break", GID), ("solo", None)]
+    # It agrees with the real tick.
+    fw._tick(NOW)
+    assert sorted(t["proposal_id"] for t in f.tasks()) == ["d-break", "solo"]
+    assert fw.dry_run_count(NOW)["count"] == 0, "an already-raised occurrence was counted again"
+
+
+def test_the_dry_run_runs_with_automation_off(fake, monkeypatch):
+    fake(_three())
+    monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "false")
+    assert fw.dry_run_count(NOW)["count"] == 1
+
+
+def test_the_dry_run_reports_the_touched_burst(fake):
+    """The critic's case: a proposal with an old reply, quiet for more than one interval, matures
+    on a time-keyed occurrence no old automatic email used."""
+    viewed = _scope("solo", None, 0, scope_group=None, scope_label=None,
+                    proposal_status="viewed", cycle_viewed_at=NOW - 20 * 24 * H)
+    f = fake([viewed])
+    f.signals["solo"] = {"customer_touch_at": NOW - 10 * 24 * H}
+    got = fw.dry_run_count(NOW)
+    assert got["count"] == 1 and re.search(r"vrt@\d{8}T\d{2}$", got["tasks"][0]["rule_key"])
+
+
+def test_the_board_query_uses_the_group_aware_task_column(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    db.list_all_portal_proposals()
+    sql = " ".join(seen["sql"].split())
+    assert " ".join(db._ROW_OPEN_TASK_SQL.split()) + " as pending_task" in sql
+
+
+def test_logging_a_call_never_resolves_a_decision_task(monkeypatch):
+    """The drawer's log-a-call resolves the open task; it must not answer 'what about the other
+    scopes?' by marking it called."""
+    seen = {}
+    monkeypatch.setattr(db, "q1", lambda sql, params=(): seen.update(sql=sql) or None)
+    db.pending_followup_task_id("d-lab1")
+    assert "coalesce(detail->>'stage', '') <> 'decision'" in seen["sql"]
+
+
+def test_the_group_email_lists_this_recipients_scopes_under_the_estimators_text(monkeypatch):
+    import email_sender
+    out = {}
+    monkeypatch.setattr(email_sender, "_send",
+                        lambda to, subject, html, headers=None, **k: out.update(
+                            to=to, subject=subject, html=html) or True)
+    ok = email_sender.send_scope_group_followup(
+        "dana@acme.com", "Dana Reed", "Acme HQ",
+        [{"label": "Breakroom", "url": "https://p/x/tok-a"},
+         {"label": "Lab 1", "url": "https://p/x/tok-b"}],
+        {"title": "Checking in", "body": "Hi {first_name},\n\nAny questions on {project}?\n\n{link}"},
+        token="tok-a")
+    assert ok and out["to"] == ["dana@acme.com"]
+    html = out["html"]
+    assert "Checking in" in html and "Hi Dana," in html and "Any questions on Acme HQ?" in html
+    assert "https://p/x/tok-a" in html and "https://p/x/tok-b" in html
+    assert "Breakroom" in html and "Lab 1" in html
+    assert "Not moving forward" not in html, "one scope's close button on a whole-project email"
+    assert html.index("Any questions on Acme HQ?") < html.index("https://p/x/tok-a")
+    # {link} written mid-sentence: words, and the buttons still go out, after the text.
+    email_sender.send_scope_group_followup(
+        "dana@acme.com", "", "Acme HQ", [{"label": "Lab 1", "url": "https://p/x/tok-b"}],
+        {"title": "Hi", "body": "Use {link} when you are ready.\n\nThanks"})
+    html = out["html"]
+    assert "Use the links below when you are ready." in html
+    assert html.index("Thanks") < html.index("https://p/x/tok-b")
+
+
+# ══ fix round PF2 (2026-10-25): group correctness ══════════════════════════════
+def _kept(rows, approved_pid, approved_at, kept_at):
+    """`approved_pid` approved at `approved_at`, then 'keep' chosen at `kept_at` (the resume note
+    every member reads, and the anchor keep stamps on the group's home)."""
+    out = []
+    for r in rows:
+        r = dict(r, scope_group_resumed_at=kept_at)
+        if r["proposal_id"] == approved_pid:
+            r.update(proposal_status="approved", approved_at=approved_at)
+        out.append(r)
+    return out
+
+
+def test_after_keep_the_approved_scopes_deposit_reminders_do_not_cap_the_siblings():
+    """#17: stop-after 3, the approved scope (once the home) has 3 deposit reminders since 'keep'.
+    The siblings' chase must not stop on them, nor be re-anchored by its deposit call."""
+    rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
+                  followup_stop_after=3)
+    rows = _kept(rows, "d-break", NOW - 100 * H, NOW - 95 * H)
+    rows[0].update(followup_reminder_times=[(NOW - k * H).isoformat() for k in (90, 80, 70)],
+                   last_staff_followup_at=NOW - 2 * H, customer_touch_at=NOW - 3 * H)
+    rows[1]["followup_anchor_at"] = NOW - 95 * H          # keep re-anchors the (open) home
+    v = rules.group_view(rows, NOW)
+    assert v["proposal_id"] == "d-lab1", "the group's home is still the approved scope"
+    assert v["followup_reminder_times"] == []
+    assert v["last_staff_followup_at"] is None and v["customer_touch_at"] is None
+    assert _customer_due(v) is not None, "the siblings' chase stopped on the deposit reminders"
+
+
+def test_an_approved_scopes_reminders_from_before_its_approval_still_count():
+    """...but what it was sent while it was an open scope of the group stays in the cap."""
+    rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
+                  followup_stop_after=1)
+    rows = _kept(rows, "d-break", NOW - 100 * H, NOW - 95 * H)
+    rows[0]["followup_reminder_times"] = [(NOW - 150 * H).isoformat()]
+    rows[1]["followup_anchor_at"] = NOW - 95 * H
+    v = rules.group_view(rows, NOW)
+    assert v["followup_reminder_times"] == [(NOW - 150 * H).isoformat()]
+    assert _customer_due(v) is None, "the group got a fresh Stop-after-N back"
+
+
+def test_the_group_plan_is_never_written_on_an_approved_scope(fake, admin):
+    """#17: snoozing or re-planning the group from a sibling's drawer moved the approved home's
+    own deposit chase."""
+    rows = _three()
+    rows[0].update(proposal_status="approved", approved_at=NOW - 5 * H)
+    f = fake(rows)
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"next_at": (NOW + timedelta(days=4)).date().isoformat()})
+    assert r.status_code == 200, r.text
+    assert r.json()["home_proposal_id"] == "d-lab1"
+    assert f.rows["d-break"].get("followup_next_at") is None
+    assert f.rows["d-lab1"].get("followup_next_at") is not None
+
+
+def _with_unannounced(**over):
+    """Three emailed scopes, and Lab 3: published into the group since, not yet emailed (a grouped
+    publish emails nobody and enrols nothing)."""
+    return _three(**over) + [_scope("d-lab3", "Lab 3", 3, followup_enrolled_at=None,
+                                    **{k: v for k, v in over.items()
+                                       if k != "followup_enrolled_at"})]
+
+
+def test_an_unannounced_scope_is_not_in_the_group_reminder():
+    """#1: the reminder's scope list and its recipients' links are the scopes the customer has
+    been told about."""
+    v = rules.group_view(_with_unannounced(), NOW)
+    assert [s["proposal_id"] for s in v["scopes"]] == ["d-break", "d-lab1", "d-lab2"]
+    assert [m["proposal_id"] for m in v["_open_members"]] == ["d-break", "d-lab1", "d-lab2"]
+
+
+def test_an_unannounced_scope_does_not_unpause_a_paused_group():
+    """#1, second case: the customer paused every scope they know about."""
+    later = (NOW + timedelta(days=30)).date()
+    rows = _three(followup_paused_until=later) + [
+        _scope("d-lab3", "Lab 3", 3, followup_enrolled_at=None)]
+    v = rules.group_view(rows, NOW)
+    assert rules.is_paused(v, NOW) and rules.due_now(v, NOW) == []
+
+
+def test_the_group_reminder_never_mails_an_unannounced_scope_so_email_again_sends_it_once(
+        fake, admin):
+    import scope_groups
+    f = fake(_with_unannounced())
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert [s["proposal_id"] for s in t["detail"]["scopes"]] == ["d-break", "d-lab1", "d-lab2"]
+    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
+        "title": "Checking in", "body": "Hi {first_name},\n\n{link}", "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    assert [g["scopes"] for g in f.sent["group"]] == [["Breakroom", "Lab 1", "Lab 2"]]
+    assert not [m for m in f.messages if m["pid"] == "d-lab3"], "a 'Reminder sent' row on Lab 3"
+    # The next combined send is Lab 3's FIRST email, so 'new' is the truth.
+    marks = [{"proposal_id": p, "detail": {"scope_group": GID}, "created_at": NOW}
+             for p in ("d-break", "d-lab1", "d-lab2")]
+    plan = scope_groups.plan_send(list(f.rows.values()), marks, NOW)
+    assert plan["pending"] == ["d-lab3"] and plan["kinds"] == {"d-lab3": "new"}
+
+
+def test_a_paused_scope_is_left_out_of_the_group_reminder():
+    """#15: one scope paused, the others chased -- the reminder does not list (or mail) it."""
+    rows = _three()
+    rows[1]["followup_paused_until"] = (NOW + timedelta(days=30)).date()
+    v = rules.group_view(rows, NOW)
+    assert [s["proposal_id"] for s in v["scopes"]] == ["d-break", "d-lab2"]
+    assert [m["proposal_id"] for m in v["_open_members"]] == ["d-break", "d-lab2"]
+
+
+@pytest.fixture
+def status(fake, monkeypatch):
+    f = fake(_three())
+    monkeypatch.setattr(main, "_require",
+                        lambda request, token: f.get_proposal(token.replace("tok-", "")))
+    monkeypatch.setattr(main, "_session_email", lambda request: "dana@acme.com")
+    monkeypatch.setattr(main.ratelimit, "allow_ip", lambda *a, **k: True)
+    monkeypatch.setattr(db, "pause_followups",
+                        lambda pid, until: f.rows[pid].update(followup_paused_until=until),
+                        raising=False)
+    client = TestClient(main.app)
+
+    def go(pid, **body):
+        return client.post("/api/portal/tok-%s/project-status" % pid, json=body)
+    return f, go
+
+
+def test_a_paused_scopes_staff_email_names_the_scope_and_says_the_others_carry_on(status):
+    """#15: the estimator read 'Automated follow-ups are paused' about the whole project, and three
+    days later a task listed the paused scope."""
+    f, go = status
+    assert go("d-lab1", status="delayed", months=2).status_code == 200
+    mail, = f.sent["staff"]
+    assert mail["subject"] == "Project delayed — Acme HQ - Lab 1"
+    assert "paused for the <strong>Lab 1</strong> scope" in mail["body"]
+    assert "still being followed up: <strong>Breakroom, Lab 2</strong>" in mail["body"]
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert [s["label"] for s in t["detail"]["scopes"]] == ["Breakroom", "Lab 2"]
+
+
+def test_a_scope_closed_by_the_customer_says_only_that_scope_stopped(status):
+    f, go = status
+    assert go("d-lab2", status="not_moving_forward", reason="price").status_code == 200
+    mail, = f.sent["staff"]
+    assert mail["subject"] == "Closed–Lost — Acme HQ - Lab 2"
+    assert "Follow-ups have stopped for the <strong>Lab 2</strong> scope" in mail["body"]
+    assert "still being followed up: <strong>Breakroom, Lab 1</strong>" in mail["body"]
+    assert "Follow-ups have stopped and the opportunity" not in mail["body"]
+
+
+def test_a_scope_status_email_names_others_that_are_not_being_chased(status):
+    f, go = status
+    f.rows["d-break"]["followup_paused_until"] = (NOW + timedelta(days=9)).date()
+    go("d-lab2", status="delayed", months=1)
+    body = f.sent["staff"][0]["body"]
+    assert "still being followed up: <strong>Lab 1</strong>" in body
+    assert "not being followed up right now: <strong>Breakroom</strong>" in body
+
+
+def test_an_ungrouped_status_email_is_unchanged(status):
+    f, go = status
+    for k in ("scope_group", "scope_label"):
+        f.rows["d-lab1"][k] = None
+    go("d-lab1", status="delayed", months=2)
+    mail, = f.sent["staff"]
+    assert mail["subject"] == "Project delayed — Acme HQ"
+    assert "<p>Automated follow-ups are paused until " in mail["body"]
+
+
+def test_a_scope_approved_again_after_keep_raises_a_new_decision_task(approve, admin, monkeypatch):
+    """#2: C approved -> decision task -> 'keep' -> C revised (approval retired) -> C approved
+    again. The second approval must raise its own task and email, or the siblings stay un-chased
+    for ever with nothing on the bell."""
+    f, go = approve
+    ids = iter(range(1, 10))
+    monkeypatch.setattr(main.db, "add_approval", lambda *a, **k: next(ids))
+    first = _decision(f, go)
+    f.clock = NOW + H
+    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, first).status_code == 200
+    assert fw.group_state_for(GID, NOW + H)[0] is not None
+    f.rows["d-lab1"].update(proposal_status="viewed", approved_at=None)     # the revision
+    f.clock = NOW + 2 * H
+    assert go().status_code == 200
+    decs = f.tasks(stage="decision")
+    assert [d["detail"]["status"] for d in decs] == ["decided", "pending"]
+    assert decs[1]["detail"]["rule_key"] == "sd:%s:d-lab1:2" % GID
+    assert [s["subject"] for s in f.sent["staff"]].count("Decide the other scopes — Acme HQ") == 2
+    assert fw.group_state_for(GID, NOW + 2 * H)[:2] == (None, "scope_approved")
+    # ...and answering it restarts the chase: the stop is not for ever.
+    f.clock = NOW + 3 * H
+    assert _decide({"action": "keep"}, decs[1]["id"]).status_code == 200
+    assert fw.group_state_for(GID, NOW + 3 * H)[0] is not None
+
+
+def test_group_schedule_is_the_homes_alone_and_keep_carries_the_former_homes_over():
+    """PF4 review: a null on the home is the STANDARD cadence, never "inherit from a member" --
+    or "reset to standard" written on the new home changes nothing. The former home's plan is
+    copied over once instead (schedule_carry), and only from a scope that really was the home."""
+    rows = _three()
+    rows[0].update(proposal_status="approved", followup_interval_days=14, followup_stop_after=2)
+    rows[2].update(followup_stop_after=5, followup_next_at=NOW + 24 * H)
+    rows[1].update(followup_interval_days=None)
+    got = rules.group_schedule(rows)          # home = d-lab1 (earliest OPEN), which has none
+    assert got == {"followup_interval_days": None, "followup_stop_after": None,
+                   "followup_next_at": None}
+    rows[1].update(followup_stop_after=3)
+    assert rules.group_schedule(rows)["followup_stop_after"] == 3
+    # The approved d-break was the home (it sorts first): its interval comes over; the new home's
+    # own stop-after is kept; the snooze date is not carried.
+    assert rules.schedule_carry(rows[0], rows[1]) == {"followup_interval_days": 14}
+    # d-lab2 sorts after the home: it never held the group's plan, so nothing of it comes over.
+    assert rules.schedule_carry(rows[2], rows[1]) == {}
+    assert rules.schedule_carry(rows[1], rows[1]) == {}
+
+
+def test_the_fallback_decision_key_has_full_precision(fake):
+    """Round 3 #6: with no approval id the key is the approval time at full precision. At hour
+    precision two approvals of one scope 20 minutes apart (approve, revise, approve) shared a key,
+    so the second raised no task and the siblings' chase stayed stopped with nothing on the bell."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW + timedelta(microseconds=7))
+    f = fake(rows)
+    main._raise_scope_decision(f.get_proposal("d-lab1"))
+    first, = f.tasks(stage="decision")
+    assert first["detail"]["rule_key"] == "sd:%s:d-lab1:2026-08-04T15:00:00.000007+00:00" % GID
+    f.decide_followup_task(first["id"], "decided", "kyle", {"outcome": "keep"})
+    f.rows["d-lab1"]["approved_at"] = NOW + timedelta(minutes=20)
+    main._raise_scope_decision(f.get_proposal("d-lab1"))
+    assert [t["detail"]["status"] for t in f.tasks(stage="decision")] == ["decided", "pending"]
+
+
+def test_keep_after_the_home_is_approved_keeps_the_groups_schedule(approve, admin, monkeypatch):
+    """Round 3 #2 (Hanz's question 6: copy over). The plan lives on the home; approving the home
+    moves the home to the next open scope, which has no plan. After 'keep' the group must still
+    run every 14 days and stop after 2, on the worker AND on the board."""
+    f, go = approve
+    f.rows["d-break"].update(followup_interval_days=14, followup_stop_after=2)
+    assert go("d-break").status_code == 200
+    dec, = f.tasks(stage="decision")
+    f.clock = NOW + H
+    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, dec["id"]).status_code == 200
+    view = fw.group_state_for(GID, NOW + H)[0]
+    assert view is not None and view["proposal_id"] == "d-lab1", "the home moved off d-break"
+    assert view["followup_interval_days"] == 14
+    assert view["followup_stop_after"] == 2
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-lab2"]["followup_plan"]["interval_days"] == 14
+    assert out["d-lab2"]["followup_plan"]["stop_after"] == 2
+    # Admin plan writes still go to the (new) home.
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"interval_days": 7})
+    assert r.status_code == 200 and r.json()["home_proposal_id"] == "d-lab1"
+    assert f.rows["d-lab1"]["followup_interval_days"] == 7
+    assert f.rows["d-break"]["followup_interval_days"] == 14
+    view = fw.group_state_for(GID, NOW + H)[0]
+    assert (view["followup_interval_days"], view["followup_stop_after"]) == (7, 2)
+    # The response is the schedule the group really runs on (it was stop_after None here).
+    assert r.json()["followup_plan"]["stop_after"] == 2
+
+
+def test_reset_to_standard_after_the_home_moved_really_resets_the_group(approve, admin,
+                                                                       monkeypatch):
+    """PF4 review: home Breakroom (14 days, stop after 2) approved, 'keep', home -> Lab 1. "The
+    standard interval, the standard reminder limit" from Lab 2's drawer answered 200 and posted
+    the card, while the worker and the board went on with Breakroom's 14 / 2 for ever."""
+    f, go = approve
+    f.rows["d-break"].update(followup_interval_days=14, followup_stop_after=2)
+    assert go("d-break").status_code == 200
+    dec, = f.tasks(stage="decision")
+    f.clock = NOW + H
+    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, dec["id"]).status_code == 200
+    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
+                                  json={"interval_days": None, "stop_after": None})
+    assert r.status_code == 200
+    assert (r.json()["followup_plan"]["interval_days"],
+            r.json()["followup_plan"]["stop_after"]) == (None, None)
+    view = fw.group_state_for(GID, NOW + H)[0]
+    assert (view["followup_interval_days"], view["followup_stop_after"]) == (None, None)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    for pid in ("d-lab1", "d-lab2"):
+        assert (out[pid]["followup_plan"]["interval_days"],
+                out[pid]["followup_plan"]["stop_after"]) == (None, None), pid
+    # The approved scope's own row is untouched: it is its own deposit chase now.
+    assert f.rows["d-break"]["followup_interval_days"] == 14
+
+
+def _log(pid, kind="call"):
+    return TestClient(main.app).post("/api/admin/proposal/%s/followups" % pid,
+                                     json={"kind": kind, "note": "Rang Dana", "by": "kyle"})
+
+
+def test_a_call_logged_on_any_open_scope_resolves_the_groups_task(fake, admin):
+    """#14: the group's task lives on the home; a call logged from Lab 1's drawer left it open, so
+    the card asking for a reminder email stayed on the bell after the phone call."""
+    f = fake(_three())
+    fw._tick(NOW)
+    t, = f.tasks()
+    assert t["proposal_id"] == "d-break"
+    assert _log("d-lab1", "note").status_code == 200
+    assert t["detail"]["status"] == "pending", "a note is not contact with the customer"
+    assert _log("d-lab1").status_code == 200
+    assert t["detail"]["status"] == "called" and t["detail"]["logged_on"] == "d-lab1"
+    assert f.rows["d-break"].get("followup_anchor_at") == NOW, "the home was not re-anchored"
+
+
+def test_a_logged_call_never_resolves_a_decision_task_or_a_detached_scopes_group(fake, admin):
+    rows = _three()
+    rows[2]["proposal_status"] = "approved"
+    f = fake(rows, drafts=[{"id": "d-break", "archived": False}, {"id": "d-lab1", "archived": False},
+                           {"id": "d-lab2", "archived": False}])
+    dec = f.reserve_followup_task("d-lab2", "sd:%s:d-lab2:1" % GID, {
+        "stage": "decision", "template": "scope_decision", "scope_group": GID,
+        "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab1"}]})
+    _log("d-lab1")
+    assert f.get_followup_task(dec)["detail"]["status"] == "pending"
+    f.rows["d-lab2"]["proposal_status"] = "sent"
+    rem = f.reserve_followup_task("d-break", "grp:1", {"stage": "pre", "scope_group": GID})
+    f.drafts = [{"id": "d-break", "archived": False}, {"id": "d-lab1", "archived": False}]
+    _log("d-lab2")                                   # d-lab2 has left the group in the tool
+    assert f.get_followup_task(rem)["detail"]["status"] == "pending"
+
+
+def test_the_board_reads_every_groups_drafts_in_one_query(fake, admin, monkeypatch):
+    """#20: each read of the drafts table detoasts all of it; the board polled it once per group."""
+    rows = _three() + [_scope("d-x1", "X 1", 5, scope_group="grp-other"),
+                       _scope("d-x2", "X 2", 6, scope_group="grp-other")]
+    f = fake(rows)
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r) for r in f.rows.values()])
+    assert TestClient(main.app).get("/api/admin/pipeline").status_code == 200
+    drafts = [r for r in f.reads if r[0] in ("drafts", "drafts_many")]
+    assert drafts == [("drafts_many", (GID, "grp-other"))], drafts
+
+
+def test_an_open_scope_out_of_the_group_never_shows_the_groups_task(fake, admin, monkeypatch):
+    """#8: SQL hands an open row with a scope_group the group's task when it has none of its own;
+    a scope the tool took out of the group (its draft no longer carries it) is not a member."""
+    f = fake(_three(), drafts=[{"id": "d-break", "archived": False},
+                               {"id": "d-lab1", "archived": False}])
+    grp = {"id": 7, "proposal_id": "d-break", "created_at": NOW,
+           "detail": {"status": "pending", "template": "not_viewed", "stage": "pre",
+                      "scope_group": GID, "scopes": [{"proposal_id": "d-break"}]}}
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r, pending_task=grp) for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in
+           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-break"]["followup_task"]["id"] == 7
+    assert out["d-lab1"]["followup_task"]["id"] == 7
+    assert out["d-lab2"]["followup_task"] is None
+
+
+def test_a_decision_tasks_link_opens_a_scope_it_is_about(fake):
+    """#8: the approved scope's drawer shows its own deposit task, so the bell's decision entry
+    opens the first sibling it lists, where the board shows the decision card."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW)
+    fake(rows)
+    row = {"id": 9, "proposal_id": "d-lab1", "created_at": NOW,
+           "detail": {"status": "pending", "template": "scope_decision", "stage": "decision",
+                      "scope_group": GID,
+                      "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab2"}]}}
+    assert main._task_view(row)["link_proposal_id"] == "d-break"
+
+
+def _decision_row():
+    return {"id": 9, "proposal_id": "d-lab1", "created_at": NOW,
+            "detail": {"status": "pending", "template": "scope_decision", "stage": "decision",
+                       "scope_group": GID,
+                       "approved_scope": {"proposal_id": "d-lab1", "label": "Lab 1"},
+                       "scopes": [{"proposal_id": "d-break", "status": "sent"},
+                                  {"proposal_id": "d-lab2", "status": "sent"}]}}
+
+
+def test_a_decision_tasks_link_is_the_first_sibling_still_open(fake, admin, monkeypatch):
+    """Round 3 #3: [A, B] listed, A closed lost since the task was raised -> the link is B, on the
+    bell's feed, the task endpoint and the board. The statuses stored on the task are a snapshot."""
+    rows = _three()
+    rows[1].update(proposal_status="approved", approved_at=NOW)
+    rows[0].update(proposal_status="closed_lost")
+    f = fake(rows)
+    dec = _decision_row()
+    f.followups.append(dec)
+    f.followups[-1]["kind"] = "followup_task"
+    assert main._task_view(dec)["link_proposal_id"] == "d-lab2"
+    client = TestClient(main.app)
+    feed = client.get("/api/admin/followup-tasks").json()["tasks"]
+    assert [t["link_proposal_id"] for t in feed if t["id"] == 9] == ["d-lab2"]
+    assert client.get("/api/admin/followup-task/9").json()["task"]["link_proposal_id"] == "d-lab2"
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [dict(r, pending_task=dec if r["proposal_id"] == "d-lab1" else None)
+                                 for r in f.rows.values()])
+    out = {r["proposal_id"]: r for r in client.get("/api/admin/pipeline").json()["proposals"]}
+    assert out["d-lab1"]["followup_task"]["link_proposal_id"] == "d-lab2"
+    # Every sibling it lists closed: the link falls back to the approved scope.
+    f.rows["d-lab2"]["proposal_status"] = "closed_lost"
+    assert main._task_view(dec)["link_proposal_id"] == "d-lab1"

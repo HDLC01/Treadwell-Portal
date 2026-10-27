@@ -259,11 +259,17 @@ def signing_project_name(proposal_row: Optional[dict[str, Any]],
     view model that shows the customer the sentence, and the certificate that records what they
     agreed to. The draft blob wins over the portal row, matching build_view_model's own order --
     otherwise a project renamed in the tool after publication would put one name on screen and a
-    different one in the legal record of the same click."""
+    different one in the legal record of the same click.
+
+    ONE SCOPE OF A MULTI-SCOPE PROJECT names its scope ("Acme HQ - Lab 1", finding #21): three
+    contracts that all say "Acme HQ" cannot say which amount each one agreed to, and their PDFs
+    would all save under one file name (contract_filename reads this too)."""
+    import scope_groups
+
     for v in ((data or {}).get("project_name"), (proposal_row or {}).get("project_name")):
         s = str(v or "").strip()
         if s:
-            return s
+            return scope_groups.display_project_name(proposal_row, s)
     return "this project"
 
 

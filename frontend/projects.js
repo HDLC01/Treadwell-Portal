@@ -29,9 +29,12 @@
     return (proposals || []).map((p) => {
       const st = status(p);
       const here = currentToken && p.token === currentToken;
-      return `<a class="proj-row${here ? " current" : ""}" href="/p/${encodeURIComponent(p.token)}"` +
+      // `display_name` is "Acme HQ — Lab 1" for one scope of a multi-scope project (the server
+      // also keeps a group's scopes next to each other), and the plain project name otherwise.
+      return `<a class="proj-row${here ? " current" : ""}${p.scope_group ? " is-scope" : ""}"` +
+        ` href="/p/${encodeURIComponent(p.token)}"` +
         `${here ? ' aria-current="page"' : ""}>` +
-        `<span class="pname">${esc(p.project_name)}</span>` +
+        `<span class="pname">${esc(p.display_name || p.project_name)}</span>` +
         `<span class="badge ${st.cls}">${st.label}</span></a>`;
     }).join("");
   }

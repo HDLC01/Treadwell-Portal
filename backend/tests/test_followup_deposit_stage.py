@@ -181,17 +181,51 @@ def test_the_same_tick_twice_reserves_the_same_key():
     assert a == b, "the rule key moves with the clock, so every tick would be a fresh send"
 
 
-def test_the_recurring_series_respects_max_recurring():
-    """Otherwise an unpaid job is chased for ever. The cap is the same knob the rest of the
-    cadence uses, so setting it once bounds every stage."""
+def test_the_recurring_series_respects_its_OWN_cap():
+    """Otherwise an unpaid job is chased for ever — so it is still capped, but by
+    deposit_max_recurring, not by max_recurring.
+
+    REPLACED BEHAVIOUR. This test used to set max_recurring=2 and assert the deposit series
+    stopped there, because "the cap is the same knob the rest of the cadence uses, so setting it
+    once bounds every stage". Hanz, 2026-10-23 (decision 5), reversed exactly that: the
+    pre-decision nudge count is what Kyle's stopgap lowers, and lowering it must never silence the
+    chase for money on a job that is already signed. The two caps are now independent, and the
+    pair of tests below pins both directions."""
     cfg = fs.defaults()
-    cfg["max_recurring"] = 2
+    cfg["deposit_max_recurring"] = 2
     keys = set()
     for day in range(1, 60):
         for d in _due(_row(), _at(24 * day), cfg):
             if d.template == "deposit_nudge":
                 keys.add(d.rule_key)
-    assert len(keys) <= 4, "the deposit reminder ignores max_recurring: %s" % sorted(keys)
+    assert len(keys) <= 4, "the deposit reminder ignores its own cap: %s" % sorted(keys)
+
+
+def test_lowering_the_pre_decision_cap_does_not_lower_the_deposit_cap():
+    """Decision 5, from the other side. max_recurring=1 is the most aggressive stopgap the
+    settings allow; the deposit stage — customer reminder AND the staff chase — has to keep going."""
+    cfg = fs.defaults()
+    cfg["max_recurring"] = 1
+    cust, staff = set(), set()
+    for day in range(1, 40):
+        for d in _due(_row(), _at(24 * day), cfg):
+            if d.template == "deposit_nudge":
+                cust.add(d.rule_key)
+            elif d.template == "staff_deposit_outstanding":
+                staff.add(d.rule_key)
+    assert len(cust) > 5, "the pre-decision cap silenced the deposit reminder: %s" % sorted(cust)
+    assert len(staff) > 5, "the pre-decision cap silenced the staff deposit chase: %s" % sorted(staff)
+
+
+def test_a_per_proposal_stop_after_never_reaches_the_deposit_stage():
+    """followup_stop_after overrides the PRE-DECISION cap for one proposal. It is a statement
+    about how often to nudge somebody who has not decided, not about chasing a signed deposit."""
+    cust = set()
+    for day in range(1, 40):
+        for d in _due(_row(followup_stop_after=1), _at(24 * day)):
+            if d.template == "deposit_nudge":
+                cust.add(d.rule_key)
+    assert len(cust) > 5, sorted(cust)
 
 
 def test_a_revision_resets_the_stage():

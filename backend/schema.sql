@@ -497,9 +497,12 @@ create index if not exists portal_followups_proposal_idx
 -- enforced by the database rather than by application bookkeeping. The worker
 -- reserves a row before sending, so a crashed tick, a container restart, or two
 -- overlapping containers during a deploy cannot double-nag a customer.
-create unique index if not exists portal_followups_rule_uidx
-  on public.portal_followups (proposal_id, (detail->>'rule_key'))
-  where kind = 'auto_email' and (detail->>'rule_key') is not null;
+--
+-- 2026-10-23: that index (portal_followups_rule_uidx, kind = 'auto_email' only) is
+-- superseded by portal_followups_rule_v2_uidx in the remind-only section at the end
+-- of this file, which covers follow-up tasks with the same key. Its create statement
+-- is retired here rather than left in place, or every boot would build it and the
+-- later section would drop it again.
 alter table public.portal_followups enable row level security;
 
 -- ── Settings ──────────────────────────────────────────────────────────────
@@ -712,3 +715,115 @@ grant select, insert, update, delete on public.portal_signed_contracts to portal
 drop policy if exists portal_app_rw on public.portal_signed_contracts;
 create policy portal_app_rw on public.portal_signed_contracts
   for all to portal_app using (true) with check (true);
+
+-- == Remind-only follow-ups (2026-10-23) ======================================================
+--
+-- Hanz's decisions: every proposal is REMIND-ONLY (1), including the ones already mid-cadence when
+-- this ships (2). A customer reminder coming due no longer emails the customer; it raises a
+-- follow-up TASK for the estimator, who sends a reviewed email, logs a call, skips or snoozes. A
+-- customer reply puts the full reminder count back (3). The pre-decision nudge cap and the deposit
+-- chase cap are separate (5) -- that one is a settings key, not DDL.
+--
+-- ALL ADDITIVE AND NULLABLE. Every existing row keeps working with NULL in all five columns, which
+-- reads as "the global cadence, remind mode, no decision taken yet". No backfill. The code reads the
+-- new columns through to_jsonb on the board query and through `select *` in the worker, so it runs
+-- on a database that has not had this block yet -- it just cannot raise a task there, because the
+-- widened CHECK below is what admits the kind. Written as plain statements (no do-blocks): the boot
+-- path's run_script splits this file on semicolons.
+--
+-- The mode. 'remind' is the only value v1 code handles; 'approve' (send a pre-filled template on a
+-- click) and 'auto' (the old automatic ladder) are FUTURE modes, legal here so they need no second
+-- migration, and nothing reads or writes them yet. NULL means remind.
+alter table public.portal_proposals add column if not exists followup_mode text;
+alter table public.portal_proposals drop constraint if exists portal_proposals_followup_mode_check;
+alter table public.portal_proposals add constraint portal_proposals_followup_mode_check
+  check (followup_mode is null or followup_mode in ('remind','approve','auto'));
+-- Stamped on every human decision about a follow-up (send / skip / called / snooze). One of the
+-- touches the schedule re-anchors on; the others (customer replies, staff-logged outreach, staff
+-- chat messages) are read from portal_questions / portal_followups and need no column.
+alter table public.portal_proposals add column if not exists followup_anchor_at timestamptz;
+-- The per-proposal schedule. NULL = the global cadence (portal_settings 'followups').
+--   followup_next_at        a specific date for the next reminder (a snooze)
+--   followup_interval_days  "every N days" for this proposal, and the gap after a touch
+--   followup_stop_after     the PRE-DECISION reminder cap for this proposal. It never reaches the
+--                           deposit chase, which has its own cap (decision 5)
+alter table public.portal_proposals add column if not exists followup_next_at timestamptz;
+alter table public.portal_proposals add column if not exists followup_interval_days int;
+alter table public.portal_proposals add column if not exists followup_stop_after int;
+alter table public.portal_proposals drop constraint if exists portal_proposals_followup_interval_days_check;
+alter table public.portal_proposals add constraint portal_proposals_followup_interval_days_check
+  check (followup_interval_days is null or followup_interval_days between 1 and 90);
+alter table public.portal_proposals drop constraint if exists portal_proposals_followup_stop_after_check;
+alter table public.portal_proposals add constraint portal_proposals_followup_stop_after_check
+  check (followup_stop_after is null or followup_stop_after between 1 and 60);
+
+-- The task is a ROW IN portal_followups, kind 'followup_task', not a table of its own. Its state
+-- (status pending/sending/sent/skipped/called/snoozed/expired, draft {title, body, source}, decided_by,
+-- decided_at) lives in `detail`. Same table so it shares the SAME dedupe as the automated emails:
+-- a task can never be raised for an occurrence the old ladder already emailed, and a future mode
+-- that sends on a click cannot double-send what a task already covered.
+--
+-- The kind CHECK is the inline column check, so its name is Postgres' auto-name
+-- portal_followups_kind_check -- the same convention this file relies on for
+-- portal_notify_recipients_kind_check and portal_questions_msg_type_check above.
+alter table public.portal_followups drop constraint if exists portal_followups_kind_check;
+alter table public.portal_followups add constraint portal_followups_kind_check
+  check (kind in ('auto_email','staff_call','staff_email','staff_text','staff_note',
+                  'customer_status','followup_task'));
+-- The rule-key dedupe, widened to cover both kinds. A NEW index name rather than a drop-and-
+-- recreate of the old one, so a reboot that re-runs this file finds it present and does nothing;
+-- the old, narrower index is dropped only after the wider one exists. Same predicate style as
+-- before, with the new kind OR-ed in.
+create unique index if not exists portal_followups_rule_v2_uidx
+  on public.portal_followups (proposal_id, (detail->>'rule_key'))
+  where kind in ('auto_email','followup_task') and (detail->>'rule_key') is not null;
+drop index if exists public.portal_followups_rule_uidx;
+-- ONE OPEN TASK PER PROPOSAL PER STAGE, enforced by the database rather than only by the worker:
+-- two containers overlapping during a deploy cannot both raise one. Also what the open-task reads
+-- (staff bell, board) are served by. OPEN is pending OR sending: the send endpoint claims a task
+-- as 'sending' before it emails, and that claim must keep the slot, or a tick mid-send raises a
+-- second task and putting the first back after a failed send collides with this index.
+--
+-- 2026-10-24 (scope groups): keyed on (proposal_id, stage), not proposal_id alone. Approving one
+-- scope of a group files ONE "decide what to do with the other scopes" task (stage 'decision') on
+-- the approved scope, and that scope still owes its own deposit reminder (stage 'deposit'). With
+-- one slot per proposal the decision task would block the deposit chase until somebody decided.
+-- A task with no stage is a pre-decision one, as followup_rules.task_stage reads it.
+--
+-- A NEW index name, created before the narrower predecessor is dropped (the rule_v2 pattern
+-- above): a reboot that re-runs this file finds it present and does nothing. The predecessor's
+-- create statement (portal_followups_one_open_task_uidx, on proposal_id alone) is retired here
+-- rather than left in place, or every boot would build it and the drop below would remove it again.
+create unique index if not exists portal_followups_one_open_task_v2_uidx
+  on public.portal_followups (proposal_id, (coalesce(detail->>'stage', 'pre')))
+  where kind = 'followup_task' and (detail->>'status') in ('pending','sending');
+drop index if exists public.portal_followups_one_open_task_uidx;
+-- The pending-only predecessor, from the same unreleased change. Dropped AFTER the wider one
+-- exists, the rule_v2 pattern above; a no-op on a database that never had it.
+drop index if exists public.portal_followups_one_pending_task_uidx;
+
+-- == Scope groups: one project, several separately priced scopes (2026-10-23) ==================
+--
+-- RJ asked for projects with no single base bid: "Breakroom" polish, "Lab 1" epoxy and "Lab 2"
+-- epoxy under one project name, each its OWN proposal the customer approves on its own. Every
+-- scope is therefore an ordinary portal_proposals row (its own proposal_id, token, approval,
+-- deposit and revisions), and these two columns are the only thing that links them. The board,
+-- the customer's list, the combined "all your scopes" email, the approve notice and the follow-up
+-- worker read the link; nothing in pricing, documents, signing or deposits does.
+--
+-- Written from the draft's own blob at publish (`data.scope_group = {id, label}`), never from a
+-- request body. NULLABLE with no default: every existing row is ungrouped, and a publish whose
+-- draft carries no scope_group writes neither column, so a stored value is never cleared by it.
+--
+-- Plain additive statements with no grant, so they can be lifted out and hand-applied on staging
+-- (where the portal_app grants elsewhere in this file roll the whole boot apply back) and on
+-- prod (which never applies this file on boot). The readers that must survive a database without
+-- them go through to_jsonb, the same as deleted_at and last_sent_at.
+--
+-- No column records "the combined email went out". That is a staff_note row in portal_followups
+-- with detail.action = 'scope_group_sent' on each scope, claimed under a row lock
+-- (db.claim_scope_group_send): no DDL, and it lands in each scope's follow-up history for free.
+alter table public.portal_proposals add column if not exists scope_group text;
+alter table public.portal_proposals add column if not exists scope_label text;
+create index if not exists portal_proposals_scope_group_idx
+  on public.portal_proposals (scope_group) where scope_group is not null;

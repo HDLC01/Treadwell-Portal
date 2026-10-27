@@ -293,7 +293,10 @@ def test_the_board_reads_recipients_and_views_ONCE_for_the_whole_page():
     body = code[i:i + 1 + m.start()] if m else code[i:]
     assert body.count("db.views_by_proposal()") == 1
     assert body.count("db.recipients_by_proposal()") == 1
-    loop = body[body.index("for r in db.list_all_portal_proposals()"):]
+    # The board's rows are read ONCE into `board` (round 3 #3: a decision task's link reads every
+    # row's current status from them), then looped over.
+    assert body.count("db.list_all_portal_proposals()") == 1
+    loop = body[body.index("for r in board:"):]
     for per_row in ("db.views_by_proposal", "db.recipients_by_proposal", "db.list_views("):
         assert per_row not in loop, "%s is called once per card" % per_row
 

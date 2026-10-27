@@ -32,6 +32,10 @@ STAFF_TEMPLATES = [
     "staff_personal_followup",
     "staff_deposit_outstanding",
     "staff_pause_expired",
+    # Remind-only (2026-10-23): the email that tells the estimator a follow-up is due. It is
+    # about a CUSTOMER email the estimator is about to send, which makes it the most tempting
+    # place of all to paste the customer's link — so it is held to the same rule.
+    "staff_followup_due",
 ]
 
 TOKEN = "gZ3liSuON-bK-jR37bxIb0psjkXmAKp8"      # the shape of a real one

@@ -67,7 +67,11 @@ def invoice_payload(proposal_row: dict[str, Any], amount: float,
     meaningful. Pure: no I/O."""
     d = draft or {}
     pid = proposal_row.get("proposal_id") or ""
-    project = (proposal_row.get("project_name") or "").strip()
+    # "Acme HQ - Lab 1" for one scope of a multi-scope project: three deposit invoices for one
+    # project name are three amounts nobody can tell apart (finding #21).
+    import scope_groups
+
+    project = scope_groups.display_project_name(proposal_row).strip()
     payload: dict[str, Any] = {
         "customer_name": (proposal_row.get("customer_name")
                           or proposal_row.get("customer_email") or "").strip(),

@@ -219,7 +219,7 @@ async function mountSwitcher() {
   // the title below it instead of reading a generic "My projects".
   const here = proposals.find((p) => p.token === TOKEN);
   const label = $("proj-switch-label");
-  if (label && here && here.project_name) label.textContent = here.project_name;
+  if (label && here && here.project_name) label.textContent = here.display_name || here.project_name;
   wrap.classList.remove("hidden");
 
   const close = () => { menu.classList.add("hidden"); btn.setAttribute("aria-expanded", "false"); };
@@ -233,15 +233,44 @@ async function mountSwitcher() {
 }
 
 function setHeader(vm, approved) {
-  const title = vm.project_name || "Your Proposal";
+  // One scope of a multi-scope project reads "Acme HQ — Lab 1", so three scopes of one job are
+  // never three identical headings. Everything else is unchanged.
+  const label = vm.scope && vm.scope.label;
+  const title = (vm.project_name || "Your Proposal") + (label ? " — " + label : "");
   const sub = vm.city_state || "";
   $("p-title").textContent = title; $("pv-title").textContent = title;
   $("p-sub").textContent = sub; $("pv-sub").textContent = sub;
+  renderScopeStrip(vm.scope);
   for (const id of ["p-status-badge", "pv-status-badge"]) {
     const b = $(id);
     if (approved) { b.className = "badge done"; b.textContent = "Approved"; }
     else { b.className = "badge warn"; b.textContent = "Awaiting your approval"; }
   }
+}
+
+/** The other scopes of a multi-scope project, as links, under the proposal heading.
+ *
+ *  RJ: a project can be several separately priced scopes ("Breakroom", "Lab 1", "Lab 2"), each
+ *  its own proposal that is approved on its own. The server sends only the scopes THIS signed-in
+ *  customer can open (it builds the list from their own project list), so nothing here filters.
+ *  Hidden for every ordinary proposal, which has no `scope`. */
+function renderScopeStrip(scope) {
+  const el = $("pv-scopes");
+  if (!el) return;
+  const sibs = (scope && scope.siblings) || [];
+  if (sibs.length < 2) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.innerHTML =
+    `<p class="muted small" style="margin:0 0 8px">This project is priced as ${sibs.length} ` +
+    `separate scopes. Each one is its own proposal, approved on its own.</p>` +
+    `<div class="scope-chips">` + sibs.map((s) => {
+      const name = esc(s.scope_label || s.display_name || s.project_name || "Proposal");
+      const done = s.proposal_status === "approved";
+      return s.current
+        ? `<span class="scope-chip is-current" aria-current="page">${name}</span>`
+        : `<a class="scope-chip${done ? " is-done" : ""}" href="/p/${encodeURIComponent(s.token)}">` +
+          `${name}${done ? " · approved" : ""}</a>`;
+    }).join("") + `</div>`;
+  el.classList.remove("hidden");
 }
 
 /** Does this project involve a deposit at all?
@@ -405,10 +434,16 @@ function renderOptions(options, addons, approved) {
     // Three kinds, because "option" alone would lie about a VE row: a value-engineering
     // alternative REPLACES the base rather than adding to it (see updateSelectedTotal, which
     // contributes its delta, not its total).
-    const kind = o.is_base ? "Base bid" : (ve ? "Alternative" : "Option");
+    //
+    // ONE SCOPE OF A MULTI-SCOPE PROJECT has no base bid -- that is RJ's whole point -- so its main
+    // row is named after the scope ("Lab 1") instead. Only when the server says this proposal is a
+    // scope; every other proposal keeps "Base bid".
+    const scopeLabel = (STATE && STATE.scope && STATE.scope.label) || "";
+    const kind = o.is_base ? (scopeLabel || "Base bid") : (ve ? "Alternative" : "Option");
     const kindClass = o.is_base ? "is-base" : (ve ? "is-alt" : "is-opt");
     const kindTitle = o.is_base
-      ? "The main scope of work — the bid this proposal is for."
+      ? (scopeLabel ? "The work in this scope. Each scope of the project is approved on its own."
+                    : "The main scope of work — the bid this proposal is for.")
       : (ve ? "An alternative to the base bid. Choosing it changes the price of the job rather "
             + "than adding to it."
             : "An extra you can add to the base bid. Its price is added to your total.");
@@ -1323,8 +1358,10 @@ function startPolling() {
 function setupDeposit() {
   const dep = (STATE && STATE.deposit) || {};
   const due = dep.due != null ? money(dep.due) : null;
-  // Customer-facing reference = the project name (the internal TW-… ref is staff-only).
-  const ref = (STATE && STATE.project_name) || "";
+  // Customer-facing reference = the project name (the internal TW-… ref is staff-only). For one
+  // scope of a multi-scope project the server names the scope too ("Acme HQ - Lab 1"): three
+  // deposits for one project otherwise carry one reference for three amounts.
+  const ref = (STATE && (STATE.payment_reference || STATE.project_name)) || "";
   $("deposit-due-line").textContent = due
     ? `Deposit due: ${due} (25% of your total). Reference: ${ref}`
     : (ref ? `Reference: ${ref}` : "");

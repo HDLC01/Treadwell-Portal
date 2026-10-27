@@ -51,8 +51,10 @@ def test_the_board_query_skips_a_deleted_project(monkeypatch):
     """The predicate, and WHERE it sits. A guard after the order by is a syntax error, and a
     guard that read the draft's column instead of ours would filter the wrong table."""
     sql, _ = _sql(monkeypatch, main.db.list_all_portal_proposals)
-    assert "where (to_jsonb(p) ->> 'deleted_at') is null" in sql
-    assert sql.index("where (to_jsonb(p)") < sql.index("order by"), (
+    # pj.j is the row's to_jsonb, worked out once per row (fix round #26).
+    assert "cross join lateral (select to_jsonb(p) as j offset 0) pj" in sql
+    assert "where (pj.j ->> 'deleted_at') is null" in sql
+    assert sql.index("where (pj.j") < sql.index("order by"), (
         "the guard has to be in the WHERE, not trailing after the sort")
 
 

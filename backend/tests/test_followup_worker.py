@@ -37,12 +37,18 @@ def _proposal(**over):
 
 
 def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
-          send_ok=True, staff_ok=True, enabled="true"):
+          send_ok=True, staff_ok=True, enabled="true", signals=None,
+          reserve_task=lambda pid, key, detail: 7, pending=(), stale=(), recorded=()):
     calls = {"reserved": [], "deleted": [], "customer": [], "staff": [], "candidates": 0,
              # What the worker echoed into the project's conversation. Stubbed like every other
              # database call here: unstubbed it is a real connection, and this one runs on the
              # success path of every test in the file.
-             "thread": []}
+             "thread": [],
+             # Remind-only (2026-10-23): the follow-up tasks the tick raised, and the decisions
+             # its housekeeping took on open ones.
+             "tasks": [], "decided": [],
+             # The recovery of a send that was claimed and never confirmed (`sending`).
+             "reopened": []}
     p = proposal if proposal is not None else _proposal()
 
     monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", enabled)
@@ -73,6 +79,25 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
 
     monkeypatch.setattr(fw.db, "reserve_followup", _reserve)
     monkeypatch.setattr(fw.db, "delete_followup", lambda rid: calls["deleted"].append(rid))
+    # The touches, the reminder count and the open task. None of them by default: a proposal
+    # nobody has touched, with no task open — the shape every pre-remind-only test assumed.
+    monkeypatch.setattr(fw.db, "followup_signals", lambda pid: dict(signals or {}))
+
+    def _reserve_task(pid, key, detail):
+        calls["tasks"].append({"key": key, "detail": detail})
+        return reserve_task(pid, key, detail)
+
+    monkeypatch.setattr(fw.db, "reserve_followup_task", _reserve_task)
+    monkeypatch.setattr(fw.db, "list_pending_followup_tasks", lambda: list(pending))
+    monkeypatch.setattr(fw.db, "decide_followup_task",
+                        lambda tid, status, by, extra=None, from_status="pending":
+                        calls["decided"].append(
+                            (tid, status, (extra or {}).get("reason"))) or {"id": tid})
+    monkeypatch.setattr(fw.db, "list_stale_sending_tasks", lambda minutes: list(stale))
+    monkeypatch.setattr(fw.db, "followup_task_send_recorded", lambda tid: tid in recorded)
+    monkeypatch.setattr(fw.db, "reopen_followup_task",
+                        lambda tid, extra=None: calls["reopened"].append(
+                            (tid, dict(extra or {}))) or True)
     monkeypatch.setattr(
         fw.db, "add_message",
         lambda pid, kind, who, body, **k: calls["thread"].append(
@@ -91,42 +116,94 @@ def _wire(monkeypatch, *, proposal=None, reserve=lambda pid, key, detail: 1,
     return calls
 
 
-def test_a_due_proposal_emails_every_recipient_and_tells_the_estimator(monkeypatch):
+# REPLACED BEHAVIOUR, 2026-10-23. The first block of this file asserted that a due proposal EMAILED
+# THE CUSTOMER from the tick. Hanz's decisions 1 and 2 replaced exactly that: every proposal is
+# remind-only, including in-flight ones, so the tick raises a follow-up task and emails the
+# estimator, and nothing reaches the customer until the estimator sends it from the CRM. The tests
+# below keep each original property (ordering, dedupe, release-on-failure, the re-read, latest-only)
+# and assert it against the remind path. Where a test's old assertion was "the customer got an
+# email", that assertion is what decision 1 removes, and the new one says so.
+_PENDING = {"id": 99, "detail": {"status": "pending", "template": "not_viewed"},
+            "created_at": "2026-08-04T10:00:00+00:00"}
+
+
+def test_a_due_proposal_raises_a_task_and_emails_only_the_estimator(monkeypatch):
+    """Was: test_a_due_proposal_emails_every_recipient_and_tells_the_estimator. The customer half
+    of that is gone by design (decision 1); the estimator half is now the follow-up-due email."""
     calls = _wire(monkeypatch)
     fw._tick(NOW)
-    assert [c["to"] for c in calls["customer"]] == ["c@x.com", "b@x.com"]
-    assert calls["customer"][0]["template"] == "not_viewed"
+    assert calls["customer"] == [], "remind-only: the tick emailed a customer"
+    assert [t["detail"]["template"] for t in calls["tasks"]] == ["not_viewed"]
+    assert calls["tasks"][0]["key"].endswith(":nv1"), "the ladder's key, shared with auto_email"
+    assert calls["tasks"][0]["detail"]["status"] == "pending"
     assert calls["staff"][0]["to"] == ["kyle@wetreadwell.com"]      # the assigned estimator
+    assert calls["staff"][0]["subject"].startswith("Follow-up due")
     assert calls["deleted"] == []
 
 
+def test_the_tick_never_calls_the_customer_send(monkeypatch):
+    """Decision 1, at its strongest: _send_customer is not reachable from the tick at all, on any
+    stage. Every stage is driven here — unopened, opened, recurring, and the deposit stage."""
+    def _boom(*a, **k):
+        raise AssertionError("the tick reached the customer send path")
+
+    monkeypatch.setattr(fw, "_send_customer", _boom)
+    for p in (_proposal(),
+              _proposal(proposal_status="viewed", cycle_viewed_at=NOW - timedelta(hours=25)),
+              _proposal(proposal_status="viewed", cycle_viewed_at=NOW - timedelta(hours=400)),
+              _proposal(proposal_status="approved", approved_at=NOW - timedelta(hours=30),
+                        cycle_viewed_at=ENROLLED, deposit_status="pending")):
+        calls = _wire(monkeypatch, proposal=p)
+        monkeypatch.setattr(fw, "_send_customer", _boom)
+        fw._tick(NOW)
+        assert calls["customer"] == [] and calls["tasks"], p
+
+
 def test_the_reservation_is_taken_before_anything_is_sent(monkeypatch):
-    """Ordering is the whole safety property, so assert it directly."""
+    """Ordering is the whole safety property, so assert it directly — now for the task: it is
+    reserved before the estimator is emailed about it."""
     order = []
-    calls = _wire(monkeypatch, reserve=lambda pid, key, detail: order.append("reserve") or 1)
-    monkeypatch.setattr(fw.email_sender, "send_followup",
-                        lambda *a, **k: order.append("send") or True)
+    calls = _wire(monkeypatch,
+                  reserve_task=lambda pid, key, detail: order.append("reserve") or 1)
+    monkeypatch.setattr(fw.email_sender, "notify_team",
+                        lambda *a, **k: order.append("notify") or ["kyle@wetreadwell.com"])
     fw._tick(NOW)
-    assert order[0] == "reserve" and "send" in order
+    assert order[0] == "reserve" and "notify" in order
 
 
 def test_an_already_reserved_rule_sends_nothing(monkeypatch):
-    """A prior tick, or the twin container during a deploy, already sent this one."""
-    calls = _wire(monkeypatch, reserve=lambda pid, key, detail: None)
+    """A prior tick, or the twin container during a deploy, already raised this one — or the old
+    ladder already emailed this occurrence, which the shared dedupe index reports the same way."""
+    calls = _wire(monkeypatch, reserve=lambda pid, key, detail: None,
+                  reserve_task=lambda pid, key, detail: None)
     fw._tick(NOW)
     assert calls["customer"] == [] and calls["staff"] == []
-    assert calls["reserved"]              # it did try
+    assert calls["tasks"]                 # it did try
 
 
-def test_a_total_send_failure_releases_the_reservation_so_the_next_tick_retries(monkeypatch):
-    calls = _wire(monkeypatch, send_ok=False, staff_ok=False)
+def test_a_failed_staff_note_releases_its_reservation_so_the_next_tick_retries(monkeypatch):
+    """Was: ..._a_total_send_failure_releases_the_reservation. The release rule is unchanged for
+    the STAFF notes. A pending task is open here, so the customer half is held and the 24h staff
+    note goes out on its own — and fails."""
+    calls = _wire(monkeypatch, staff_ok=False, signals={"pending_task": _PENDING})
     fw._tick(NOW)
+    assert calls["tasks"] == []
     assert calls["deleted"], "a failed send must not leave the rule marked as sent"
 
 
-def test_a_partial_send_keeps_the_reservation(monkeypatch):
-    """One recipient bounced, another got it. Retrying would re-nag the one who did."""
-    calls = _wire(monkeypatch)
+def test_a_task_is_kept_even_when_the_estimator_email_fails(monkeypatch):
+    """Unlike an email, a task nobody was emailed about is still on the bell and the board, so
+    releasing it would only lose the record and raise it again next tick."""
+    calls = _wire(monkeypatch, staff_ok=False)
+    fw._tick(NOW)
+    assert calls["tasks"] and calls["deleted"] == []
+
+
+def test_a_partial_send_still_counts_as_sent(monkeypatch):
+    """One recipient bounced, another got it. Retrying would re-nag the one who did. The rule now
+    lives where customer email is sent — the estimator's send of a task (send_task_email) — and
+    True there is what keeps the task from being reopened."""
+    _wire(monkeypatch)
     sent = {"n": 0}
 
     def _one_ok(addr, url, proj, tmpl, **k):
@@ -134,8 +211,9 @@ def test_a_partial_send_keeps_the_reservation(monkeypatch):
         return sent["n"] == 1        # first succeeds, second fails
 
     monkeypatch.setattr(fw.email_sender, "send_followup", _one_ok)
-    fw._tick(NOW)
-    assert calls["deleted"] == []
+    tpl = {"title": "Checking in", "body": "Hi {first_name},\n\n{link}", "cta": "View"}
+    assert fw.send_task_email(_proposal(), "checkin", True, tpl) is True
+    assert sent["n"] == 2
 
 
 def test_the_kill_switch_stops_everything(monkeypatch):
@@ -171,11 +249,16 @@ def test_a_proposal_approved_since_the_list_was_built_is_not_nagged_to_approve(m
                  cycle_viewed_at=ENROLLED, deposit_status="pending")
     monkeypatch.setattr(fw.db, "get_proposal", lambda pid: fresh)
     fw._tick(NOW)
-    sent = [c["template"] for c in calls["customer"]]
+    # Remind-only: the reminder is a TASK now, never an email (decision 1). The property is the
+    # same one — what is raised for the estimator to send is the deposit reminder, not a
+    # proposal-chasing one.
+    assert calls["customer"] == []
+    raised = [t["detail"]["template"] for t in calls["tasks"]]
     for chasing in ("not_viewed", "next_steps", "second_nudge", "checkin"):
-        assert chasing not in sent, (
+        assert chasing not in raised, (
             "a customer who approved since the list was built is still being asked to approve")
-    assert sent and set(sent) == {"deposit_nudge"}, sent
+    assert raised and set(raised) == {"deposit_nudge"}, raised
+    assert calls["tasks"][0]["detail"]["stage"] == "deposit"
 
 
 def test_a_proposal_approved_AND_PAID_since_the_list_was_built_is_skipped(monkeypatch):
@@ -223,29 +306,35 @@ def test_one_bad_proposal_does_not_end_the_sweep(monkeypatch):
 
     monkeypatch.setattr(fw.db, "get_proposal", _get)
     fw._tick(NOW)
-    assert calls["customer"], "the healthy proposal must still be chased"
+    assert calls["tasks"], "the healthy proposal must still be chased"
 
 
 def test_the_deposit_sentence_follows_the_proposal_flag(monkeypatch):
-    """Telling a GC we need a deposit on a job sent without one is simply wrong."""
+    """Telling a GC we need a deposit on a job sent without one is simply wrong. Asserted where
+    the customer email is now sent — the estimator's send of a task."""
     viewed = _proposal(proposal_status="viewed", cycle_viewed_at=NOW - timedelta(hours=25),
                        deposit_required=False)
     calls = _wire(monkeypatch, proposal=viewed)
     fw._tick(NOW)
+    assert calls["tasks"][0]["detail"]["template"] == "next_steps"
+    tpl = {"title": "Next", "body": "We need {need}.\n\n{link}", "cta": "Review"}
+    fw.send_task_email(viewed, "next_steps", False, tpl)
     assert calls["customer"][0]["deposit"] is False
     assert calls["customer"][0]["template"] == "next_steps"
 
 
 def test_the_status_ask_appears_only_on_the_recurring_stage(monkeypatch):
+    """Carried on the task, so the estimator's send includes the escape hatch exactly where the
+    automatic email did."""
     early = _proposal(proposal_status="viewed", cycle_viewed_at=NOW - timedelta(hours=25))
     calls = _wire(monkeypatch, proposal=early)
     fw._tick(NOW)
-    assert calls["customer"][0]["ask"] is False
+    assert calls["tasks"][0]["detail"]["include_status_ask"] is False
 
     late = _proposal(proposal_status="viewed", cycle_viewed_at=NOW - timedelta(hours=150))
     calls2 = _wire(monkeypatch, proposal=late)
     fw._tick(NOW)
-    assert calls2["customer"][0]["ask"] is True
+    assert calls2["tasks"][0]["detail"]["include_status_ask"] is True
 
 
 def test_an_unassigned_proposal_still_reaches_a_human(monkeypatch):
@@ -307,51 +396,49 @@ def test_anything_that_is_not_an_explicit_yes_leaves_automation_off(monkeypatch)
 # Hanz, 2026-08-19: "For the Email follow ups, can it appear in the ChatBox and a history of the
 # follow ups." A customer who reads the portal rather than their inbox used to watch the thread go
 # silent while six emails went out, and staff had no shared record of what had been chased.
-def test_a_sent_reminder_appears_in_the_thread(monkeypatch):
+def test_a_raised_task_appears_in_the_thread_for_staff_only(monkeypatch):
+    """Was: test_a_sent_reminder_appears_in_the_thread. On this step the tick used to write a
+    customer-visible "Reminder sent" row, because it had emailed them. Under remind-only it emails
+    nobody outside the company, so the honest record is ONE internal card saying a follow-up is due
+    and that nothing has gone to the customer yet."""
     calls = _wire(monkeypatch)
     fw._tick(NOW)
-    # TWO rows on this step, because it sends twice: the customer's reminder and the
-    # estimator's. The customer's is the one WITHOUT meta.internal, and it is picked by that
-    # flag rather than by position so this keeps asserting the customer's card if the order
-    # the cadence returns its dues ever changes.
-    assert len(calls["thread"]) == 2, calls["thread"]
-    echo = next(m for m in calls["thread"] if not (m["meta"] or {}).get("internal"))
-    # `system` because both screens already render that as a card — the customer's app.js and the
-    # staff drawer's portal.js — and because it sits inside the existing msg_type CHECK constraint,
-    # so this needed no migration.
-    assert echo["msg_type"] == "system"
-    assert echo["meta"]["followup"] is True, "not marked machine-sent, so it will ring the bell"
+    assert len(calls["thread"]) == 1, calls["thread"]
+    card = calls["thread"][0]
+    assert card["msg_type"] == "system"
+    assert card["meta"]["internal"] is True, "a staff-only note is in the customer's thread"
+    assert card["meta"]["template"] == "staff_followup_due"
+    assert card["meta"]["task_id"] == 7
+    assert "nothing has gone to them" in card["body"].lower()
     # Written as "Heading — detail": both renderers split on the dash for the card's title.
-    assert " — " in echo["body"], echo["body"]
+    assert 0 < card["body"].find(" — ") <= 60, card["body"]
 
 
 def test_the_wording_is_what_we_would_say_to_the_customers_face(monkeypatch):
-    """The customer sees this row in their own thread. Our internal vocabulary for the cadence —
+    """The customer sees this row in their own thread when an estimator SENDS a follow-up (the
+    send endpoint echoes through _echo_to_thread). Our internal vocabulary for the cadence —
     "nudge", "chase", "second nudge", the rule keys, the template names — reads as being told off
     when it is pointed at the person it describes.
 
     Mutation: echo `due.template` or `due.rule_key` instead of a sentence."""
     calls = _wire(monkeypatch)
-    fw._tick(NOW)
-    body = next(m for m in calls["thread"]
-                if not (m["meta"] or {}).get("internal"))["body"].lower()
+    fw._echo_to_thread("p1", rules.Due("c1:nv1", "customer", "not_viewed"), {"task_id": 7})
+    row = calls["thread"][0]
+    body = row["body"].lower()
     for word in ("nudge", "chase", "cadence", "not_viewed", "rule", "template"):
         assert word not in body, "internal wording reached the customer: %r" % body
     assert "we emailed you" in body, body
+    assert row["meta"]["followup"] is True and not row["meta"].get("internal")
+    assert row["meta"]["task_id"] == 7
 
 
 def test_nothing_is_written_when_the_email_did_not_go(monkeypatch):
     """The reservation is released and retried, so a row here would claim we wrote to somebody we
-    never reached — and the retry would then write a second one.
-
-    BOTH halves of the step fail here, because both halves now write. With only the customer
-    send failing, the estimator's email still went out and its own row is legitimate — which
-    is what the pair of assertions below pins: an attempt was made on each side, and neither
-    left a record."""
-    calls = _wire(monkeypatch, send_ok=False, staff_ok=False)
+    never reached — and the retry would then write a second one. With a task already open the
+    staff note is the only send on this step, and it fails."""
+    calls = _wire(monkeypatch, staff_ok=False, signals={"pending_task": _PENDING})
     fw._tick(NOW)
-    assert calls["customer"], "the test needs a send attempt to have happened"
-    assert calls["staff"], "the estimator's half was never attempted either"
+    assert calls["staff"], "the test needs a send attempt to have happened"
     assert calls["thread"] == []
 
 
@@ -366,7 +453,9 @@ def test_nothing_is_written_when_the_email_did_not_go(monkeypatch):
 # reader that opts out (main.py, include_internal=True). So wording written for an estimator
 # reaches the estimator and stops there.
 _STAFF_TEMPLATES = ("staff_not_viewed", "staff_personal_followup",
-                    "staff_deposit_outstanding", "staff_pause_expired")
+                    "staff_deposit_outstanding", "staff_pause_expired",
+                    # Remind-only (2026-10-23): the card for a raised follow-up task.
+                    "staff_followup_due")
 
 
 class _Due:
@@ -501,6 +590,7 @@ def test_the_staff_wording_is_written_for_an_estimator(thread):
     assert "read" in by["staff_personal_followup"]
     assert "deposit" in by["staff_deposit_outstanding"]
     assert "delay" in by["staff_pause_expired"]
+    assert "nothing has gone" in by["staff_followup_due"]
     assert len(set(by.values())) == len(_STAFF_TEMPLATES), "two reminders say the same thing"
 
 
@@ -523,21 +613,26 @@ def test_an_unmapped_template_still_says_nothing(thread):
     assert db.list_messages("p1", include_internal=True) == []
 
 
-def test_the_tick_records_both_halves_of_the_same_step(monkeypatch, thread):
-    """End to end through the cadence rather than at the helper. The not-viewed step sends twice —
-    the customer's reminder and the estimator's — and the Chat box has to show both, with only one
-    of them visible to the customer.
+def test_the_tick_records_the_step_for_staff_and_tells_the_customer_nothing(monkeypatch, thread):
+    """End to end through the cadence rather than at the helper.
 
-    Mutation: restore the `if due.audience != "customer": return` early return."""
+    Was: test_the_tick_records_both_halves_of_the_same_step, which asserted the customer's
+    "Reminder sent" row AND the estimator's. Under remind-only (decisions 1-2) the customer is not
+    emailed on this step, so there is no customer row to record; the 24h not-opened staff note is
+    folded into the follow-up-due email (one email about one moment), and the thread gets exactly
+    one card — internal, so the customer's copy of the thread is untouched.
+
+    Mutation: echo the task as a non-internal row, or send the folded staff note as well."""
     calls = _wire(monkeypatch)
     # Un-stub the writer: this test wants the real INSERT, into the fake thread above.
     monkeypatch.setattr(fw.db, "add_message", _REAL_ADD_MESSAGE)
     fw._tick(NOW)
-    assert [c["template"] for c in calls["customer"]] == ["not_viewed", "not_viewed"]
-    assert calls["staff"], "the estimator's half of the step never sent"
+    assert calls["customer"] == []
+    assert len(calls["staff"]) == 1, "the folded staff note went out as a second email"
+    assert "nv1_staff" in " ".join(calls["reserved"]), "the folded note was not consumed"
     both = db.list_messages("p1", include_internal=True)
-    assert [r["meta"]["template"] for r in both] == ["not_viewed", "staff_not_viewed"]
-    assert [r["meta"]["template"] for r in db.list_messages("p1")] == ["not_viewed"]
+    assert [r["meta"]["template"] for r in both] == ["staff_followup_due"]
+    assert db.list_messages("p1") == []
 
 
 def test_a_staff_reminder_cannot_reach_the_customers_notification_bell(monkeypatch):

@@ -179,3 +179,64 @@ def test_deposit_required_defaults_true_for_legacy_rows(pipeline):
     assert card["deposit_required"] is True
     off, = pipeline([_row(deposit_required=False)])
     assert off["deposit_required"] is False
+
+
+# ── the next follow-up date (remind-only, 2026-10-23) ────────────────────────
+# THE BUG: the board's "next follow-up" is followup_rules.next_due_at over the pipeline row, and the
+# pipeline query never selected cycle_viewed_at. For every VIEWED proposal next_due_at therefore saw
+# no view and computed the not-viewed track's date — anchored on the send, not the view, on the
+# wrong step of the ladder. The worker reads `select *`, so it acted on a different schedule from
+# the one the board showed.
+import followup_rules as _fr
+
+_ALL_DAY = {"send_start_hour": 0, "send_end_hour": 24}
+
+
+def test_the_board_query_selects_every_field_the_schedule_reads(monkeypatch):
+    """The regression for the omission itself, and for the next one: every key next_due_at reads
+    (followup_rules.INPUT_KEYS) must come out of this SELECT, as a column or an alias."""
+    seen = {}
+    monkeypatch.setattr(main.db, "qall", lambda sql, params=(): seen.update(sql=sql) or [])
+    main.db.list_all_portal_proposals()
+    flat = " ".join(seen["sql"].split())
+    select = flat[:flat.rindex(" from public.portal_proposals p ")]
+    missing = [k for k in _fr.INPUT_KEYS
+               if ("p.%s," % k) not in select and ("p.%s " % k) not in select
+               and (" as %s," % k) not in select and (" as %s " % k) not in select
+               and not select.endswith(" as %s" % k)]
+    assert not missing, "the board computes next_due_at without: %s" % missing
+
+
+def test_a_viewed_proposal_shows_the_viewed_tracks_date(pipeline):
+    now = dt.datetime.now(dt.timezone.utc)
+    viewed = now - dt.timedelta(hours=2)
+    row = _row(proposal_status="viewed", followup_enrolled_at=now - dt.timedelta(hours=100),
+               cycle_viewed_at=viewed, viewed_at=viewed,
+               created_at=now - dt.timedelta(hours=100))
+    card, = pipeline([row])
+    got = dt.datetime.fromisoformat(card["next_followup_at"])
+    # Pinned against due_now's OWN math, not against next_due_at: nothing is due a minute before
+    # the date the board shows, and the viewed track's first step (v1) is due a minute after.
+    before = [d for d in _fr.due_now(row, got - dt.timedelta(minutes=1), _ALL_DAY)
+              if d.audience == "customer"]
+    after = [d for d in _fr.due_now(row, got + dt.timedelta(minutes=1), _ALL_DAY)
+             if d.audience == "customer"]
+    assert before == [] and [d.rule_key.split(":")[-1] for d in after] == ["v1"], (got, after)
+    assert got == viewed + dt.timedelta(hours=24)
+    # And the old computation — the same row with the view missing, as the query delivered it —
+    # really was different, so this test would have caught the bug.
+    blind = dict(row, cycle_viewed_at=None)
+    assert _fr.next_due_at(blind, now) != got
+
+
+def test_the_card_carries_the_open_task_and_the_plan(pipeline):
+    task = {"id": 12, "created_at": "2026-10-20T15:00:00+00:00",
+            "detail": {"status": "pending", "template": "checkin", "stage": "pre"}}
+    card, = pipeline([_row(pending_task=task, followup_interval_days=5)])
+    assert card["followup_task"] == {"id": 12, "status": "pending", "template": "checkin",
+                                     "label": "Recurring check-in", "stage": "pre",
+                                     "due_at": "2026-10-20T15:00:00+00:00"}
+    assert card["followup_plan"]["interval_days"] == 5
+    assert card["followup_plan"]["mode"] == "remind"
+    none, = pipeline([_row()])
+    assert none["followup_task"] is None

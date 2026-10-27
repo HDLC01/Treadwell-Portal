@@ -261,7 +261,23 @@ def set_recipients(proposal_id: str, emails: list[str], added_by: Optional[str] 
 # ── admin (publish + pipeline) ──────────────────────────────────────────────────
 def create_portal_proposal(proposal_id, token, customer_email, customer_name, project_name, pdf_path,
                            published_by, deposit_required: bool = True,
-                           revision_no: Optional[int] = None) -> None:
+                           revision_no: Optional[int] = None,
+                           scope_group: Optional[str] = None,
+                           scope_label: Optional[str] = None) -> None:
+    """A new portal row. A SCOPE writes its group in the SAME insert, so a database without the
+    scope-group DDL refuses the whole row instead of leaving a visible, ungrouped, un-emailed one
+    (findings #24/#40). An ungrouped row's insert is exactly what it always was."""
+    if scope_group:
+        execute(
+            "insert into public.portal_proposals "
+            "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, "
+            "published_by, deposit_required, current_revision_no, scope_group, scope_label) "
+            "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (proposal_id, token, customer_email, customer_name, project_name, pdf_path,
+             published_by, bool(deposit_required),
+             None if revision_no is None else int(revision_no), scope_group, scope_label or None),
+        )
+        return
     execute(
         "insert into public.portal_proposals "
         "(proposal_id, token, customer_email, customer_name, project_name, pdf_path, published_by, "
@@ -287,6 +303,417 @@ def update_portal_proposal(proposal_id, customer_email, customer_name, project_n
          None if deposit_required is None else bool(deposit_required),
          None if revision_no is None else int(revision_no), proposal_id),
     )
+
+
+def scope_group_columns_ready() -> bool:
+    """Does this database have portal_proposals.scope_group and scope_label? Read only: the
+    capability handshake (GET /api/admin/capabilities) says "no scope groups" rather than let a
+    grouped publish be refused after the tool has already minted a revision. Any failure is "no"."""
+    try:
+        q1("select scope_group, scope_label from public.portal_proposals limit 0")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("scope-group columns not readable: %s", exc)
+        return False
+
+
+# Fix round #29/#30: the remind-only DDL that every follow-up task needs. Without the widened kind
+# CHECK a task insert raises CheckViolation (caught and only logged: the worker raises nothing and an
+# approval files no "decide the other scopes" task), and without the two v2 indexes the dedupe and
+# the one-open-task-per-stage slot are not what the code relies on. Catalog reads only.
+_FOLLOWUP_DDL_SQL = (
+    "select "
+    # No CHECK on portal_followups that names `kind` may leave 'followup_task' out. (No such CHECK
+    # at all also admits it.) strpos, not LIKE: a `%` would collide with the driver's markers.
+    " not exists (select 1 from pg_constraint c "
+    "   where c.conrelid = 'public.portal_followups'::regclass and c.contype = 'c' "
+    "     and strpos(pg_get_constraintdef(c.oid), 'kind') > 0 "
+    "     and strpos(pg_get_constraintdef(c.oid), 'followup_task') = 0) as kind_ok, "
+    " exists (select 1 from pg_indexes where schemaname = 'public' "
+    "   and indexname = 'portal_followups_one_open_task_v2_uidx') as open_ok, "
+    " exists (select 1 from pg_indexes where schemaname = 'public' "
+    "   and indexname = 'portal_followups_rule_v2_uidx') as rule_ok")
+_FOLLOWUP_DDL_CACHE: dict = {"at": None, "value": False}
+
+
+def followup_tasks_ready(max_age: float = 5.0) -> bool:
+    """Does this database have the remind-only DDL (the kind CHECK admits 'followup_task', and the
+    one_open_task_v2 and rule_v2 indexes exist)? Read only, cached for `max_age` seconds because
+    the capability route is polled by the tool. Any failure is "no"."""
+    import time
+
+    now = time.monotonic()
+    at = _FOLLOWUP_DDL_CACHE["at"]
+    if at is not None and now - at < max_age:
+        return _FOLLOWUP_DDL_CACHE["value"]
+    try:
+        row = q1(_FOLLOWUP_DDL_SQL) or {}
+        value = bool(row.get("kind_ok") and row.get("open_ok") and row.get("rule_ok"))
+        if not value:
+            log.warning("remind-only DDL incomplete: %s", row)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("remind-only DDL not readable: %s", exc)
+        value = False
+    _FOLLOWUP_DDL_CACHE.update(at=now, value=value)
+    return value
+
+
+def set_scope_group(proposal_id: str, group_id: str, label: Optional[str]) -> None:
+    """Link this proposal to its scope group (see the scope-group block at the end of schema.sql).
+
+    Only ever called when the draft CARRIES a scope_group, so a legacy publish never reaches it and
+    the columns of an ungrouped row are never written, not even with NULL. Named directly rather
+    than through to_jsonb: a write to a column that is not there must fail loudly, because a scope
+    that silently failed to join its group would be emailed nowhere at all."""
+    execute("update public.portal_proposals set scope_group=%s, scope_label=%s, updated_at=now() "
+            "where proposal_id=%s", (group_id, label or None, proposal_id))
+
+
+def list_scope_group(group_id: str) -> list[dict[str, Any]]:
+    """Every live (not deleted) proposal in one scope group, in the order they were published.
+
+    STAFF / SERVER USE ONLY. This is the whole group regardless of who each scope was sent to, so
+    it must never be what a customer's sibling list is built from -- that list comes from
+    list_proposals_by_email, which applies the customer's own primary-OR-recipient scoping."""
+    return qall(
+        "select * from public.portal_proposals "
+        "where scope_group = %s and (to_jsonb(portal_proposals) ->> 'deleted_at') is null "
+        "order by created_at, proposal_id",
+        (group_id,),
+    )
+
+
+def list_scope_group_drafts(group_id: str) -> list[str]:
+    """The LIVE member draft ids the PROPOSAL TOOL has in a group, published or not.
+
+    The combined send compares this with list_scope_group to refuse a partial first send: a scope
+    that has been split off in the tool but not yet published has no portal row, so only the drafts
+    table knows it exists. Membership is scope_groups.split_members, the one rule everything uses:
+    a trashed, archived or wrong-kind (Test in a real project) draft is not expected."""
+    import scope_groups
+
+    return scope_groups.split_members(list_scope_group_draft_states(group_id))[0]
+
+
+def list_scope_group_draft_states(group_id: str) -> list[dict[str, Any]]:
+    """`[{"id", "archived", "is_test", "project_name"}]` for every non-deleted draft that carries
+    this scope group. The raw facts scope_groups.split_members decides membership from.
+
+    `archived` and `is_test` live inside the draft blob (the tool's drafts.set_archived and
+    set_test_flag); `is_test` is a tri-state, so it is handed over raw (None = nobody has said, and
+    the project name decides)."""
+    return [{"id": r["id"], "archived": bool(r.get("archived")), "is_test": r.get("is_test"),
+             "project_name": r.get("project_name")} for r in qall(
+        "select id, coalesce(data ->> 'archived', '') = 'true' as archived, "
+        "data ->> 'is_test' as is_test, data ->> 'project_name' as project_name "
+        "from public.drafts "
+        "where deleted_at is null and data -> 'scope_group' ->> 'id' = %s order by id",
+        (group_id,),
+    )]
+
+
+def list_scope_group_draft_states_many(group_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """list_scope_group_draft_states for several groups in ONE query: {group id: states}, every
+    asked-for group present (an empty list when no draft carries it).
+
+    For the board (fix round #20): the drafts table has no index the portal can use on
+    data->'scope_group'->>'id' (portal_app may only SELECT it), so each read detoasts every draft.
+    Once per board request, not once per group per request."""
+    gids = sorted({g for g in group_ids or [] if g})
+    out: dict[str, list[dict[str, Any]]] = {g: [] for g in gids}
+    if not gids:
+        return out
+    for r in qall(
+            "select data -> 'scope_group' ->> 'id' as gid, id, "
+            "coalesce(data ->> 'archived', '') = 'true' as archived, "
+            "data ->> 'is_test' as is_test, data ->> 'project_name' as project_name "
+            "from public.drafts "
+            "where deleted_at is null and data -> 'scope_group' ->> 'id' = any(%s) order by id",
+            (gids,)):
+        out.setdefault(r["gid"], []).append(
+            {"id": r["id"], "archived": bool(r.get("archived")), "is_test": r.get("is_test"),
+             "project_name": r.get("project_name")})
+    return out
+
+
+def list_scope_group_history(group_id: str) -> list[dict[str, Any]]:
+    """Every proposal that is or was part of one scope group's follow-up, DELETED ones included:
+    the rows that carry the group, plus any row a group follow-up row was filed on (a former home
+    keeps the group's sent tasks, its staff_email touch and its anchor stamp after it is closed,
+    deleted or taken out of the group). `group_tagged` says whether the row holds such a follow-up.
+
+    Read by followup_worker.group_state_for so the group's last estimator touch and its counted
+    reminders survive a re-home (followup_rules.group_state's `history`). Read only."""
+    return qall(
+        "select p.*, exists(select 1 from public.portal_followups f "
+        "                   where f.proposal_id = p.proposal_id "
+        "                     and f.detail->>'scope_group' = %s) as group_tagged "
+        "from public.portal_proposals p "
+        "where p.scope_group = %s or p.proposal_id in ("
+        "  select f2.proposal_id from public.portal_followups f2 "
+        "   where f2.detail->>'scope_group' = %s) "
+        "order by p.created_at, p.proposal_id",
+        (group_id, group_id, group_id),
+    )
+
+
+def list_open_group_tasks(group_id: str) -> list[dict[str, Any]]:
+    """Every OPEN (pending/sending) follow-up task filed for one scope group, on any proposal --
+    the group's reminder task on its home scope, and any "decide the other scopes" task. Not
+    filtered on deleted rows on purpose: a task left on a deleted home is exactly what re-homing
+    has to find and expire."""
+    return qall(
+        "select id, proposal_id, detail, created_at from public.portal_followups "
+        "where kind = 'followup_task' and detail->>'status' in ('pending','sending') "
+        "  and detail->>'scope_group' = %s order by id",
+        (group_id,),
+    )
+
+
+_SCOPE_RESUME = "scope_group_resume"
+
+
+def scope_group_resumed_at(group_id: str) -> Any:
+    """When somebody last chose 'keep chasing the other scopes' for this group, or None. Read by
+    followup_rules.group_chase_stopped: newer than the latest approval -> the group chase runs."""
+    row = q1("select max(created_at) as at from public.portal_followups "
+             "where kind = 'staff_note' and detail->>'action' = %s "
+             "  and detail->>'scope_group' = %s", (_SCOPE_RESUME, group_id))
+    return (row or {}).get("at")
+
+
+def followup_rule_key_exists(proposal_id: str, rule_key: str) -> bool:
+    """Has this occurrence already been reserved (an automated email or a task)? Read-only; the
+    dry run uses it to say what the next tick would REALLY raise after the dedupe index."""
+    row = q1("select 1 as hit from public.portal_followups "
+             "where proposal_id = %s and kind in ('auto_email','followup_task') "
+             "  and detail->>'rule_key' = %s limit 1", (proposal_id, rule_key))
+    return bool(row)
+
+
+_SCOPE_SENT = "scope_group_sent"
+
+
+_MARKS_SQL = ("select id, proposal_id, detail, created_at from public.portal_followups "
+              "where kind = 'staff_note' and detail ->> 'action' = %s ")
+
+
+def list_scope_group_marks(group_ids: list[str]) -> list[dict[str, Any]]:
+    """Every `scope_group_sent` mark of these groups: `[{id, proposal_id, detail, created_at}]`.
+    What scope_groups.scope_states reads to say which scopes the customer has been told about."""
+    gids = sorted({g for g in group_ids or [] if g})
+    if not gids:
+        return []
+    return qall(_MARKS_SQL + "and detail ->> 'scope_group' = any(%s) order by id",
+                (_SCOPE_SENT, gids))
+
+
+def _lock_scope_rows(conn, ids: list[str]) -> list[dict[str, Any]]:
+    """Lock the scopes `for update` in a fixed order and read what the send plan needs. A second
+    caller blocks here until the first commits, then reads its marks (READ COMMITTED takes a fresh
+    snapshot per statement), so two simultaneous sends cannot both claim a scope.
+    `last_sent_at` through to_jsonb, like every column prod may get after the code."""
+    return conn.execute(
+        "select proposal_id, current_revision_no, "
+        "(to_jsonb(p) ->> 'last_sent_at') as last_sent_at "
+        "from public.portal_proposals p where proposal_id = any(%s) "
+        "order by proposal_id for update", (ids,)).fetchall()
+
+
+def claim_scope_group_send(group_id: str, proposal_ids: list[str],
+                           by: Optional[str] = None,
+                           include_unknown: bool = False) -> Optional[dict[str, Any]]:
+    """Claim the scopes of one group that the customer has NOT been told about yet.
+
+    Returns `{"send_no", "pending", "kinds", "first", "revisions"}` (scope_groups.plan_send) or None
+    when every scope in `proposal_ids` is already announced at its current revision or is being
+    sent right now: that None is what makes a double click, a retried request or a second tab safe.
+
+    RESERVE FIRST, SEND SECOND, exactly as the follow-up worker does. The record is a `staff_note`
+    row with `detail.action = 'scope_group_sent'` per claimed scope carrying `revision_no` and
+    `kind`; settle_scope_group_send adds who it reached (`delivery`). Until then it is IN FLIGHT and
+    holds the scope for scope_groups.INFLIGHT_TTL. A process that dies BEFORE the first email
+    (no `attempt_at`, mark_scope_group_attempt) leaves a mark that stops counting after that; one
+    that dies after it leaves the scope 'unknown', which only `include_unknown` (a person's
+    decision) sends again. Rows, not a column: no DDL."""
+    import scope_groups
+
+    order = [p for p in dict.fromkeys(proposal_ids or []) if p]
+    ids = sorted(order)
+    if not ids:
+        return None
+    with pool().connection() as conn:
+        locked = {r["proposal_id"]: r for r in _lock_scope_rows(conn, ids)}
+        now = conn.execute("select now() as now").fetchone()["now"]
+        # The WHOLE group's marks: plan_send reads only the claimed scopes' marks for what is
+        # pending, and every mark for `first` (a closed scope's earlier send still counts).
+        marks = conn.execute(_MARKS_SQL + "and detail ->> 'scope_group' = %s order by id",
+                             (_SCOPE_SENT, group_id)).fetchall()
+        rows = [locked[p] for p in order if p in locked]
+        plan = scope_groups.plan_send(rows, marks, now, include_unknown=include_unknown)
+        if not plan["pending"]:
+            return None
+        row = conn.execute(
+            "select coalesce(max((detail ->> 'send_no')::int), 0) as n "
+            "from public.portal_followups where kind = 'staff_note' "
+            "  and detail ->> 'action' = %s and detail ->> 'scope_group' = %s",
+            (_SCOPE_SENT, group_id)).fetchone()
+        n = int((row or {}).get("n") or 0) + 1
+        revisions = {}
+        for pid in plan["pending"]:
+            rev = locked[pid].get("current_revision_no")
+            revisions[pid] = rev
+            conn.execute(
+                "insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+                "values (%s, 'staff_note', %s, %s)",
+                (pid, Jsonb({"action": _SCOPE_SENT, "scope_group": group_id, "send_no": n,
+                             "revision_no": rev, "kind": plan["kinds"][pid],
+                             "scopes": plan["pending"]}), by))
+    return {"send_no": n, "pending": plan["pending"], "kinds": plan["kinds"],
+            "first": plan["first"], "revisions": revisions}
+
+
+def mark_scope_group_attempt(group_id: str, send_no: int, sent_with: dict[str, dict]) -> None:
+    """Stamp a claimed send as ABOUT TO EMAIL, before the first address is tried.
+
+    `attempt_at` is what lets scope_groups.mark_status tell a send that died before mailing anybody
+    (the scope may simply be sent again) from one whose result was lost after the emails went out
+    (never re-sent on its own: the customer would get it twice). `sent_with` is
+    `{proposal_id: {"note", "files"}}`, what the email carries for that scope, kept so a
+    `retry_failed` sends the same note and files."""
+    from datetime import datetime, timezone
+
+    at = datetime.now(timezone.utc).isoformat()
+    with pool().connection() as conn:
+        for pid, extra in (sent_with or {}).items():
+            conn.execute(
+                "update public.portal_followups set detail = detail || %s "
+                "where kind = 'staff_note' and proposal_id = %s and detail ->> 'action' = %s "
+                "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s",
+                (Jsonb({"attempt_at": at, "note": (extra or {}).get("note"),
+                        "files": list((extra or {}).get("files") or [])}),
+                 pid, _SCOPE_SENT, group_id, int(send_no)))
+
+
+_SCOPE_NOTE = "scope_group_note"
+
+
+def stash_scope_group_note(proposal_id: str, group_id: str, revision_no: Optional[int],
+                           note: Optional[str], files: list[dict[str, Any]],
+                           by: Optional[str] = None) -> None:
+    """Keep the note and the files a GROUPED publish was given, for the combined email that will
+    carry them (a grouped publish emails nobody: finding #17). `files` are uploads.store records
+    already on disk under this proposal. Read back by list_scope_group_notes."""
+    execute("insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+            "values (%s, 'staff_note', %s, %s)",
+            (proposal_id, Jsonb({"action": _SCOPE_NOTE, "scope_group": group_id,
+                                 "revision_no": revision_no, "note": note,
+                                 "files": list(files or [])}), by))
+
+
+def list_scope_group_notes(group_id: str, proposal_ids: list[str]) -> list[dict[str, Any]]:
+    """The stashed publish notes of these scopes (scope_groups.stashed_extras picks the current
+    one per scope)."""
+    ids = sorted({p for p in proposal_ids or [] if p})
+    if not ids:
+        return []
+    return qall(_MARKS_SQL + "and detail ->> 'scope_group' = %s and proposal_id = any(%s) "
+                "order by id", (_SCOPE_NOTE, group_id, ids))
+
+
+def settle_scope_group_send(group_id: str, send_no: int, delivery: dict[str, dict]) -> None:
+    """Record who each claimed scope reached: `{proposal_id: {"delivered": [...], "failed": [...]}}`.
+
+    A scope that reached NOBODY loses its mark (it is not announced, and the next send can try it
+    again); a scope that reached somebody keeps it with the delivery list, which is where
+    `retry_failed` reads the addresses to try again. One transaction for the whole send."""
+    where = ("where kind = 'staff_note' and proposal_id = %s and detail ->> 'action' = %s "
+             "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s")
+    with pool().connection() as conn:
+        for pid, dv in (delivery or {}).items():
+            args = (pid, _SCOPE_SENT, group_id, int(send_no))
+            if (dv or {}).get("delivered"):
+                conn.execute("update public.portal_followups set detail = detail || %s " + where,
+                             (Jsonb({"delivery": {"delivered": list(dv.get("delivered") or []),
+                                                  "failed": list(dv.get("failed") or [])}}),)
+                             + args)
+            else:
+                conn.execute("delete from public.portal_followups " + where, args)
+
+
+def release_scope_group_send(group_id: str, send_no: int) -> None:
+    """Undo a claim whose send reached nobody, so the next call can try again."""
+    execute("delete from public.portal_followups "
+            "where kind = 'staff_note' and detail ->> 'action' = %s "
+            "  and detail ->> 'scope_group' = %s and (detail ->> 'send_no')::int = %s",
+            (_SCOPE_SENT, group_id, int(send_no)))
+
+
+def claim_scope_group_retry(group_id: str, proposal_ids: list[str]) -> dict[str, dict]:
+    """`{proposal_id: {"mark_id", "failed", "kind"}}`: the addresses that did not get each scope's
+    latest email (scope_groups.retry_targets), claimed by stamping `retry_at` on the mark under the
+    same row lock as a send, so two retries cannot both mail them. {} = nothing to retry."""
+    import scope_groups
+
+    ids = sorted({p for p in proposal_ids or [] if p})
+    if not ids:
+        return {}
+    with pool().connection() as conn:
+        rows = _lock_scope_rows(conn, ids)
+        now = conn.execute("select now() as now").fetchone()["now"]
+        marks = conn.execute(_MARKS_SQL + "and detail ->> 'scope_group' = %s "
+                             "and proposal_id = any(%s) order by id",
+                             (_SCOPE_SENT, group_id, ids)).fetchall()
+        targets = scope_groups.retry_targets(rows, marks, now)
+        for t in targets.values():
+            conn.execute("update public.portal_followups set detail = detail || %s where id = %s",
+                         (Jsonb({"retry_at": now.isoformat()}), t["mark_id"]))
+    return targets
+
+
+def settle_scope_group_retry(results: dict[int, dict]) -> None:
+    """`{mark_id: {"delivered": [...], "failed": [...]}}` after a retry: the new delivery lists,
+    and the retry claim released."""
+    with pool().connection() as conn:
+        for mark_id, dv in (results or {}).items():
+            conn.execute(
+                "update public.portal_followups set detail = (detail - 'retry_at') || %s "
+                "where id = %s",
+                (Jsonb({"delivery": {"delivered": list(dv.get("delivered") or []),
+                                     "failed": list(dv.get("failed") or [])}}), int(mark_id)))
+
+
+def adopt_into_scope_group(proposal_id: str, group_id: str, label: Optional[str]) -> None:
+    """Put an EXISTING portal row into its scope group, before anything else about a publish or a
+    send touches it.
+
+    The columns are named directly, so on a database without the scope-group DDL this raises
+    BEFORE a customer-visible write (findings #24/#40). And a row the customer was already emailed
+    as an ordinary proposal (a project sent, then given "New scope": findings #1/#2) gets an
+    `adopted` mark at the revision it was sent at, so it counts as announced -- and a later revision
+    of it as revised -- instead of blocking the group or being emailed again as new."""
+    with pool().connection() as conn:
+        conn.execute("update public.portal_proposals set scope_group=%s, scope_label=%s, "
+                     "updated_at=now() where proposal_id=%s",
+                     (group_id, label or None, proposal_id))
+        row = conn.execute(
+            "select current_revision_no, (to_jsonb(p) ->> 'last_sent_at') as last_sent_at "
+            "from public.portal_proposals p where proposal_id = %s", (proposal_id,)).fetchone()
+        if not row or not row.get("last_sent_at"):
+            return
+        seen = conn.execute("select 1 as hit from public.portal_followups "
+                            "where proposal_id = %s and kind = 'staff_note' "
+                            "  and detail ->> 'action' = %s and detail ->> 'scope_group' = %s "
+                            "limit 1", (proposal_id, _SCOPE_SENT, group_id)).fetchone()
+        if seen:
+            return
+        conn.execute(
+            "insert into public.portal_followups (proposal_id, kind, detail, created_by) "
+            "values (%s, 'staff_note', %s, null)",
+            (proposal_id, Jsonb({"action": _SCOPE_SENT, "scope_group": group_id, "send_no": 0,
+                                 "revision_no": row.get("current_revision_no"),
+                                 "adopted": True, "kind": "first",
+                                 "scopes": [proposal_id]})))
 
 
 def list_all_portal_proposals() -> list[dict[str, Any]]:
@@ -326,10 +753,17 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # lookup returns NULL for an absent key instead, so the board simply shows no click
         # badge, and it starts working the moment the column lands — no restart, no cache.
         # Verified against the prod database: absent key -> NULL, present key -> identical value.
-        "(to_jsonb(p) ->> 'link_clicked_at')::timestamptz as link_clicked_at, "
-        "(to_jsonb(p) ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
+        "(pj.j ->> 'link_clicked_at')::timestamptz as link_clicked_at, "
+        "(pj.j ->> 'last_link_clicked_at')::timestamptz as last_link_clicked_at, "
         # When THIS send went out, for the same to_jsonb reason as the click columns above.
-        "(to_jsonb(p) ->> 'last_sent_at')::timestamptz as last_sent_at, "
+        "(pj.j ->> 'last_sent_at')::timestamptz as last_sent_at, "
+        # Which scope group this proposal belongs to, and its scope's name. to_jsonb for the
+        # same reason: prod gets the code before the ALTER, and NULL just means "ungrouped".
+        "(pj.j ->> 'scope_group') as scope_group, "
+        "(pj.j ->> 'scope_label') as scope_label, "
+        # Which revision the customer link points at: a scope is "announced" only at the revision
+        # its combined email named (scope_groups.scope_states), so the board's send state needs it.
+        "p.current_revision_no, "
         # Follow-up automation state.
         "p.assigned_estimator, p.followup_enrolled_at, p.followup_disabled_at, "
         "p.followup_paused_until, p.closed_lost_reason, p.closed_at, "
@@ -379,9 +813,47 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "   where f.proposal_id = p.proposal_id "
         "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
         "     and f.detail->>'action' is null) "
-        "  as last_staff_followup_at "
+        "  as last_staff_followup_at, "
+        # ── what followup_rules.next_due_at reads, all of it (followup_rules.INPUT_KEYS) ──
+        # The board's "next follow-up" date is next_due_at over THIS row. cycle_viewed_at was
+        # never selected, so for every viewed proposal next_due_at saw no view and computed the
+        # NOT-viewed track's date: anchored on the send instead of the view, and on the wrong step
+        # of the ladder. test_admin_pipeline.py now pins every input key against this select.
+        "p.cycle_viewed_at, "
+        # Remind-only (2026-10-23): the per-proposal schedule and the explicit decision stamp.
+        # Through to_jsonb for the reason the click columns above give — prod gets the code before
+        # the ALTER, and a missing column must read as NULL here, not take the board down.
+        "(pj.j ->> 'followup_anchor_at')::timestamptz as followup_anchor_at, "
+        "(pj.j ->> 'followup_next_at')::timestamptz as followup_next_at, "
+        "(pj.j ->> 'followup_interval_days')::int as followup_interval_days, "
+        "(pj.j ->> 'followup_stop_after')::int as followup_stop_after, "
+        "(pj.j ->> 'followup_mode') as followup_mode, "
+        # The touches and the reminder count, with the SAME predicates the worker reads them
+        # with (db.followup_signals). customer_replied_at above stays as it was for the board;
+        # this one leaves out auto-replies, which must not reset a reminder count.
+        + _CUSTOMER_TOUCH_SQL.format(pid="p.proposal_id") + " as customer_touch_at, "
+        + _STAFF_MESSAGE_SQL.format(pid="p.proposal_id") + " as last_staff_message_at, "
+        + _REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " as followup_reminder_times, "
+        # What a scope GROUP folds (round 3 #4): only on grouped rows, so an ungrouped row costs
+        # nothing more.
+        "(case when (pj.j ->> 'scope_group') is not null then "
+        + _GROUP_REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " end) as group_reminder_times, "
+        + _DEPOSIT_HISTORY_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " as deposit_history, "
+        # The open follow-up task, if any, so the board (polled every 25s) can show it without a
+        # second request.
+        + _ROW_OPEN_TASK_SQL + " as pending_task "
         "from public.portal_proposals p "
+        # Fix round #26: the row's jsonb, worked out ONCE (every optional column above is read
+        # from it). `offset 0` stops Postgres inlining the lateral, which would bring back one
+        # whole-row serialisation per column; measured 3x slower on the board without it.
+        "cross join lateral (select to_jsonb(p) as j offset 0) pj "
         "left join public.drafts d on d.id = p.proposal_id "
+        # The newest open group-tagged task of each scope group, once for the whole board
+        # (_ROW_OPEN_TASK_SQL's group arm reads gt.id).
+        "left join " + _GROUP_OPEN_TASKS_SQL + " gt on gt.gid = (pj.j ->> 'scope_group') "
         # A DELETED project is off the board (2026-08-24). The ONE reader of
         # portal_proposals that has to forget a row exists, together with
         # list_followup_candidates below -- see delete_proposal.
@@ -392,7 +864,7 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # the board and the Follow-ups page down together. An absent key is NULL, and NULL
         # here means live, so the board keeps working and starts filtering the moment the
         # column lands.
-        "where (to_jsonb(p) ->> 'deleted_at') is null "
+        "where (pj.j ->> 'deleted_at') is null "
         "order by p.created_at desc"
     )
 
@@ -958,12 +1430,19 @@ def set_assigned_estimator(proposal_id: str, email: Optional[str]) -> None:
             "where proposal_id=%s", ((email or None), proposal_id))
 
 
-def enroll_followup(proposal_id: str) -> None:
+def enroll_followup(proposal_id: str, keep_pause: bool = False) -> None:
     """Start (or restart) the cadence for a freshly sent proposal.
 
     Deliberately does NOT clear `followup_disabled_at`: an estimator taking a
     proposal off automation is a human decision, and sending a revision should not
-    quietly undo it. The drawer toggle is how you turn it back on."""
+    quietly undo it. The drawer toggle is how you turn it back on.
+
+    `keep_pause`: the combined scope-group email, which must never wipe a customer's own
+    "we're delayed" pause by emailing them about a new or revised scope."""
+    if keep_pause:
+        execute("update public.portal_proposals set followup_enrolled_at=now(), "
+                "cycle_viewed_at=null, updated_at=now() where proposal_id=%s", (proposal_id,))
+        return
     execute("update public.portal_proposals set followup_enrolled_at=now(), "
             "cycle_viewed_at=null, followup_paused_until=null, updated_at=now() "
             "where proposal_id=%s", (proposal_id,))
@@ -1150,6 +1629,326 @@ def reserve_followup(proposal_id: str, rule_key: str, detail: dict) -> Optional[
 def delete_followup(followup_id: int) -> None:
     """Release a reservation whose send failed outright, so the next tick retries."""
     execute("delete from public.portal_followups where id=%s", (followup_id,))
+
+
+# ── Remind-only follow-up tasks (2026-10-23) ──────────────────────────────────
+# A matured customer reminder no longer emails the customer; it raises a `followup_task` row in
+# portal_followups for the estimator to act on. Same table, same rule_key, same partial unique
+# index as the automated emails (schema.sql, portal_followups_rule_v2_uidx), so a task can never be
+# raised for an occurrence the old ladder already emailed, and a future mode that sends on a click
+# cannot double-send what a task already covered. A SECOND table was the alternative and is exactly
+# what would have let the two drift apart.
+#
+# Task state lives in `detail` (jsonb): status (pending | sending | sent | skipped | called |
+# snoozed | expired), template, stage, cycle, draft {title, body, source}, decided_by, decided_at, and
+# whatever the decision carried. A second partial unique index allows only ONE pending task per
+# proposal, so "one open task at a time" holds in the database and not only in the worker.
+
+# The touch predicates, written ONCE and used by both the worker's read (followup_signals) and the
+# board's query (list_all_portal_proposals). If these two disagreed, the board would date the next
+# follow-up off a different set of touches than the worker acts on. `{pid}` is the proposal-id
+# expression: `%s` for one proposal, `p.proposal_id` inside the pipeline.
+#
+# CUSTOMER touch: any customer-authored row — chat, emailed reply, status answer, deposit
+# submission — except an out-of-office the inbound relay recorded (meta.auto_reply). An
+# autoresponder is not the customer coming back to us, and counting it would reset their reminder
+# count (decision 3) every time they went on holiday.
+_CUSTOMER_TOUCH_SQL = (
+    "(select max(q.created_at) from public.portal_questions q "
+    "   where q.proposal_id = {pid} and q.author_kind = 'customer' "
+    "     and coalesce((q.meta ->> 'auto_reply')::boolean, false) is not true)")
+# STAFF message: an estimator writing to the customer in the thread, typed in the drawer or emailed
+# through the relay. Not the server's own signed-contract row (meta.system_doc), and not cards:
+# msg_type 'text' only. That one predicate also keeps out every staff-only row, because every
+# meta.internal row the server writes (view cards, CRM cards, staff reminder echoes) is a 'system'
+# card — so no internal predicate here, and test_internal_rows_are_not_activity keeps guarding the
+# one place it belongs.
+_STAFF_MESSAGE_SQL = (
+    "(select max(q.created_at) from public.portal_questions q "
+    "   where q.proposal_id = {pid} and q.author_kind = 'staff' and q.msg_type = 'text' "
+    "     and coalesce(q.meta ->> 'system_doc', '') <> 'true')")
+# STAFF logged outreach — the same predicate last_staff_followup_at has always used on the board.
+_STAFF_FOLLOWUP_SQL = (
+    "(select max(f.created_at) from public.portal_followups f "
+    "   where f.proposal_id = {pid} "
+    "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
+    "     and f.detail->>'action' is null)")
+# Every reminder of THIS send cycle, for the cap: tasks the estimator SENT or answered with a CALL,
+# plus the customer emails the automatic ladder sent before remind-only shipped. jsonb, so it rides
+# one column. Unordered on purpose: only the count after a point in time is used, and the board
+# query's tests locate its own trailing ORDER BY by the first occurrence of those words.
+#
+# Hanz, 2026-10-24 (decision 6): only a reminder that actually reached the customer, by email or by
+# phone, counts toward "Stop after N". A skipped or snoozed task did not, and neither did one that
+# is still open, expired, or a "decide the other scopes" task (that one is for staff).
+_REMINDER_TIMES_SQL = (
+    "(select coalesce(jsonb_agg(f.created_at), '[]'::jsonb) "
+    "   from public.portal_followups f "
+    "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
+    "    and ((f.kind = 'followup_task' and f.detail->>'status' in ('sent','called')) "
+    "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
+# The same count as a scope GROUP folds it (round 3 #4, residual #17): without the member's
+# DEPOSIT-stage tasks. A scope whose approval was retired (a revision put it back to sent) still
+# holds the deposit reminders of that approval; they were never the siblings' follow-ups and must
+# not count toward the group's "Stop after N". The single chase keeps reading the full count above
+# (its deposit cap counts them, fix round #11). Derived from the predicate above, not a copy of it.
+_REMINDER_TASK_PRED = "f.detail->>'status' in ('sent','called'))"
+if _REMINDER_TIMES_SQL.count(_REMINDER_TASK_PRED) != 1:  # the derivation below must apply
+    raise RuntimeError("_REMINDER_TIMES_SQL changed: update _GROUP_REMINDER_TIMES_SQL")
+_GROUP_REMINDER_TIMES_SQL = _REMINDER_TIMES_SQL.replace(
+    _REMINDER_TASK_PRED,
+    "f.detail->>'status' in ('sent','called') "
+    "and coalesce(f.detail->>'stage', '') <> 'deposit')")
+# The deposit chase's own history in this send cycle (fix round #11/#3), for
+# followup_rules.deposit_series_done:
+#   customer_legacy  the old ladder's recurring customer deposit emails (`:depr@`). Every customer
+#                    auto_email row is the old ladder's: remind-only never writes one.
+#   staff_legacy     the old ladder's recurring staff deposit emails (`:depsr@`) - the rows WITHOUT
+#                    the `engine` mark followup_worker now puts on every staff note it reserves.
+#   staff            every staff deposit email of the cycle, old or new (dep_staff/depsr/depst).
+#   *_legacy_last    when the newest row of each old series was reserved: the old ladder froze its
+#                    key at the cap and reserved only the latest occurrence per tick, so a chase it
+#                    finished can hold far fewer than max_recurring rows (prod's first sweep).
+# The old code capped both chases at max_recurring, so a chase that reached it had FINISHED; the
+# deposit's own cap (200) must not start it again. Regex, not LIKE: a `%` here would collide with
+# the driver's parameter markers.
+_DEPOSIT_HISTORY_SQL = (
+    "(select jsonb_build_object("
+    "   'customer_legacy', count(*) filter (where f.detail->>'audience' = 'customer' "
+    "                                         and f.detail->>'rule_key' ~ ':depr@'), "
+    "   'staff_legacy', count(*) filter (where f.detail->>'audience' = 'staff' "
+    "                                      and f.detail->>'rule_key' ~ ':depsr@' "
+    "                                      and f.detail->>'engine' is null), "
+    "   'staff', count(*) filter (where f.detail->>'audience' = 'staff' "
+    "                               and f.detail->>'rule_key' ~ ':(dep_staff$|depsr@|depst@)'), "
+    "   'customer_legacy_last', max(f.created_at) filter (where f.detail->>'audience' = 'customer' "
+    "                                         and f.detail->>'rule_key' ~ ':depr@'), "
+    "   'staff_legacy_last', max(f.created_at) filter (where f.detail->>'audience' = 'staff' "
+    "                                      and f.detail->>'rule_key' ~ ':depsr@' "
+    "                                      and f.detail->>'engine' is null)) "
+    "   from public.portal_followups f "
+    "  where f.proposal_id = {pid} and f.kind = 'auto_email' "
+    "    and f.created_at >= coalesce({enrolled}, f.created_at))")
+# The newest OPEN task (there is at most one: portal_followups_one_open_task_uidx). Open means
+# pending, or `sending` — claimed by the send endpoint and not yet confirmed. A `sending` task must
+# hold the slot: if it did not, a tick during the send would raise a second task, and putting the
+# first back to pending after a failed send would then collide with the unique index.
+_PENDING_TASK_SQL = (
+    "(select to_jsonb(t) from (select f.id, f.detail, f.created_at "
+    "   from public.portal_followups f "
+    "  where f.id = (select max(f2.id) from public.portal_followups f2 "
+    "                 where f2.proposal_id = {pid} and f2.kind = 'followup_task' "
+    "                   and f2.detail->>'status' in ('pending','sending'))) t)")
+# The board's version for ONE ROW: a scope of a group also shows the GROUP's open task, which lives
+# on the group's home scope, so every scope's drawer shows it. An ungrouped row takes the first
+# branch, which is exactly _PENDING_TASK_SQL. scope_group is read through the row's jsonb for the
+# reason every pipeline column is: prod may get this code before its ALTER.
+#
+# Written for list_all_portal_proposals ONLY: `pj.j` is that query's to_jsonb(p), worked out once per
+# row, and `gt` its join of the newest open group-tagged task per scope group (fix round #26). The
+# group arm used to be an OR over every open task in the table, a bitmap scan per grouped row.
+_GROUP_OPEN_TASKS_SQL = (
+    "(select f.detail->>'scope_group' as gid, max(f.id) as id "
+    "   from public.portal_followups f "
+    "  where f.kind = 'followup_task' and f.detail->>'status' in ('pending','sending') "
+    "    and f.detail->>'scope_group' is not null "
+    "  group by f.detail->>'scope_group')")
+#
+# WHICH task, for a grouped row (fix round #8): the row's OWN open task first -- an approved scope's
+# deposit task, the group reminder on the home, a scope taken out of the group with its own single
+# task -- never hidden behind a newer group task; then, only for an OPEN row (sent / viewed), the
+# group's newest open task (a sibling's drawer shows the group reminder or the "decide the other
+# scopes" task); last, the row's own decision task. main._apply_group_schedules then drops a group
+# task from an open row that is not a LIVE member (the drafts decide that, not SQL).
+_ROW_OPEN_TASK_SQL = (
+    "(case when (pj.j ->> 'scope_group') is null then "
+    + _PENDING_TASK_SQL.format(pid="p.proposal_id") +
+    " else (select to_jsonb(t) from (select f.id, f.proposal_id, f.detail, f.created_at "
+    "   from public.portal_followups f "
+    "  where f.id = coalesce("
+    "      (select max(f2.id) from public.portal_followups f2 "
+    "        where f2.proposal_id = p.proposal_id and f2.kind = 'followup_task' "
+    "          and f2.detail->>'status' in ('pending','sending') "
+    "          and coalesce(f2.detail->>'stage', '') <> 'decision'), "
+    "      case when p.proposal_status in ('sent','viewed') then gt.id end, "
+    "      (select max(f3.id) from public.portal_followups f3 "
+    "        where f3.proposal_id = p.proposal_id and f3.kind = 'followup_task' "
+    "          and f3.detail->>'status' in ('pending','sending')))) t)"
+    " end)")
+
+
+def followup_signals(proposal_id: str) -> dict[str, Any]:
+    """What the schedule needs beyond the proposal row, for ONE proposal (the worker's read).
+
+    Keys match followup_rules.TOUCH_KEYS / INPUT_KEYS, plus `pending_task` ({id, detail,
+    created_at} or None). Reads only tables and columns that exist before this change's DDL, so the
+    worker keeps running on a database that has not had it yet (no task can be raised there,
+    because the widened CHECK is what admits the kind)."""
+    enrolled = "(select pp.followup_enrolled_at from public.portal_proposals pp " \
+               "where pp.proposal_id = %s)"
+    sql = ("select "
+           + _CUSTOMER_TOUCH_SQL.format(pid="%s") + " as customer_touch_at, "
+           + _STAFF_FOLLOWUP_SQL.format(pid="%s") + " as last_staff_followup_at, "
+           + _STAFF_MESSAGE_SQL.format(pid="%s") + " as last_staff_message_at, "
+           + _REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
+           + " as followup_reminder_times, "
+           + _GROUP_REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
+           + " as group_reminder_times, "
+           + _DEPOSIT_HISTORY_SQL.format(pid="%s", enrolled=enrolled) + " as deposit_history, "
+           + _PENDING_TASK_SQL.format(pid="%s") + " as pending_task")
+    return q1(sql, (proposal_id,) * 10) or {}
+
+
+def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Optional[int]:
+    """Raise a follow-up task for one reminder occurrence, or None if it already exists.
+
+    Same contract as reserve_followup: the unique index on (proposal_id, rule_key) is the dedupe,
+    shared with auto_email, and the pending-per-proposal index makes a second open task a no-op
+    too. ON CONFLICT DO NOTHING with no target covers both."""
+    payload = dict(detail or {})
+    payload["rule_key"] = rule_key
+    payload.setdefault("status", "pending")
+    row = q1("insert into public.portal_followups (proposal_id, kind, detail) "
+             "values (%s,'followup_task',%s) on conflict do nothing returning id",
+             (proposal_id, Jsonb(payload)))
+    return int(row["id"]) if row else None
+
+
+def pending_followup_task_id(proposal_id: str) -> Optional[int]:
+    """The id of this proposal's open follow-up task, or None."""
+    # Never a "decide the other scopes" task: logging a call on the approved scope is not that
+    # decision, and resolving it as `called` would leave the siblings un-chased and un-closed.
+    row = q1("select max(id) as id from public.portal_followups "
+             "where proposal_id = %s and kind = 'followup_task' and detail->>'status' = 'pending' "
+             "  and coalesce(detail->>'stage', '') <> 'decision'",
+             (proposal_id,))
+    return int(row["id"]) if row and row.get("id") is not None else None
+
+
+def get_followup_task(task_id: int) -> Optional[dict[str, Any]]:
+    return q1("select id, proposal_id, kind, detail, created_by, created_at "
+              "from public.portal_followups where id = %s and kind = 'followup_task'",
+              (int(task_id),))
+
+
+def list_pending_followup_tasks(limit: int = 500) -> list[dict[str, Any]]:
+    """Every open task, oldest first, with what the staff bell needs to label it. Deleted projects
+    are left out; the worker's housekeeping expires their tasks on its next pass."""
+    return qall(
+        "select f.id, f.proposal_id, f.detail, f.created_at, "
+        "       p.project_name, p.customer_name, p.customer_email, "
+        "       coalesce(p.assigned_estimator, d.owner_email, p.published_by) as estimator_email "
+        "from public.portal_followups f "
+        "join public.portal_proposals p on p.proposal_id = f.proposal_id "
+        "left join public.drafts d on d.id = p.proposal_id "
+        "where f.kind = 'followup_task' and f.detail->>'status' = 'pending' "
+        "  and (to_jsonb(p) ->> 'deleted_at') is null "
+        "order by f.created_at asc limit %s",
+        (int(limit),),
+    )
+
+
+def decide_followup_task(task_id: int, status: str, by: Optional[str],
+                         extra: Optional[dict] = None,
+                         from_status: str = "pending") -> Optional[dict[str, Any]]:
+    """Move a task from `from_status` (pending, by default) to `status`, atomically. None if it
+    was not in `from_status` any more.
+
+    The status guard in the WHERE is the double-click and two-tab protection: the send endpoint
+    claims the task here (pending -> sending) BEFORE emailing, so a second press finds nothing to
+    claim and sends nothing, and only after the email went does it finish it (sending -> sent).
+    Reserve, then send — the worker's rule, applied to a human."""
+    patch = dict(extra or {})
+    patch.update({"status": status, "decided_by": by,
+                  "decided_at": _now_iso()})
+    return q1("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) || %s "
+              "where id = %s and kind = 'followup_task' and detail->>'status' = %s "
+              "returning id, proposal_id, detail, created_at",
+              (Jsonb(patch), int(task_id), from_status))
+
+
+def reopen_followup_task(task_id: int, extra: Optional[dict] = None) -> bool:
+    """Put a `sending` task back to pending — the send it was claimed for did not go out (or, from
+    the worker's recovery, nothing says it did). True if this call reopened it.
+
+    Guarded on `sending`, like the claim is guarded on pending: it must never resurrect a task the
+    housekeeping expired or that another request already finished. `extra` rides along — the
+    recovery flags `send_unconfirmed` so the compose box can warn before a second send."""
+    patch = dict(extra or {})
+    patch.update({"status": "pending", "decided_by": None, "decided_at": None,
+                  "sending_at": None})
+    row = q1("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) || %s "
+             "where id = %s and kind = 'followup_task' and detail->>'status' = 'sending' "
+             "returning id", (Jsonb(patch), int(task_id)))
+    return bool(row)
+
+
+def list_stale_sending_tasks(minutes: int) -> list[dict[str, Any]]:
+    """Tasks claimed for a send more than `minutes` ago and never settled: the send endpoint lost
+    its database between claiming the task and finishing or reopening it. The worker settles them
+    (followup_worker._recover_stuck_sends). A task with no `sending_at` counts as stale — it can only
+    have come from a claim this code did not write."""
+    return qall(
+        "select id, proposal_id, detail, created_at from public.portal_followups "
+        "where kind = 'followup_task' and detail->>'status' = 'sending' "
+        "  and coalesce((detail->>'sending_at')::timestamptz, created_at) "
+        "      < now() - make_interval(mins => %s) "
+        "order by id", (int(minutes),))
+
+
+def followup_task_send_recorded(task_id: int) -> bool:
+    """Did the send endpoint record that this task's email went? It writes a staff_email row
+    carrying the task id right after a send succeeds — the evidence the recovery trusts."""
+    row = q1("select 1 as hit from public.portal_followups "
+             "where kind = 'staff_email' and detail->>'task_id' = %s limit 1",
+             (str(int(task_id)),))
+    return bool(row)
+
+
+def set_followup_task_draft(task_id: int, draft: dict) -> None:
+    """Store the draft the compose box should open with (AI or default). Pending tasks only."""
+    execute("update public.portal_followups set detail = coalesce(detail, '{}'::jsonb) "
+            "  || jsonb_build_object('draft', %s::jsonb) "
+            "where id = %s and kind = 'followup_task' and detail->>'status' = 'pending'",
+            (Jsonb(draft), int(task_id)))
+
+
+def stamp_followup_anchor(proposal_id: str, clear_next: bool = True) -> None:
+    """A human decision on this proposal's follow-up: re-anchor the schedule on now.
+
+    `clear_next` drops a snooze date at the same time, because a decision made after the snooze
+    was set supersedes it. Named directly, not through to_jsonb: this is a WRITE, and a write to
+    a column the database does not have must fail loudly rather than pretend."""
+    if clear_next:
+        execute("update public.portal_proposals set followup_anchor_at = now(), "
+                "followup_next_at = null, updated_at = now() where proposal_id = %s",
+                (proposal_id,))
+    else:
+        execute("update public.portal_proposals set followup_anchor_at = now(), "
+                "updated_at = now() where proposal_id = %s", (proposal_id,))
+
+
+_UNSET = object()
+
+
+def set_followup_plan(proposal_id: str, *, next_at: Any = _UNSET, interval_days: Any = _UNSET,
+                      stop_after: Any = _UNSET) -> None:
+    """This proposal's own schedule. Only the fields passed are written; None clears one."""
+    sets, params = [], []
+    for col, val in (("followup_next_at", next_at), ("followup_interval_days", interval_days),
+                     ("followup_stop_after", stop_after)):
+        if val is not _UNSET:
+            sets.append("%s = %%s" % col)
+            params.append(val)
+    if not sets:
+        return
+    execute("update public.portal_proposals set " + ", ".join(sets)
+            + ", updated_at = now() where proposal_id = %s", tuple(params) + (proposal_id,))
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def list_followup_candidates() -> list[dict[str, Any]]:
