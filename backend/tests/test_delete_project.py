@@ -18,8 +18,10 @@ FOUR THINGS ARE PINNED HERE, and the second is the one with teeth:
   1. the row leaves the board (list_all_portal_proposals);
   2. it leaves the cadence, so nothing keeps emailing the customer from the trash
      (list_followup_candidates AND followup_rules.due_now, which is real code and runs here);
-  3. the CUSTOMER is untouched -- their link still resolves, because deleting a project off our
-     board is not the same act as revoking what somebody was already sent;
+  3. the CUSTOMER no longer sees it -- REVERSED 2026-10-28. This used to pin "deleting is not
+     revoking": the link kept working. Hanz, after a deleted proposal showed up as an extra tab on
+     a customer's project: "make sure that doesn't happen again". The link now answers 410
+     proposal_gone (test_deleted_proposal.py has the per-route proof);
   4. restoring puts the card back and leaves the chase OFF.
 
 The query tests assert the SQL rather than a result set, which is this file's established
@@ -200,7 +202,8 @@ def test_deleting_records_the_act_and_tells_the_next_reader_what_it_did(client):
     assert card["meta"] == {"crm": "status_deleted", "internal": True}, (
         "the card must be internal, or deleting a project rings the customer's bell about it")
     assert "Hanz" in card["body"], "the card does not say who did it"
-    for phrase in ("off the board", "follow-ups have stopped", "still works"):
+    # "no longer available", not "still works": since 2026-10-28 the customer's link is gone too.
+    for phrase in ("off the board", "follow-ups have stopped", "no longer available"):
         assert phrase in card["body"], phrase
 
 
@@ -224,33 +227,31 @@ def test_restoring_a_live_project_changes_nothing_and_narrates_nothing(client):
     assert client.calls["cards"] == [] and client.calls["followups"] == []
 
 
-# -- 4. the customer is untouched -------------------------------------------
-def test_the_customers_own_page_still_resolves_for_a_deleted_project(monkeypatch):
-    """DELETING IS NOT REVOKING, and this is the assertion that holds the line.
-
-    The customer's view reads portal_proposals by TOKEN (get_proposal_by_token) and renders the
-    revision that was pinned when the proposal was sent, and neither of those is filtered. Taking a
-    project off our board must not break a link somebody was already given -- if a link ever needs
-    revoking that is a different feature, with a different word on the button."""
+# -- 4. the customer no longer sees it ---------------------------------------
+def test_the_customers_own_page_refuses_a_deleted_project(monkeypatch):
+    """REVERSED 2026-10-28. This test used to assert the opposite ("deleting is not revoking"):
+    a deleted project's link still opened. Hanz asked for it never to happen again after a deleted
+    proposal reached a customer, so the same request now answers 410 with the sentence the page
+    shows. The REAL lookup gate and the REAL access check; only the thread read is stubbed."""
     deleted = {"proposal_id": "p1", "token": "tok", "customer_email": "dave@x.com",
                "proposal_status": "sent", "deposit_status": "pending",
                "contacts_status": "pending", "schedule_status": "pending",
                "deposit_invoice_no": None, "deposit_amount": None, "deposit_required": True,
                "current_revision_no": 2,
                "deleted_at": "2026-08-24T12:00:00+00:00"}
-    # The REAL lookup and the REAL access check; only the thread read is stubbed.
     monkeypatch.setattr(main.db, "get_proposal_by_token", lambda tok: deleted)
     monkeypatch.setattr(main, "_session_email", lambda request: "dave@x.com")
     monkeypatch.setattr(main.db, "list_messages", lambda pid, after: [])
     r = TestClient(main.app).get("/api/portal/tok/messages?after=0")
-    assert r.status_code == 200, r.text
-    assert r.json()["ok"] is True
-    assert r.json()["status"]["proposal"] == "sent"
+    assert r.status_code == 410, r.text
+    assert r.json() == {"ok": False, "error": "proposal_gone",
+                        "message": main.PROPOSAL_GONE_MESSAGE}
 
 
 def test_the_token_lookup_is_deliberately_unfiltered(monkeypatch):
-    """The other half of the claim above, at the query. A `deleted_at is null` added here would
-    turn every deleted project's customer link into a 404 -- silently, weeks later."""
+    """The gate is main._customer_proposal, NOT the query. Inbound email has to SEE a deleted row
+    to route a reply to it to staff (instead of calling it unmatched), so a `deleted_at is null`
+    here would quietly change what the inbound path does."""
     seen = {}
     monkeypatch.setattr(main.db, "q1", lambda sql, params=(): seen.update(sql=sql))
     main.db.get_proposal_by_token("tok")

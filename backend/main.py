@@ -170,6 +170,47 @@ def _session_email(request: Request) -> Optional[str]:
     return ca.session_email(request.cookies.get(config.SESSION_COOKIE))
 
 
+# ── a deleted proposal is gone for the customer ───────────────────────────────
+# Hanz, 2026-10-28: a project sent as two proposals showed the customer THREE, the third a
+# proposal deleted after it was sent ("make sure that doesn't happen again"). The project list
+# already skips deleted rows (db.list_proposals_by_email); this closes the other door, the deleted
+# proposal's own /p/<token> link, which used to open the whole page and accept an approval.
+#
+# ONE GATE, raised rather than returned. Every customer route that starts from a token goes
+# through _customer_proposal, either directly (the page data route, the link click) or through
+# _require (every action and download). Raising means a new route built on _require refuses a
+# deleted proposal without knowing this rule exists; test_deleted_proposal.py counts the call
+# sites of db.get_proposal_by_token so a route that skips the gate fails a test.
+#
+# The db lookup itself stays unfiltered on purpose: inbound email has to SEE a deleted row to
+# route a reply to it to staff instead of filing it as unmatched, and staff/admin routes go by
+# proposal_id (db.get_proposal), which restore depends on.
+PROPOSAL_GONE_MESSAGE = ("This proposal is no longer available. If you have questions, "
+                         "reply to the email or contact Treadwell.")
+
+
+class ProposalGone(Exception):
+    """A customer route reached a deleted proposal. Answered as 410 by _proposal_gone below."""
+
+
+def _customer_proposal(token: str) -> Optional[dict]:
+    """The portal_proposals row behind a customer link, or None when there is none.
+
+    Raises ProposalGone for a deleted one: before any access check and before any write, so the
+    caller writes nothing. Says nothing about WHO may see it; that is _can_access."""
+    p = db.get_proposal_by_token(token)
+    if p and p.get("deleted_at"):
+        raise ProposalGone(token)
+    return p
+
+
+@app.exception_handler(ProposalGone)
+async def _proposal_gone(request: Request, exc: ProposalGone):
+    # 410 with the sentence the customer reads. No project name, price or status: the page shows
+    # this and nothing else (frontend/app.js renderGone).
+    return _json({"ok": False, "error": "proposal_gone", "message": PROPOSAL_GONE_MESSAGE}, 410)
+
+
 def _can_access(request: Request, proposal: dict) -> bool:
     se = _session_email(request)
     if not se:
@@ -578,9 +619,12 @@ def portal_page(token: str, request: Request) -> FileResponse:
     timestamp."""
     if request.method == "GET":
         try:
-            p = db.get_proposal_by_token(token)
+            p = _customer_proposal(token)
             if p:
                 db.mark_link_clicked(p["proposal_id"])
+        except ProposalGone:
+            pass                              # a deleted proposal's click is not a signal; the
+                                              # page itself shows the no-longer-available state
         except Exception:                     # noqa: BLE001 — never block the page
             log.warning("mark_link_clicked failed for token %s", token[:8], exc_info=True)
     return FileResponse(FRONTEND_DIR / "index.html", headers=_NO_CACHE)
@@ -758,7 +802,11 @@ async def me_feedback(request: Request) -> JSONResponse:
     pid = None
     tok = str(body.get("token") or "").strip()
     if tok:
-        p = _require(request, tok)
+        try:
+            p = _require(request, tok)
+        except ProposalGone:
+            p = None                          # feedback is about the portal, not this proposal:
+                                              # a deleted one costs the context, not the message
         if p:
             pid = p.get("proposal_id")
     try:
@@ -793,7 +841,7 @@ def me_proposals(request: Request) -> JSONResponse:
 # ── per-proposal (email-scoped access) ────────────────────────────────────────
 @app.get("/api/portal/{token}")
 def api_get_portal(token: str, request: Request) -> JSONResponse:
-    p = db.get_proposal_by_token(token)
+    p = _customer_proposal(token)     # a deleted proposal: 410 proposal_gone, signed in or not
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     se = _session_email(request)
@@ -1020,8 +1068,11 @@ def _serve_upload(proposal_id: str, file_id: str, internal: bool = False):
 
 
 def _require(request: Request, token: str):
-    """Return the proposal row if the session email may access it, else None."""
-    p = db.get_proposal_by_token(token)
+    """Return the proposal row if the session email may access it, else None.
+
+    Raises ProposalGone for a deleted proposal (410, nothing written): every customer action and
+    download starts here, so none of them can act on one."""
+    p = _customer_proposal(token)
     if not p or not _can_access(request, p):
         return None
     return p
@@ -2677,6 +2728,39 @@ async def api_inbound_resend(request: Request):
                 f"thread.</strong></p>",
                 from_email, "", subject, body_txt, reply_to=from_email or None)
             return _json({"ok": True, "unmatched": True})
+
+    if p.get("deleted_at"):
+        # A reply to a proposal that was DELETED after it went out. Matched by its token (address
+        # or thread header; the sender fallback never offers a deleted row), and it used to be
+        # filed in that proposal's thread, where no board shows it, and a staff email would even
+        # be relayed to the customer with a link that now says "no longer available".
+        #
+        # Now: nothing is written to the thread and nothing reaches the customer. The email goes
+        # to this project's roster marked as a reply to a deleted proposal, with Reply-To set to
+        # the sender, so whoever reads it answers from their own inbox. An auto-reply is dropped,
+        # as for an unmatched email. No thread row means no dedup anchor; Svix retries only on a
+        # non-2xx, so normal traffic forwards once (the unmatched path has the same trade).
+        if fetched is None:
+            fetched = _inbound_body(email_id, data)
+            if fetched is None:
+                return _json({"ok": False, "error": "fetch_failed"}, 500)
+        body_txt, full = fetched
+        if inbound.is_auto_reply(subject, full.get("headers")):
+            log.info("inbound: auto-reply to deleted proposal %s dropped", p["proposal_id"])
+            return _json({"ok": True, "ignored": "auto_reply"})
+        project = p.get("project_name") or "proposal"
+        log.info("inbound: email from %r for DELETED proposal %s -- forwarded to staff, "
+                 "not filed", from_email, p["proposal_id"])
+        _inbound_forward(
+            email_sender._resolve_notify("general", proposal_id=p["proposal_id"]),
+            f"Reply to a deleted proposal — {project}",
+            "A reply to a deleted proposal",
+            "<p><strong>⚠ This proposal was deleted. The email was NOT added to its portal "
+            "thread and the customer was not notified. Reply from your own inbox if it needs "
+            "an answer.</strong></p>",
+            from_email, project, subject, body_txt, reply_to=from_email or None,
+            verb="replied by email")
+        return _json({"ok": True, "deleted_proposal": True})
 
     pid = p["proposal_id"]
     if db.has_email_message(pid, email_id):
@@ -5698,10 +5782,12 @@ def _staff_close_lost(proposal_id: str, p: dict, reason: str, note: str,
 # the Test tab onto Active with nobody touching it. Hiding the portal row is what makes the card
 # leave; the two halves have to happen together, which is what the tool's route now guarantees.
 #
-# A SOFT HIDE, not a delete, and the reversibility is the requirement rather than caution. The
-# customer's link keeps working either way — it reads portal_proposals by TOKEN and renders the
-# pinned draft_revisions snapshot, neither of which is filtered — because deleting a project off
-# our board is not the same act as revoking what somebody was already sent.
+# A SOFT HIDE, not a delete, and the reversibility is the requirement rather than caution.
+#
+# THE CUSTOMER'S LINK STOPS WORKING (changed 2026-10-28). It used to keep working ("deleting is not
+# revoking"); then a deleted proposal reached a customer as an extra tab and Hanz said "make sure
+# that doesn't happen again". The link now shows "This proposal is no longer available" and every
+# action on it is refused (_customer_proposal). Restoring brings the link back.
 @app.post("/api/admin/proposal/{proposal_id}/delete")
 async def admin_delete_proposal(proposal_id: str, request: Request) -> JSONResponse:
     """Take this proposal off the staff board and stop its follow-ups. Reversible."""
@@ -5725,9 +5811,9 @@ async def admin_delete_proposal(proposal_id: str, request: Request) -> JSONRespo
     # notification bell (list_customer_events) — the customer is told nothing about this.
     _crm_card(proposal_id,
               ("%s deleted this project. It is off the board and the follow-ups have stopped; "
-               "the link the customer already has still works." % who) if who
+               "the customer's link now says it is no longer available." % who) if who
               else ("Project deleted. It is off the board and the follow-ups have stopped; "
-                    "the link the customer already has still works."),
+                    "the customer's link now says it is no longer available."),
               "status_deleted")
     return _json({"ok": True, "deleted": True})
 

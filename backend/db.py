@@ -128,10 +128,16 @@ def list_proposals_by_email(email: str) -> list[dict[str, Any]]:
 
 
 def email_has_proposal(email: str) -> bool:
+    """Whether this email may be sent a sign-in code: it is on at least one proposal that has NOT
+    been deleted. A customer whose only proposal was deleted gets the login page's "no project
+    with this email" answer instead of a code that opens an empty list (Hanz, 2026-10-28)."""
     row = q1(
-        "select 1 from public.portal_proposals where lower(customer_email) = lower(%s) "
+        "select 1 from public.portal_proposals p where lower(p.customer_email) = lower(%s) "
+        "  and (to_jsonb(p) ->> 'deleted_at') is null "
         "union all "
-        "select 1 from public.portal_proposal_recipients where lower(email) = lower(%s) limit 1",
+        "select 1 from public.portal_proposal_recipients r "
+        "  join public.portal_proposals p on p.proposal_id = r.proposal_id "
+        "  where lower(r.email) = lower(%s) and (to_jsonb(p) ->> 'deleted_at') is null limit 1",
         (email, email),
     )
     return row is not None
@@ -964,6 +970,8 @@ def list_customer_events(email: str, limit: int = 30) -> list[dict[str, Any]]:
         "  and coalesce((q.meta->>'followup')::boolean, false) = false "
         "  and coalesce((q.meta->>'view')::boolean, false) = false "
         "  and coalesce((q.meta->>'internal')::boolean, false) = false "
+        # A deleted proposal rings nobody's bell: its link only says "no longer available".
+        "  and (to_jsonb(p) ->> 'deleted_at') is null "
         "  and q.proposal_id in ("
         "    select proposal_id from public.portal_proposals where lower(customer_email) = lower(%s)"
         "    union"

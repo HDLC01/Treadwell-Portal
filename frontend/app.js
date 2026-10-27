@@ -20,6 +20,9 @@ async function api(method, path, body) {
   catch { return { ok: false, status: 0, data: {} }; }   // network failure
   let data = {};
   try { data = await res.json(); } catch {}
+  // A deleted proposal answers every route with 410 proposal_gone (main._customer_proposal).
+  // Caught HERE, the one door every request goes through, so no action needs its own check.
+  if (res.status === 410 && data.error === "proposal_gone") renderGone(data.message);
   return { ok: res.ok && data.ok !== false, status: res.status, data };
 }
 
@@ -47,6 +50,7 @@ let STATE = null;
   if (res.status === 0 || res.status >= 500) { renderError(); return; }
   const { ok, data } = res;
   if (!ok && data.error === "not_found") { renderNotFound(); return; }
+  if (GONE) return;   // a deleted proposal: api() has already drawn the no-longer-available card
   if (data.authed && data.view) { renderPortal(data.view); }
   else if (data.wrong_account) { renderWrongAccount(); }
   else { renderGate(); }
@@ -70,6 +74,30 @@ function renderNotFound() {
   hide($("loading"));
   const g = $("gate"); show(g);
   g.innerHTML = '<div class="card login-card"><h1>Link not found</h1><p class="muted">This proposal link is invalid or has expired. Please contact your Treadwell representative.</p></div>';
+}
+
+// The proposal was deleted after it was sent (Hanz, 2026-10-28). The server says the sentence
+// (main.PROPOSAL_GONE_MESSAGE); this is the fallback if a response ever arrives without it.
+const GONE_TEXT = "This proposal is no longer available. If you have questions, reply to the email or contact Treadwell.";
+let GONE = false;
+
+/** The no-longer-available card, and nothing else: no document, price, status, approve, deposit,
+ *  contract or chat. Called by api() on any 410 proposal_gone. Idempotent.
+ *
+ *  If the portal was already on screen (deleted while the customer had it open), reload instead:
+ *  the shell's sidebar and bell were built for a live proposal and live outside #portal, and the
+ *  boot path draws this card on a clean page. The reloaded boot has no STATE, so it cannot loop. */
+function renderGone(message) {
+  if (GONE) return;
+  GONE = true;
+  if (POLL_TIMER) { clearInterval(POLL_TIMER); POLL_TIMER = null; }
+  if (STATE) { location.reload(); return; }
+  hide($("loading")); hide($("portal"));
+  const g = $("gate"); show(g);
+  g.innerHTML = '<div class="card login-card" role="status">' +
+    "<h1>Proposal no longer available</h1>" +
+    '<p class="muted">' + esc(message || GONE_TEXT) + "</p>" +
+    '<a class="btn btn-secondary btn-block" href="/">View your projects</a></div>';
 }
 
 function renderError() {
