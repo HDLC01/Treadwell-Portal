@@ -13,11 +13,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import db
+import email_sender
 import followup_rules
 import main
 import scope_groups
 
 client = TestClient(main.app)
+# The real renderer, kept before any fixture replaces it on the module.
+_REAL_SCOPE_LINKS = email_sender.send_scope_group_links
 
 GID = "grp-acme-0001"
 T0 = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)
@@ -251,8 +254,13 @@ def test_an_unknown_send_of_an_older_revision_does_not_hold_back_a_revision():
     assert plan["pending"] == ["d-lab1"] and plan["unknown"] == []
 
 
-def test_a_scope_added_after_the_first_send_is_emailed_alone_as_new(send):
-    """Findings #7/#11/#14: the drawer's button used to answer 'already sent' and reach nobody."""
+def _changes(email):
+    return [(s["label"], s["change"]) for s in email["scopes"]]
+
+
+def test_a_scope_added_after_the_first_send_is_announced_as_new_beside_the_others(send):
+    """Findings #7/#11/#14: the drawer's button used to answer 'already sent' and reach nobody.
+    Hanz, 2026-10-28: the email lists the project's current proposals, only Lab 3 marked."""
     go, calls, f = send
     assert go().status_code == 200
     f.rows.append(_row("d-lab3", "Lab 3", created_at=T0 + timedelta(seconds=3)))
@@ -261,8 +269,8 @@ def test_a_scope_added_after_the_first_send_is_emailed_alone_as_new(send):
     r = go(by="rj@wetreadwell.com")
     assert r.status_code == 200, r.text
     e = calls["emails"][1]
-    assert _labels(e) == ["Lab 3"], "the update email re-sent scopes the customer already has"
-    assert [s["change"] for s in e["scopes"]] == ["new"]
+    assert _changes(e) == [("Breakroom", None), ("Lab 1", None), ("Lab 2", None),
+                           ("Lab 3", "new")]
     j = r.json()
     assert j["first"] is False and [s["kind"] for s in j["scopes"]] == ["new"]
     # Only Lab 3 is newly announced: enrolled; the others are not enrolled again.
@@ -282,7 +290,10 @@ def test_an_unpublished_scope_blocks_only_the_first_send(send):
     r = go()
     assert r.status_code == 200, r.text
     assert r.json()["not_included"] == ["d-lab3"]
-    assert _labels(calls["emails"][-1]) == ["Lab 1"]
+    # Lab 3 is not published: not listed. Lab 1 is the one marked.
+    assert _changes(calls["emails"][-1]) == [("Breakroom", None), ("Lab 1", "revised"),
+                                              ("Lab 2", None)]
+    assert [s["proposal_id"] for s in r.json()["scopes"]] == ["d-lab1"]
 
 
 def test_a_revision_after_the_send_is_pending_and_emailed_as_revised(send):
@@ -293,8 +304,33 @@ def test_a_revision_after_the_send_is_pending_and_emailed_as_revised(send):
     r = go()
     assert r.status_code == 200, r.text
     e = calls["emails"][-1]
-    assert _labels(e) == ["Lab 1"] and [s["change"] for s in e["scopes"]] == ["revised"]
+    assert _changes(e) == [("Breakroom", None), ("Lab 1", "revised"), ("Lab 2", None)]
     assert r.json()["scopes"][0]["kind"] == "revised"
+    # The one button and the reply thread are the project's first proposal, as on the first email.
+    assert e["token"] == "tok-d-break" and e["reply_to"] == "rt-tok-d-break"
+
+
+def test_email_again_never_lists_a_deleted_or_closed_proposal(send):
+    """Hanz, 2026-10-28: a removed proposal is simply not listed -- no 'withdrawn', no gap."""
+    go, calls, f = send
+    go()
+    f.row("d-lab2")["deleted_at"] = T0
+    f.row("d-break")["proposal_status"] = "closed_lost"
+    f.publish_revision("d-lab1", 2)
+    r = go()
+    assert r.status_code == 200, r.text
+    assert _changes(calls["emails"][-1]) == [("Lab 1", "revised")]
+
+
+def test_email_again_marks_an_approved_proposal_as_approved(send):
+    go, calls, f = send
+    go()
+    f.row("d-break")["proposal_status"] = "approved"
+    f.publish_revision("d-lab2", 2)
+    assert go().status_code == 200
+    e = calls["emails"][-1]
+    assert [(s["label"], s["approved"], s["change"]) for s in e["scopes"]] == [
+        ("Breakroom", True, None), ("Lab 1", False, None), ("Lab 2", False, "revised")]
 
 
 def test_an_old_mark_without_a_revision_counts_as_announced(send):
@@ -319,8 +355,10 @@ def test_a_scope_sent_as_an_ordinary_proposal_joins_without_blocking_or_resendin
     r = go()
     assert r.status_code == 200, r.text
     assert f.calls["adopted"] == [("d-polish", GID, "Polish")]
-    assert _labels(calls["emails"][0]) == ["Lab 1"], "the approved parent was emailed again"
-    assert [s["change"] for s in calls["emails"][0]["scopes"]] == ["new"]
+    # Polish is listed as the approved proposal it is, never re-announced; Lab 1 is the new one.
+    assert [(s["label"], s["approved"], s["change"]) for s in calls["emails"][0]["scopes"]] == [
+        ("Polish", True, None), ("Lab 1", False, "new")]
+    assert [s["proposal_id"] for s in r.json()["scopes"]] == ["d-lab1"]
 
 
 def test_no_delivery_at_all_is_a_502_and_marks_nothing(send):
@@ -343,8 +381,12 @@ def test_each_recipient_sees_only_their_scopes_in_an_update(send):
     calls["emails"].clear()
     r = go()
     assert r.status_code == 200, r.text
-    by_to = {e["to"]: _labels(e) for e in calls["emails"]}
-    assert by_to == {"cust@acme.com": ["Breakroom", "Lab 2"], "pat@acme.com": ["Lab 2"]}
+    by_to = {e["to"]: _changes(e) for e in calls["emails"]}
+    assert by_to == {"cust@acme.com": [("Breakroom", "revised"), ("Lab 1", None),
+                                       ("Lab 2", "revised")],
+                     "pat@acme.com": [("Lab 2", "revised")]}, "pat saw a scope they are not on"
+    # Pat's email threads and opens on Lab 2, the one proposal Pat can open.
+    assert {e["to"]: e["token"] for e in calls["emails"]}["pat@acme.com"] == "tok-d-lab2"
     assert {x["email"]: x["delivered"] for x in r.json()["recipients"]} == {
         "cust@acme.com": True, "pat@acme.com": True}
 
@@ -371,6 +413,33 @@ def test_retry_failed_mails_only_the_address_that_failed(send):
     # Nothing left to retry.
     r = go(retry_failed=True)
     assert r.status_code == 409 and r.json()["error"] == "nothing_to_send"
+
+
+def test_a_retry_of_email_again_is_the_same_revision_email(send):
+    """The address a revision bounced for gets what the others got: every live proposal of theirs,
+    the revised one marked."""
+    go, calls, f = send
+    go()
+    f.publish_revision("d-lab1", 2)
+    calls["ok"]["fn"] = lambda to: False
+    assert go().status_code == 502
+    calls["ok"]["fn"] = lambda to: True
+    calls["emails"].clear()
+    # A 502 announced nothing, so this is the next ordinary send, not a retry.
+    assert go().status_code == 200
+    assert _changes(calls["emails"][-1]) == [("Breakroom", None), ("Lab 1", "revised"),
+                                              ("Lab 2", None)]
+    # Now a real retry: Pat is added to Lab 1 and bounces on the following revision.
+    f.recipients["d-lab1"] = ["cust@acme.com", "pat@acme.com"]
+    f.publish_revision("d-lab1", 3)
+    calls["ok"]["fn"] = lambda to: to != "pat@acme.com"
+    assert go().status_code == 200
+    calls["ok"]["fn"] = lambda to: True
+    calls["emails"].clear()
+    r = go(retry_failed=True)
+    assert r.status_code == 200, r.text
+    [e] = calls["emails"]
+    assert e["to"] == "pat@acme.com" and _changes(e) == [("Lab 1", "revised")]
 
 
 def test_a_retry_that_fails_again_is_a_502_and_can_be_retried(send):
@@ -537,33 +606,133 @@ def test_an_unreadable_attachment_is_refused_before_anything_is_claimed(send):
     assert f.calls["claims"] == [] and calls["emails"] == []
 
 
-def test_the_email_renderer_names_new_and_revised_and_attaches(monkeypatch):
+@pytest.fixture
+def outbox(monkeypatch):
+    """The REAL email_sender.send_scope_group_links with only the transport faked: every email is
+    recorded at _send, the one function that calls Resend, and httpx.post is a tripwire."""
     import email_sender
     sent = []
-    monkeypatch.setattr(email_sender, "_send",
-                        lambda to, subject, html, headers=None, **k: sent.append(
-                            {"html": html, **k}) or True)
+
+    def fake_send(to, subject, html, headers=None, reply_to=None, attachments=None):
+        sent.append({"to": list(to), "subject": subject, "html": html, "headers": headers,
+                     "reply_to": reply_to, "attachments": attachments})
+        return True
+
+    def no_network(*a, **k):
+        raise AssertionError("a test reached for Resend")
+    monkeypatch.setattr(email_sender, "_send", fake_send)
+    monkeypatch.setattr(email_sender.httpx, "post", no_network)
+    monkeypatch.setattr(email_sender, "_thread_subject_template", lambda: "{project} proposal")
+    return sent
+
+
+def _heading(h):
+    return re.search(r"<h2[^>]*>(.*?)</h2>", h).group(1)
+
+
+def _items(h):
+    return re.findall(r'<li style="margin:4px 0">(.*?)</li>', h)
+
+
+def _buttons(h):
+    return re.findall(r'<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>', h)
+
+
+REVISION_WORDS = ("withdrawn", "withdraw", "Base Bid", "unchanged", "updated", "(new)")
+
+
+def test_the_email_renderer_reads_email_again_as_a_revision(outbox):
+    import email_sender
     ok = email_sender.send_scope_group_links(
         "cust@acme.com", "Dana Reed", "Acme HQ",
-        [{"label": "Lab 3", "url": "https://p/x/p/tok-c", "change": "new"},
-         {"label": "Lab 1", "url": "https://p/x/p/tok-a", "change": "revised"}],
-        note="Call me Monday", token="tok-c", attachments=[("a.pdf", b"%PDF")])
+        [{"label": "Epoxy", "url": "https://p/x/p/tok-e", "approved": True},
+         {"label": "Polish", "url": "https://p/x/p/tok-p", "change": "revised"},
+         {"label": "Room 2", "url": "https://p/x/p/tok-r", "change": "new"}],
+        note="Call me Monday", token="tok-e", attachments=[("a.pdf", b"%PDF")])
     assert ok
-    h = sent[0]["html"]
-    assert "Lab 3 (new)" in h and "Lab 1 (revised)" in h
-    # "Email again": ONE button, to the first proposal it names; the names are text.
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', h) == ["https://p/x/p/tok-c"]
-    assert '<li style="margin:4px 0">Lab 1 (revised)</li>' in h
-    assert "1 new proposal and 1 revised proposal" in h
-    assert "Your proposals have been updated" in h
-    assert "Call me Monday" in h
-    assert sent[0]["attachments"] == [("a.pdf", b"%PDF")]
-    # The first email of a project keeps its wording.
-    sent.clear()
+    [m] = outbox
+    h = m["html"]
+    assert _heading(h) == "Your proposals have been revised"
+    # ONE button, to the first proposal it names; every proposal is named as text under it.
+    assert _buttons(h) == [("https://p/x/p/tok-e", "View &amp; approve your proposals")]
+    assert _items(h) == ["Epoxy &mdash; approved", "Polish (revised)", "Room 2 (revised)"]
+    for word in REVISION_WORDS:
+        assert word not in h, word
+    assert "Call me Monday" in h and m["attachments"] == [("a.pdf", b"%PDF")]
+    # The subject stays the project's one thread subject, so the revision joins the thread.
+    assert m["subject"] == "Acme HQ proposal"
+
+
+def test_the_first_email_keeps_its_wording(outbox):
+    import email_sender
     email_sender.send_scope_group_links("cust@acme.com", "Dana", "Acme HQ",
-                                        [{"label": "Lab 1", "url": "https://p/x/p/a"},
-                                         {"label": "Lab 2", "url": "https://p/x/p/b"}])
-    assert "Your proposals are ready" in sent[0]["html"] and "(new)" not in sent[0]["html"]
+                                        [{"label": "Epoxy", "url": "https://p/x/p/a"},
+                                         {"label": "Polish", "url": "https://p/x/p/b"}])
+    h = outbox[0]["html"]
+    assert _heading(h) == "Your proposals are ready"
+    assert "revised" not in h
+    assert _buttons(h) == [("https://p/x/p/a", "View &amp; approve your proposals")]
+    assert _items(h) == ["Epoxy", "Polish"]
+    assert outbox[0]["subject"] == "Acme HQ proposal"
+
+
+def test_a_revision_of_a_single_proposal_reads_in_the_singular(outbox):
+    import email_sender
+    email_sender.send_scope_group_links("pat@acme.com", "", "Acme HQ",
+                                        [{"label": "Room 2", "url": "https://p/x/p/r",
+                                          "change": "revised"}])
+    h = outbox[0]["html"]
+    assert _heading(h) == "Your proposal has been revised"
+    assert _items(h) == ["Room 2 (revised)"]
+
+
+@pytest.fixture
+def send_real(send, outbox, monkeypatch):
+    """The combined send route, with the REAL renderer behind it and only _send faked."""
+    import email_sender
+    go, calls, f = send
+    monkeypatch.setattr(main.email_sender, "send_scope_group_links", _REAL_SCOPE_LINKS)
+    assert main.email_sender is email_sender
+    return go, f, outbox
+
+
+def test_email_again_through_the_route_is_a_revision_of_the_live_proposals(send_real):
+    """End to end on the route: send, delete Lab 2, revise Lab 1, press again. The customer reads
+    "Your proposals have been revised", one button, Breakroom and Lab 1 (revised). Lab 2 is not
+    there, and no word says it went."""
+    go, f, outbox = send_real
+    assert go().status_code == 200
+    first = outbox[-1]["html"]
+    assert _heading(first) == "Your proposals are ready"
+    assert _items(first) == ["Breakroom", "Lab 1", "Lab 2"]
+    f.row("d-lab2")["deleted_at"] = T0
+    f.publish_revision("d-lab1", 2)
+    r = go()
+    assert r.status_code == 200, r.text
+    [m] = outbox[1:]
+    h = m["html"]
+    assert m["to"] == ["cust@acme.com"]
+    assert _heading(h) == "Your proposals have been revised"
+    assert _buttons(h) == [(f"{main.config.PUBLIC_BASE_URL}/p/tok-d-break",
+                            "View &amp; approve your proposals")]
+    assert _items(h) == ["Breakroom", "Lab 1 (revised)"]
+    assert "Lab 2" not in h
+    for word in REVISION_WORDS:
+        assert word not in h, word
+
+
+def test_email_again_through_the_route_lists_only_each_recipients_proposals(send_real):
+    go, f, outbox = send_real
+    f.recipients["d-lab2"] = ["cust@acme.com", "pat@acme.com"]
+    go()
+    outbox.clear()
+    f.publish_revision("d-lab2", 2)
+    assert go().status_code == 200
+    by_to = {m["to"][0]: m["html"] for m in outbox}
+    assert _items(by_to["cust@acme.com"]) == ["Breakroom", "Lab 1", "Lab 2 (revised)"]
+    assert _items(by_to["pat@acme.com"]) == ["Lab 2 (revised)"]
+    assert _heading(by_to["pat@acme.com"]) == "Your proposal has been revised"
+    assert "Breakroom" not in by_to["pat@acme.com"] and "Lab 1" not in by_to["pat@acme.com"]
 
 
 # ══ 6. the board says honestly what has been emailed ═════════════════════════

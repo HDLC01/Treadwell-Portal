@@ -411,7 +411,11 @@ def _scope_button_and_list(scopes: list[dict]) -> str:
     still approved on its own there. The list only names them -- no second link to click.
 
     `scopes` is already narrowed to THIS recipient by every caller, so the list never names a
-    proposal they cannot open. Labels are estimator-typed and escaped."""
+    proposal they cannot open. Labels are estimator-typed and escaped.
+
+    A scope the customer has not seen in this form -- `change` 'new' or 'revised' -- is marked
+    "(revised)" either way. Hanz, 2026-10-28: an email sent again reads as a revision of the
+    project, so the customer is told which proposals to look at again, not how we filed them."""
     many = len(scopes) > 1
     if all(s.get("approved") for s in scopes):
         label = "View your proposals" if many else "View your proposal"
@@ -424,7 +428,7 @@ def _scope_button_and_list(scopes: list[dict]) -> str:
     for s in scopes:
         text = _esc(s.get("label") or "Proposal")
         if s.get("change") in ("new", "revised"):
-            text += " (%s)" % s["change"]
+            text += " (revised)"
         if s.get("approved"):
             text += " &mdash; approved"
         items.append(f'<li style="margin:4px 0">{text}</li>')
@@ -443,9 +447,15 @@ def send_scope_group_links(email: str, name: str, project_name: str, scopes: lis
     by the caller to the scopes THIS recipient is on.
 
     `change` is None on the first email of a project ("your proposals are ready"). A LATER email
-    names only scopes the customer has not seen yet, each marked 'new' or 'revised' (Hanz's
-    decision 3), and says so: a customer who gets "your proposals are ready" twice cannot tell
-    which one is different.
+    ("Email again") reads as a REVISION of the project. Hanz, 2026-10-28: it lists every CURRENT
+    live proposal of this recipient (the caller passes them all; a deleted or closed one is simply
+    not there), the ones the customer has not seen in this form ('new' or 'revised') marked
+    "(revised)", and is headed "Your proposals have been revised". It never says what was taken
+    away and never calls a proposal by its position: a customer who gets "your proposals are
+    ready" twice cannot tell which one is different, and one told a proposal was "withdrawn"
+    reads it as the job being pulled. The revision is in the HEADING (the line Gmail shows as the
+    snippet); the subject stays the project's one thread subject on every send, because a
+    different subject splits the project's Gmail thread (customer_thread_subject).
 
     Same conventions as send_portal_link: the project's one thread subject, first-name greeting,
     the estimator's optional note and attachments, the red button style. `token` is the scope
@@ -467,17 +477,13 @@ def send_scope_group_links(email: str, name: str, project_name: str, scopes: lis
     update = any(s.get("change") in ("new", "revised") for s in scopes)
     many = len(scopes) > 1
     if update:
-        n_new = sum(1 for s in scopes if s.get("change") == "new")
-        n_rev = sum(1 for s in scopes if s.get("change") == "revised")
-        what = " and ".join(x for x in (
-            ("%d new proposal%s" % (n_new, "s" if n_new != 1 else "")) if n_new else "",
-            ("%d revised proposal%s" % (n_rev, "s" if n_rev != 1 else "")) if n_rev else "") if x)
-        lead = (f"We have {what} for <strong>{_esc(project_name)}</strong>. "
-                f"The proposals you already have are unchanged.")
-        if n_rev:
-            lead += (" A revised proposal replaces the earlier version of that scope, so please "
-                     "review it again before you approve.")
-        heading = "Your proposals have been updated" if many else "Your proposal has been updated"
+        lead = ((f"We have revised your proposals for <strong>{_esc(project_name)}</strong>. "
+                 f"Your current proposals are listed below. Please review the ones marked "
+                 f"(revised) before you approve them; each one is approved on its own.")
+                if many else
+                (f"We have revised your proposal for <strong>{_esc(project_name)}</strong>. "
+                 f"Please review it again before you approve it."))
+        heading = "Your proposals have been revised" if many else "Your proposal has been revised"
     else:
         lead = (f"Your proposals for <strong>{_esc(project_name)}</strong> are ready to review. "
                 f"They are all on one page, and each one is approved on its own."

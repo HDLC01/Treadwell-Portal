@@ -141,6 +141,55 @@ def test_restoring_brings_the_link_back(app):
     assert r.status_code == 200 and r.json()["authed"] is True
 
 
+# -- staff and service calls: no email about a deleted proposal ---------------
+SERVICE = "svc-pg-test"
+
+
+def _staff(monkeypatch):
+    monkeypatch.setattr(config, "SERVICE_TOKEN", SERVICE)
+    db.execute("update public.drafts set data = %s where id = 'gone-b'",
+               (Jsonb({"project_name": "Acme HQ", "contact_email": DANA,
+                       "contact_name": "Dana Customer"}),))
+    return TestClient(main.app, headers={"x-service-token": SERVICE})
+
+
+def _snapshot(pid):
+    return db.q1("select to_jsonb(p) - 'updated_at' as j from public.portal_proposals p "
+                 "where proposal_id = %s", (pid,))["j"]
+
+
+def test_publish_and_notify_on_a_deleted_row_are_refused_and_nothing_is_sent(app, monkeypatch):
+    """Review finding, 2026-10-28, on the real tables: a publish onto the deleted row used to
+    rewrite it and email Dana a link that says "no longer available"; /api/notify the same."""
+    staff = _staff(monkeypatch)
+    before = _snapshot("gone-b")
+    msgs = db.q1("select count(*) as n from public.portal_questions "
+                 "where proposal_id = 'gone-b'")["n"]
+    r = staff.post("/api/admin/publish", json={"draft_id": "gone-b", "revision_no": 2,
+                                                "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 409 and r.json()["error"] == "proposal_deleted", r.text
+    for kind in ("published", "reply"):
+        r = staff.post("/api/notify", json={"proposal_id": "gone-b", "type": kind,
+                                            "message": "hello"})
+        assert r.status_code == 409 and r.json()["error"] == "proposal_deleted", r.text
+    assert app.sent == [], "an email went out about a deleted proposal"
+    assert _snapshot("gone-b") == before, "the deleted row was written"
+    assert db.q1("select count(*) as n from public.portal_questions "
+                 "where proposal_id = 'gone-b'")["n"] == msgs
+
+
+def test_the_tools_restore_then_publish_still_sends(app, monkeypatch):
+    """The tool's restore calls this portal's restore route first; the publish after it works."""
+    staff = _staff(monkeypatch)
+    r = staff.post("/api/admin/proposal/gone-b/restore", json={"by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200 and r.json()["was_deleted"] is True, r.text
+    assert _row("gone-b")["deleted_at"] is None
+    r = staff.post("/api/admin/publish", json={"draft_id": "gone-b", "by": "kyle@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    # _send is recorded as (to, subject), notify_team as (heading,): the customer got one email.
+    assert [x[0] for x in app.sent if len(x) == 2] == [[DANA]]
+
+
 # -- the exception: a signer keeps the contract and the invoice ---------------
 def _sign(pid):
     """An approved proposal with a built signed contract and an issued deposit invoice, written

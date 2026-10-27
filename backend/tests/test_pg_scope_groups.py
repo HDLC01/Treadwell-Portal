@@ -1735,6 +1735,37 @@ def test_a_retired_approvals_deposit_tasks_leave_the_groups_reminder_count(clean
     assert why == "" and len(view["followup_reminder_times"]) == 1
 
 
+def test_email_again_on_real_rows_reads_as_a_revision_of_the_live_proposals(clean, outbox, client):
+    """Hanz, 2026-10-28, on real rows and the real renderer: Epoxy and Polish and an old third
+    proposal go out in one email; the third is deleted and Polish revised. "Email again" is headed
+    "Your proposals have been revised", has one button, lists Epoxy and Polish (revised), and never
+    names the deleted one or says it went."""
+    gid = gid_new()
+    who = "dana@customer.example"
+    ids = [f"{gid}-epoxy", f"{gid}-polish", f"{gid}-old"]
+    for i, (pid, label) in enumerate(zip(ids, ("Epoxy", "Polish", "Base Bid 2"))):
+        add_draft(pid, gid, label)
+        add_proposal(pid, gid, label, days_ago=10 - i, sent=False, email=who)
+    url = f"/api/admin/scope-group/{gid}/send"
+    assert client.post(url, json={"by": KYLE}).status_code == 200
+    [first] = [m for m in outbox.sent if who in m["to"]]
+    assert re.search(r"<h2[^>]*>(.*?)</h2>", first["html"]).group(1) == "Your proposals are ready"
+    assert "Base Bid 2" in first["html"]
+
+    db.delete_proposal(ids[2])
+    set_cols(ids[1], current_revision_no=2)
+    outbox.sent.clear()
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 200, r.text
+    [m] = [m for m in outbox.sent if who in m["to"]]
+    h = m["html"]
+    assert re.search(r"<h2[^>]*>(.*?)</h2>", h).group(1) == "Your proposals have been revised"
+    assert re.findall(r'<li style="margin:4px 0">(.*?)</li>', h) == ["Epoxy", "Polish (revised)"]
+    assert len(re.findall(r"<a\b", h)) == 1, "more than one link in the email"
+    for word in ("Base Bid", "withdrawn", "unchanged"):
+        assert word not in h, word
+
+
 # ── a deleted proposal is not on the customer's list (Hanz, 2026-10-28) ────────
 def test_the_customers_list_leaves_out_a_deleted_proposal(clean):
     """A project sent as Epoxy + Polish, plus an old proposal deleted after it was sent: the

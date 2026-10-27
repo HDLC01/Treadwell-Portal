@@ -2564,6 +2564,23 @@ def api_signed_contract_pdf(token: str, request: Request):
 
 
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
+DELETED_REFUSAL_MESSAGE = ("This proposal was deleted, so nothing was sent to the customer. "
+                           "Restore the project first, then send it again.")
+
+
+def _deleted_refusal(proposal_id: str, what: str) -> JSONResponse:
+    """409 for a staff/service call that would email a customer about a DELETED proposal.
+
+    The customer's link answers "no longer available" (_customer_proposal), so an email pointing
+    at it is a dead link at best and, for a publish, a deleted proposal brought back without
+    anybody restoring it. Nothing is written and nothing is sent; restoring the project
+    (admin_restore_proposal, which the tool's restore calls first) clears deleted_at and the same
+    call then works."""
+    log.warning("%s refused for deleted proposal %s: nothing sent", what, proposal_id)
+    return _json({"ok": False, "error": "proposal_deleted",
+                  "message": DELETED_REFUSAL_MESSAGE}, 409)
+
+
 @app.post("/api/notify")
 async def api_notify(request: Request) -> JSONResponse:
     presented = request.headers.get("x-service-token") or ""
@@ -2573,6 +2590,9 @@ async def api_notify(request: Request) -> JSONResponse:
     p = db.get_proposal(body.get("proposal_id")) if body.get("proposal_id") else None
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
+    if p.get("deleted_at"):
+        # No email of any kind about a deleted proposal: its link says "no longer available".
+        return _deleted_refusal(p["proposal_id"], "notify")
     kind = body.get("type")
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     primary = (p.get("customer_email") or "").strip().lower()
@@ -3134,6 +3154,11 @@ async def admin_publish(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": str(e)}, 400)
 
     existing = db.get_proposal(draft_id)
+    if existing and existing.get("deleted_at"):
+        # Refused before anything is written or sent (review of the deleted-link change,
+        # 2026-10-28): publishing onto a deleted row would email the customer a link that
+        # answers "no longer available". The tool's restore clears deleted_at first.
+        return _deleted_refusal(draft_id, "publish")
     revised = False
     # A SCOPE JOINS ITS GROUP BEFORE ANYTHING CUSTOMER-VISIBLE IS WRITTEN (findings #24/#40). The
     # scope columns are named directly, so on a database without the scope-group DDL this refuses
@@ -3602,19 +3627,21 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
         return _json({"ok": False, "error": "send_not_recorded", "emailed": []}, 503)
 
     primary = (lead.get("customer_email") or "").strip().lower()
+    on_live = {r["proposal_id"]: set(_on(r)) for r in live}
     emailed: list[str] = []
     for e, mine in per.items():
+        listed = _scope_email_list(live, on_live, e, {
+            r["proposal_id"]: kinds.get(r["proposal_id"]) for r in mine})
         try:
             ok = email_sender.send_scope_group_links(
                 e, (lead.get("customer_name") or "") if e == primary else "", project,
                 [{"label": _label(r), "url": _url(r),
                   "approved": (r.get("proposal_status") or "") == "approved",
-                  "change": None if kinds.get(r["proposal_id"]) == "first"
-                  else kinds.get(r["proposal_id"])} for r in mine],
+                  "change": change} for r, change in listed],
                 # The first of THEIR scopes, so a reply from a contact on Lab 2 alone lands in
                 # Lab 2's thread rather than in one they cannot open.
-                reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
-                note=_scope_note_for(note, mine, extras, _label), token=mine[0]["token"],
+                reply_to=email_sender.proposal_reply_to(listed[0][0]["token"]),
+                note=_scope_note_for(note, mine, extras, _label), token=listed[0][0]["token"],
                 attachments=_scope_files_for(group_atts, mine, extras) or None)
         except Exception as exc:  # noqa: BLE001 — one bad address must not stop the others
             log.warning("scope group %s: send to %s failed: %s", group_id, e, exc)
@@ -3728,6 +3755,25 @@ def _scope_send_extras(group_id: str, pending: list, note: Optional[str],
     return out
 
 
+def _scope_email_list(live: list, on_live: dict, email: str, kinds: dict) -> list:
+    """`[(row, change)]`: what one recipient's combined email lists, in publish order.
+
+    Hanz, 2026-10-28: an "Email again" reads as a revision of the project, so it names the
+    project's CURRENT live proposals that this address is on -- not only the ones being announced,
+    which made a project of three read like a project of one -- and a deleted, closed-lost or
+    removed proposal is simply not there (`live` is scope_groups.send_rows). `kinds` is
+    {proposal_id: send kind} for the scopes this email announces to this address; their `change`
+    is 'new'/'revised' on a later send (marked "(revised)") and None on the first. Every other
+    listed scope is None: the customer already has it as it stands.
+
+    Per-recipient as before: `on_live[pid]` is who that scope is addressed to, so another
+    contact's scope is never named. The announced ones (drawn from `live` by both callers) are
+    listed whatever `on_live` says, so the email always carries the proposal it was sent for."""
+    return [(r, None if kinds.get(r["proposal_id"]) in (None, "first")
+             else kinds[r["proposal_id"]])
+            for r in live if r["proposal_id"] in kinds or email in on_live.get(r["proposal_id"], ())]
+
+
 def _scope_note_for(note: Optional[str], mine: list, extras: dict, label) -> Optional[str]:
     """The note one recipient's combined email carries. The request's own message wins; otherwise
     the Files-page notes of THEIR scopes, each named when there is more than one."""
@@ -3809,20 +3855,24 @@ def _retry_scope_group_send(group_id, live, by_pid, project, lead, by, note, gro
             if e in still_on:                  # an address taken off the scope is not chased
                 per.setdefault(e, []).append(r)
     primary = (lead.get("customer_email") or "").strip().lower()
+    on_live = {r["proposal_id"]: set(_on(r)) for r in live}
     emailed: list[str] = []
     # THE ORIGINAL EMAIL'S note and files (recorded on the mark by mark_scope_group_attempt),
     # unless this request brings its own: the person it failed for gets what everyone else got.
     orig = {pid: {"note": t.get("note")} for pid, t in targets.items()}
     for e, mine in per.items():
+        # The same email the others got: every live proposal of theirs, the ones it failed for
+        # marked as that send marked them.
+        listed = _scope_email_list(live, on_live, e, {
+            r["proposal_id"]: targets[r["proposal_id"]]["kind"] for r in mine})
         try:
             ok = email_sender.send_scope_group_links(
                 e, (lead.get("customer_name") or "") if e == primary else "", project,
                 [{"label": _label(r), "url": _url(r),
                   "approved": (r.get("proposal_status") or "") == "approved",
-                  "change": None if targets[r["proposal_id"]]["kind"] == "first"
-                  else targets[r["proposal_id"]]["kind"]} for r in mine],
-                reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
-                note=_scope_note_for(note, mine, orig, _label), token=mine[0]["token"],
+                  "change": change} for r, change in listed],
+                reply_to=email_sender.proposal_reply_to(listed[0][0]["token"]),
+                note=_scope_note_for(note, mine, orig, _label), token=listed[0][0]["token"],
                 attachments=_retry_files_for(group_atts, mine, targets) or None)
         except Exception as exc:  # noqa: BLE001
             log.warning("scope group %s: retry to %s failed: %s", group_id, e, exc)
