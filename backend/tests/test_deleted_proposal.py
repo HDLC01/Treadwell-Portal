@@ -211,7 +211,19 @@ def test_every_token_route_resolves_through_the_gate():
         if "{token}" not in getattr(r, "path", ""):
             continue
         src = inspect.getsource(r.endpoint)
-        assert "_require(request, token)" in src or "_customer_proposal(token)" in src, r.path
+        assert ("_require(request, token)" in src or "_require_kept(request, token)" in src
+                or "_customer_proposal(token)" in src), r.path
+
+
+def test_only_the_two_documents_a_signer_keeps_use_require_kept():
+    """_require_kept is the ESIGN exception (a signer keeps their copy). It belongs on the signed
+    contract and the deposit invoice and nowhere else: on any other route it would let a deleted
+    proposal be acted on again."""
+    kept = sorted(r.path for r in main.app.routes
+                  if "{token}" in getattr(r, "path", "")
+                  and "_require_kept(request, token)" in inspect.getsource(r.endpoint))
+    assert kept == ["/api/portal/{token}/deposit-invoice.pdf",
+                    "/api/portal/{token}/signed-contract.pdf"], kept
 
 
 def test_only_the_gate_and_the_inbound_router_read_the_raw_token_lookup():
@@ -223,6 +235,116 @@ def test_only_the_gate_and_the_inbound_router_read_the_raw_token_lookup():
     gate = inspect.getsource(main._customer_proposal)
     assert "db.get_proposal_by_token(" in gate
 
+
+
+# -- the exception: what a customer signed stays theirs ----------------------
+# ESIGN 7001(d)/(e): the signer must be able to keep their copy, and the approval email says the
+# contract "can always be downloaded from your portal". Deleting a SIGNED job off the board used to
+# 410 both documents, leaving the email attachment as the customer's only copy.
+KEPT = {"/api/portal/{t}/signed-contract.pdf", "/api/portal/{t}/deposit-invoice.pdf"}
+
+
+def _sign_and_delete(world, monkeypatch):
+    world.state["row"].update(approved_at="2026-10-20T15:00:00+00:00", proposal_status="approved",
+                              deposit_invoice_no="TW-1001", deposit_amount=2500)
+    _delete(world)
+    served = []
+    monkeypatch.setattr(main.db, "get_signed_contract",
+                        lambda pid: {"approval_id": 1, "proposal_id": pid, "pdf": b"%PDF-c"})
+    monkeypatch.setattr(main, "_signed_contract_pdf",
+                        lambda p: served.append("contract") or (b"%PDF-contract", None, 200))
+    monkeypatch.setattr(main.db, "get_pinned_draft_data", lambda p: {"project_name": "Acme HQ"})
+    monkeypatch.setattr(main.invoice, "invoice_payload", lambda p, amount, no, draft: {"no": no})
+    monkeypatch.setattr(main.invoice, "render_invoice_pdf",
+                        lambda payload: served.append("invoice") or b"%PDF-invoice")
+    return served
+
+
+def test_a_signer_still_downloads_the_signed_contract_after_the_project_is_deleted(world,
+                                                                                  monkeypatch):
+    served = _sign_and_delete(world, monkeypatch)
+    r = world.get(f"/api/portal/{TOKEN}/signed-contract.pdf")
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert r.content == b"%PDF-contract" and served == ["contract"]
+    assert r.headers["content-type"] == "application/pdf"
+
+
+def test_a_signer_still_downloads_the_deposit_invoice_after_the_project_is_deleted(world,
+                                                                                  monkeypatch):
+    served = _sign_and_delete(world, monkeypatch)
+    r = world.get(f"/api/portal/{TOKEN}/deposit-invoice.pdf")
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert r.content == b"%PDF-invoice" and served == ["invoice"]
+
+
+@pytest.mark.parametrize("method,path,body", ROUTES, ids=[f"{m} {p}" for m, p, _ in ROUTES])
+def test_a_signed_deleted_proposal_refuses_every_other_route(world, monkeypatch, method, path,
+                                                             body):
+    """The exception is two downloads and nothing else: a signed, deleted proposal still cannot
+    be approved again, paid, messaged, viewed or opened, and nothing is written or sent."""
+    if path in KEPT:
+        pytest.skip("one of the two kept documents")
+    _sign_and_delete(world, monkeypatch)
+    r = _call(world, method, path, body)
+    assert r.status_code == 410, (r.status_code, r.text[:300])
+    assert r.json()["error"] == "proposal_gone"
+    assert world.calls["sql"] == [] and world.calls["emails"] == [] and world.calls["http"] == []
+
+
+@pytest.mark.parametrize("session", [None, "someone@else.example"], ids=["signed out", "other"])
+@pytest.mark.parametrize("path", sorted(KEPT))
+def test_the_kept_documents_are_still_session_gated_and_say_gone_to_anyone_else(
+        world, monkeypatch, path, session):
+    """Not the signer: the same 410 as any deleted proposal. Not a 401, which would tell a
+    stranger holding the link that this one was signed, and never the PDF."""
+    served = _sign_and_delete(world, monkeypatch)
+    monkeypatch.setattr(main.db, "email_can_access", lambda pid, email: False)
+    world.state["session"] = session
+    r = _call(world, "GET", path, None)
+    assert r.status_code == 410, (r.status_code, r.text[:300])
+    assert r.json() == {"ok": False, "error": "proposal_gone",
+                        "message": main.PROPOSAL_GONE_MESSAGE}
+    assert served == []
+
+
+def test_an_unsigned_deleted_proposal_keeps_nothing(world):
+    """_require_kept reads approved_at: a deleted proposal nobody signed stays gone on both routes
+    (the sweep above covers this too, with an authorised session)."""
+    _delete(world)
+    for path in sorted(KEPT):
+        assert _call(world, "GET", path, None).status_code == 410, path
+
+
+def test_the_gone_page_offers_the_signer_their_documents(world, monkeypatch):
+    """The page data route is still 410 (no project, price or status), but for the signed-in
+    signer it names the two documents, so /p/<token> is where they download them."""
+    _sign_and_delete(world, monkeypatch)
+    body = world.get(f"/api/portal/{TOKEN}").json()
+    assert body == {"ok": False, "error": "proposal_gone", "message": main.PROPOSAL_GONE_MESSAGE,
+                    "documents": ["signed_contract", "deposit_invoice"]}
+    assert "Acme HQ" not in str(body)
+
+
+def test_the_gone_page_names_no_documents_to_a_stranger(world, monkeypatch):
+    _sign_and_delete(world, monkeypatch)
+    monkeypatch.setattr(main.db, "email_can_access", lambda pid, email: False)
+    world.state["session"] = None
+    assert set(world.get(f"/api/portal/{TOKEN}").json()) == {"ok", "error", "message"}
+    world.state["session"] = "someone@else.example"
+    assert set(world.get(f"/api/portal/{TOKEN}").json()) == {"ok", "error", "message"}
+
+
+def test_the_gone_page_offers_only_what_exists(world, monkeypatch):
+    """No invoice issued (no deposit asked), and a contract row that could not be read: the card
+    offers neither, and a broken lookup never turns the 410 into a 500."""
+    _sign_and_delete(world, monkeypatch)
+    world.state["row"].update(deposit_invoice_no=None, deposit_amount=None)
+
+    def boom(pid):
+        raise RuntimeError("database down")
+    monkeypatch.setattr(main.db, "get_signed_contract", boom)
+    r = world.get(f"/api/portal/{TOKEN}")
+    assert r.status_code == 410 and "documents" not in r.json()
 
 # -- the landing page ---------------------------------------------------------
 def test_the_landing_page_still_serves_but_records_no_click_for_a_deleted_proposal(world):

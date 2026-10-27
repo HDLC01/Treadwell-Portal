@@ -22,7 +22,7 @@ async function api(method, path, body) {
   try { data = await res.json(); } catch {}
   // A deleted proposal answers every route with 410 proposal_gone (main._customer_proposal).
   // Caught HERE, the one door every request goes through, so no action needs its own check.
-  if (res.status === 410 && data.error === "proposal_gone") renderGone(data.message);
+  if (res.status === 410 && data.error === "proposal_gone") renderGone(data.message, data.documents);
   return { ok: res.ok && data.ok !== false, status: res.status, data };
 }
 
@@ -86,18 +86,32 @@ let GONE = false;
  *
  *  If the portal was already on screen (deleted while the customer had it open), reload instead:
  *  the shell's sidebar and bell were built for a live proposal and live outside #portal, and the
- *  boot path draws this card on a clean page. The reloaded boot has no STATE, so it cannot loop. */
-function renderGone(message) {
+ *  boot path draws this card on a clean page. The reloaded boot has no STATE, so it cannot loop.
+ *
+ *  `documents` is the one exception: a customer who SIGNED this proposal keeps their copy of the
+ *  contract and the deposit invoice (ESIGN; main._retained_documents). The server names them by
+ *  key and only to that signed-in customer; the links are built here from this page's own token,
+ *  so nothing in the answer becomes markup. */
+const GONE_DOCS = {
+  signed_contract: ["signed-contract.pdf", "Download your signed contract (PDF)"],
+  deposit_invoice: ["deposit-invoice.pdf", "Download your deposit invoice (PDF)"],
+};
+function renderGone(message, documents) {
   if (GONE) return;
   GONE = true;
   if (POLL_TIMER) { clearInterval(POLL_TIMER); POLL_TIMER = null; }
   if (STATE) { location.reload(); return; }
   hide($("loading")); hide($("portal"));
   const g = $("gate"); show(g);
+  const docs = (Array.isArray(documents) ? documents : [])
+    .filter((k) => Object.prototype.hasOwnProperty.call(GONE_DOCS, k))
+    .map((k) => `<a class="btn btn-primary btn-block" href="/api/portal/${encodeURIComponent(TOKEN)}/${GONE_DOCS[k][0]}">${GONE_DOCS[k][1]}</a>`)
+    .join("");
+  const projects = '<a class="btn btn-secondary btn-block" href="/">View your projects</a>';
   g.innerHTML = '<div class="card login-card" role="status">' +
     "<h1>Proposal no longer available</h1>" +
     '<p class="muted">' + esc(message || GONE_TEXT) + "</p>" +
-    '<a class="btn btn-secondary btn-block" href="/">View your projects</a></div>';
+    (docs ? '<div class="stack">' + docs + projects + "</div>" : projects) + "</div>";
 }
 
 function renderError() {

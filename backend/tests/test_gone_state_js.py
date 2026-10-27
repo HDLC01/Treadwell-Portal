@@ -64,6 +64,35 @@ def test_any_other_answer_leaves_the_page_alone(ran):
         assert r["portalHidden"] is False, case
 
 
+
+# -- the exception: a customer who signed keeps their copy -------------------
+@needs_node
+def test_a_signer_of_a_deleted_proposal_gets_their_two_documents(ran):
+    """ESIGN 7001(d)/(e): deleting a signed job off the board must not take the signed contract
+    or the deposit invoice away from the customer (main._retained_documents names them)."""
+    gate = ran["signed"]["gate"]
+    assert 'href="/api/portal/tok/signed-contract.pdf"' in gate
+    assert 'href="/api/portal/tok/deposit-invoice.pdf"' in gate
+    assert "Download your signed contract (PDF)" in gate
+    assert "Download your deposit invoice (PDF)" in gate
+    # Unknown keys are dropped, never drawn: not as markup, not as a link.
+    assert "<img" not in gate and "&lt;img" not in gate
+    assert gate.count("<a ") == 3, gate      # two documents + View your projects
+    assert ran["signed"]["gone"] is True and ran["signed"]["portalHidden"]
+
+
+@needs_node
+def test_only_the_documents_named_are_offered(ran):
+    gate = ran["contractOnly"]["gate"]
+    assert "signed-contract.pdf" in gate and "deposit-invoice.pdf" not in gate
+
+
+@needs_node
+def test_a_documents_value_that_is_not_a_list_offers_nothing(ran):
+    gate = ran["notAList"]["gate"]
+    assert "script" not in gate and ".pdf" not in gate
+    assert gate.count("<a ") == 1
+
 # -- the login page: a signed-in customer with nothing left to open ----------
 LOGIN_HARNESS = pathlib.Path(__file__).resolve().parent / "js" / "login-empty-harness.js"
 

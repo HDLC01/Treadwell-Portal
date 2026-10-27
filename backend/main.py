@@ -190,7 +190,13 @@ PROPOSAL_GONE_MESSAGE = ("This proposal is no longer available. If you have ques
 
 
 class ProposalGone(Exception):
-    """A customer route reached a deleted proposal. Answered as 410 by _proposal_gone below."""
+    """A customer route reached a deleted proposal. Answered as 410 by _proposal_gone below.
+
+    Carries the row so the answer can offer a signer their own documents (_retained_documents)."""
+
+    def __init__(self, row: dict):
+        super().__init__(row.get("proposal_id"))
+        self.row = row
 
 
 def _customer_proposal(token: str) -> Optional[dict]:
@@ -200,15 +206,60 @@ def _customer_proposal(token: str) -> Optional[dict]:
     caller writes nothing. Says nothing about WHO may see it; that is _can_access."""
     p = db.get_proposal_by_token(token)
     if p and p.get("deleted_at"):
-        raise ProposalGone(token)
+        raise ProposalGone(p)
     return p
+
+
+# THE ONE EXCEPTION: WHAT THE CUSTOMER ALREADY SIGNED. ESIGN 7001(d)/(e) says the signer must be
+# able to keep their copy of an e-signed agreement, and the approval email promises the contract
+# "can always be downloaded from your portal". Deleting a signed project off the board must not
+# take that copy back. So a deleted proposal that was APPROVED still serves its signed contract
+# and its deposit invoice -- to a session that may see it (_can_access), on those two routes only
+# (_require_kept). Every other route stays gone: nothing can be approved, paid, asked or viewed on
+# it, and anyone but its customers gets the same 410 as for any deleted proposal (not a 401, which
+# would tell a stranger holding the link that this one was signed).
+def _require_kept(request: Request, token: str):
+    """_require, except that a deleted proposal's signer may still download what they signed.
+    Only api_signed_contract_pdf and api_deposit_invoice_pdf call it."""
+    try:
+        return _require(request, token)
+    except ProposalGone as gone:
+        p = gone.row
+        if p.get("approved_at") and _can_access(request, p):
+            return p
+        raise
+
+
+def _retained_documents(request: Request, p: dict) -> list:
+    """Which of a deleted proposal's documents this visitor may still download: keys, not URLs
+    (the page builds the links from its own token). Empty unless the proposal was approved AND the
+    session may see it, so a signed-out visitor learns nothing about the proposal. Never raises:
+    it decorates a refusal and must not turn one into a 500."""
+    try:
+        if not p.get("approved_at") or not _can_access(request, p):
+            return []
+        docs = []
+        if db.get_signed_contract(p["proposal_id"]):
+            docs.append("signed_contract")
+        if p.get("deposit_invoice_no") and p.get("deposit_amount") is not None:
+            docs.append("deposit_invoice")
+        return docs
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not list the kept documents of deleted proposal %s: %s: %s",
+                  p.get("proposal_id"), type(exc).__name__, exc)
+        return []
 
 
 @app.exception_handler(ProposalGone)
 async def _proposal_gone(request: Request, exc: ProposalGone):
     # 410 with the sentence the customer reads. No project name, price or status: the page shows
-    # this and nothing else (frontend/app.js renderGone).
-    return _json({"ok": False, "error": "proposal_gone", "message": PROPOSAL_GONE_MESSAGE}, 410)
+    # this and nothing else (frontend/app.js renderGone) -- except, for the signer of an approved
+    # one, links to the contract and invoice they keep (see the note above _customer_proposal).
+    body = {"ok": False, "error": "proposal_gone", "message": PROPOSAL_GONE_MESSAGE}
+    docs = _retained_documents(request, exc.row)
+    if docs:
+        body["documents"] = docs
+    return _json(body, 410)
 
 
 def _can_access(request: Request, proposal: dict) -> bool:
@@ -2201,8 +2252,11 @@ def api_pdf(token: str, request: Request):
 def api_deposit_invoice_pdf(token: str, request: Request):
     """The deposit invoice document. Rendered on demand from the stored columns
     (no blob storage) — the invoice NUMBER is what's persisted, so the document is
-    always reproducible and always matches what was emailed."""
-    p = _require(request, token)
+    always reproducible and always matches what was emailed.
+
+    Still served after the project is deleted, if it was approved: the customer keeps what
+    they were billed for (_require_kept)."""
+    p = _require_kept(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     invoice_no = p.get("deposit_invoice_no")
@@ -2495,8 +2549,11 @@ def api_signed_contract_pdf(token: str, request: Request):
     email attaches it too; this is the copy that is still here when the email is not.
 
     Session-gated exactly like api_deposit_invoice_pdf -- _require checks the customer's own
-    session against this proposal, so the /p/<token> link is a deep link and not the gate."""
-    p = _require(request, token)
+    session against this proposal, so the /p/<token> link is a deep link and not the gate.
+
+    STILL SERVED AFTER THE PROJECT IS DELETED -- the one route besides the invoice that is. A
+    signer keeps their copy; deleting a job off the staff board does not take it back."""
+    p = _require_kept(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     pdf, err, status = _signed_contract_pdf(p)
@@ -5787,7 +5844,9 @@ def _staff_close_lost(proposal_id: str, p: dict, reason: str, note: str,
 # THE CUSTOMER'S LINK STOPS WORKING (changed 2026-10-28). It used to keep working ("deleting is not
 # revoking"); then a deleted proposal reached a customer as an extra tab and Hanz said "make sure
 # that doesn't happen again". The link now shows "This proposal is no longer available" and every
-# action on it is refused (_customer_proposal). Restoring brings the link back.
+# action on it is refused (_customer_proposal). Restoring brings the link back. A SIGNED one still
+# lets its customer download the signed contract and the deposit invoice (_require_kept): deleting
+# a job off the board does not take back the copy ESIGN says the signer keeps.
 @app.post("/api/admin/proposal/{proposal_id}/delete")
 async def admin_delete_proposal(proposal_id: str, request: Request) -> JSONResponse:
     """Take this proposal off the staff board and stop its follow-ups. Reversible."""

@@ -56,6 +56,7 @@ async function drive(opts) {
      ${escLine()}
      ${line(/^const GONE_TEXT = .*$/m, "GONE_TEXT")}
      ${line(/^let GONE = .*$/m, "GONE")}
+     ${line(/^const GONE_DOCS = \{[\s\S]*?\n\};$/m, "GONE_DOCS")}
      let STATE = STATE_IN;
      let POLL_TIMER = STATE_IN ? 7 : null;
      ${fn("renderGone")}
@@ -81,5 +82,14 @@ async function drive(opts) {
     body: { ok: false, error: "proposal_gone", message: "gone" } });
   out.otherGone = await drive({ status: 410, body: { ok: false, error: "something_else" } });
   out.live = await drive({ status: 200, body: { ok: true, authed: true } });
+  // A deleted proposal the signed-in customer SIGNED: the two documents they keep, and nothing the
+  // server could name beyond those two keys turns into a link or into markup.
+  out.signed = await drive({ status: 410, body: { ok: false, error: "proposal_gone",
+    message: "gone", documents: ["signed_contract", "deposit_invoice", "<img src=x>",
+                                 "__proto__", "constructor"] } });
+  out.contractOnly = await drive({ status: 410, body: { ok: false, error: "proposal_gone",
+    message: "gone", documents: ["signed_contract"] } });
+  out.notAList = await drive({ status: 410, body: { ok: false, error: "proposal_gone",
+    message: "gone", documents: "<script>alert(1)</script>" } });
   process.stdout.write(JSON.stringify(out) + "\n");
 })().catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
