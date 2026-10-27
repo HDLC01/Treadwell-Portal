@@ -3575,9 +3575,18 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
     lead = live[0]                                   # list_scope_group is in publish order
     project = lead.get("project_name") or "your project"
     by_pid = {r["proposal_id"]: r for r in live}
+    # NAMED AS THE TOOL NAMES THEM NOW (review, 2026-10-28). The email lists every live proposal of
+    # a recipient, republished or not, and the stored scope_label is only refreshed by a publish: a
+    # scope renamed in the tool since (an old split's "Base Bid 2") would be named by its old label.
+    try:
+        draft_labels = db.list_scope_group_draft_labels(group_id) or {}
+    except Exception as exc:  # noqa: BLE001 — the stored names are still right for most scopes
+        log.warning("scope group %s: draft labels unreadable: %s", group_id, exc)
+        draft_labels = {}
 
     def _label(r: dict) -> str:
-        return r.get("scope_label") or r.get("project_name") or "Proposal"
+        return (_cap(draft_labels.get(r["proposal_id"]), _SCOPE_LABEL_MAX) or r.get("scope_label")
+                or r.get("project_name") or "Proposal")
 
     def _url(r: dict) -> str:
         return f"{config.PUBLIC_BASE_URL}/p/{r['token']}"

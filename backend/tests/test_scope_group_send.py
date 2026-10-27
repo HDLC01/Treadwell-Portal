@@ -333,6 +333,42 @@ def test_email_again_marks_an_approved_proposal_as_approved(send):
         ("Breakroom", True, None), ("Lab 1", False, None), ("Lab 2", False, "revised")]
 
 
+def test_email_again_names_a_proposal_that_was_not_republished_as_the_tool_names_it_now(send):
+    """Review, 2026-10-28: Email again lists proposals that were NOT republished, and their stored
+    scope_label is only refreshed by a publish. A project split before the sheet names went out as
+    "Base Bid 1"/"Base Bid 2"; the tool now calls them Epoxy and Polish, only Epoxy is republished.
+    The customer reads Epoxy (revised), Polish -- never the position label "Base Bid 2"."""
+    go, calls, f = send
+    f.row("d-break")["scope_label"] = "Base Bid 1"
+    f.row("d-lab1")["scope_label"] = "Base Bid 2"
+    go()
+    # Renamed in the tool; only Epoxy is republished (which refreshes its stored label).
+    f.draft_data["d-break"] = {"scope_group": {"id": GID, "label": "Epoxy"}}
+    f.draft_data["d-lab1"] = {"scope_group": {"id": GID, "label": "Polish"}}
+    # Another group's draft never names a scope of this one.
+    f.draft_data["d-lab2"] = {"scope_group": {"id": "grp-other", "label": "Elsewhere"}}
+    f.row("d-break")["scope_label"] = "Epoxy"
+    f.publish_revision("d-break", 2)
+    calls["emails"].clear()
+    r = go()
+    assert r.status_code == 200, r.text
+    # Lab 2's draft carries no label for this group: its stored name stands.
+    assert _changes(calls["emails"][-1]) == [("Epoxy", "revised"), ("Polish", None),
+                                              ("Lab 2", None)]
+
+
+def test_unreadable_draft_labels_fall_back_to_the_stored_names(send, monkeypatch):
+    go, calls, f = send
+
+    def _boom(gid):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(main.db, "list_scope_group_draft_labels", _boom)
+    r = go()
+    assert r.status_code == 200, r.text
+    assert _labels(calls["emails"][0]) == ["Breakroom", "Lab 1", "Lab 2"]
+
+
 def test_an_old_mark_without_a_revision_counts_as_announced(send):
     go, calls, f = send
     for pid in ("d-break", "d-lab1", "d-lab2"):
@@ -429,17 +465,27 @@ def test_a_retry_of_email_again_is_the_same_revision_email(send):
     assert go().status_code == 200
     assert _changes(calls["emails"][-1]) == [("Breakroom", None), ("Lab 1", "revised"),
                                               ("Lab 2", None)]
-    # Now a real retry: Pat is added to Lab 1 and bounces on the following revision.
-    f.recipients["d-lab1"] = ["cust@acme.com", "pat@acme.com"]
+    # Now a real retry: Pat is added to every proposal and bounces on the following revision of
+    # Lab 1. The retry must list all three (review, 2026-10-28): listing only the one it failed for
+    # is the "project of three reads like a project of one" email Hanz rejected.
+    for pid in ("d-break", "d-lab1", "d-lab2"):
+        f.recipients[pid] = ["cust@acme.com", "pat@acme.com"]
     f.publish_revision("d-lab1", 3)
     calls["ok"]["fn"] = lambda to: to != "pat@acme.com"
+    calls["emails"].clear()
     assert go().status_code == 200
+    whole = [("Breakroom", None), ("Lab 1", "revised"), ("Lab 2", None)]
+    assert [_changes(e) for e in calls["emails"] if e["to"] == "pat@acme.com"] == [whole]
     calls["ok"]["fn"] = lambda to: True
     calls["emails"].clear()
     r = go(retry_failed=True)
     assert r.status_code == 200, r.text
     [e] = calls["emails"]
-    assert e["to"] == "pat@acme.com" and _changes(e) == [("Lab 1", "revised")]
+    # The same email the bounced send was: every live proposal of Pat's in publish order, Lab 1
+    # marked as that send marked it, opening and threading on the FIRST LISTED (Breakroom) -- not
+    # on Lab 1, the one proposal the retry was claimed for.
+    assert e["to"] == "pat@acme.com" and _changes(e) == whole
+    assert e["token"] == "tok-d-break" and e["reply_to"] == "rt-tok-d-break"
 
 
 def test_a_retry_that_fails_again_is_a_502_and_can_be_retried(send):

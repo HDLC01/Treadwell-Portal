@@ -1766,6 +1766,43 @@ def test_email_again_on_real_rows_reads_as_a_revision_of_the_live_proposals(clea
         assert word not in h, word
 
 
+def test_email_again_names_a_proposal_not_republished_by_its_draft_label(clean, outbox, client):
+    """Review, 2026-10-28, on real rows: a project split before the sheet names went out as
+    "Base Bid 1"/"Base Bid 2". The tool renames them Epoxy and Polish and only Epoxy is
+    republished, so Polish's portal row still says "Base Bid 2". Email again names it Polish."""
+    gid = gid_new()
+    who = "dana@customer.example"
+    ids = [f"{gid}-a", f"{gid}-b"]
+    for i, (pid, label) in enumerate(zip(ids, ("Base Bid 1", "Base Bid 2"))):
+        add_draft(pid, gid, label)
+        add_proposal(pid, gid, label, days_ago=10 - i, sent=False, email=who)
+    url = f"/api/admin/scope-group/{gid}/send"
+    assert client.post(url, json={"by": KYLE}).status_code == 200
+
+    for pid, label in zip(ids, ("Epoxy", "Polish")):
+        db.execute("update public.drafts set data = jsonb_set(data, '{scope_group,label}', %s) "
+                   "where id = %s", (Jsonb(label), pid))
+    set_cols(ids[0], scope_label="Epoxy", current_revision_no=2)     # Epoxy alone republished
+    assert db.get_proposal(ids[1])["scope_label"] == "Base Bid 2"
+    outbox.sent.clear()
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 200, r.text
+    [m] = [m for m in outbox.sent if who in m["to"]]
+    assert re.findall(r'<li style="margin:4px 0">(.*?)</li>', m["html"]) == [
+        "Epoxy (revised)", "Polish"]
+    assert "Base Bid" not in m["html"]
+
+
+def test_the_draft_labels_read_is_this_groups_live_labelled_drafts(clean):
+    gid, other = gid_new(), gid_new()
+    add_draft("a", gid, "Epoxy")
+    add_draft("b", gid, None)                     # no label: the caller keeps the stored one
+    add_draft("c", gid, "Gone", deleted=True)
+    add_draft("d", other, "Elsewhere")
+    add_draft("e")                                # not grouped at all
+    assert db.list_scope_group_draft_labels(gid) == {"a": "Epoxy"}
+
+
 # ── a deleted proposal is not on the customer's list (Hanz, 2026-10-28) ────────
 def test_the_customers_list_leaves_out_a_deleted_proposal(clean):
     """A project sent as Epoxy + Polish, plus an old proposal deleted after it was sent: the

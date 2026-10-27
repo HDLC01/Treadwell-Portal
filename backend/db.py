@@ -423,6 +423,20 @@ def list_scope_group_draft_states(group_id: str) -> list[dict[str, Any]]:
     )]
 
 
+def list_scope_group_draft_labels(group_id: str) -> dict[str, str]:
+    """`{draft id: label}`: what the PROPOSAL TOOL calls each scope of a group right now.
+
+    portal_proposals.scope_label is only written on a publish or an adoption, so a scope renamed in
+    the tool and not republished keeps its old name there (an old split's "Base Bid 2"). The
+    combined email lists every live proposal of a recipient, republished or not, so it names them
+    from here. A draft with no label is left out; the caller falls back to the stored one."""
+    return {r["id"]: r["label"] for r in qall(
+        "select id, data -> 'scope_group' ->> 'label' as label from public.drafts "
+        "where deleted_at is null and data -> 'scope_group' ->> 'id' = %s",
+        (group_id,),
+    ) if r.get("label")}
+
+
 def list_scope_group_draft_states_many(group_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
     """list_scope_group_draft_states for several groups in ONE query: {group id: states}, every
     asked-for group present (an empty list when no draft carries it).
