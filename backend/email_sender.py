@@ -645,7 +645,8 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
                   reply_to: str | None = None, token: str | None = None,
                   include_status_ask: bool = False,
                   templates: dict | None = None) -> bool:
-    """One automated follow-up. `template` names which of the four; `templates` is the wording
+    """One automated follow-up. `template` names which email (followup_settings.TEMPLATE_KEYS, or a
+    legacy task's `checkin` / `deposit_nudge`); `templates` is the wording
     staff have saved (followup_settings), and None means use the wording as shipped.
 
     The deposit sentence is conditional: promising "signed proposal and deposit" on a
@@ -697,6 +698,16 @@ def send_followup(email: str, url: str, project_name: str, template: str, *,
             f'{_cta(url, "View your proposal")}'
             f'<p style="color:#64748b">Any questions at all, just reply to this email — '
             f'it comes straight to us.</p>'
+        )
+    elif template == "not_viewed_2":
+        title = "Checking your proposal reached you"
+        body = (
+            f'{greeting}'
+            f"<p>We haven't seen the proposal for <strong>{_esc(project_name)}</strong> opened "
+            f"yet, so we wanted to check it didn't get lost in your inbox.</p>"
+            f'{_cta(url, "View your proposal")}'
+            f'<p style="color:#64748b">If somebody else should be looking at it, just reply and '
+            f'tell us who.</p>'
         )
     elif template == "next_steps":
         title = "Getting you on the schedule"

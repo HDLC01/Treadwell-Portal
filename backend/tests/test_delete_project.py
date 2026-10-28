@@ -124,7 +124,8 @@ def test_restoring_leaves_the_chase_off(monkeypatch):
 def test_due_now_returns_nothing_for_a_deleted_project():
     """The engine itself, over a row shaped exactly as delete_proposal leaves it. Real code, no
     stubs: this is the last line of defence if the candidate query is ever widened again."""
-    now = dt.datetime(2026, 8, 24, 12, 0, tzinfo=dt.timezone.utc)
+    # Noon Central: inside the customer send window, so the live row's 1st email is due.
+    now = dt.datetime(2026, 8, 24, 17, 0, tzinfo=dt.timezone.utc)
     long_ago = dt.datetime(2026, 6, 1, 12, 0, tzinfo=dt.timezone.utc)
     live = {"proposal_id": "p1", "proposal_status": "sent",
             "followup_enrolled_at": long_ago, "followup_disabled_at": None,

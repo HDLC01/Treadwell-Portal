@@ -853,20 +853,13 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         "(pj.j ->> 'followup_interval_days')::int as followup_interval_days, "
         "(pj.j ->> 'followup_stop_after')::int as followup_stop_after, "
         "(pj.j ->> 'followup_mode') as followup_mode, "
-        # The touches and the reminder count, with the SAME predicates the worker reads them
-        # with (db.followup_signals). customer_replied_at above stays as it was for the board;
-        # this one leaves out auto-replies, which must not reset a reminder count.
+        # The touches, with the SAME predicates the worker reads them with (db.followup_signals).
+        # customer_replied_at above stays as it was for the board; this one leaves out auto-replies.
         + _CUSTOMER_TOUCH_SQL.format(pid="p.proposal_id") + " as customer_touch_at, "
         + _STAFF_MESSAGE_SQL.format(pid="p.proposal_id") + " as last_staff_message_at, "
-        + _REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
-        + " as followup_reminder_times, "
-        # What a scope GROUP folds (round 3 #4): only on grouped rows, so an ungrouped row costs
-        # nothing more.
-        "(case when (pj.j ->> 'scope_group') is not null then "
-        + _GROUP_REMINDER_TIMES_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
-        + " end) as group_reminder_times, "
-        + _DEPOSIT_HISTORY_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
-        + " as deposit_history, "
+        # The sent history the schedule counts (followup_rules.plan), as the worker reads it.
+        + _SENT_HISTORY_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
+        + " as followup_sent_history, "
         # The open follow-up task, if any, so the board (polled every 25s) can show it without a
         # second request.
         + _ROW_OPEN_TASK_SQL + " as pending_task "
@@ -1700,62 +1693,20 @@ _STAFF_FOLLOWUP_SQL = (
     "   where f.proposal_id = {pid} "
     "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
     "     and f.detail->>'action' is null)")
-# Every reminder of THIS send cycle, for the cap: tasks the estimator SENT or answered with a CALL,
-# plus the customer emails the automatic ladder sent before remind-only shipped. jsonb, so it rides
-# one column. Unordered on purpose: only the count after a point in time is used, and the board
-# query's tests locate its own trailing ORDER BY by the first occurrence of those words.
-#
-# Hanz, 2026-10-24 (decision 6): only a reminder that actually reached the customer, by email or by
-# phone, counts toward "Stop after N". A skipped or snoozed task did not, and neither did one that
-# is still open, expired, or a "decide the other scopes" task (that one is for staff).
-_REMINDER_TIMES_SQL = (
-    "(select coalesce(jsonb_agg(f.created_at), '[]'::jsonb) "
+# THE COUNT the schedule runs on (followup_rules.plan, 2026-10-28): every customer reminder of THIS
+# send cycle that reached the customer, as [{at, template, rule_key}]. The automatic customer emails
+# of every engine that ever ran (auto_email, audience customer: the old ladder's and this one's) and
+# the follow-up tasks an estimator SENT or answered with a CALL (the remind-only period). The
+# template says which step a row belongs to. Unordered on purpose (the rules sort it): the board
+# query's tests locate its trailing ORDER BY by the first occurrence of those words.
+_SENT_HISTORY_SQL = (
+    "(select coalesce(jsonb_agg(jsonb_build_object("
+    "     'at', f.created_at, 'template', f.detail->>'template', "
+    "     'rule_key', f.detail->>'rule_key')), '[]'::jsonb) "
     "   from public.portal_followups f "
     "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
     "    and ((f.kind = 'followup_task' and f.detail->>'status' in ('sent','called')) "
     "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
-# The same count as a scope GROUP folds it (round 3 #4, residual #17): without the member's
-# DEPOSIT-stage tasks. A scope whose approval was retired (a revision put it back to sent) still
-# holds the deposit reminders of that approval; they were never the siblings' follow-ups and must
-# not count toward the group's "Stop after N". The single chase keeps reading the full count above
-# (its deposit cap counts them, fix round #11). Derived from the predicate above, not a copy of it.
-_REMINDER_TASK_PRED = "f.detail->>'status' in ('sent','called'))"
-if _REMINDER_TIMES_SQL.count(_REMINDER_TASK_PRED) != 1:  # the derivation below must apply
-    raise RuntimeError("_REMINDER_TIMES_SQL changed: update _GROUP_REMINDER_TIMES_SQL")
-_GROUP_REMINDER_TIMES_SQL = _REMINDER_TIMES_SQL.replace(
-    _REMINDER_TASK_PRED,
-    "f.detail->>'status' in ('sent','called') "
-    "and coalesce(f.detail->>'stage', '') <> 'deposit')")
-# The deposit chase's own history in this send cycle (fix round #11/#3), for
-# followup_rules.deposit_series_done:
-#   customer_legacy  the old ladder's recurring customer deposit emails (`:depr@`). Every customer
-#                    auto_email row is the old ladder's: remind-only never writes one.
-#   staff_legacy     the old ladder's recurring staff deposit emails (`:depsr@`) - the rows WITHOUT
-#                    the `engine` mark followup_worker now puts on every staff note it reserves.
-#   staff            every staff deposit email of the cycle, old or new (dep_staff/depsr/depst).
-#   *_legacy_last    when the newest row of each old series was reserved: the old ladder froze its
-#                    key at the cap and reserved only the latest occurrence per tick, so a chase it
-#                    finished can hold far fewer than max_recurring rows (prod's first sweep).
-# The old code capped both chases at max_recurring, so a chase that reached it had FINISHED; the
-# deposit's own cap (200) must not start it again. Regex, not LIKE: a `%` here would collide with
-# the driver's parameter markers.
-_DEPOSIT_HISTORY_SQL = (
-    "(select jsonb_build_object("
-    "   'customer_legacy', count(*) filter (where f.detail->>'audience' = 'customer' "
-    "                                         and f.detail->>'rule_key' ~ ':depr@'), "
-    "   'staff_legacy', count(*) filter (where f.detail->>'audience' = 'staff' "
-    "                                      and f.detail->>'rule_key' ~ ':depsr@' "
-    "                                      and f.detail->>'engine' is null), "
-    "   'staff', count(*) filter (where f.detail->>'audience' = 'staff' "
-    "                               and f.detail->>'rule_key' ~ ':(dep_staff$|depsr@|depst@)'), "
-    "   'customer_legacy_last', max(f.created_at) filter (where f.detail->>'audience' = 'customer' "
-    "                                         and f.detail->>'rule_key' ~ ':depr@'), "
-    "   'staff_legacy_last', max(f.created_at) filter (where f.detail->>'audience' = 'staff' "
-    "                                      and f.detail->>'rule_key' ~ ':depsr@' "
-    "                                      and f.detail->>'engine' is null)) "
-    "   from public.portal_followups f "
-    "  where f.proposal_id = {pid} and f.kind = 'auto_email' "
-    "    and f.created_at >= coalesce({enrolled}, f.created_at))")
 # The newest OPEN task (there is at most one: portal_followups_one_open_task_uidx). Open means
 # pending, or `sending` — claimed by the send endpoint and not yet confirmed. A `sending` task must
 # hold the slot: if it did not, a tick during the send would raise a second task, and putting the
@@ -1807,8 +1758,8 @@ _ROW_OPEN_TASK_SQL = (
 def followup_signals(proposal_id: str) -> dict[str, Any]:
     """What the schedule needs beyond the proposal row, for ONE proposal (the worker's read).
 
-    Keys match followup_rules.TOUCH_KEYS / INPUT_KEYS, plus `pending_task` ({id, detail,
-    created_at} or None). Reads only tables and columns that exist before this change's DDL, so the
+    Keys: the touches, `followup_sent_history` (followup_rules.INPUT_KEYS) and `pending_task`
+    ({id, detail, created_at} or None). Reads only tables and columns that exist before this change's DDL, so the
     worker keeps running on a database that has not had it yet (no task can be raised there,
     because the widened CHECK is what admits the kind)."""
     enrolled = "(select pp.followup_enrolled_at from public.portal_proposals pp " \
@@ -1817,13 +1768,10 @@ def followup_signals(proposal_id: str) -> dict[str, Any]:
            + _CUSTOMER_TOUCH_SQL.format(pid="%s") + " as customer_touch_at, "
            + _STAFF_FOLLOWUP_SQL.format(pid="%s") + " as last_staff_followup_at, "
            + _STAFF_MESSAGE_SQL.format(pid="%s") + " as last_staff_message_at, "
-           + _REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
-           + " as followup_reminder_times, "
-           + _GROUP_REMINDER_TIMES_SQL.format(pid="%s", enrolled=enrolled)
-           + " as group_reminder_times, "
-           + _DEPOSIT_HISTORY_SQL.format(pid="%s", enrolled=enrolled) + " as deposit_history, "
+           + _SENT_HISTORY_SQL.format(pid="%s", enrolled=enrolled)
+           + " as followup_sent_history, "
            + _PENDING_TASK_SQL.format(pid="%s") + " as pending_task")
-    return q1(sql, (proposal_id,) * 10) or {}
+    return q1(sql, (proposal_id,) * sql.count("%s")) or {}
 
 
 def reserve_followup_task(proposal_id: str, rule_key: str, detail: dict) -> Optional[int]:
@@ -1981,23 +1929,11 @@ def _now_iso() -> str:
 def list_followup_candidates() -> list[dict[str, Any]]:
     """Proposals the cadence should consider this tick.
 
-    Paused rows are deliberately INCLUDED: the rule engine needs them to notice a
-    pause that has expired and remind the estimator. Closed-lost is excluded — there
-    is nothing left to chase. A DELETED project is excluded for a stronger reason: it
-    is off the board, so an email going out about it would be a chase nobody could see.
-
-    APPROVED is included while its deposit is still outstanding. Hanz, 2026-08-12:
-    "followups should be automated until a deposit has been received." It used to be
-    excluded here, which is why widening the rule engine alone would have changed
-    nothing — an approved proposal never reached it.
-
-    This clause is deliberately coarser than the rules are. `received` is the last
-    stop either audience has, so anything short of it is a candidate; whether THIS
-    tick owes the customer or only the estimator is followup_rules' decision, made
-    against the fresh row. A `deposit_required` of NULL predates the optional-deposit
-    column and means the default, which was required — and a FALSE with an invoice
-    raised against it anyway (`deposit_requested_at`) is staff deciding after the fact
-    that money is due, which is money worth chasing."""
+    SENT or VIEWED only (2026-10-28): follow-ups run from "proposal sent" until it is approved, and
+    nothing follows an approved or lost proposal (there is no deposit chase). Paused rows are
+    INCLUDED: the rules hold them, and resume them the morning after the pause ends. A DELETED
+    project is excluded: it is off the board, so an email about it would be one nobody could see.
+    test_followup_auto_email.py executes this clause and diffs it against followup_rules.in_scope."""
     return qall(
         "select * from public.portal_proposals "
         # A DELETED project is never chased. Deleting stamps followup_disabled_at too, so the
@@ -2012,17 +1948,9 @@ def list_followup_candidates() -> list[dict[str, Any]]:
         # deliberately -- aliasing this query as `p` would mean qualifying every other column in
         # it for no gain, and test_delete_project.py pins that form.
         #
-        # Nothing reads this SOURCE TEXT any more. test_followup_deposit_stage.py used to grep
-        # it for three substrings; it now EXECUTES this clause over a synthetic corpus and diffs
-        # the rows it admits against followup_rules.in_scope, so rewording the predicate without
-        # changing what it means is free, and changing what it means fails.
         "where (to_jsonb(portal_proposals) ->> 'deleted_at') is null "
         "  and followup_enrolled_at is not null and followup_disabled_at is null "
-        "  and (proposal_status in ('sent','viewed') "
-        "       or (proposal_status = 'approved' "
-        "           and (coalesce(deposit_required, true) "
-        "                or deposit_requested_at is not null) "
-        "           and coalesce(deposit_status, '') <> 'received')) "
+        "  and proposal_status in ('sent','viewed') "
         "order by followup_enrolled_at"
     )
 

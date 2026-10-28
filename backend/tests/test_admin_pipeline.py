@@ -222,7 +222,8 @@ def test_a_viewed_proposal_shows_the_viewed_tracks_date(pipeline):
     after = [d for d in _fr.due_now(row, got + dt.timedelta(minutes=1), _ALL_DAY)
              if d.audience == "customer"]
     assert before == [] and [d.rule_key.split(":")[-1] for d in after] == ["v1"], (got, after)
-    assert got == viewed + dt.timedelta(hours=24)
+    # The opened step's 1st email: 3 days after they open it, by default.
+    assert got == viewed + dt.timedelta(days=3)
     # And the old computation — the same row with the view missing, as the query delivered it —
     # really was different, so this test would have caught the bug.
     blind = dict(row, cycle_viewed_at=None)
@@ -232,11 +233,13 @@ def test_a_viewed_proposal_shows_the_viewed_tracks_date(pipeline):
 def test_the_card_carries_the_open_task_and_the_plan(pipeline):
     task = {"id": 12, "created_at": "2026-10-20T15:00:00+00:00",
             "detail": {"status": "pending", "template": "checkin", "stage": "pre"}}
-    card, = pipeline([_row(pending_task=task, followup_interval_days=5)])
+    card, = pipeline([_row(pending_task=task, followup_next_at="2026-11-02T13:00:00+00:00")])
     assert card["followup_task"] == {"id": 12, "status": "pending", "template": "checkin",
                                      "label": "Recurring check-in", "stage": "pre",
                                      "due_at": "2026-10-20T15:00:00+00:00"}
-    assert card["followup_plan"]["interval_days"] == 5
-    assert card["followup_plan"]["mode"] == "remind"
+    # "Next email on" only (2026-10-28); the worker emails the customer itself ('auto').
+    assert card["followup_plan"]["next_at"] == "2026-11-02T13:00:00+00:00"
+    assert "interval_days" not in card["followup_plan"]
+    assert card["followup_plan"]["mode"] == "auto"
     none, = pipeline([_row()])
     assert none["followup_task"] is None

@@ -1,43 +1,34 @@
-"""The tick that actually chases proposals.
+"""The tick that sends the follow-up emails.
 
-One daemon thread, started at boot. The portal runs a single uvicorn worker, so
-there is exactly one of these per container and no cross-process coordination is
-needed — but a DEPLOY briefly runs two containers, and a crash can restart one
-mid-send, so the dedupe cannot live in memory. It lives in the database: the worker
-RESERVES the right to send (a row in portal_followups, protected by a partial unique
-index on the rule key) and only then sends.
+WHAT IT DOES (Hanz, 2026-10-28: "the follow ups should be a follow up email to the customer
+okay?"). When a follow-up comes due (followup_rules.due_now) the worker EMAILS THE CUSTOMER itself:
+the proposal's customer and every recipient on it who has not opted out of follow-ups, with the
+saved template for that email, under the project's one email-thread subject, inside the Central
+send window. When a step's emails are used up it tells the estimator once, if that switch is on.
 
-That ordering is deliberate. If the process dies between reserving and sending, the
-customer misses one nudge and the next cadence step covers it. If it sent first and
-died before recording, the customer would get the same nag twice on every restart —
-and there is no way to un-send an email. At-most-once is the right bias here.
+This reverses the remind-only model of 2026-10-23 (portal #27), where a due reminder raised a
+`followup_task` for the estimator and emailed nobody outside the company. Reminder tasks are no
+longer raised; any still pending are marked expired by the housekeeping pass (`auto_followups`),
+so an estimator cannot send by hand what the worker is about to send. The table and its rows stay
+readable, the task endpoints still answer for them, and the scope-group DECISION task ("decide
+what to do with the other proposals") is still raised and re-nagged — it is a staff job, not a
+customer reminder.
 
-Everything is per-proposal try/except: one malformed row must never stop the sweep
-for everyone else.
+THE SEND IS THE OLD AUTO-EMAIL PATH, reused: reserve, then send. The worker RESERVES the right to
+send (a row in portal_followups, kind auto_email, under a unique (proposal, rule key) index) and
+only then sends; a send that reached nobody releases the reservation so the next tick retries.
+A deploy briefly runs two containers and a crash can restart one mid-send, so the dedupe cannot
+live in memory: if the process dies between reserving and sending, the customer misses one email
+(at-most-once is the right bias — there is no un-sending). The reserved row is also what the
+schedule counts (db._SENT_HISTORY_SQL), so a restart cannot reset the 2-per-step cap.
 
-REMIND-ONLY (2026-10-23). Hanz's decisions 1 and 2: every proposal, including every one already
-mid-cadence when this shipped, is in remind mode. A CUSTOMER reminder coming due no longer emails
-the customer. It reserves a `followup_task` row instead — through the SAME partial unique index the
-automated emails used, so an occurrence the old ladder already emailed cannot come back as a task —
-and tells the estimator, by email (`staff_followup_due`) and through the pending-task feed the
-staff tool polls. The estimator then sends a reviewed email, logs a call, skips, or snoozes (main.py,
-/api/admin/followup-task/...). `_send_customer` is not reachable from the tick at all; the only
-caller left is the estimator's explicit send.
-
-One open task per proposal. While one is pending, no second one is raised: the human decision is
-what resolves it, not the clock. A task whose proposal leaves scope (signed and paid, closed lost,
-automation off, paused, re-sent, moved to another stage) is marked expired by the housekeeping pass
-at the top of each tick, so nothing dangles in an estimator's queue for a job that has moved on.
-
-The STAFF reminders are unchanged in kind — they always went to the estimator — except that the two
-pre-decision notes (`staff_not_viewed`, `staff_personal_followup`) are folded into the task email when
-both fall due in the same tick, so the estimator gets one email about one moment rather than two.
+Everything is per-proposal try/except: one malformed row must never stop the sweep for everyone
+else.
 """
 from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -46,7 +37,6 @@ from datetime import datetime, timezone
 import config
 import db
 import email_sender
-import followup_draft
 import followup_rules as rules
 import followup_settings
 
@@ -55,13 +45,13 @@ log = logging.getLogger("portal")
 _START_LOCK = threading.Lock()
 _started = False
 
-# Read from the environment on EVERY tick, not at import: flipping automation off in
-# production is an env change plus a restart, and the flag has to be believed
-# immediately rather than at whatever value it held when the module loaded.
+# detail.engine on every row this worker reserves.
+ENGINE_MARK = "auto-2026-10-28"
+
+
+# Read from the environment on EVERY tick, not at import: flipping automation off in production is
+# an env change plus a restart, and the flag has to be believed immediately.
 def _enabled() -> bool:
-    # The fallback default is FALSE at both levels — the env var and the config attribute.
-    # `getattr(..., True)` would have quietly re-enabled automation on any build where the
-    # config attribute went missing, which is the one case you least want it guessing.
     raw = os.environ.get("FOLLOWUP_AUTOMATION_ENABLED",
                          "true" if getattr(config, "FOLLOWUP_AUTOMATION_ENABLED", False) else "false")
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
@@ -76,15 +66,7 @@ def _interval() -> int:
 
 
 def ensure_started() -> bool:
-    """Start the loop once. Called from app startup rather than lazily off a request:
-    a proposal nobody is looking at is exactly the one that needs chasing, so waiting
-    for traffic would mean the quiet proposals never get followed up.
-
-    Two things stop it before it starts. Under pytest, because every test file builds
-    a TestClient and would otherwise spawn a thread that blocks on a database the
-    tests deliberately don't have. And when automation is off, because a sweep that
-    can only return early is not worth a thread — `_tick` re-reads the flag anyway,
-    so this only decides whether to bother spinning one up at boot."""
+    """Start the loop once, at app startup. Not under pytest, and not when automation is off."""
     global _started
     if "pytest" in sys.modules:
         return False
@@ -111,20 +93,12 @@ def _run() -> None:
 
 
 def _customer_recipients(p: dict) -> list[str]:
-    """The contacts who should be CHASED — not simply everyone on the proposal.
+    """The contacts who get the follow-up emails — not simply everyone on the proposal.
 
-    Hanz, 2026-08-12: "just like the 25% deposit creat a checkbox for each contact if they will
-    be able to receive the automated follow ups or no". An accounts-payable address wants the
-    invoice and not four reminders.
-
-    get_followup_recipients rather than get_recipients: every other customer-facing email still
-    goes to everybody, because opting out of the chase is not opting out of the proposal.
-
-    Falls back to the primary contact when the list is empty, exactly as before — but note the
-    difference between EMPTY and ALL-OPTED-OUT. An empty list means we could not read the
-    recipients, so the primary is the safe guess. Every contact opting out is a decision somebody
-    made, and honouring it means sending nothing; that is what the explicit flag below is for.
-    """
+    Per-contact opt-outs are honoured (db.get_followup_recipients): an accounts-payable address
+    wants the invoice, not reminders. EMPTY and ALL-OPTED-OUT differ: a failed read falls back to
+    the primary contact, but every contact opting out is a decision, and honouring it means
+    sending nothing."""
     try:
         rec = db.get_followup_recipients(p["proposal_id"])
     except Exception:  # noqa: BLE001
@@ -133,8 +107,6 @@ def _customer_recipients(p: dict) -> list[str]:
         return [e for e in [p.get("customer_email")] if e]
     if rec:
         return rec
-    # Readable, and deliberately nobody. Distinguished from a failed read so a project whose
-    # contacts have all opted out is left alone instead of falling back to the primary.
     try:
         if db.get_recipients(p["proposal_id"]):
             return []
@@ -143,33 +115,8 @@ def _customer_recipients(p: dict) -> list[str]:
     return [e for e in [p.get("customer_email")] if e]
 
 
-def _days_since(raw) -> int | None:
-    """Whole days between a stored timestamp and now, or None if it cannot be read.
-
-    None rather than 0: "approved 0 days ago" in a reminder about a job going quiet is worse than
-    not saying when, and a missing or malformed `approved_at` must not stop the email — the point
-    of the send is the outstanding deposit, not the date."""
-    try:
-        when = rules._aware(raw)
-        if when is None and isinstance(raw, str) and raw.strip():
-            # rules._aware takes a real datetime only, which is what psycopg hands back here. A
-            # STRING reaches this on any path that has been through JSON — a stubbed row in a
-            # test, or a row read back through PostgREST. Parsing it rather than giving up keeps
-            # the sentence honest instead of silently printing "recently" for every send.
-            when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-            if not when.tzinfo:
-                when = when.replace(tzinfo=timezone.utc)
-        if when is None:
-            return None
-        return max(0, int((datetime.now(timezone.utc) - when).total_seconds() // 86400))
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _staff_recipients(p: dict) -> list[str]:
-    """The assigned estimator owns the follow-up. Proposals published before
-    assignment was required fall back to the notification roster so the nudge still
-    reaches a human."""
+    """The assigned estimator owns the follow-up; older proposals fall back to the roster."""
     who = (p.get("assigned_estimator") or "").strip()
     if who:
         return [who]
@@ -180,26 +127,18 @@ def _staff_recipients(p: dict) -> list[str]:
 
 
 def _settings() -> dict:
-    """The cadence and wording staff have saved, laid over the shipped defaults.
-
-    Never raises. A settings table that does not exist yet, or a database blip, must not stop the
-    cadence — it falls back to the cadence as shipped, which is what every environment ran before
-    these settings existed. That is also what lets this code deploy before the DDL is applied."""
+    """The schedule and wording staff have saved, over the shipped defaults. Never raises."""
     try:
         return followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
     except Exception as exc:  # noqa: BLE001
-        log.warning("[followup] could not read settings (%s) - using the shipped cadence", exc)
+        log.warning("[followup] could not read settings (%s) - using the shipped schedule", exc)
         return followup_settings.defaults()
 
 
 def _send_customer(p: dict, due, templates: dict | None = None) -> bool:
+    """One follow-up email to every follow-up recipient of `p`. True when at least one went."""
     token = p.get("token")
     url = f"{config.PUBLIC_BASE_URL}/p/{token}"
-    # The deposit reminder lands them ON the deposit step rather than at the top of a proposal
-    # they have already read and approved. Same anchor the bell links use, so `applyHashView`
-    # already handles it — a made-up fragment would open the page and quietly do nothing.
-    if due.template == "deposit_nudge":
-        url += "#proposal/deposit"
     reply_to = email_sender.proposal_reply_to(token)
     project = p.get("project_name") or "your project"
     name = p.get("customer_name") or ""
@@ -219,27 +158,23 @@ def _send_customer(p: dict, due, templates: dict | None = None) -> bool:
     return ok
 
 
-# What the customer has (not) done, in the estimator's words, per customer template. Used by the
-# follow-up-due email so it says WHICH reminder this is — these are different phone calls.
-_TASK_SITUATION = {
-    "not_viewed": "hasn't opened the proposal yet",
-    "next_steps": "has opened the proposal but hasn't approved it",
-    "second_nudge": "has opened the proposal but still hasn't approved it",
-    "checkin": "has had the proposal a while and still hasn't decided",
-    "deposit_nudge": "approved the proposal, and the deposit hasn't come in",
-}
-
-
 def _scope_names(scopes) -> str:
     return ", ".join(email_sender._esc(s.get("label") or "a scope")
                      for s in (scopes or []) if isinstance(s, dict))
 
 
-def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
-    """`for_template` is the CUSTOMER template a staff_followup_due email is about.
+# What the customer has (not) done, in the estimator's words, per step.
+_STEP_SITUATION = {
+    rules.NOT_OPENED: "still hasn't opened the proposal",
+    rules.OPENED: "has opened the proposal but hasn't decided",
+}
 
-    `p` may be a scope group's synthetic proposal (followup_rules.group_view): it then carries
-    `scopes`, which the email lists, and `link_proposal_id`, an OPEN scope for the CRM button."""
+
+def _send_staff(p: dict, due, info: dict | None = None) -> bool:
+    """An estimator email. `p` may be a scope group's synthetic proposal (rules.group_view): it then
+    carries `scopes`, which the email lists, and `link_proposal_id`, an OPEN scope for the button.
+
+    `info` is the plan's {step, sent} for the estimator's "follow-ups are done" note."""
     to = _staff_recipients(p)
     if not to:
         log.info("[followup] no staff recipient for %s", p["proposal_id"])
@@ -248,106 +183,50 @@ def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
     link_pid = p.get("link_proposal_id") or pid
     project = p.get("project_name") or "this project"
     token = p.get("token")
-    # NO CUSTOMER LINK IN A STAFF EMAIL. Hanz, 2026-08-24: "can we remove the Proposal link in
-    # the email for the treadwell staff". It read as clutter and it was worse than that: that
-    # URL is the customer's own magic link, and /p/{token} is the whole credential. A staff
-    # reminder lands in several inboxes, gets forwarded, and quoted in replies, so every copy was
-    # another way into a customer's proposal by anyone who saw it. Staff never needed it either:
-    # `reply_link=crm_url` below is the button they actually press, and it lands on the CRM card
-    # where the same proposal is reachable behind a login.
-    #
-    # `token` is still read above because the CUSTOMER emails need it. If you are adding a link
-    # to a staff email, link the CRM, not the portal.
+    # NO CUSTOMER LINK IN A STAFF EMAIL (Hanz, 2026-08-24): /p/{token} is the customer's whole
+    # credential. The button links the CRM card instead.
     crm_url = f"{config.PROPOSAL_TOOL_PUBLIC_URL}/portal.html?open={link_pid}"
     who = p.get("customer_name") or p.get("customer_email") or "the customer"
-    # For a deposit chase the figure that matters is the DEPOSIT, not the whole job — the estimator
-    # is about to ask for one specific number, and quoting the contract value would have them
-    # asking for the wrong one.
-    amount = (p.get("deposit_amount") or p.get("approved_total")
-              if (due.template == "staff_deposit_outstanding" or for_template == "deposit_nudge")
-              else p.get("approved_total") or p.get("deposit_amount"))
-    amount_txt = f"${float(amount):,.2f}" if amount is not None else "—"
+    esc = email_sender._esc
 
-    if due.template == "staff_not_viewed":
-        subject = f"Not viewed yet — {project}"
-        body = (f"<p><strong>{email_sender._esc(who)}</strong> hasn't opened the proposal for "
-                f"<strong>{email_sender._esc(project)}</strong> yet — it went out 24 hours ago.</p>"
-                f"<p>A quick call often beats another email.</p>")
-    elif due.template == "staff_followup_due":
-        # Remind-only: a reminder to the CUSTOMER is due, and nothing has been sent to them. This
-        # email is the estimator's cue; the draft waits in the CRM behind the button below.
-        situation = _TASK_SITUATION.get(for_template or "", "hasn't decided yet")
-        subject = f"Follow-up due — {project}"
-        body = (f"<p><strong>{email_sender._esc(who)}</strong> {situation} on "
-                f"<strong>{email_sender._esc(project)}</strong>, and a follow-up is due.</p>"
-                f"<ul>"
-                f"<li>Customer: {email_sender._esc(who)}</li>"
-                f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
-                f"<li>Amount: {amount_txt}</li>"
-                f"</ul>"
-                f"<p>Nothing has been sent to the customer. Open it in the CRM to review the "
-                f"draft email and send it, log a call instead, or skip it for now.</p>")
-    elif due.template == "staff_pause_expired":
-        until = p.get("followup_paused_until")
-        subject = f"Follow-up reminder — {project}"
-        body = (f"<p>The delay window {email_sender._esc(who)} asked for on "
-                f"<strong>{email_sender._esc(project)}</strong> ended "
-                f"{email_sender._esc(until)}. Follow-up reminders have resumed.</p>"
-                f"<p>Worth a personal check-in before the next one comes due.</p>")
-    elif due.template == "staff_deposit_outstanding":
-        # The half that keeps going after the customer's reminders stop. A cheque "in the post"
-        # that never lands has to stay somebody's problem, so this says WHICH of the two it is
-        # rather than one vague "deposit outstanding" — they are different phone calls.
-        submitted = str(p.get("deposit_status") or "").strip().lower() == "submitted"
-        days = _days_since(p.get("approved_at"))
-        ago = f"{days} day{'' if days == 1 else 's'} ago" if days is not None else "recently"
-        subject = (f"Deposit not in yet — {project}" if not submitted
-                   else f"Deposit still unconfirmed — {project}")
-        head = (f"<p><strong>{email_sender._esc(who)}</strong> approved "
-                f"<strong>{email_sender._esc(project)}</strong> {ago}, and the deposit ")
-        body = (head + ("has been recorded on their side but has not arrived yet.</p>"
-                        if submitted else "has not come in.</p>")
-                + f"<ul>"
-                + f"<li>Customer: {email_sender._esc(who)}</li>"
-                + f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
-                + f"<li>Amount: {amount_txt}</li>"
-                + f"</ul>"
-                + ("<p>Their own reminders have stopped — they've told us it's on the way, so "
-                   "this one is ours to chase. Mark it received in the CRM when it lands.</p>"
-                   if submitted else
-                   "<p>You'll keep getting reminders to chase it. Dates aren't held until the "
-                   "deposit is in, so a call is worth more than the next email.</p>"))
-    elif due.template == "staff_scope_decision":
-        # Scope groups (Hanz's decision 2): one scope was approved, the chase on the others has
-        # stopped, and somebody has to decide what happens to them. Never auto-closed.
+    if due.template == "staff_scope_decision":
+        # Scope groups: one proposal was approved, the follow-ups on the others have stopped, and
+        # somebody has to decide what happens to them. Never auto-closed.
         dec = p.get("_decision") or {}
         subject = f"Decide the other scopes — {project}"
-        body = (f"<p><strong>{email_sender._esc(who)}</strong> approved the "
-                f"<strong>{email_sender._esc(dec.get('approved_label') or 'one')}</strong> scope "
-                f"of <strong>{email_sender._esc(project)}</strong>.</p>"
+        body = (f"<p><strong>{esc(who)}</strong> approved the "
+                f"<strong>{esc(dec.get('approved_label') or 'one')}</strong> scope "
+                f"of <strong>{esc(project)}</strong>.</p>"
                 f"<p>Follow-up reminders for the other scopes have stopped: "
                 f"<strong>{_scope_names(dec.get('scopes'))}</strong>.</p>"
                 f"<p>Open it in the CRM to close them as lost, keep following up on them, or "
                 f"leave them as they are. Nothing has been closed.</p>")
-    else:   # staff_personal_followup
-        subject = f"Time for a personal follow-up — {project}"
-        body = (f"<p><strong>{email_sender._esc(who)}</strong> has read the proposal for "
-                f"<strong>{email_sender._esc(project)}</strong> but hasn't approved it.</p>"
+    else:   # staff_followups_done — the "Tell the estimator" switch
+        info = info or {}
+        amount = p.get("approved_total") or p.get("deposit_amount")
+        amount_txt = f"${float(amount):,.2f}" if amount is not None else "—"
+        situation = _STEP_SITUATION.get(info.get("step") or "", "hasn't decided yet")
+        n = int(info.get("sent") or 0)
+        if n:
+            sent_line = ("Both follow-up emails have gone to them" if n >= 2
+                         else "The follow-up email has gone to them")
+            sent_line += ", and no more will be sent automatically."
+        else:
+            sent_line = "No follow-up emails are switched on for this step."
+        subject = f"Follow-ups done — {project}"
+        body = (f"<p><strong>{esc(who)}</strong> {situation} on "
+                f"<strong>{esc(project)}</strong>.</p>"
+                f"<p>{sent_line} A call is the next step.</p>"
                 f"<ul>"
-                f"<li>Customer: {email_sender._esc(who)}</li>"
-                f"<li>Email: {email_sender._esc(p.get('customer_email') or '—')}</li>"
+                f"<li>Customer: {esc(who)}</li>"
+                f"<li>Email: {esc(p.get('customer_email') or '—')}</li>"
                 f"<li>Amount: {amount_txt}</li>"
-                f"</ul>"
-                f"<p>Reminders continue, but this one is worth a call.</p>")
+                f"</ul>")
     if p.get("scopes") and due.template != "staff_scope_decision":
-        # A scope group's reminder is about the PROJECT: say which scopes it covers.
         body += (f"<p>This project has several proposals. Still open: "
                  f"<strong>{_scope_names(p.get('scopes'))}</strong>.</p>")
     try:
-        # notify_team returns the addresses it DELIVERED to (one send per person), so `bool()`
-        # asks the only question the caller has: did anything land? Falsy means the sweep releases
-        # the reservation and retries next tick, which is what a False meant before the loop —
-        # same branch, same meaning. `_send_customer` above answers it the same way.
+        # notify_team returns the addresses it DELIVERED to; falsy means release and retry.
         return bool(email_sender.notify_team(
             subject, body, recipients=to, reply_link=crm_url, proposal_id=link_pid,
             reply_to=email_sender.proposal_reply_to(token)))
@@ -357,53 +236,23 @@ def _send_staff(p: dict, due, for_template: str | None = None) -> bool:
 
 
 # What each reminder says once it is in the conversation, written for the person who RECEIVED it.
-#
-# Hanz, 2026-08-19: "For the Email follow ups, can it appear in the ChatBox and a history of the
-# follow ups." Until now a customer who reads the portal instead of their inbox watched the thread
-# go silent while six emails went out — and staff had no shared record of what had been chased.
-#
-# The internal vocabulary stays internal. "Nudge", "second nudge", "chase", "cadence" and the rule
-# keys are how we talk about this to each other; `not_viewed` rendered on a customer's own screen as
-# "Not opened yet" reads like being told off. Each line below says what we did and why, in the words
-# we would use to their face. THE CUSTOMER MAP — the staff one is below, and the split is what
-# decides whether a row is internal.
+# The CUSTOMER map: a plain row in the thread they read.
 _ECHO = {
     "not_viewed": "Reminder sent — we emailed you a link to the proposal in case it got buried.",
+    "not_viewed_2": "Reminder sent — we emailed you again in case the proposal got lost.",
     "next_steps": "Reminder sent — we emailed you about the next steps on this proposal.",
     "second_nudge": "Reminder sent — we emailed you again about this proposal.",
+    # Legacy templates: an old task an estimator still sends by hand.
     "checkin": "Checking in — we emailed you to see where this stands.",
     "deposit_nudge": "Reminder sent — we emailed you about the deposit for this project.",
 }
 
-
-# The STAFF half of the same record. Four reminders go to the estimator and nobody else, and
-# until now they appeared in the conversation NOWHERE: the drawer showed a thread that went quiet
-# while the estimator's inbox filled up. These rows are marked `internal`, which is what keeps them
-# in the staff drawer and out of the customer's copy of the thread (db.list_messages).
-#
-# Written for an ESTIMATOR, so the wording is not the customer's. "Reminder sent" would be a lie
-# here — nothing was sent to the customer on these steps — and each line says which fact triggered
-# the email that just went out, in the same terms as that email.
+# The STAFF map: rows marked `internal`, so they stay in the staff drawer and out of the
+# customer's copy of the thread (db.list_messages).
 _ECHO_STAFF = {
-    "staff_not_viewed": ("Nobody has opened this yet — the proposal has gone unread since it "
-                         "was sent, and the estimator has been emailed. A call usually beats "
-                         "another email."),
-    "staff_personal_followup": ("Worth a call — the customer has read the proposal and not "
-                                "approved it, and the estimator has been emailed. The follow-up "
-                                "reminders carry on either way."),
-    "staff_deposit_outstanding": ("Deposit still outstanding — the job is approved and the "
-                                  "money has not arrived, and the estimator has been emailed. "
-                                  "Dates are not held until it is in."),
-    "staff_pause_expired": ("Delay window has ended — the wait the customer asked for is "
-                            "over and the follow-up reminders have resumed. The estimator has "
-                            "been emailed."),
-    # Remind-only. The card that says a follow-up task was raised. "Nothing has gone to them" is
-    # the sentence that matters: until 2026-10-23 a card at this moment meant an email HAD gone.
-    "staff_followup_due": ("Follow-up due — a reminder for the customer is ready to review and "
-                           "send from the CRM. Nothing has gone to them yet; the estimator has "
-                           "been emailed."),
-    # Scope groups: one scope was approved, so the chase on the others stopped and a decision task
-    # was raised. Nothing was closed; the estimator decides.
+    rules.ESTIMATOR_TEMPLATE: ("Follow-ups done — the follow-up emails for this step have all gone "
+                               "and the customer hasn't decided. The estimator has been emailed; a "
+                               "call is the next step."),
     "staff_scope_decision": ("Decision needed — a scope of this project was approved, so the "
                              "follow-up reminders for the other scopes have stopped. Nothing has "
                              "been closed; the estimator has been emailed to decide."),
@@ -413,28 +262,10 @@ _ECHO_STAFF = {
 def _echo_to_thread(pid: str, due, extra_meta: dict | None = None) -> None:
     """Put a sent reminder into the project's conversation, so both sides can see it happened.
 
-    BOTH AUDIENCES, on two different maps, because the two readerships are different people.
-    A customer reminder posts a plain row: they received that email and the row is the record of
-    it in the thread they read. A staff reminder posts an INTERNAL row — `meta.internal`, which
-    `db.list_messages` excludes by default (its docstring is the authority) and which only the
-    staff drawer opts out of with `include_internal=True`. That flag is what lets the estimator's
-    own reminders sit in the shared thread at all: "Dates are not held until it is in" and the
-    customer's outstanding balance are notes about them, not to them.
-
-    Which map a row comes from therefore decides its visibility, so the audience is read once here
-    and never re-derived. An unmapped template still says nothing rather than guessing, on either
-    side; adding a fifth staff reminder without deciding its wording posts nothing instead of
-    posting the internal template name.
-
-    `msg_type="system"` because both screens already render that as a card (app.js in the portal,
-    portal.js in the staff drawer) and it sits inside the existing CHECK constraint — no new message
-    type, so no migration. `meta.followup` marks these as machine-sent, which is what keeps them out
-    of the customer's notification bell: being emailed and then pinged about having been emailed is
-    one event, not two.
-
-    Called only after a send actually succeeded, so a released reservation leaves no claim that we
-    wrote to somebody we did not. Best-effort: the email has gone, and nothing here is worth undoing
-    it over."""
+    The audience decides the map and the map decides visibility: a customer reminder posts a plain
+    row, a staff one an INTERNAL row. An unmapped template says nothing. `meta.followup` keeps
+    these out of the customer's notification bell. Called only after a send succeeded.
+    Best-effort: the email has gone, and nothing here is worth undoing it over."""
     audience = getattr(due, "audience", "")
     template = getattr(due, "template", "")
     if audience == "customer":
@@ -445,10 +276,8 @@ def _echo_to_thread(pid: str, due, extra_meta: dict | None = None) -> None:
     else:
         return
     if not body:
-        return                              # an unmapped template says nothing rather than guessing
+        return
     if extra_meta:
-        # Only ADDS keys (e.g. the task id an estimator's hand-sent reminder came from). The
-        # visibility keys set above are never overridden from here.
         meta = dict({k: v for k, v in extra_meta.items() if k not in meta}, **meta)
     try:
         db.add_message(pid, "staff", None, body, msg_type="system", meta=meta)
@@ -458,23 +287,17 @@ def _echo_to_thread(pid: str, due, extra_meta: dict | None = None) -> None:
 
 def send_task_email(p: dict, template: str, include_status_ask: bool, tpl: dict,
                     rule_key: str = "task") -> bool:
-    """Send ONE follow-up the estimator has reviewed. The only route to `_send_customer` left.
-
-    `tpl` is the edited {title, body, cta}, already validated by the caller. It rides the same
-    rendering path a saved template does (email_sender.send_followup with `templates`), so the
-    branded shell, the per-proposal Reply-To, the thread headers, the deposit deep-link and the
-    per-contact opt-outs are exactly what the automatic email had."""
+    """Send ONE follow-up an estimator reviewed (an old task, sent by hand). Same rendering path as
+    the automatic email, so the shell, Reply-To, thread headers and opt-outs are identical."""
     due = rules.Due(rule_key, "customer", template, bool(include_status_ask))
     return _send_customer(p, due, {template: tpl})
 
 
 def send_group_task_email(view: dict, tpl: dict) -> dict:
-    """Send a scope group's reviewed follow-up: ONE email PER RECIPIENT, listing only the open
-    scopes that recipient is chased on, with the estimator's edited text. Returns
+    """A scope group's follow-up: ONE email PER RECIPIENT, listing only the open proposals that
+    recipient is on, with one button to the project page (as the combined send). Returns
     {email: [proposal_id, ...]} for every address it was DELIVERED to (empty = nothing went).
-
-    Recipients per scope are the chase list (`_customer_recipients`: per-contact opt-outs
-    honoured), merged across the group's open scopes in group order."""
+    Used by the worker's automatic group email and by an old group task sent by hand."""
     members = view.get("_open_members") or []
     per: dict[str, list[dict]] = {}
     for m in members:
@@ -493,7 +316,7 @@ def send_group_task_email(view: dict, tpl: dict) -> dict:
                   "url": f"{config.PUBLIC_BASE_URL}/p/{m.get('token')}", "approved": False}
                  for m in mine],
                 tpl, deposit_required=view.get("deposit_required") is not False,
-                # A reply lands in the thread of the first scope THEY are on.
+                # A reply lands in the thread of the first proposal THEY are on.
                 reply_to=email_sender.proposal_reply_to(mine[0].get("token")),
                 token=mine[0].get("token"))
         except Exception as exc:  # noqa: BLE001 — one bad address must not stop the others
@@ -504,22 +327,12 @@ def send_group_task_email(view: dict, tpl: dict) -> dict:
     return delivered
 
 
-# The two pre-decision staff notes that say the same thing as a follow-up-due email. When both fall
-# due in one tick (the 24h not-opened step always does), the task email is the one that goes out
-# and the note is consumed without a second email. Deposit and pause-expired notes are different
-# news and are never folded.
-_FOLDED_INTO_TASK = ("staff_not_viewed", "staff_personal_followup")
-
-# detail.engine on every staff note this worker reserves (see _act_on_dues).
-ENGINE_MARK = "remind-only"
-
+# ── housekeeping ──────────────────────────────────────────────────────────────
 
 def _expire_stale_tasks(now: datetime) -> None:
-    """Housekeeping: a pending task whose proposal has moved on is marked expired.
-
-    Without this a task raised on Tuesday for a customer who signed on Wednesday would sit in the
-    estimator's queue for ever — and, worse, block every later task on that proposal, because one
-    pending task is the gate. Never raises: housekeeping must not stop the sweep."""
+    """A pending REMINDER task is expired: the worker emails the customer itself now, and a task
+    left open would let an estimator send the same reminder by hand. A scope-group DECISION task
+    is judged against its siblings and re-nagged while it is live. Never raises."""
     try:
         pending = db.list_pending_followup_tasks()
     except Exception as exc:  # noqa: BLE001
@@ -527,34 +340,29 @@ def _expire_stale_tasks(now: datetime) -> None:
         return
     for t in pending or []:
         try:
-            if is_group_task(t.get("detail")):
-                # A scope group's task is judged against the GROUP (group_view), and a decision
-                # task against its siblings — never against the proposal it is filed on, which for
-                # the decision task is the approved scope and would read as "moved on" at once.
-                ok, why, _subject = judge_task(t, now)
-            else:
-                p = db.get_proposal(t["proposal_id"])
-                ok, why = rules.task_is_live(t.get("detail") or {}, p, now)
+            d = t.get("detail") or {}
+            if d.get("stage") != rules.DECISION_STAGE:
+                db.decide_followup_task(t["id"], "expired", None, {"reason": "auto_followups"})
+                log.info("[followup] task %s on %s expired (auto_followups)",
+                         t["id"], t["proposal_id"])
+                continue
+            ok, why, _subject = judge_task(t, now)
             if not ok:
                 db.decide_followup_task(t["id"], "expired", None, {"reason": why})
                 log.info("[followup] task %s on %s expired (%s)", t["id"], t["proposal_id"], why)
-            elif (t.get("detail") or {}).get("stage") == rules.DECISION_STAGE:
+            else:
                 _renag_decision(t, now)
         except Exception as exc:  # noqa: BLE001
             log.warning("[followup] could not check task %s: %s", t.get("id"), exc)
 
 
-# ── scope groups (2026-10-24) ─────────────────────────────────────────────────
-# RJ's "one project, many proposals": a project priced as several separately approved scopes is
-# chased as ONE project. The group's live OPEN scopes are folded into one synthetic proposal
-# (followup_rules.group_view) filed on a stable HOME scope; it raises one task per due occurrence and
-# one estimator email per moment. An APPROVED scope leaves the group pass and keeps its own ordinary
-# deposit chase. Approving any scope stops the group chase and raises ONE "decide what to do with the
-# other scopes" task (main.api_approve); nothing is ever closed automatically.
+# ── scope groups ──────────────────────────────────────────────────────────────
+# A project priced as several separately approved proposals is followed up as ONE project: one
+# email per recipient listing their open proposals, at most 2 per step for the whole group, filed on
+# the group's HOME proposal. Approving any proposal stops the group and raises ONE "decide what to
+# do with the others" task (main.api_approve); nothing is ever closed automatically.
 
 # How often an unresolved decision task re-emails the estimator, and how many times at most.
-# Ignoring it would leave the other scopes un-chased and un-closed for ever, so it nags; capped so
-# it cannot nag for ever either.
 DECISION_RENAG_DAYS = 3
 DECISION_RENAG_MAX = 5
 
@@ -565,11 +373,8 @@ def is_group_task(detail) -> bool:
 
 
 def group_members(group_id: str, strict: bool = True) -> list[dict]:
-    """The LIVE members of one scope group (followup_rules.live_members), freshly read.
-
-    Raises when the drafts cannot be read and `strict` (the worker: fail closed, chase nothing
-    rather than guess). `strict=False` falls back to the portal rows as stored, for callers whose
-    worst case is a staff task rather than a customer email."""
+    """The LIVE members of one scope group (followup_rules.live_members), freshly read. Raises when
+    the drafts cannot be read and `strict` (the worker: fail closed, email nobody)."""
     rows = db.list_scope_group(group_id)
     try:
         drafts = db.list_scope_group_draft_states(group_id)
@@ -581,9 +386,8 @@ def group_members(group_id: str, strict: bool = True) -> list[dict]:
 
 
 def _with_signals(members: list[dict], group_id: str) -> list[dict]:
-    """Each member with what group_view reads beyond the row: its touches and counted reminders
-    (db.followup_signals) and the group's last 'keep chasing' decision. Unguarded, like the single
-    path's read: without the touches the schedule would be guessed."""
+    """Each member with its sent history (db.followup_signals) and the group's last 'keep
+    following up' decision. Unguarded: without the history the cap would be guessed."""
     resumed = db.scope_group_resumed_at(group_id)
     out = []
     for m in members:
@@ -595,10 +399,8 @@ def _with_signals(members: list[dict], group_id: str) -> list[dict]:
 
 
 def _group_history(group_id: str, members: list[dict]) -> list[dict]:
-    """The group's NON-live rows (rules.history_rows), each with its signals: where a closed,
-    deleted or detached former home keeps the group's last send (staff_email + anchor) and its
-    counted reminders. Unguarded like _with_signals: without them a re-homed group would be
-    chased again a day after it was emailed, past its "Stop after N"."""
+    """The group's NON-live rows (rules.history_rows), each with its sent history: a closed or
+    deleted former home still holds the group's sends."""
     rows = db.list_scope_group_history(group_id)
     live_ids = {m.get("proposal_id") for m in members}
     if not any(r.get("proposal_id") not in live_ids for r in rows or []):
@@ -619,11 +421,8 @@ def group_state_for(group_id: str, now: datetime) -> tuple:
 
 
 def judge_task(task: dict, now: datetime) -> tuple:
-    """(ok, reason, subject): may this open task still be acted on, and against what?
-
-    `subject` is the proposal for an ordinary task, the group's synthetic proposal for a group
-    reminder, and `{"scope_members": [...]}` for a decision task. The ONE judgement for the
-    worker's housekeeping and every task endpoint, so the two cannot disagree."""
+    """(ok, reason, subject): may this open task still be acted on, and against what? The ONE
+    judgement for the housekeeping and every task endpoint."""
     d = task.get("detail") or {}
     gid = d.get("scope_group")
     if d.get("stage") == rules.DECISION_STAGE:
@@ -653,8 +452,7 @@ def _current_status(pid: str) -> str | None:
 
 def _renag_decision(task: dict, now: datetime) -> None:
     """Re-email the estimator about an unresolved decision task every DECISION_RENAG_DAYS, at most
-    DECISION_RENAG_MAX times. Reserved like every staff note (rule key per task per occurrence), so
-    the twin container and a re-run tick send it once. Never raises."""
+    DECISION_RENAG_MAX times. Reserved like every send (rule key per task per occurrence)."""
     try:
         created = rules._ts(task.get("created_at"))
         if created is None:
@@ -673,7 +471,6 @@ def _renag_decision(task: dict, now: datetime) -> None:
         d = task.get("detail") or {}
         p = dict(p, _decision={"approved_label": (d.get("approved_scope") or {}).get("label"),
                                "scopes": d.get("scopes") or []})
-        # The CRM button: the first listed sibling STILL open, read fresh (round 3 #3).
         ids = [s.get("proposal_id") for s in d.get("scopes") or []
                if isinstance(s, dict) and s.get("proposal_id")]
         try:
@@ -681,8 +478,7 @@ def _renag_decision(task: dict, now: datetime) -> None:
                 ids, _current_status,
                 (d.get("approved_scope") or {}).get("proposal_id") or pid)
         except Exception as exc:  # noqa: BLE001 — the link only
-            log.warning("[followup] decision task %s: scope statuses unreadable: %s",
-                        task.get("id"), exc)
+            log.warning("[followup] decision task %s: statuses unreadable: %s", task.get("id"), exc)
             p["link_proposal_id"] = ids[0] if ids else pid
         due = rules.Due(key, "staff", "staff_scope_decision")
         if not _send_staff(p, due):
@@ -692,23 +488,14 @@ def _renag_decision(task: dict, now: datetime) -> None:
 
 
 # How long a `sending` claim may stand before the tick decides the send is not in flight any more.
-# A send is one Resend call per recipient, seconds long; fifteen minutes is far past any live one,
-# so a slow send is never reopened under the estimator who pressed the button.
 SENDING_STALE_MINUTES = 15
 
 
 def _recover_stuck_sends() -> None:
-    """Settle tasks the send endpoint claimed (`sending`) and then lost its database before it
-    could finish or reopen them (audit, 2026-10-23).
-
-    Without this a task whose email failed, and whose reopen ALSO failed, sat claimed for ever:
-    every retry was 409, and because `sending` holds the one-open-task slot no later reminder on
-    that proposal could be raised either. Two outcomes, and neither emails anybody:
-      - the staff_email row the endpoint writes after a REAL send exists -> finish it as `sent`;
-      - otherwise -> back to pending, flagged `send_unconfirmed`, for the estimator to look at.
-    The second guess can be wrong only when the email went AND both later writes failed; then the
-    estimator sees the task again with a warning, which costs a look at the thread. Leaving it
-    stuck cost every reminder that proposal would ever get. Never raises."""
+    """Settle old tasks the send endpoint claimed (`sending`) and then lost its database before it
+    could finish or reopen them. The staff_email row written after a REAL send -> finish as sent;
+    otherwise -> back to pending, flagged `send_unconfirmed` (the expiry pass then retires it).
+    Neither emails anybody. Never raises."""
     try:
         stuck = db.list_stale_sending_tasks(SENDING_STALE_MINUTES)
     except Exception as exc:  # noqa: BLE001
@@ -730,51 +517,13 @@ def _recover_stuck_sends() -> None:
             log.warning("[followup] could not settle task %s: %s", tid, exc)
 
 
-def _raise_task(p: dict, due, cfg: dict, extra: dict | None = None) -> bool:
-    """Reserve a follow-up task for a matured customer reminder and tell the estimator.
-
-    Returns True only when THIS call created the task. The reservation goes through the same
-    partial unique index the automated emails used (db.reserve_followup_task), so the twin
-    container during a deploy, a re-run tick, or an occurrence the old ladder already emailed all
-    dedupe to nothing.
-
-    The staff email is best-effort and the task is NOT released if it fails: unlike an automated
-    customer email, a task that nobody was emailed about is still on the staff tool's bell and
-    in the pipeline, so releasing it would only lose the record."""
-    pid = p["proposal_id"]
-    enrolled = rules._aware(p.get("followup_enrolled_at"))
-    draft = followup_draft.default_draft(due.template, cfg)
-    detail = {
-        "audience": "customer", "template": due.template, "status": "pending",
-        "stage": rules.task_stage(due.template),
-        "cycle": rules.cycle_key(enrolled) if enrolled else None,
-        "include_status_ask": bool(due.include_status_ask),
-        "mode": rules.followup_mode(p),
-        # The plain starting point, stored so the compose box opens instantly. The AI draft is
-        # fetched on demand when the estimator opens the task — see followup_draft.
-        "draft": {"title": draft["title"], "body": draft["body"], "source": "default"},
-    }
-    if extra:
-        # A scope group's task: scope_group and scopes [{proposal_id, label, status}].
-        detail.update(extra)
-    rid = db.reserve_followup_task(pid, due.rule_key, detail)
-    if rid is None:
-        return False
-    log.info("[followup] %s %s -> task %s (remind)", pid, due.rule_key, rid)
-    note = rules.Due(due.rule_key, "staff", "staff_followup_due")
-    if not _send_staff(p, note, for_template=due.template):
-        log.warning("[followup] task %s raised for %s but the estimator email did not go", rid, pid)
-    _echo_to_thread(pid, note, {"task_id": rid})
-    return True
-
+# ── the tick ──────────────────────────────────────────────────────────────────
 
 def _tick(now: datetime | None = None) -> None:
     if not _enabled():
         return
     now = now or datetime.now(timezone.utc)
-    # One read per tick, so every proposal in this pass is judged by the same cadence. Reading it
-    # per row would let an edit landing mid-tick apply to half the candidates and not the rest,
-    # which is the kind of inconsistency nobody would ever reproduce.
+    # One read per tick, so every proposal in this pass is judged by the same schedule.
     cfg = _settings()
     try:
         candidates = db.list_followup_candidates()
@@ -782,40 +531,19 @@ def _tick(now: datetime | None = None) -> None:
         log.error("[followup] could not list candidates: %s", exc)
         return
 
-    # Settle unconfirmed sends first, so a task reopened here is judged by the expiry pass below in
-    # the same tick (a reopened task whose proposal has since been signed is expired at once).
     _recover_stuck_sends()
-    # Before the candidates, so a task expired here (stage moved, proposal paused, re-sent) no
-    # longer blocks the fresh task that proposal may be owed in this same tick.
     _expire_stale_tasks(now)
 
-    # Ordinary proposals, plus scopes that are not OPEN live members of a group (an approved scope
-    # chasing its deposit, a scope taken out of its group): the tick as it was before scope groups.
     singles, groups = _partition(candidates)
     for row in singles:
         pid = row.get("proposal_id")
         try:
-            # Re-read before acting. The list may be minutes old by the time we reach
-            # this row, and a proposal approved or taken off automation in between
-            # must not get one last nag.
-            fresh = db.get_proposal(pid) or row
-            if fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
+            fresh = _fresh(pid, row)
+            if fresh is None:
                 continue
-            # The touches, the reminder count and the open task: what the schedule needs beyond
-            # the proposal row. Unguarded on purpose — without the open task we cannot honour
-            # "one task at a time", so a failed read skips this row rather than guessing.
-            signals = db.followup_signals(pid) or {}
-            fresh = dict(fresh, **{k: v for k, v in signals.items() if k != "pending_task"})
-            pending = signals.get("pending_task")
-            if pending and is_group_task((pending or {}).get("detail")):
-                # A scope group's task (or a decision task) filed on this scope is not THIS
-                # scope's own reminder and must not hold its slot: an approved scope keeps its
-                # deposit chase. The one-open-task-per-stage index still stops a duplicate.
-                pending = None
-            _act_on_dues(fresh, pid, rules.due_now(fresh, now, cfg), pending, cfg)
+            _act_on_dues(fresh, pid, rules.due_now(fresh, now, cfg), cfg, now)
         except Exception as exc:  # noqa: BLE001 — never let one row end the sweep
             log.warning("[followup] skipped %s: %s", pid, exc)
-    # One pass per scope group: one task per due occurrence, on the group's home scope.
     for gid in groups:
         try:
             _process_group(gid, now, cfg)
@@ -823,14 +551,24 @@ def _tick(now: datetime | None = None) -> None:
             log.warning("[followup] skipped scope group %s: %s", gid, exc)
 
 
-def _partition(candidates: list) -> tuple:
-    """(singles, group ids). PARTITIONED ON LIVE OPEN MEMBERS, not on scope_group alone.
+def _fresh(pid: str, row: dict) -> dict | None:
+    """The proposal re-read with its sent history, or None if it has left the follow-up window.
 
-    A candidate is a group candidate only while it is an OPEN (sent/viewed) live member of its
-    group: an approved scope with a deposit outstanding keeps its own ordinary deposit chase as a
-    single, and a scope the tool has taken out of the group is an ordinary proposal again. An
-    archived scope is in the group but not live, so it is chased neither way. A group whose
-    membership cannot be read is skipped this tick (fail closed) rather than chased per scope."""
+    Re-read before acting: the candidate list may be minutes old, and a proposal approved or
+    switched off in between must not get one last email. The history read is unguarded on purpose:
+    without it the cap cannot be honoured, so a failed read skips this row rather than guessing."""
+    fresh = db.get_proposal(pid) or row
+    if fresh.get("deleted_at") or fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
+        return None
+    signals = db.followup_signals(pid) or {}
+    return dict(fresh, **{k: v for k, v in signals.items() if k != "pending_task"})
+
+
+def _partition(candidates: list) -> tuple:
+    """(singles, group ids). A candidate is a group candidate while it is an OPEN live member of
+    its group; a scope the tool has taken out of the group is an ordinary proposal again; an
+    archived one is followed up neither way. A group whose membership cannot be read is skipped
+    this tick (fail closed) rather than emailed per proposal."""
     singles, groups, by_gid = [], [], {}
     for row in candidates or []:
         gid = row.get("scope_group")
@@ -858,120 +596,110 @@ def _partition(candidates: list) -> tuple:
     return singles, groups
 
 
-def _act_on_dues(p: dict, pid: str, dues: list, pending, cfg: dict,
-                 task_extra: dict | None = None) -> None:
-    """Raise the customer task and send the staff notes `dues` asks for: the tick's own body,
-    shared by an ordinary proposal and a scope group's synthetic one (filed under `pid`)."""
-    # Customer first, so the staff notes below know whether a task went out this tick.
-    dues = sorted(dues, key=lambda d: d.audience != "customer")
-    task_raised = False
+def _reserve(pid: str, due, extra: dict | None = None):
+    detail = {"audience": due.audience, "template": due.template, "engine": ENGINE_MARK}
+    if extra:
+        detail.update(extra)
+    return db.reserve_followup(pid, due.rule_key, detail)
+
+
+def _act_on_dues(p: dict, pid: str, dues: list, cfg: dict, now: datetime) -> None:
+    """Send what `dues` asks for on one ordinary proposal: reserve, send, release on failure."""
+    templates = (cfg or {}).get("templates")
     for due in dues:
         if due.audience == "customer":
-            # REMIND-ONLY. Never _send_customer from here (decisions 1 and 2).
-            if pending:
-                continue            # one open task per proposal; the human resolves it
-            task_raised = _raise_task(p, due, cfg, task_extra) or task_raised
-            continue
-        rid = db.reserve_followup(pid, due.rule_key, {
-            "audience": due.audience, "template": due.template,
-            # Tells this engine's staff notes from the old automatic ladder's, which carried no
-            # mark: the deposit chase's legacy cap counts only the old ones
-            # (db._DEPOSIT_HISTORY_SQL, followup_rules.deposit_series_done).
-            "engine": ENGINE_MARK,
-        })
-        if rid is None:
-            continue        # already sent — a prior tick, or the twin container
-        if task_raised and due.template in _FOLDED_INTO_TASK:
-            # Consumed, not sent: the follow-up-due email that just went out covers it,
-            # and the reservation stops it firing on its own next tick.
-            log.info("[followup] %s %s folded into the task email", pid, due.rule_key)
-            continue
-        if not _send_staff(p, due):
-            # Nothing went out, so release the claim and let the next tick try.
-            # A systemic outage therefore retries at tick cadence rather than
-            # silently swallowing the whole cadence step.
-            db.delete_followup(rid)
-            log.info("[followup] %s %s not sent — reservation released",
-                     pid, due.rule_key)
+            if not _customer_recipients(p):
+                # Every contact opted out of follow-ups: nothing to send, and nothing reserved, so
+                # nothing is counted as sent either.
+                log.info("[followup] %s %s: every contact opted out", pid, due.rule_key)
+                continue
+            rid = _reserve(pid, due)
+            if rid is None:
+                continue        # already sent — a prior tick, or the twin container
+            ok = _send_customer(p, due, templates)
         else:
-            log.info("[followup] %s %s -> %s", pid, due.rule_key, due.audience)
-            _echo_to_thread(pid, due)
+            rid = _reserve(pid, due)
+            if rid is None:
+                continue
+            pl = rules.plan(p, now, cfg)
+            ok = _send_staff(p, due, {"step": pl.step, "sent": pl.sent})
+        if not ok:
+            # Nothing went out: release the claim and let the next tick try.
+            db.delete_followup(rid)
+            log.info("[followup] %s %s not sent — reservation released", pid, due.rule_key)
+            continue
+        log.info("[followup] %s %s -> %s", pid, due.rule_key, due.audience)
+        _echo_to_thread(pid, due)
 
 
 def _process_group(gid: str, now: datetime, cfg: dict) -> None:
-    """One scope group's pass: ONE task per due occurrence, filed on the group's HOME scope, and
-    one estimator email per moment (the staff notes run through the same synthetic proposal).
-
-    Re-homing: an open group task that is not on the current home (the home was deleted, taken out
-    of the group, closed) is expired here, and the next due occurrence is raised on the new home.
-    A group whose chase has stopped (a scope approved) has its open reminder task expired too."""
-    view, why, _members = group_state_for(gid, now)
-    home = view.get("proposal_id") if view else None
-    pending = None
-    for t in db.list_open_group_tasks(gid) or []:
-        d = t.get("detail") or {}
-        if d.get("stage") == rules.DECISION_STAGE:
-            continue                    # judged and re-nagged by the housekeeping pass
-        if view is None or t.get("proposal_id") != home:
-            if (d.get("status") or "pending") == "pending":
-                reason = (why or "finished") if view is None else "rehomed"
-                db.decide_followup_task(t["id"], "expired", None, {"reason": reason})
-                log.info("[followup] group task %s on %s expired (%s)",
-                         t["id"], t.get("proposal_id"), reason)
-                continue
-        pending = pending or t      # still open (or `sending`): it holds the group's slot
+    """One scope group's pass: ONE email per recipient per due occurrence, reserved and recorded on
+    the group's HOME proposal, and the estimator's note through the same synthetic proposal."""
+    view, _why, _members = group_state_for(gid, now)
     if view is None:
         return
-    dues = rules.due_now(view, now, cfg)
-    _act_on_dues(view, home, dues, pending, cfg,
-                 {"scope_group": gid, "scopes": view.get("scopes") or []})
+    home = view["proposal_id"]
+    templates = (cfg or {}).get("templates") or {}
+    for due in rules.due_now(view, now, cfg):
+        extra = {"scope_group": gid, "scopes": view.get("scopes") or []}
+        if due.audience == "customer":
+            tpl = templates.get(due.template) or followup_settings.DEFAULT_TEMPLATES[due.template]
+            rid = _reserve(home, due, extra)
+            if rid is None:
+                continue
+            delivered = send_group_task_email(view, tpl)
+            if not delivered:
+                db.delete_followup(rid)
+                log.info("[followup] group %s %s not sent — reservation released",
+                         gid, due.rule_key)
+                continue
+            log.info("[followup] group %s %s -> %d recipient(s)", gid, due.rule_key,
+                     len(delivered))
+            reached = []
+            for pids in delivered.values():
+                for pid in pids:
+                    if pid not in reached:
+                        reached.append(pid)
+            for pid in reached:
+                _echo_to_thread(pid, due, {"scope_group": gid})
+        else:
+            rid = _reserve(home, due, extra)
+            if rid is None:
+                continue
+            pl = rules.plan(view, now, cfg)
+            if not _send_staff(view, due, {"step": pl.step, "sent": pl.sent}):
+                db.delete_followup(rid)
+                continue
+            _echo_to_thread(home, due)
 
 
-# ── the deploy-day dry run ────────────────────────────────────────────────────
-# A customer reminder in the TOUCHED shape (followup_rules._customer_plan): 'nvrt@', 'vrt@', 'deprt@'.
-# No old automatic email ever used one of these keys, so these are the tasks the deploy itself causes.
-_TOUCHED_KEY = re.compile(r":(?:nvr|vr|depr)t@")
-_DEPOSIT_TEMPLATES = ("deposit_nudge", "staff_deposit_outstanding")
-
+# ── the release-day dry run ───────────────────────────────────────────────────
 
 def dry_run_count(now: datetime | None = None) -> dict:
-    """What the NEXT tick would do: the tasks it would raise AND every estimator email it would
-    send. READ-ONLY.
+    """What the NEXT tick would do, READ-ONLY: exactly which customers it would email, and every
+    estimator email. Run it (backend/ops/followup_dry_run.py) before switching automation on.
 
-    Why it exists (critic finding, 2026-10-24): the TOUCHED shape of the schedule keys its
-    occurrences on time ('vrt@<stamp>'), a key no old automatic email ever used, so any live
-    proposal with a prior reply, chat message or logged call that has been quiet for more than one
-    interval matures on the first tick after deploy. Hanz runs this before switching automation on,
-    to see that burst before the estimators do. Entry point: backend/ops/followup_dry_run.py.
+    It evaluates what the tick evaluates — the same candidates, the same single/group partition,
+    the same sent history, the same schedule, the same opt-outs — and reserves, sends, expires and
+    writes NOTHING, whatever FOLLOWUP_AUTOMATION_ENABLED says. An occurrence whose rule key is
+    already reserved is left out, as the dedupe index would leave it out.
 
-    It evaluates exactly what the tick evaluates (the same candidates, the same single/group
-    partition, the same signals, the same schedule, the same per-proposal order as _act_on_dues)
-    and reserves, sends, expires and writes NOTHING. It runs whatever FOLLOWUP_AUTOMATION_ENABLED
-    says, because it is the check you make before turning that on. An occurrence whose rule key is
-    already reserved (an old automatic email, a task already raised) is left out, as the dedupe
-    index would leave it out; a proposal whose open task the housekeeping would expire first is
-    still counted as blocked.
-
-    Returns (fix round #12/#18/#4 added everything after `skipped`):
-      count, tasks [{proposal_id, rule_key, template, scope_group}]   the tasks it would raise
-      skipped [...]                                                    rows it could not evaluate
+    Returns:
+      at, in_send_window
+      customer_emails [{proposal_id, project_name, rule_key, template, step, ordinal,
+                        recipients [...], scope_group, scopes}]
+      customer_email_count            emails (one per proposal or group, each to its recipients)
+      recipient_count                 addresses those emails go to
+      opted_out [{proposal_id, rule_key}]   due, but every contact has opted out: nothing goes
       staff_emails [{proposal_id, rule_key, template, scope_group}], staff_email_count
-          every estimator email: one staff_followup_due per task, each staff note whose key is not
-          reserved yet (deposit outstanding, pause expired, not viewed ...) and is not folded into a
-          task email, and each decision-task re-nag
-      touched_tasks [...]     the tasks in the touched shape: the deploy-day burst itself
-      deposit_restarts [...]  deposit reminders (task or estimator email) on a job whose OLD ladder
-                              had already finished that chase: by the guard's time test, OR because
-                              the old ladder's frozen key (rules.legacy_frozen_keys) is reserved.
-                              The schedule holds these (followup_rules.deposit_series_done), so
-                              anything here is a bug.
-      deposit_held [{proposal_id, audience}]  the finished deposit chases being held, for review.
-    """
+      tasks_to_expire [{task_id, proposal_id, template}]   pending reminder tasks the tick retires
+      skipped [...]                   rows it could not evaluate
+    `count` is customer_email_count, kept for callers of the old shape."""
     now = now or datetime.now(timezone.utc)
     cfg = _settings()
-    out: dict = {"count": 0, "tasks": [], "skipped": [], "at": now.isoformat(),
-                 "staff_emails": [], "staff_email_count": 0, "touched_tasks": [],
-                 "deposit_restarts": [], "deposit_held": []}
+    out: dict = {"at": now.isoformat(), "in_send_window": rules.in_send_window(now, cfg),
+                 "customer_emails": [], "opted_out": [], "staff_emails": [],
+                 "tasks_to_expire": [], "skipped": []}
 
     def _used(pid: str, key: str) -> bool:
         try:
@@ -979,80 +707,51 @@ def dry_run_count(now: datetime | None = None) -> dict:
         except Exception:  # noqa: BLE001 — unknown counts as new: over-reporting is the safe side
             return False
 
-    def _restart(p: dict, pid: str, due, gid) -> None:
-        if (p.get("proposal_status") or "") != "approved" or due.template not in _DEPOSIT_TEMPLATES:
-            return
-        c = rules._Cadence(rules.effective_cfg(cfg, p))
-        audience = "customer" if due.audience == "customer" else "staff"
-        # Two INDEPENDENT signs the old ladder had finished: the guard's own time test, and the
-        # old ladder's frozen key sitting in the dedupe table. The second is what lets this bucket
-        # name a restart the guard's predicate misses.
-        if rules.deposit_legacy_finished(p, audience, c) or \
-                any(_used(pid, k) for k in rules.legacy_frozen_keys(p, audience, c)):
-            out["deposit_restarts"].append({"proposal_id": pid, "rule_key": due.rule_key,
-                                            "template": due.template, "scope_group": gid})
-
-    def _simulate(p: dict, pid: str, dues: list, pending, gid=None) -> None:
-        """_act_on_dues, minus every write."""
-        task_raised = False
-        for due in sorted(dues, key=lambda d: d.audience != "customer"):
-            entry = {"proposal_id": pid, "rule_key": due.rule_key, "template": due.template,
-                     "scope_group": gid}
-            if due.audience == "customer":
-                if pending or _used(pid, due.rule_key):
-                    continue
-                out["tasks"].append(entry)
-                if _TOUCHED_KEY.search(due.rule_key):
-                    out["touched_tasks"].append(entry)
-                out["staff_emails"].append(dict(entry, template="staff_followup_due"))
-                task_raised = True
-                _restart(p, pid, due, gid)
-                continue
+    def _simulate(p: dict, pid: str, gid=None, view=None) -> None:
+        pl = rules.plan(p, now, cfg)
+        for due in rules.due_now(p, now, cfg):
             if _used(pid, due.rule_key):
                 continue
-            if task_raised and due.template in _FOLDED_INTO_TASK:
-                continue
-            out["staff_emails"].append(entry)
-            _restart(p, pid, due, gid)
+            if due.audience == "customer":
+                if view is not None:
+                    rec = []
+                    for m in view.get("_open_members") or []:
+                        for e in _customer_recipients(m):
+                            e = (e or "").strip().lower()
+                            if e and e not in rec:
+                                rec.append(e)
+                else:
+                    rec = list(_customer_recipients(p))
+                if not rec:
+                    out["opted_out"].append({"proposal_id": pid, "rule_key": due.rule_key})
+                    continue
+                out["customer_emails"].append({
+                    "proposal_id": pid, "project_name": p.get("project_name"),
+                    "rule_key": due.rule_key, "template": due.template, "step": pl.step,
+                    "ordinal": (pl.next_ordinal or 0) + 1, "recipients": rec,
+                    "scope_group": gid,
+                    "scopes": [s.get("label") for s in (view or {}).get("scopes") or []]})
+            else:
+                out["staff_emails"].append({"proposal_id": pid, "rule_key": due.rule_key,
+                                            "template": due.template, "scope_group": gid})
 
     candidates = db.list_followup_candidates()
     singles, groups = _partition(candidates)
     for row in singles:
         pid = row.get("proposal_id")
         try:
-            fresh = db.get_proposal(pid) or row
-            if fresh.get("followup_disabled_at") or not rules.in_scope(fresh):
-                continue
-            signals = db.followup_signals(pid) or {}
-            fresh = dict(fresh, **{k: v for k, v in signals.items() if k != "pending_task"})
-            pending = signals.get("pending_task")
-            if pending and is_group_task((pending or {}).get("detail")):
-                pending = None
-            if (fresh.get("proposal_status") or "") == "approved":
-                c = rules._Cadence(rules.effective_cfg(cfg, fresh))
-                for audience in ("customer", "staff"):
-                    if rules.deposit_outstanding(fresh, for_customer=audience == "customer") \
-                            and rules.deposit_legacy_finished(fresh, audience, c):
-                        out["deposit_held"].append({"proposal_id": pid, "audience": audience})
-            _simulate(fresh, pid, rules.due_now(fresh, now, cfg), pending)
+            fresh = _fresh(pid, row)
+            if fresh is not None:
+                _simulate(fresh, pid)
         except Exception as exc:  # noqa: BLE001
             out["skipped"].append({"proposal_id": pid, "error": str(exc)})
     for gid in groups:
         try:
             view, _why, _m = group_state_for(gid, now)
-            if view is None:
-                continue
-            # _process_group expires an open group task that is not on the home; one on the home
-            # holds the group's slot (no new task) but the staff notes still go.
-            open_tasks = [t for t in db.list_open_group_tasks(gid) or []
-                          if (t.get("detail") or {}).get("stage") != rules.DECISION_STAGE
-                          and t.get("proposal_id") == view["proposal_id"]]
-            _simulate(view, view["proposal_id"], rules.due_now(view, now, cfg),
-                      open_tasks[0] if open_tasks else None, gid)
+            if view is not None:
+                _simulate(view, view["proposal_id"], gid, view)
         except Exception as exc:  # noqa: BLE001
             out["skipped"].append({"scope_group": gid, "error": str(exc)})
-    # The housekeeping pass re-emails the estimator about an unresolved decision task
-    # (_renag_decision): the same live check, the same key, nothing sent.
     try:
         pending_tasks = db.list_pending_followup_tasks() or []
     except Exception as exc:  # noqa: BLE001
@@ -1061,6 +760,9 @@ def dry_run_count(now: datetime | None = None) -> dict:
     for t in pending_tasks:
         d = t.get("detail") or {}
         if d.get("stage") != rules.DECISION_STAGE:
+            out["tasks_to_expire"].append({"task_id": t.get("id"),
+                                           "proposal_id": t.get("proposal_id"),
+                                           "template": d.get("template")})
             continue
         try:
             ok, _why, _subject = judge_task(t, now)
@@ -1077,6 +779,8 @@ def dry_run_count(now: datetime | None = None) -> dict:
                                             "scope_group": d.get("scope_group")})
         except Exception as exc:  # noqa: BLE001
             out["skipped"].append({"task_id": t.get("id"), "error": str(exc)})
-    out["count"] = len(out["tasks"])
+    out["customer_email_count"] = len(out["customer_emails"])
+    out["recipient_count"] = sum(len(e["recipients"]) for e in out["customer_emails"])
     out["staff_email_count"] = len(out["staff_emails"])
+    out["count"] = out["customer_email_count"]
     return out

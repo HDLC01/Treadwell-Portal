@@ -1,4 +1,6 @@
-"""Remind-only follow-ups (2026-10-23): the endpoints the staff tool's email-writer proxies.
+"""Follow-up TASK endpoints the staff tool's email-writer proxies. Since 2026-10-28 the cadence emails
+the customer itself and raises no reminder tasks, so these answer for old tasks still open and for
+a scope group's decision task; the plan route keeps only "Next email on".
 
   GET  /api/admin/followup-tasks                     the bell's feed of open tasks
   GET  /api/admin/followup-task/{id}                 one task + whether it can still be sent
@@ -140,7 +142,9 @@ def test_send_emails_the_edited_text_records_a_touch_and_echoes_it(api):
     ({"proposal_status": "closed_lost"}, "closed_lost"),
     ({"proposal_status": "approved", "deposit_status": "received",
       "approved_at": NOW - dt.timedelta(days=1)}, "finished"),
-    ({"proposal_status": "approved", "approved_at": NOW - dt.timedelta(days=1)}, "stage_changed"),
+    # Approved with the deposit still out: "finished" since 2026-10-28 (no deposit chase). It was
+    # "stage_changed" while the cadence chased deposits.
+    ({"proposal_status": "approved", "approved_at": NOW - dt.timedelta(days=1)}, "finished"),
     ({"followup_disabled_at": NOW}, "automation_off"),
     ({"followup_paused_until": (NOW + dt.timedelta(days=40)).date()}, "paused"),
     ({"followup_enrolled_at": NOW - dt.timedelta(hours=2)}, "resent"),
@@ -340,14 +344,15 @@ def test_html_is_stripped_not_sent(api):
     assert sent["templates"]["checkin"]["title"] == "Hi"
 
 
-def test_the_deposit_reminder_never_carries_the_cancel_buttons(api):
+def test_an_old_deposit_reminder_task_can_no_longer_email_the_customer(api):
+    """There is no deposit chase from the cadence (2026-10-28). An old deposit task still open is
+    refused and retired, never sent. Replaced test_the_deposit_reminder_never_carries_the_cancel_
+    buttons, which sent it."""
     api.state["row"].update(proposal_status="approved", approved_at=NOW - dt.timedelta(days=1))
     api.state["task"] = _task(template="deposit_nudge", stage="deposit", include_status_ask=True)
     r = api.post("/api/admin/followup-task/5/send", json=GOOD)
-    assert r.status_code == 200, r.text
-    sent, = api.calls["sent"]
-    assert sent["include_status_ask"] is False
-    assert sent["url"].endswith("#proposal/deposit")
+    assert r.status_code == 409 and r.json()["reason"] == "finished", r.text
+    assert api.calls["sent"] == []
 
 
 # ── skip / called / snooze ────────────────────────────────────────────────────
@@ -492,18 +497,28 @@ def test_the_pending_feed_is_shaped_for_the_bell(api, monkeypatch):
     assert [t["id"] for t in mine] == [6]
 
 
-def test_the_plan_endpoint_validates_and_writes_only_what_was_sent(api):
+def test_the_plan_endpoint_only_moves_the_next_email(api):
+    """The drawer's "Reminder schedule" keeps only "Next email on" (2026-10-28): "Then every" and
+    "Stop after" are gone, so the route writes next_at and nothing else."""
+    day = (NOW + dt.timedelta(days=4)).astimezone(followup_rules.BUSINESS_TZ).date().isoformat()
     r = api.post("/api/admin/proposal/pid-1/followup-plan",
-                 json={"interval_days": 5, "stop_after": 3, "by": "kyle@wetreadwell.com"})
+                 json={"next_at": day, "interval_days": 5, "stop_after": 3,
+                       "by": "kyle@wetreadwell.com"})
     assert r.status_code == 200, r.text
-    assert api.calls["plan"] == [{"interval_days": 5, "stop_after": 3}]
-    assert api.post("/api/admin/proposal/pid-1/followup-plan",
-                    json={"interval_days": 0}).status_code == 400
-    assert api.post("/api/admin/proposal/pid-1/followup-plan",
-                    json={"stop_after": 500}).status_code == 400
+    (kw,) = api.calls["plan"]
+    assert list(kw) == ["next_at"], "a retired schedule field was written: %s" % kw
+    assert kw["next_at"].astimezone(followup_rules.BUSINESS_TZ).date().isoformat() == day
+    assert "interval_days" not in r.json()["followup_plan"]
+    assert "stop_after" not in r.json()["followup_plan"]
+    # Only the retired fields: nothing to change, nothing written.
+    bad = api.post("/api/admin/proposal/pid-1/followup-plan", json={"interval_days": 5})
+    assert bad.status_code == 400 and bad.json()["error"] == "nothing_to_change"
     assert api.post("/api/admin/proposal/pid-1/followup-plan", json={}).status_code == 400
-    r = api.post("/api/admin/proposal/pid-1/followup-plan", json={"interval_days": None})
-    assert r.status_code == 200 and api.calls["plan"][-1] == {"interval_days": None}
+    past = api.post("/api/admin/proposal/pid-1/followup-plan", json={"next_at": "2020-01-01"})
+    assert past.status_code == 400 and past.json()["error"] == "date_in_past"
+    r = api.post("/api/admin/proposal/pid-1/followup-plan", json={"next_at": None})
+    assert r.status_code == 200 and api.calls["plan"][-1] == {"next_at": None}
+    assert len(api.calls["plan"]) == 2
 
 
 # ── the drawer's own "log a call" ─────────────────────────────────────────────

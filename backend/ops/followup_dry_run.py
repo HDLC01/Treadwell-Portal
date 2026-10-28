@@ -1,15 +1,18 @@
-"""What the follow-up worker's NEXT tick would do, without doing any of it.
+"""Exactly which customers the follow-up worker's NEXT tick would email, without doing any of it.
 
-Run it BEFORE follow-up automation is switched on after a deploy (fix round #12/#18/#4): the first
-tick runs 20 seconds after the container boots when FOLLOWUP_AUTOMATION_ENABLED is true, and once a
-tick has run, its tasks are reserved and this reports nothing. So:
+Since 2026-10-28 a follow-up is an automatic EMAIL TO THE CUSTOMER (at most 2 per step, until the
+proposal is approved). Run this BEFORE follow-up automation is switched on after a release: the
+first tick runs 20 seconds after the container boots when FOLLOWUP_AUTOMATION_ENABLED is true, and
+once a tick has run its sends are reserved and this reports nothing. So:
 
   1. deploy with FOLLOWUP_AUTOMATION_ENABLED=false in the box's .env;
   2. inside the running container (WORKDIR is /app/backend):
          docker exec <container> python ops/followup_dry_run.py
      add --json for the JSON alone, and --now <ISO datetime> to evaluate the tick at another
-     moment (default: the real clock; customer reminders only fall due 8am-6pm Central);
-  3. read the counts; when they look right, set the flag to true and restart the container.
+     moment (default: the real clock). Customer emails only go 8am-6pm Central: outside that
+     window the list is empty, so pass e.g. --now 2026-10-29T09:00:00 to see the first in-window
+     tick;
+  3. read the list; when it looks right, set the flag to true and restart the container.
 
 READ-ONLY, three ways: followup_worker.dry_run_count reserves, sends and writes nothing; this
 script opens its database pool with every transaction READ ONLY, so a write anywhere underneath
@@ -51,14 +54,15 @@ def refuse_email() -> None:
 
 
 def table(result: dict) -> str:
-    """The short human summary printed after the JSON."""
+    """The short human summary printed after the JSON: every customer the tick would email."""
     lines = [
-        "follow-up dry run at %s" % result.get("at"),
-        "  tasks the tick would raise ........ %d" % len(result.get("tasks") or []),
-        "    of which touched (deploy burst) . %d" % len(result.get("touched_tasks") or []),
+        "follow-up dry run at %s (%s the customer send window)"
+        % (result.get("at"), "inside" if result.get("in_send_window") else "OUTSIDE"),
+        "  customer emails it would send ..... %d (to %d addresses)"
+        % (len(result.get("customer_emails") or []), int(result.get("recipient_count") or 0)),
+        "  due but every contact opted out ... %d" % len(result.get("opted_out") or []),
         "  estimator emails it would send .... %d" % len(result.get("staff_emails") or []),
-        "  finished deposit chases restarted . %d" % len(result.get("deposit_restarts") or []),
-        "  finished deposit chases held ...... %d" % len(result.get("deposit_held") or []),
+        "  old reminder tasks it would expire  %d" % len(result.get("tasks_to_expire") or []),
         "  rows it could not evaluate ........ %d" % len(result.get("skipped") or []),
     ]
     by_template: dict = {}
@@ -66,12 +70,13 @@ def table(result: dict) -> str:
         by_template[e.get("template")] = by_template.get(e.get("template"), 0) + 1
     for tpl in sorted(by_template):
         lines.append("    %-32s %d" % (tpl, by_template[tpl]))
-    if result.get("tasks"):
+    if result.get("customer_emails"):
         lines.append("")
-        lines.append("  %-38s %-12s %s" % ("proposal", "template", "rule key"))
-        for t in result["tasks"]:
-            lines.append("  %-38s %-12s %s" % (t.get("proposal_id"), t.get("template"),
-                                               t.get("rule_key")))
+        lines.append("  %-30s %-13s %-5s %s" % ("project", "template", "email", "to"))
+        for e in result["customer_emails"]:
+            lines.append("  %-30s %-13s %-5s %s" % (
+                (e.get("project_name") or e.get("proposal_id") or "")[:30], e.get("template"),
+                "%s" % e.get("ordinal"), ", ".join(e.get("recipients") or [])))
     return "\n".join(lines)
 
 

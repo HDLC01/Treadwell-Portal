@@ -139,8 +139,7 @@ def _followup_state(p: dict) -> dict:
         "paused_until": _iso(p.get("followup_paused_until")),
         "closed_lost_reason": p.get("closed_lost_reason"),
         "closed_at": _iso(p.get("closed_at")),
-        # Always 'remind' in v1 (decisions 1-2): a due reminder tells the estimator, and only the
-        # estimator sends. Travels so the drawer can say so instead of "automated".
+        # 'auto' (2026-10-28): a due follow-up is emailed to the customer by the worker itself.
         "mode": followup_rules.followup_mode(p),
     }
 
@@ -4076,9 +4075,9 @@ def admin_pipeline(request: Request) -> JSONResponse:
     # The SAVED cadence, read once for the whole board rather than per row.
     #
     # `next_due_at` used to be called with no cfg, so this column was computed from the shipped
-    # constants while the worker used whatever staff had saved. Change "every 3 days" to "every 5"
-    # and every date on the board is wrong; raise `max_recurring` and it reads "Nothing scheduled"
-    # while emails keep going out. A schedule nobody can see anywhere else has to be the real one.
+    # constants while the worker used whatever staff had saved: change a number of days and every
+    # date on the board is wrong while emails keep going out on the other schedule. A schedule
+    # nobody can see anywhere else has to be the real one.
     #
     # Guarded, because an unreadable settings row must not take down the pipeline the way the
     # unguarded click columns would have — the shipped cadence is the right answer when we cannot
@@ -4158,10 +4157,10 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # otherwise exists nowhere a human can see. None = nothing is coming
             # (not automated, switched off, approved, closed, or cadence exhausted).
             "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc(), followup_cfg)),
-            # Remind-only (2026-10-23). The open follow-up task, if any — the staff bell can read
-            # it here off the poll it already makes ({id, status, template, label, stage, due_at}
-            # or null; full detail at GET /api/admin/followup-task/{id}) — and this proposal's own
-            # schedule ({mode, interval_days, stop_after, next_at, anchor_at}; nulls = global).
+            # The open follow-up task, if any (since 2026-10-28 only a scope group's decision
+            # task, or an old reminder task the next tick retires) — {id, status, template, label,
+            # stage, due_at} or null; full detail at GET /api/admin/followup-task/{id} — and this
+            # proposal's own schedule ({mode, next_at, anchor_at}; next_at null = as scheduled).
             "followup_task": _task_summary(r.get("pending_task"), status_now.get),
             "followup_plan": _followup_plan(r),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
@@ -4467,21 +4466,35 @@ def admin_get_followup_settings(request: Request) -> JSONResponse:
         # badly. Served rather than hardcoded in the editor for the same reason labels are:
         # the message that refuses a save and the heading above the form must not disagree.
         "editor_titles": dict(followup_settings.EDITOR_TITLES),
+        # Which template is which email (2026-10-28): {step: [1st email's key, 2nd email's key]}.
+        "step_templates": {k: list(v) for k, v in followup_settings.CADENCE_TEMPLATES.items()},
+        "days_range": [followup_settings.DAYS_MIN, followup_settings.DAYS_MAX],
     })
+
+
+def _saved_followup_settings() -> Optional[dict]:
+    """What is saved now, merged, as the base a save lays its fields over. None when it cannot be
+    read (the payload then stands on the shipped defaults for any field it leaves out)."""
+    try:
+        return followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[settings] could not read follow-up settings for a save: %s", exc)
+        return None
 
 
 @app.put("/api/admin/settings/followups")
 async def admin_put_followup_settings(request: Request) -> JSONResponse:
-    """Save the cadence. Returns what was actually stored, including any clamping.
+    """Save the schedule. Returns what was actually stored, so the page shows what was saved.
 
-    Returning the stored values rather than an empty ok is deliberate: numbers get pulled into
-    range on the way in, and somebody who typed 2 hours needs to see that they got 4 rather than
-    believe their edit took."""
+    A number out of range (days 1 to 90, never 0) is REFUSED with a 400 whose `error` is the
+    sentence to show ("2nd email must be 1 to 90 days after the 1st"); nothing is clamped or
+    replaced. A field the payload leaves out keeps its saved value."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
     try:
-        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body,
+                                         _saved_followup_settings())
     except followup_settings.ValidationError as exc:
         return _json({"ok": False, "error": str(exc)}, 400)
     by = _cap(body.get("by"), 120) or None
@@ -4519,7 +4532,8 @@ async def admin_preview_followup_settings(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
     try:
-        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body,
+                                         _saved_followup_settings())
     except followup_settings.ValidationError as exc:
         return _json({"ok": False, "error": str(exc)}, 400)
     # ALL_TEMPLATE_KEYS, matching the GET and the PUT. This endpoint is what runs as somebody
@@ -4810,9 +4824,9 @@ def admin_list_followups(proposal_id: str, request: Request) -> JSONResponse:
 # estimator sends it from here. The staff tool proxies these with its service token, exactly like
 # every other /api/admin route.
 #
-# EVERY decision is a touch that re-anchors the schedule (followup_rules._customer_plan): the next
-# reminder lands one interval after the decision, not one interval after an anchor nobody moved.
-# Each also clears a snooze date, except the snooze itself.
+# Since 2026-10-28 the cadence no longer raises reminder tasks (the worker emails the customer), so
+# these endpoints answer only for old tasks still open and for a scope group's decision task. A
+# task SENT or answered with a CALL counts as one of its step's 2 emails (db._SENT_HISTORY_SQL).
 _TASK_LOG_KINDS = {"call": "staff_call", "text": "staff_text", "email": "staff_email",
                    "note": "staff_note"}
 _SNOOZE_MAX_DAYS = 366
@@ -4936,10 +4950,10 @@ def _task_summary(raw, status_of=None) -> Optional[dict]:
 
 
 def _followup_plan(p: dict) -> dict:
-    """This proposal's own schedule, for the drawer. None everywhere = the global cadence."""
+    """This proposal's own schedule, for the drawer: "Next email on" (`next_at`; None = as the
+    global schedule says). "Then every" and "Stop after" are gone (2026-10-28): at most 2 emails
+    per step, nothing repeats."""
     return {"mode": followup_rules.followup_mode(p),
-            "interval_days": p.get("followup_interval_days"),
-            "stop_after": p.get("followup_stop_after"),
             "next_at": _iso(p.get("followup_next_at")),
             "anchor_at": _iso(p.get("followup_anchor_at"))}
 
@@ -5601,10 +5615,12 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
 
 @app.post("/api/admin/proposal/{proposal_id}/followup-plan")
 async def admin_followup_plan(proposal_id: str, request: Request) -> JSONResponse:
-    """This proposal's own schedule. Body (every key optional; null clears it):
-    {interval_days: 1-90, stop_after: 1-60, next_at: 'YYYY-MM-DD' | ISO, by}.
+    """This proposal's "Next email on" date. Body: {next_at: 'YYYY-MM-DD' | ISO | null, by}.
 
-    stop_after is the PRE-DECISION cap only; the deposit chase keeps its own (decision 5)."""
+    `next_at` moves the NEXT follow-up email to that day (8am Central for a bare date), earlier or
+    later; null puts it back where the schedule has it. It never adds an email: a step whose 2
+    emails have gone stays done. "Then every" and "Stop after" are gone (2026-10-28):
+    `interval_days` / `stop_after` in a body are ignored and never written."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     p = db.get_proposal(proposal_id)
@@ -5612,51 +5628,24 @@ async def admin_followup_plan(proposal_id: str, request: Request) -> JSONRespons
         return _json({"ok": False, "error": "not_found"}, 404)
     body = await _body(request)
     by = _cap(body.get("by"), 120) or None
-    kw: dict = {}
-    for key, lo, hi in (("interval_days", 1, 90), ("stop_after", 1, 60)):
-        if key in body:
-            v = body.get(key)
-            if v is None or v == "":
-                kw[key] = None
-                continue
-            try:
-                n = int(v)
-            except (TypeError, ValueError):
-                return _json({"ok": False, "error": "invalid_" + key}, 400)
-            if isinstance(v, bool) or not lo <= n <= hi:
-                return _json({"ok": False, "error": "invalid_" + key}, 400)
-            kw[key] = n
-    if "next_at" in body:
-        if body.get("next_at") in (None, ""):
-            kw["next_at"] = None
-        else:
-            when, bad = _future_when(body.get("next_at"))
-            if bad:
-                return _json({"ok": False, "error": bad}, 400)
-            kw["next_at"] = when
-    if not kw:
-        return _json({"ok": False, "error": "nothing_to_change"}, 400)
-    # A scope group is chased as ONE project, on its HOME scope's schedule (group_view reads the
-    # interval, stop-after and snooze from there), so a change made from any open scope's drawer is
-    # written to the home row. Everything else is unchanged.
+    if "next_at" not in body:
+        return _json({"ok": False, "error": "nothing_to_change",
+                      "message": "Only the next email's date can be changed here."}, 400)
+    if body.get("next_at") in (None, ""):
+        when = None
+    else:
+        when, bad = _future_when(body.get("next_at"))
+        if bad:
+            return _json({"ok": False, "error": bad}, 400)
+    # A scope group is followed up as ONE project, on its HOME proposal's row (group_view reads the
+    # date from there), so a change made from any open proposal's drawer is written to the home.
     target = _followup_home_of(p) or proposal_id
-    if kw.get("next_at") is not None:
-        db.stamp_followup_anchor(target, clear_next=False)
-    db.set_followup_plan(target, **kw)
+    db.set_followup_plan(target, next_at=when)
     who = _actor_name(by)
-    parts = []
-    if "interval_days" in kw:
-        parts.append("every %d days" % kw["interval_days"] if kw["interval_days"]
-                     else "the standard interval")
-    if "stop_after" in kw:
-        parts.append("stop after %d reminders" % kw["stop_after"] if kw["stop_after"]
-                     else "the standard reminder limit")
-    if "next_at" in kw:
-        parts.append(("next on %s" % kw["next_at"].astimezone(
-            followup_rules.BUSINESS_TZ).date().isoformat()) if kw["next_at"]
-            else "no fixed next date")
-    _crm_card(proposal_id, ("%s changed this project's follow-ups: %s." % (who, ", ".join(parts)))
-              if who else ("Follow-ups changed: %s." % ", ".join(parts)), "followup_plan")
+    part = (("next email on %s" % when.astimezone(followup_rules.BUSINESS_TZ).date().isoformat())
+            if when else "next email back on schedule")
+    _crm_card(proposal_id, ("%s changed this project's follow-ups: %s." % (who, part))
+              if who else ("Follow-ups changed: %s." % part), "followup_plan")
     fresh = db.get_proposal(target) or p
     out = {"ok": True, "followup_plan": _followup_plan(fresh)}
     if target != proposal_id:
