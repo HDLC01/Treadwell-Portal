@@ -494,6 +494,21 @@ def test_without_contact_the_second_still_goes():
     assert fr.plan(_after_first(), FIRST + 7 * D, ALL_DAY).skipped_key is None
 
 
+def test_a_pause_after_the_first_moves_the_second_to_the_pause_end_and_does_not_skip_it():
+    """A "Project delayed" click after the 1st is a pause, not a reply (db._CUSTOMER_TOUCH_SQL
+    leaves the click out of customer_touch_at): the 2nd waits for the pause to end and then goes,
+    as the revisit nudge it was designed to be. test_pg_followup_auto drives the real endpoint."""
+    until = (FIRST + 10 * D).astimezone(fr.BUSINESS_TZ).date()      # past the 2nd's day 7
+    resume = datetime(until.year, until.month, until.day, tzinfo=fr.BUSINESS_TZ) + D
+    p = _after_first(followup_paused_until=until)
+    for at in (FIRST + 7 * D, FIRST + 10 * D):
+        assert cust(p, at) == [], "the 2nd went inside the pause"
+    pl = fr.plan(p, FIRST + 8 * D, ALL_DAY)
+    assert (pl.next_at, pl.next_template, pl.skipped_key) == (resume, "not_viewed_2", None)
+    d, = cust(p, resume)
+    assert d.template == "not_viewed_2", "the pause's end did not send the revisit nudge"
+
+
 def test_the_estimator_note_after_a_skipped_second_follows_its_own_switch():
     p = _after_first(customer_touch_at=FIRST + D)
     # Dated off the 1st (the step's last email), not off the reply: no re-anchor.

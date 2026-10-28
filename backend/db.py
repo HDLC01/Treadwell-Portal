@@ -1674,10 +1674,16 @@ def delete_followup(followup_id: int) -> None:
 # submission — except an out-of-office the inbound relay recorded (meta.auto_reply). An
 # autoresponder is not the customer coming back to us, and counting it would reset their reminder
 # count (decision 3) every time they went on holiday.
+# Nor is the "Project delayed" click (msg_type status_update, meta.status 'delayed'): it sets the
+# pause, and the step's 2nd email is the nudge that goes when the pause ends (followup_rules.plan,
+# "at its end instead"). Counting it as a reply skipped that nudge and told the estimator "the
+# customer replied". customer_touch_at is read only as followup_rules.CONTACT_KEYS' reply.
 _CUSTOMER_TOUCH_SQL = (
     "(select max(q.created_at) from public.portal_questions q "
     "   where q.proposal_id = {pid} and q.author_kind = 'customer' "
-    "     and coalesce((q.meta ->> 'auto_reply')::boolean, false) is not true)")
+    "     and coalesce((q.meta ->> 'auto_reply')::boolean, false) is not true "
+    "     and not (coalesce(q.msg_type, '') = 'status_update' "
+    "              and coalesce(q.meta ->> 'status', '') = 'delayed'))")
 # STAFF message: an estimator writing to the customer in the thread, typed in the drawer or emailed
 # through the relay. Not the server's own signed-contract row (meta.system_doc), and not cards:
 # msg_type 'text' only. That one predicate also keeps out every staff-only row, because every

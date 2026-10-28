@@ -398,3 +398,54 @@ def test_a_reply_or_logged_contact_after_the_first_email_skips_the_second(clean,
     assert board["ooo"]["customer_touch_at"] is None, "an auto-reply counted as a reply"
     assert board["note"]["last_staff_contact_at"] is None, "a note counted as contact"
     assert board["taskrow"]["last_staff_contact_at"] is None, "a task's own row counted"
+
+
+def test_a_project_delayed_click_after_the_first_is_a_pause_not_a_reply(clean, outbox,
+                                                                        monkeypatch):
+    """The customer's own "Project delayed" click, through the real endpoint, after the 1st email.
+    It is customer-authored (a status_update row), but it is the pause, not a reply: the 2nd email
+    is the nudge that goes when the pause ends, and the estimator is never told they replied."""
+    from fastapi.testclient import TestClient
+
+    import main
+
+    monkeypatch.setattr(main, "_can_access", lambda request, p: True)
+    monkeypatch.setattr(main, "_session_email", lambda request: None)
+    monkeypatch.setattr(main.ratelimit, "allow_ip", lambda *a, **k: True)
+    client = TestClient(main.app)
+
+    start = in_window() - 30 * D
+    click_at = start + 5 * D                       # after the 1st (day 3), before the 2nd (day 10)
+    until = (start + 15 * D).astimezone(rules.BUSINESS_TZ).date()
+    resume = datetime(until.year, until.month, until.day, rules._schedule(None)["send_start_hour"],
+                      tzinfo=rules.BUSINESS_TZ) + D
+    add_proposal("held", enrolled_days=0)
+    set_cols("held", followup_enrolled_at=start, created_at=start, last_sent_at=start)
+
+    sim = start
+    while sim <= start + 25 * D:
+        if sim == click_at:
+            r = client.post("/api/portal/tok-held/project-status",
+                            json={"status": "delayed", "months": 2})
+            assert r.status_code == 200, r.text
+            row = db.qall("select msg_type, meta from public.portal_questions "
+                          "where proposal_id = 'held' and author_kind = 'customer'")
+            assert [(m["msg_type"], m["meta"]["status"]) for m in row] == \
+                [("status_update", "delayed")], row
+            # The endpoint paused off the real calendar; put the pause on the simulated one.
+            set_cols("held", followup_paused_until=until)
+            outbox.sent.clear()                     # the endpoint's own staff notice
+        _at(sim)
+        followup_worker._tick(sim)
+        _at(sim)
+        sim += 6 * H
+
+    customer = [r for r in emails("held") if r["detail"]["audience"] == "customer"]
+    assert [r["detail"]["template"] for r in customer] == ["not_viewed", "not_viewed_2"], \
+        "the delayed click skipped the revisit nudge as if the customer had replied"
+    assert customer[1]["created_at"] >= resume, "the 2nd went inside the pause"
+    staff = [m["html"] for m in outbox.staff()]
+    assert staff and not any("replied" in h or "was not sent" in h for h in staff), staff
+    assert db.followup_signals("held")["customer_touch_at"] is None
+    board = {r["proposal_id"]: r for r in db.list_all_portal_proposals()}
+    assert board["held"]["customer_touch_at"] is None

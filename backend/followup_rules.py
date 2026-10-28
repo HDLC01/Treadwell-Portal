@@ -107,7 +107,9 @@ GROUP_TASK_TEMPLATE_DECISION = "scope_decision"
 # CONTACT: the customer and Treadwell talking, which skips a step's 2nd email. Each key is computed
 # from the DATA by one SQL predicate shared by the worker (db.followup_signals) and the board
 # (db.list_all_portal_proposals), so both see the same contact:
-#   customer_touch_at      the newest customer-authored row, out-of-office auto-replies excluded
+#   customer_touch_at      the newest customer-authored row, out-of-office auto-replies and the
+#                          "Project delayed" click excluded (a pause is not a reply: the 2nd
+#                          goes when it ends)
 #   last_staff_contact_at  the newest call / email / text an estimator LOGGED (not a note, not a
 #                          bookkeeping row, not the row a reminder task's own send or call wrote)
 #   last_staff_message_at  the newest message an estimator wrote to the customer in the thread
