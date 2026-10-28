@@ -4488,13 +4488,18 @@ async def admin_put_followup_settings(request: Request) -> JSONResponse:
 
     A number out of range (days 1 to 90, never 0) is REFUSED with a 400 whose `error` is the
     sentence to show ("2nd email must be 1 to 90 days after the 1st"); nothing is clamped or
-    replaced. A field the payload leaves out keeps its saved value."""
+    replaced. A field the payload leaves out keeps its saved value.
+
+    RESET is explicit: `reset: true` lays the payload over the SHIPPED defaults instead of the saved
+    row, and the answer carries `reset: true` so the tool's page says "Reset" only when it was. A
+    bare empty payload is not a reset (it keeps everything as saved)."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
+    reset = isinstance(body, dict) and body.get("reset") is True
     try:
         cfg = followup_settings.validate(body.get("settings") if "settings" in body else body,
-                                         _saved_followup_settings())
+                                         None if reset else _saved_followup_settings())
     except followup_settings.ValidationError as exc:
         return _json({"ok": False, "error": str(exc)}, 400)
     by = _cap(body.get("by"), 120) or None
@@ -4511,6 +4516,7 @@ async def admin_put_followup_settings(request: Request) -> JSONResponse:
         "ok": True,
         "settings": cfg,
         "saved": True,
+        "reset": reset,
         "updated_at": _iso(meta.get("updated_at")),
         "updated_by": meta.get("updated_by") or by or "",
         # ALL_TEMPLATE_KEYS, not TEMPLATE_KEYS: the editor has a tab for the "Proposal sent"

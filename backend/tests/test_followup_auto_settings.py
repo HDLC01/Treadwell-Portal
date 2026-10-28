@@ -286,3 +286,40 @@ def test_the_worker_reads_the_old_prod_row_as_its_migration(monkeypatch):
     monkeypatch.setattr(W.db, "get_settings", lambda k: PROD_ROW)
     cfg = W._settings()
     assert (cfg["opened_first_days"], cfg["opened_second_days"], cfg["estimator_days"]) == (3, 7, 1)
+
+
+# ── Reset (review 2026-10-29) ──────────────────────────────────────────────────
+# The tool's Reset button PUTs {settings: {}, reset: true} and says "Reset to the default cadence."
+# only when the answer carries reset: true. A bare empty payload keeps what is saved.
+def _customised():
+    c = fs.validate(dict(SCHEDULE, not_opened_first_days=10, send_start_hour=9))
+    c["templates"]["not_viewed_2"] = {"title": "Custom", "body": "Mine\n\n{link}", "cta": "Go"}
+    return fs.validate(c)
+
+
+def test_reset_true_stores_the_shipped_defaults_and_says_so(api):
+    api["row"] = _customised()
+    r = api["client"].put("/api/admin/settings/followups",
+                          json={"settings": {}, "reset": True, "by": "hanz@wetreadwell.com"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["reset"] is True
+    assert api["saved"][-1] == fs.defaults()
+    assert j["settings"] == fs.defaults()
+
+
+def test_an_empty_save_without_reset_keeps_what_is_saved_and_says_not_reset(api):
+    api["row"] = _customised()
+    r = api["client"].put("/api/admin/settings/followups", json={"settings": {}})
+    assert r.status_code == 200, r.text
+    assert r.json()["reset"] is False
+    assert api["saved"][-1]["not_opened_first_days"] == 10
+    assert api["saved"][-1]["templates"]["not_viewed_2"]["title"] == "Custom"
+
+
+def test_reset_is_only_the_literal_true(api):
+    api["row"] = _customised()
+    r = api["client"].put("/api/admin/settings/followups",
+                          json={"settings": {}, "reset": "yes"})
+    assert r.json()["reset"] is False
+    assert api["saved"][-1]["not_opened_first_days"] == 10

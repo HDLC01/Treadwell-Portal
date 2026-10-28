@@ -1699,14 +1699,22 @@ _STAFF_FOLLOWUP_SQL = (
 # the follow-up tasks an estimator SENT or answered with a CALL (the remind-only period). The
 # template says which step a row belongs to. Unordered on purpose (the rules sort it): the board
 # query's tests locate its trailing ORDER BY by the first occurrence of those words.
+# Also the OLD ladder's two estimator notes (`…:nv1_staff`, `…:v48_staff`, audience staff), which are
+# not customer emails and never counted (followup_rules.sent_history drops audience staff): they
+# tell the rules this cycle's step was already reported to the estimator (legacy_estimator_told).
 _SENT_HISTORY_SQL = (
     "(select coalesce(jsonb_agg(jsonb_build_object("
     "     'at', f.created_at, 'template', f.detail->>'template', "
-    "     'rule_key', f.detail->>'rule_key')), '[]'::jsonb) "
+    "     'rule_key', f.detail->>'rule_key', "
+    "     'audience', case when f.kind = 'auto_email' then f.detail->>'audience' end)), "
+    "   '[]'::jsonb) "
     "   from public.portal_followups f "
     "  where f.proposal_id = {pid} and f.created_at >= coalesce({enrolled}, f.created_at) "
     "    and ((f.kind = 'followup_task' and f.detail->>'status' in ('sent','called')) "
-    "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer')))")
+    "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'customer') "
+    "         or (f.kind = 'auto_email' and f.detail->>'audience' = 'staff' "
+    "             and substr(f.detail->>'rule_key', length(f.detail->>'rule_key') - 9) "
+    "                 in (':nv1_staff', ':v48_staff'))))")
 # The newest OPEN task (there is at most one: portal_followups_one_open_task_uidx). Open means
 # pending, or `sending` — claimed by the send endpoint and not yet confirmed. A `sending` task must
 # hold the slot: if it did not, a tick during the send would raise a second task, and putting the

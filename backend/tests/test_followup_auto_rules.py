@@ -347,3 +347,111 @@ def test_the_mode_is_auto():
 def test_the_cadence_templates_are_the_four_editable_emails():
     assert [t for step in ("not_opened", "opened") for t in fs.CADENCE_TEMPLATES[step]] == \
         list(fs.TEMPLATE_KEYS)
+
+
+# ── review 2026-10-29: rows as the OLDER engines and schema left them ─────────────
+# A proposal opened before `cycle_viewed_at` existed is 'viewed' with no cycle stamp (schema.sql
+# adds the column with no backfill). It IS opened: the customer must never be told it is not.
+MIGRATED = fs.merge({"first_nudge_hours": 72, "second_nudge_hours": 168,
+                     "recurring_hours": 2160, "max_recurring": 1,
+                     "staff_personal_hours": 24})
+OLD_SENT = NOW - 60 * D
+
+
+def _mig(**over):
+    c = dict(MIGRATED)
+    c.update(ALL_DAY)
+    c.update(over)
+    return c
+
+
+def test_a_viewed_row_with_no_cycle_stamp_is_opened_not_unopened():
+    p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, cycle_viewed_at=None)
+    d, = cust(p, NOW, _mig())
+    assert (tag(d), d.template) == ("v1", "next_steps")
+    assert fr.plan(p, NOW, _mig()).step == fr.OPENED
+    # Its 2nd is the opened step's 2nd, never "we haven't seen it opened yet".
+    p["followup_sent_history"] = [_h(NOW, "next_steps")]
+    d, = cust(p, NOW + 7 * D, _mig())
+    assert (tag(d), d.template) == ("v2", "second_nudge")
+    for at in (NOW + 7 * D, NOW + 30 * D):
+        assert all(x.template not in ("not_viewed", "not_viewed_2")
+                   for x in fr.due_now(p, at, _mig()))
+
+
+def test_a_viewed_row_with_no_cycle_stamp_is_dated_by_the_views_of_this_send():
+    # viewed_at (first view EVER) after the send: the 1st opened email is 3 days after it.
+    seen = OLD_SENT + 50 * D
+    p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, viewed_at=seen,
+           last_viewed_at=seen + 2 * D)
+    assert fr.next_due_at(p, NOW, _mig()) == seen + 3 * D
+    # viewed_at from BEFORE this send (a revision): the latest view, if it is of this send.
+    p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, viewed_at=OLD_SENT - 9 * D,
+           last_viewed_at=seen)
+    assert fr.next_due_at(p, NOW, _mig()) == seen + 3 * D
+    # No view of this send can be seen at all: the send itself.
+    p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, viewed_at=OLD_SENT - 9 * D,
+           last_viewed_at=OLD_SENT - 8 * D)
+    assert fr.next_due_at(p, NOW, _mig()) == OLD_SENT + 3 * D
+    # A 'sent' row is not opened, whatever an older send's stamps say.
+    p = _p(proposal_status="sent", followup_enrolled_at=OLD_SENT, viewed_at=OLD_SENT - 9 * D)
+    assert fr.plan(p, NOW, _mig()).step == fr.NOT_OPENED
+
+
+def test_the_schedule_reads_the_view_stamps_the_board_and_worker_carry():
+    assert {"viewed_at", "last_viewed_at", "cycle_viewed_at"} <= set(fr.INPUT_KEYS)
+
+
+def _old(at, tag_, template, audience=None):
+    row = {"at": at.isoformat(), "template": template, "rule_key": "%s:%s" % (
+        fr.cycle_key(OLD_SENT), tag_)}
+    if audience:
+        row["audience"] = audience
+    return row
+
+
+def test_an_old_estimator_note_means_release_day_sends_no_second_one():
+    """A viewed proposal the old ladder chased 5 times and reported to the estimator: the first
+    tick owes the customer nothing (the step is used up) and the estimator nothing either."""
+    hist = [_old(OLD_SENT + (5 + i) * D, "vr@%d" % i, "checkin", "customer") for i in range(5)]
+    hist.append(_old(OLD_SENT + 4 * D, "v48_staff", None, "staff"))
+    p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT,
+           cycle_viewed_at=OLD_SENT + D, followup_sent_history=hist)
+    assert fr.due_now(p, NOW, _mig()) == []
+    assert fr.plan(p, NOW, _mig()).estimator_at is None
+    # Without that old note the step's estimator note is still owed (once).
+    p["followup_sent_history"] = hist[:-1]
+    assert [tag(s) for s in staff(p, NOW, _mig())] == ["v_est"]
+
+
+def test_the_old_not_opened_note_covers_only_the_not_opened_step():
+    hist = [_old(OLD_SENT + 3 * D, "nv1", "not_viewed", "customer"),
+            _old(OLD_SENT + 10 * D, "nvr@1", "not_viewed", "customer"),
+            _old(OLD_SENT + 3 * D, "nv1_staff", None, "staff")]
+    p = _p(followup_enrolled_at=OLD_SENT, followup_sent_history=hist)
+    assert fr.due_now(p, NOW, _mig()) == []
+    # Opened since, and the opened step used up by the old ladder too: no old v48 note -> told.
+    p.update(proposal_status="viewed", cycle_viewed_at=OLD_SENT + 11 * D)
+    p["followup_sent_history"] = hist + [
+        _old(OLD_SENT + 14 * D, "v1", "next_steps", "customer"),
+        _old(OLD_SENT + 21 * D, "v2", "second_nudge", "customer")]
+    assert [tag(s) for s in staff(p, NOW, _mig())] == ["v_est"]
+
+
+def test_an_old_estimator_note_is_never_counted_as_a_customer_email():
+    """One old 1st email plus the old ladder's estimator note: the 2nd is still owed."""
+    hist = [_old(OLD_SENT + 3 * D, "nv1", "not_viewed", "customer"),
+            _old(OLD_SENT + 3 * D, "nv1_staff", None, "staff")]
+    p = _p(followup_enrolled_at=OLD_SENT, followup_sent_history=hist)
+    assert fr.sent_history(p) == [(OLD_SENT + 3 * D, "not_viewed")]
+    d, = cust(p, NOW, _mig())
+    assert (tag(d), d.template) == ("nv2", "not_viewed_2")
+
+
+def test_once_this_engine_emails_in_the_step_the_estimator_note_after_it_goes():
+    """The old note reported the old emails; the 2nd sent by this engine is news."""
+    hist = [_old(OLD_SENT + 3 * D, "nv1", "not_viewed", "customer"),
+            _old(OLD_SENT + 3 * D, "nv1_staff", None, "staff"),
+            _old(NOW - 2 * D, "a:nv2", "not_viewed_2", "customer")]
+    p = _p(followup_enrolled_at=OLD_SENT, followup_sent_history=hist)
+    assert [tag(s) for s in staff(p, NOW, _mig())] == ["nv_est"]

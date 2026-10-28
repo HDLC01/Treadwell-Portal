@@ -75,6 +75,12 @@ _STEP_OF_TEMPLATE = {
 }
 _UNCOUNTED_TEMPLATES = ("deposit_nudge",)
 
+# The older engines' estimator notes, by step: the ladder's "not opened yet" note and its "time for
+# a personal follow-up" note. db._SENT_HISTORY_SQL carries them (audience staff) so the release-day
+# tick does not tell an estimator a second time about a step the old engine already reported. They
+# never count as customer emails.
+_LEGACY_ESTIMATOR_SUFFIX = {NOT_OPENED: ":nv1_staff", OPENED: ":v48_staff"}
+
 # ── follow-up MODE ────────────────────────────────────────────────────────────
 # 'auto': the worker emails the customer itself. The remind-only mode of 2026-10-23 (a task for the
 # estimator instead of an email) is retired from the cadence; its task rows stay readable.
@@ -90,8 +96,8 @@ GROUP_TASK_TEMPLATE_DECISION = "scope_decision"
 # (test_admin_pipeline.py): a field the worker sees and the board does not is how the board comes
 # to show a date the worker will not act on.
 INPUT_KEYS = ("proposal_status", "followup_enrolled_at", "followup_disabled_at",
-              "followup_paused_until", "cycle_viewed_at", "followup_next_at",
-              "followup_sent_history")
+              "followup_paused_until", "cycle_viewed_at", "viewed_at", "last_viewed_at",
+              "followup_next_at", "followup_sent_history")
 
 
 def followup_mode(p: dict) -> str:
@@ -230,23 +236,72 @@ def in_scope(p: dict) -> bool:
     return (p.get("proposal_status") or "") in OPEN_STATUSES
 
 
-def sent_history(p: dict) -> list:
-    """The proposal's counted customer reminders as [(at, template)], oldest first, current cycle
-    only. Accepts the jsonb list the database returns ({at, template, rule_key}) or a JSON string."""
+def _cycle_rows(p: dict) -> list:
+    """The history rows of the current cycle as [(at, template, audience, rule_key)]. A row with
+    no audience is a customer reminder (a sent or called task carries none)."""
     enrolled = _aware(p.get("followup_enrolled_at")) or _ts(p.get("followup_enrolled_at"))
     out = []
     for row in _times_list(p.get("followup_sent_history")):
         if isinstance(row, dict):
             at, tpl = _ts(row.get("at")), (row.get("template") or "")
+            aud, key = (row.get("audience") or "customer"), (row.get("rule_key") or "")
         else:                                   # a bare timestamp: template unknown
-            at, tpl = _ts(row), ""
+            at, tpl, aud, key = _ts(row), "", "customer", ""
         if at is None or (enrolled is not None and at < enrolled):
             continue
-        if tpl in _UNCOUNTED_TEMPLATES:
-            continue
-        out.append((at, tpl))
+        out.append((at, tpl, aud, key))
+    return out
+
+
+def sent_history(p: dict) -> list:
+    """The proposal's counted customer reminders as [(at, template)], oldest first, current cycle
+    only. Accepts the jsonb list the database returns ({at, template, rule_key, audience}) or a
+    JSON string. An estimator note in the list (audience staff) is never a customer email."""
+    out = [(at, tpl) for at, tpl, aud, _key in _cycle_rows(p)
+           if aud != "staff" and tpl not in _UNCOUNTED_TEMPLATES]
     out.sort(key=lambda r: r[0])
     return out
+
+
+def _engine_key(key: str) -> bool:
+    """Was this rule key reserved by THIS engine (the `:a:` namespace)?"""
+    return (":%s:" % KEY_NS) in (key or "")
+
+
+def legacy_estimator_told(p: dict, step: str) -> bool:
+    """Did an older engine already send this cycle's estimator note for `step`, with none of the
+    step's customer emails sent by this engine since? Then the release-day tick owes no new note:
+    the estimator heard about this step from the old ladder, and nothing has happened since. Once
+    this engine emails the customer in the step, the note after it is new news and goes."""
+    suffix = _LEGACY_ESTIMATOR_SUFFIX.get(step)
+    if not suffix:
+        return False
+    rows = _cycle_rows(p)
+    if not any(aud == "staff" and key.endswith(suffix) for _at, _t, aud, key in rows):
+        return False
+    return not any(aud != "staff" and _engine_key(key) and _step_of(tpl, step) == step
+                   for _at, tpl, aud, key in rows)
+
+
+def opened_at(p: dict) -> Optional[datetime]:
+    """When the customer opened THIS send, or None if they have not.
+
+    `cycle_viewed_at` when it is stamped. A row whose status is 'viewed' without it was opened
+    before that column existed (schema.sql adds it with no backfill) and IS opened: it is dated by
+    the first view of this send we can still see (`viewed_at`, then `last_viewed_at`, whichever is
+    not from before the send), else by the send itself. Never "not opened yet": that would email a
+    customer who read the proposal that they have not opened it."""
+    enrolled = _aware(p.get("followup_enrolled_at")) or _ts(p.get("followup_enrolled_at"))
+    viewed = _ts(p.get("cycle_viewed_at"))
+    if viewed is not None:
+        return viewed
+    if (p.get("proposal_status") or "") != "viewed":
+        return None
+    for k in ("viewed_at", "last_viewed_at"):
+        at = _ts(p.get(k))
+        if at is not None and (enrolled is None or at >= enrolled):
+            return at
+    return enrolled
 
 
 def _step_of(template: str, current: str) -> str:
@@ -276,7 +331,7 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
         return Plan(reason="finished")
 
     s = _schedule(cfg)
-    viewed = _aware(p.get("cycle_viewed_at")) or _ts(p.get("cycle_viewed_at"))
+    viewed = opened_at(p)                       # a 'viewed' row with no cycle stamp IS opened
     step = OPENED if viewed is not None else NOT_OPENED
     anchor = viewed if viewed is not None else enrolled
     if anchor < enrolled:                       # a view stamp from before this send: not this cycle
@@ -315,6 +370,8 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
 
     # The step's emails are all sent (or all switched off): only the estimator's note is left.
     if not s["estimator_on"]:
+        return Plan(reason="step_done", **common)
+    if legacy_estimator_told(p, step):          # the old ladder already told them; nothing since
         return Plan(reason="step_done", **common)
     est = (last if last is not None else anchor) + timedelta(days=int(s["estimator_days"]))
     if resume is not None and est < resume:
@@ -543,12 +600,13 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
         return None, "not_enrolled"
     enrolled = _min_ts(m.get("followup_enrolled_at") for m in open_)
     home = group_home(live)
-    opened = [m for m in open_ if m.get("cycle_viewed_at")]
+    # Opened = a cycle stamp OR a 'viewed' status (a view from before cycle_viewed_at existed).
+    opened = [t for t in (opened_at(m) for m in open_) if t is not None]
     view = dict(home)
     view.update({
         "proposal_status": "viewed" if opened else "sent",
         "followup_enrolled_at": enrolled,
-        "cycle_viewed_at": _min_ts(m.get("cycle_viewed_at") for m in open_),
+        "cycle_viewed_at": min(opened) if opened else None,
         "followup_disabled_at": None,
         "deleted_at": None,
         "approved_at": None,

@@ -226,7 +226,8 @@ def test_a_viewed_proposal_shows_the_viewed_tracks_date(pipeline):
     assert got == viewed + dt.timedelta(days=3)
     # And the old computation — the same row with the view missing, as the query delivered it —
     # really was different, so this test would have caught the bug.
-    blind = dict(row, cycle_viewed_at=None)
+    # (Every view stamp, since a 'viewed' row with no cycle stamp is dated by viewed_at.)
+    blind = dict(row, cycle_viewed_at=None, viewed_at=None, last_viewed_at=None)
     assert _fr.next_due_at(blind, now) != got
 
 

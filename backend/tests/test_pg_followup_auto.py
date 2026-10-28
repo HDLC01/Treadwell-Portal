@@ -289,3 +289,48 @@ def test_the_live_prod_settings_row_is_read_as_its_migration(clean, outbox):
     followup_worker._tick(in_window())
     assert outbox.customers() == ["due@customer.example"]
     assert "Is it there?" in outbox.sent[0]["html"], "the saved wording was not used"
+
+
+# ── review 2026-10-29: rows as the OLDER engines and the schema left them ─────────
+def old_staff_note(pid, key, days_ago):
+    """The old ladder's estimator note, exactly as it reserved it (audience staff)."""
+    db.execute("insert into public.portal_followups (proposal_id, kind, detail, created_at) "
+               "values (%s, 'auto_email', %s, now() - make_interval(secs => %s))",
+               (pid, Jsonb({"audience": "staff", "template": "staff_personal_followup",
+                            "rule_key": key}), float(days_ago) * 86400))
+
+
+def test_release_day_sends_no_second_estimator_note_and_never_says_not_opened(clean, outbox):
+    # Chased by the old ladder 5 times and reported to the estimator: nothing to anybody.
+    add_proposal("chased", status="viewed", enrolled_days=60, cycle_viewed_at=ago(59))
+    ck = rules.cycle_key(db.get_proposal("chased")["followup_enrolled_at"])
+    for i in range(5):
+        old_row("chased", ck + ":vr@%d" % i, "checkin", 50 - i)
+    old_staff_note("chased", ck + ":v48_staff", 58)
+    # The same, never reported (no old note): the estimator hears once.
+    add_proposal("unreported", status="viewed", enrolled_days=60, cycle_viewed_at=ago(59))
+    ck = rules.cycle_key(db.get_proposal("unreported")["followup_enrolled_at"])
+    for i in range(2):
+        old_row("unreported", ck + ":vr@%d" % i, "checkin", 50 - i)
+    # Opened before cycle_viewed_at existed: 'viewed', no cycle stamp. It is OPENED.
+    add_proposal("legacyview", status="viewed", enrolled_days=60, viewed_at=ago(55),
+                 last_viewed_at=ago(54))
+    assert db.get_proposal("legacyview")["cycle_viewed_at"] is None
+
+    hist = db.followup_signals("chased")["followup_sent_history"]
+    assert [h["audience"] for h in hist].count("staff") == 1
+    assert len(rules.sent_history(dict(db.get_proposal("chased"), followup_sent_history=hist))) == 5
+
+    now = in_window()
+    dry = followup_worker.dry_run_count(now)
+    named = {e["proposal_id"]: e["template"] for e in dry["customer_emails"]}
+    assert named == {"legacyview": "next_steps"}, dry
+    assert sorted(s["proposal_id"] for s in dry["staff_emails"]) == ["unreported"], dry
+    followup_worker._tick(now)
+    assert outbox.customers() == ["legacyview@customer.example"]
+    assert len(outbox.staff()) == 1
+    staff_keys = [r["detail"]["rule_key"] for r in emails() if r["detail"]["audience"] == "staff"]
+    assert [k.rsplit(":", 1)[1] for k in staff_keys] == ["v_est"]
+    assert db.get_proposal("legacyview") is not None
+    sent = [r["detail"]["template"] for r in emails("legacyview")]
+    assert sent == ["next_steps"], "a customer who opened it was told it was not opened"
