@@ -61,6 +61,15 @@ class FakeSendDB:
     def get_recipients(self, pid):
         return list(self.recipients.get(pid, []))
 
+    def list_scope_group_draft_labels(self, gid):
+        # Like the SQL: the label of every draft whose blob carries this group.
+        out = {}
+        for pid, data in self.draft_data.items():
+            sg = (data or {}).get("scope_group") or {}
+            if isinstance(sg, dict) and sg.get("id") == gid and sg.get("label"):
+                out[pid] = sg["label"]
+        return out
+
     # ── claims ───────────────────────────────────────────────────────────────
     def _marks_for(self, gid, ids):
         return [m for m in self.marks
@@ -184,6 +193,7 @@ class FakeSendDB:
         for name in ("list_scope_group", "list_scope_group_draft_states",
                      "list_scope_group_draft_states_many", "list_scope_group_drafts",
                      "list_scope_group_marks", "get_proposal", "get_draft_data", "get_recipients",
+                     "list_scope_group_draft_labels",
                      "claim_scope_group_send", "settle_scope_group_send",
                      "mark_scope_group_attempt", "release_scope_group_send",
                      "stash_scope_group_note", "list_scope_group_notes",

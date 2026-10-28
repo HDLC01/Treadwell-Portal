@@ -1,30 +1,15 @@
-"""The follow-up cadence and its wording, as editable settings.
+"""The follow-up emails' WORDING as editable settings: templates, rendering, previews and the
+settings endpoints' storage behaviour.
 
-Hanz asked for the cadence to be editable — the intervals AND the four customer emails — by any
-signed-in user, as one global setting. Until now both were Python constants: changing "every 3
-days" to "every 5" meant a code edit and a deploy.
+The SCHEDULE half (2026-10-28: 1st/2nd email per step with switches, days 1-90 refused rather than
+clamped, the old row migrated on read) is tested in test_followup_auto_settings.py; this file's
+clamping and old-cadence tests went with the old shape.
 
-Everything these settings touch ends up in a CUSTOMER's inbox, which sets the bar. A wrong value
-here is not an internal inconvenience like a mislabelled project; it is visible outside the
-company and it repeats every few days until somebody notices. So the tests below are mostly about
-the ways a well-meaning edit could go wrong:
+Everything here ends up in a CUSTOMER's inbox:
 
-  * **An interval of 1 hour** would chase somebody 24 times a day. Values are CLAMPED rather than
-    rejected — a form that refuses a number without explaining is how people give up and ask an
-    engineer — so the test is that the clamp exists and that it bites.
-  * **A send window that ends before it opens** (18 to 8) would silence every customer email and
-    look like the cadence had simply stopped. It falls back to the shipped window instead.
-  * **A template with the link deleted** is a wasted send: those emails exist to get somebody back
-    to the proposal. This is the one case that hard-refuses, because silently re-appending a button
-    somebody deliberately removed is worse than saying no.
-  * **HTML pasted into a template** would reach a customer's mail client as a broken layout that
-    nobody sees until they do. Stripped, not escaped — escaping shows them a literal `&lt;b&gt;`.
-  * **A missing settings table.** The DDL lands after the code on every environment, so an absent
-    row must mean "the cadence as shipped" rather than "no cadence at all".
-
-The last one is why `cfg` is an OPTIONAL argument all the way down: the 24 existing tests in
-test_followup_rules.py pass unchanged, which is the evidence that this feature cannot have altered
-the cadence for anybody who has not edited it.
+  * **A template with the link deleted** is a wasted send, so it is refused.
+  * **HTML pasted into a template** is stripped, not escaped.
+  * **A missing settings table** means "as shipped", never "no follow-ups".
 """
 from datetime import datetime, timedelta, timezone
 
@@ -40,101 +25,12 @@ NOW = datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc)      # 09:00 Central, ins
 DEFAULTS_ = fs.DEFAULTS
 
 
-# ── the defaults are the shipped cadence ──────────────────────────────
-def test_the_defaults_are_exactly_the_constants_the_cadence_shipped_with():
-    """If these drift, every environment that has never opened the editor silently gets a
-    different cadence than it had — the one change this feature must not make."""
-    d = fs.defaults()
-    assert d["first_nudge_hours"] == R.FIRST_NUDGE.total_seconds() / 3600 == 24
-    assert d["second_nudge_hours"] == R.SECOND_NUDGE.total_seconds() / 3600 == 72
-    assert d["recurring_hours"] == R.RECURRING.total_seconds() / 3600 == 72
-    assert d["staff_personal_hours"] == R.STAFF_PERSONAL.total_seconds() / 3600 == 48
-    assert d["max_recurring"] == R.MAX_RECURRING == 20
-    assert d["send_start_hour"] == R.SEND_START_HOUR == 8
-    assert d["send_end_hour"] == R.SEND_END_HOUR == 18
-
-
-def test_the_default_templates_cover_every_editable_email():
-    """`Due.template` names one of the emails the worker chases with; the editor ALSO owns the
-    proposal-sent email, which the worker must never use. Both sets are asserted here because
-    that separation is the one mistake in this area that reaches a customer: "sent" inside
-    TEMPLATE_KEYS would mail "your proposal is ready" as a three-day reminder.
-
-    Not pinned to a count. This tuple grew by one when the deposit stage arrived (2026-08-12), and
-    the claim worth protecting was never "there are exactly four" — it is "every cadence email has
-    wording behind it, and the sent email is not a cadence email"."""
-    assert set(fs.DEFAULT_TEMPLATES) == set(fs.ALL_TEMPLATE_KEYS)
-    assert set(fs.TEMPLATE_KEYS) < set(fs.ALL_TEMPLATE_KEYS)
-    assert fs.SENT_KEY not in fs.TEMPLATE_KEYS
-    assert set(fs.ALL_TEMPLATE_KEYS) - set(fs.TEMPLATE_KEYS) == {fs.SENT_KEY}, (
-        "an email is editable but unreachable by the cadence, and it is not the sent email")
-    for key, t in fs.DEFAULT_TEMPLATES.items():
-        assert t["title"] and t["body"] and t["cta"], key
-        assert "{link}" in t["body"], key
-        assert "subject" not in t, (
-            "%s still carries its own subject; a project has ONE, shared by every update "
-            "about it, or Gmail files each email as a separate conversation" % key)
-    assert fs.DEFAULT_THREAD_SUBJECT and "{project}" in fs.DEFAULT_THREAD_SUBJECT
-
-
-# ── clamping, not rejecting ───────────────────────────────────────────
-@pytest.mark.parametrize("field,given,expect", [
-    ("recurring_hours", 1, 4),              # below the floor -> the floor
-    ("recurring_hours", 999999, 24 * 90),   # ceiling: 90 days
-    ("max_recurring", 5000, 60),
-])
-def test_absurd_numbers_are_pulled_into_range(field, given, expect):
-    assert fs.validate({field: given})[field] == expect
-
-
-@pytest.mark.parametrize("field", ["first_nudge_hours", "second_nudge_hours",
-                                   "recurring_hours", "staff_personal_hours", "max_recurring"])
-@pytest.mark.parametrize("given", [0, -5, -999])
-def test_zero_and_negatives_fall_back_rather_than_clamping_to_the_floor(field, given):
-    """Clamping these to the floor would turn a typo into the most aggressive cadence the system
-    allows — type 0 in the recurring box and customers get an email every four hours. A nonsense
-    value is not an attempt at a fast schedule."""
-    assert fs.validate({field: given})[field] == DEFAULTS_[field]
-
-
-def test_an_out_of_range_hour_takes_the_whole_window_back_to_the_default():
-    """Clamping start=99 to 23 would leave 23-to-18, which ends before it opens — so the window
-    check catches it and restores 8-18. The pair has to stay coherent, not each field
-    individually."""
-    got = fs.validate({"send_start_hour": 99})
-    assert (got["send_start_hour"], got["send_end_hour"]) == (8, 18)
-    got = fs.validate({"send_end_hour": 0})
-    assert (got["send_start_hour"], got["send_end_hour"]) == (8, 18)
-
-
+# ── the send window ───────────────────────────────────────────────────
 def test_midnight_is_a_legitimate_window_start():
     """0 means midnight for this one field, so it must not be treated as "unset" like a 0 interval
     is. Staff mail is unclamped anyway, but a customer window of 0-8 is a real choice."""
     got = fs.validate({"send_start_hour": 0, "send_end_hour": 8})
     assert (got["send_start_hour"], got["send_end_hour"]) == (0, 8)
-
-
-@pytest.mark.parametrize("junk", ["", None, "abc", True, False, {}, []])
-def test_unreadable_numbers_fall_back_to_the_default(junk):
-    assert fs.validate({"recurring_hours": junk})["recurring_hours"] == 72
-
-
-def test_a_number_typed_as_text_still_works():
-    """People type into a form; "48" arrives as a string."""
-    assert fs.validate({"first_nudge_hours": "48"})["first_nudge_hours"] == 48
-    assert fs.validate({"first_nudge_hours": " 48 "})["first_nudge_hours"] == 48
-
-
-def test_a_window_that_ends_before_it_opens_falls_back():
-    """THE dangerous one. 18-to-8 would silence every customer email and read as the cadence
-    having stopped for no reason."""
-    got = fs.validate({"send_start_hour": 18, "send_end_hour": 8})
-    assert (got["send_start_hour"], got["send_end_hour"]) == (8, 18)
-
-
-def test_an_equal_window_falls_back_too():
-    got = fs.validate({"send_start_hour": 12, "send_end_hour": 12})
-    assert (got["send_start_hour"], got["send_end_hour"]) == (8, 18)
 
 
 def test_a_legitimate_narrow_window_is_kept():
@@ -169,14 +65,6 @@ def test_a_refusal_names_the_email_the_way_the_screen_does(key, label):
     leaked = msg.replace(label, "")
     assert key.replace("_", " ") not in leaked, (
         "the refusal still leaks the raw database key %r" % key)
-
-
-def test_an_over_long_body_is_refused_by_its_screen_name_too():
-    """The other refusal a person has to act on. Same reasoning."""
-    with pytest.raises(fs.ValidationError) as e:
-        fs.validate({"templates": {"second_nudge": {"body": "x" * 4100 + " {link}"}}})
-    assert "Second reminder" in str(e.value)
-    assert "4000" in str(e.value), "the limit is not stated, so there is nothing to trim towards"
 
 
 def test_every_email_has_a_screen_name():
@@ -245,23 +133,6 @@ def test_an_unknown_template_name_is_refused():
         fs.validate_template("nope", {"body": "{link}"})
 
 
-# ── merge: a stored row over the defaults ─────────────────────────────
-@pytest.mark.parametrize("stored", [None, {}, "nonsense", 5, [], {"templates": "nope"}])
-def test_a_missing_or_corrupt_row_yields_the_shipped_cadence(stored):
-    """The DDL lands after the code on every environment, so this is the normal state on the day
-    of a deploy — not an edge case."""
-    got = fs.merge(stored)
-    assert got["first_nudge_hours"] == 24
-    assert set(got["templates"]) == set(fs.ALL_TEMPLATE_KEYS)
-
-
-def test_a_partial_row_keeps_the_defaults_for_everything_it_omits():
-    got = fs.merge({"recurring_hours": 120})
-    assert got["recurring_hours"] == 120
-    assert got["first_nudge_hours"] == 24           # untouched
-    assert got["send_end_hour"] == 18
-
-
 def test_a_stored_template_that_has_gone_bad_falls_back_to_just_that_one():
     """A hand-edited row, or an older shape, must not take the whole cadence down — and must not
     take the other three emails with it."""
@@ -273,54 +144,12 @@ def test_a_stored_template_that_has_gone_bad_falls_back_to_just_that_one():
     assert got["templates"]["not_viewed"]["title"] == "Kept"
 
 
-def test_stored_numbers_are_clamped_on_the_way_out_too():
-    """Validation runs on save, but a row written by hand or by an older version reaches the
-    worker without ever passing through it."""
-    assert fs.merge({"recurring_hours": 1})["recurring_hours"] == 4
-
-
 # ── the rules honour it ───────────────────────────────────────────────
 def _sent(hours_ago, **extra):
     p = {"followup_enrolled_at": NOW - timedelta(hours=hours_ago),
          "proposal_status": "sent", "cycle_viewed_at": None}
     p.update(extra)
     return p
-
-
-def test_no_config_behaves_exactly_as_the_constants_did():
-    """The 24 tests in test_followup_rules.py assert this too, by passing nothing. Stated here as
-    well because it is the promise the whole feature rests on."""
-    assert [d.template for d in R.due_now(_sent(30), NOW)] == ["not_viewed", "staff_not_viewed"]
-    assert R.due_now(_sent(20), NOW) == []
-
-
-def test_a_longer_first_nudge_delays_the_email():
-    """30 hours in: due by default, not due at 48."""
-    assert R.due_now(_sent(30), NOW, {"first_nudge_hours": 48}) == []
-    assert [d.template for d in R.due_now(_sent(50), NOW, {"first_nudge_hours": 48})] \
-        == ["not_viewed", "staff_not_viewed"]
-
-
-def test_a_shorter_first_nudge_brings_it_forward():
-    assert [d.template for d in R.due_now(_sent(8), NOW, {"first_nudge_hours": 6})] \
-        == ["not_viewed", "staff_not_viewed"]
-
-
-def test_the_recurring_interval_is_honoured():
-    """Unviewed and long past the first nudge: which occurrence has matured depends on the
-    interval, so the two schedules must land on different occurrences.
-
-    This test used to assert the ORDINAL inside the rule key ("nvr3" vs "nvr9"), and its own
-    docstring called that carrying "the number". That was the defect, not the design: raising an
-    interval made the same elapsed time yield a SMALLER ordinal, colliding with a key already
-    consumed, and the send was deduped away for months. Keys are the occurrence time now, so the
-    property to hold is that two intervals cannot produce the same key."""
-    p = _sent(24 + 72 * 3 + 1)
-    slow = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 72}) if "nvr" in d.rule_key]
-    fast = [d.rule_key for d in R.due_now(p, NOW, {"recurring_hours": 50}) if "nvr" in d.rule_key]
-    assert slow and fast, (slow, fast)
-    assert slow != fast, (
-        "both intervals produced the same dedupe key, so changing the cadence silences the chase")
 
 
 def test_two_schedules_that_genuinely_coincide_still_dedupe():
@@ -334,60 +163,10 @@ def test_two_schedules_that_genuinely_coincide_still_dedupe():
     assert a == b, (a, b)
 
 
-def test_the_recurring_cap_is_honoured():
-    p = _sent(24 + 72 * 40)
-    capped = R.next_due_at(p, NOW, {"max_recurring": 2})
-    assert capped is None, "a cap of 2 should have been exhausted long ago"
-    assert R.next_due_at(p, NOW, {"max_recurring": 200}) is not None
-
-
-def test_the_staff_nudge_interval_is_honoured():
-    viewed = {"followup_enrolled_at": NOW - timedelta(hours=200),
-              "proposal_status": "viewed",
-              "cycle_viewed_at": NOW - timedelta(hours=30)}
-    assert any(d.template == "staff_personal_followup"
-               for d in R.due_now(viewed, NOW, {"staff_personal_hours": 24}))
-    assert not any(d.template == "staff_personal_followup"
-                   for d in R.due_now(viewed, NOW, {"staff_personal_hours": 48}))
-
-
-def test_the_send_window_is_honoured():
-    """09:00 Central. A window starting at 10 should hold the customer email back — and keep the
-    staff one, which is unclamped because it lands in a work inbox."""
-    got = R.due_now(_sent(30), NOW, {"send_start_hour": 10, "send_end_hour": 18})
-    assert [d.audience for d in got] == ["staff"]
-
-
 def test_a_corrupt_window_in_the_stored_config_does_not_silence_everything():
     """Validation prevents this on save, but a hand-edited row reaches the rules directly. Second
     line of defence, because the failure mode is silent."""
     assert R.in_send_window(NOW, {"send_start_hour": 18, "send_end_hour": 8}) is True
-
-
-@pytest.mark.parametrize("bad", [{"first_nudge_hours": "abc"}, {"first_nudge_hours": None},
-                                {"first_nudge_hours": -1}, {"first_nudge_hours": True},
-                                {"recurring_hours": 0}, "nonsense", None, 5])
-def test_junk_config_is_ignored_rather_than_crashing_the_tick(bad):
-    """One bad settings row must not stop the cadence for every proposal."""
-    got = R.due_now(_sent(30), NOW, bad if isinstance(bad, dict) else None)
-    assert [d.template for d in got] == ["not_viewed", "staff_not_viewed"]
-
-
-# ── the worker ────────────────────────────────────────────────────────
-def test_the_worker_falls_back_when_the_settings_table_is_missing(monkeypatch):
-    """This is the state on the day the code deploys and the DDL has not been applied. It must
-    send exactly as it did before, not stop."""
-    def boom(_key):
-        raise RuntimeError('relation "portal_settings" does not exist')
-    monkeypatch.setattr(W.db, "get_settings", boom)
-    got = W._settings()
-    assert got["first_nudge_hours"] == 24
-    assert set(got["templates"]) == set(fs.ALL_TEMPLATE_KEYS)
-
-
-def test_the_worker_uses_a_saved_cadence(monkeypatch):
-    monkeypatch.setattr(W.db, "get_settings", lambda _k: {"recurring_hours": 120})
-    assert W._settings()["recurring_hours"] == 120
 
 
 def test_the_worker_reads_the_settings_once_per_tick_not_once_per_proposal(monkeypatch):
@@ -408,6 +187,9 @@ def test_the_worker_reads_the_settings_once_per_tick_not_once_per_proposal(monke
     monkeypatch.setattr(W.db, "get_proposal", lambda pid: {
         "proposal_id": pid, "proposal_status": "sent",
         "followup_enrolled_at": NOW, "cycle_viewed_at": None})
+    monkeypatch.setattr(W.db, "followup_signals", lambda pid: {})
+    monkeypatch.setattr(W.db, "list_pending_followup_tasks", lambda: [])
+    monkeypatch.setattr(W.db, "list_stale_sending_tasks", lambda minutes: [])
     W._tick(NOW)
     assert len(reads) == 1, "settings were read %d times for 3 candidates" % len(reads)
 
@@ -514,52 +296,9 @@ HDRS = {"X-Service-Token": "test-token"}
 @pytest.fixture(autouse=True)
 def _service_token(monkeypatch):
     monkeypatch.setattr(portal_main, "_admin_ok", lambda request: True)
-
-
-def test_get_returns_a_usable_cadence_even_with_no_row(monkeypatch):
-    """The state on the day the code deploys and the DDL has not been applied."""
-    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: None)
-    monkeypatch.setattr(portal_main.db, "settings_meta", lambda k: {})
-    j = client.get("/api/admin/settings/followups").json()
-    assert j["ok"] is True
-    assert j["settings"]["first_nudge_hours"] == 24
-    assert j["saved"] is False, "a fresh install must not look like somebody's choice"
-    assert set(j["previews"]) == set(fs.ALL_TEMPLATE_KEYS)
-
-
-def test_get_survives_the_table_not_existing(monkeypatch):
-    def boom(_k):
-        raise RuntimeError('relation "portal_settings" does not exist')
-    monkeypatch.setattr(portal_main.db, "get_settings", boom)
-    monkeypatch.setattr(portal_main.db, "settings_meta", boom)
-    j = client.get("/api/admin/settings/followups").json()
-    assert j["ok"] is True and j["settings"]["recurring_hours"] == 72
-
-
-def test_get_reports_who_last_changed_it(monkeypatch):
-    """These settings send email to customers, so "who and when" has to be answerable."""
-    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: {"recurring_hours": 120})
-    monkeypatch.setattr(portal_main.db, "settings_meta",
-                        lambda k: {"updated_at": NOW, "updated_by": "hanz@wetreadwell.com"})
-    j = client.get("/api/admin/settings/followups").json()
-    assert j["saved"] is True
-    assert j["updated_by"] == "hanz@wetreadwell.com"
-    assert j["settings"]["recurring_hours"] == 120
-
-
-def test_put_saves_and_returns_what_was_actually_stored(monkeypatch):
-    """Returning the stored values matters because numbers are clamped: somebody who typed 2 hours
-    needs to see they got 4, not believe their edit took."""
-    saved = {}
-    monkeypatch.setattr(portal_main.db, "save_settings",
-                        lambda k, v, by=None: saved.update(key=k, value=v, by=by))
-    r = client.put("/api/admin/settings/followups",
-                   json={"settings": {"recurring_hours": 2}, "by": "hanz@wetreadwell.com"})
-    j = r.json()
-    assert r.status_code == 200 and j["ok"] is True
-    assert j["settings"]["recurring_hours"] == 4, "the clamp is not reflected back"
-    assert saved["value"]["recurring_hours"] == 4, "the unclamped value was stored"
-    assert saved["by"] == "hanz@wetreadwell.com"
+    # A save reads what is saved first (it is the base the payload lays over). Stubbed as absent
+    # so no test pays a pool timeout.
+    monkeypatch.setattr(portal_main, "_saved_followup_settings", lambda: None)
 
 
 def test_put_returns_the_audit_line_so_the_editor_need_not_reload(monkeypatch):
@@ -653,31 +392,6 @@ def test_put_reports_a_storage_failure_rather_than_claiming_success(monkeypatch)
     assert "settings table" in r.json()["error"]
 
 
-def test_an_empty_payload_is_how_a_reset_is_expressed(monkeypatch):
-    """The editor sends {} to reset, so the server is the only place that defines "default" —
-    no second definition in the browser to drift from this one."""
-    saved = {}
-    monkeypatch.setattr(portal_main.db, "save_settings",
-                        lambda k, v, by=None: saved.update(value=v))
-    j = client.put("/api/admin/settings/followups", json={"settings": {}}).json()
-    assert j["settings"]["first_nudge_hours"] == 24
-    assert saved["value"]["templates"]["checkin"] == fs.DEFAULT_TEMPLATES["checkin"]
-
-
-def test_preview_renders_without_saving(monkeypatch):
-    called = []
-    monkeypatch.setattr(portal_main.db, "save_settings",
-                        lambda *a, **k: called.append(1))
-    r = client.post("/api/admin/settings/followups/preview", json={"settings": {"templates": {
-        "checkin": {"title": "Hi {project}", "body": "Hello {first_name} {link}",
-                    "cta": "Open"}}}})
-    j = r.json()
-    assert r.status_code == 200
-    assert j["previews"]["checkin"]["title"] == "Hi Westport Retail Center"
-    assert "Dave" in j["previews"]["checkin"]["body"]
-    assert not called, "a preview must never write"
-
-
 def test_preview_reports_why_a_template_will_not_send():
     r = client.post("/api/admin/settings/followups/preview",
                     json={"settings": {"templates": {"checkin": {"body": "no button"}}}})
@@ -751,27 +465,6 @@ def test_a_missing_table_is_not_reported_as_a_failed_read(monkeypatch):
     assert j["read_failed"] is False and j["saved"] is False
 
 
-def test_a_blip_on_the_decorative_caption_does_not_discard_the_config(monkeypatch):
-    """settings_meta only feeds "who last changed this". It used to share the try with the real
-    read, so a failure on the caption threw away a config that had been read perfectly well."""
-    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: {"recurring_hours": 120})
-    monkeypatch.setattr(portal_main.db, "settings_meta",
-                        lambda k: (_ for _ in ()).throw(RuntimeError("statement timeout")))
-    j = client.get("/api/admin/settings/followups").json()
-    assert j["settings"]["recurring_hours"] == 120, "a saved cadence was thrown away"
-    assert j["saved"] is True
-    assert j["read_failed"] is False
-
-
-def test_the_worker_keeps_sending_when_the_settings_read_fails(monkeypatch):
-    """Falling back to the shipped cadence is right for the WORKER - stopping the chase would be
-    worse than chasing on the old schedule. Only the editor must refuse to act."""
-    monkeypatch.setattr(W.db, "get_settings",
-                        lambda k: (_ for _ in ()).throw(db.SettingsUnreadable("reset")))
-    cfg = W._settings()
-    assert cfg["recurring_hours"] == fs.DEFAULTS["recurring_hours"]
-
-
 def test_the_pipeline_reads_the_new_columns_so_a_pre_DDL_prod_survives():
     """The audit's worst finding, and nothing tested this query.
 
@@ -802,49 +495,6 @@ def test_the_pipeline_reads_the_new_columns_so_a_pre_DDL_prod_survives():
     # The columns that have always existed stay direct — the indirection is only for the new ones,
     # and turning the whole select into jsonb lookups would hide a genuine typo.
     assert "p.proposal_status" in sql and "p.viewed_at" in sql
-
-
-def test_the_board_dates_come_from_the_saved_cadence_not_the_shipped_one(monkeypatch):
-    """From the audit. The worker used the saved cadence and this column used the constants, so
-    the moment anybody edited "every 3 days" every date on the board was wrong — and with a raised
-    max_recurring it reads "Nothing scheduled" while emails keep going out.
-
-    THE CLOCK IS FROZEN ON BOTH SIDES, and it has to be. This test anchored the row at the fixed
-    NOW above but let the endpoint call the real `_now_utc()`, so `elapsed` grew by 24h a day and on
-    2026-08-19 it walked into an arithmetic collision: at ~745h elapsed the shipped cadence gives
-    72 + 72×10 = 792h and a 240h cadence gives 72 + 240×3 = 792h, the same date, and a real
-    regression would have looked identical. It failed on main with nothing changed but the date.
-
-    So the assertion is no longer "these two differ" — it is the exact date each cadence produces,
-    computed from the rules rather than hardcoded, which cannot collide and cannot rot."""
-    enrolled = NOW - timedelta(hours=400)
-    viewed = NOW - timedelta(hours=400)
-    row = {"proposal_id": "p1", "token": "t", "customer_email": "c@x.com",
-           "proposal_status": "viewed", "deposit_status": "pending", "schedule_status": "pending",
-           "followup_enrolled_at": enrolled, "cycle_viewed_at": viewed, "created_at": enrolled}
-    monkeypatch.setattr(portal_main.db, "unread_counts", lambda: {})
-    monkeypatch.setattr(portal_main.db, "list_all_portal_proposals", lambda: [row])
-    monkeypatch.setattr(portal_main, "_now_utc", lambda: NOW)
-
-    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: None)
-    shipped = client.get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
-
-    monkeypatch.setattr(portal_main.db, "get_settings", lambda k: {"recurring_hours": 240})
-    saved = client.get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
-
-    # anchor + second_nudge + recurring × (n+1), the same expression due_now indexes on. Derived
-    # from followup_rules so an intentional change to the cadence maths updates both at once.
-    want_shipped = R.next_due_at(row, NOW, fs.defaults())
-    want_saved = R.next_due_at(
-        row, NOW, fs.merge({"recurring_hours": 240}))
-    assert want_shipped != want_saved, (
-        "the fixture no longer distinguishes the two cadences — pick a different recurring_hours")
-
-    assert shipped == want_shipped.isoformat(), (
-        "the board reports %s for the shipped cadence, the rules say %s" % (shipped, want_shipped))
-    assert saved == want_saved.isoformat(), (
-        "the board reports %s after the cadence was edited, the rules say %s — it is still using "
-        "the constants" % (saved, want_saved))
 
 
 def test_an_unreadable_cadence_does_not_take_the_whole_board_down(monkeypatch):

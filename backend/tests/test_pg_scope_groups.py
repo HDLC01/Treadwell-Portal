@@ -743,26 +743,32 @@ def test_a_task_shares_the_rule_key_dedupe_with_the_old_automatic_emails(clean):
 
 
 # ══ f. the reminder cap counts only what reached the customer ═════════════════
-def test_reminder_times_count_only_sent_and_called_tasks(clean):
+def test_sent_history_counts_only_what_reached_the_customer(clean):
+    """THE COUNT the schedule's 2-per-step cap runs on (db._SENT_HISTORY_SQL), on real rows: this
+    cycle's customer auto emails and the tasks sent or answered with a call; nothing skipped,
+    snoozed, expired, open or sending, no staff email, nothing from before this send."""
     add_proposal("p1", enrolled=20, days_ago=20)
     for status, age in (("sent", 9), ("called", 8), ("skipped", 7), ("snoozed", 6),
                         ("expired", 5), ("decided", 4.5), ("sending", 4)):
-        add_followup("p1", "followup_task", task("p1", status=status, stage=f"s-{status}"),
-                     days_ago=age)
+        add_followup("p1", "followup_task", task("p1", status=status, stage=f"s-{status}",
+                                                 template="next_steps"), days_ago=age)
     add_followup("p1", "followup_task", task("p1", status="pending", stage="pre"), days_ago=3)
-    add_followup("p1", "auto_email", {"audience": "customer", "rule_key": "old:1"}, days_ago=12)
+    add_followup("p1", "auto_email", {"audience": "customer", "rule_key": "old:1",
+                                      "template": "not_viewed"}, days_ago=12)
     add_followup("p1", "auto_email", {"audience": "staff", "rule_key": "old:2"}, days_ago=11)
     # Before this send cycle's enrolment: never counted.
     add_followup("p1", "followup_task", task("p1", status="sent", stage="old-cycle"), days_ago=25)
     add_followup("p1", "auto_email", {"audience": "customer", "rule_key": "old:3"}, days_ago=26)
 
-    times = db.followup_signals("p1")["followup_reminder_times"]
-    assert len(times) == 3, times                       # sent, called, the customer auto_email
+    hist = db.followup_signals("p1")["followup_sent_history"]
+    assert sorted(h["template"] for h in hist) == ["next_steps", "next_steps", "not_viewed"], hist
+    assert {h["rule_key"] for h in hist} >= {"old:1"}
     board = next(r for r in db.list_all_portal_proposals() if r["proposal_id"] == "p1")
-    assert sorted(board["followup_reminder_times"]) == sorted(times)
-    # And the schedule reads them as three reminders.
-    since = ago(20)
-    assert rules._reminders_since(dict(board), since) == 3
+    assert sorted(h["at"] for h in board["followup_sent_history"]) == \
+        sorted(h["at"] for h in hist)
+    # And the schedule reads them: one not-opened email and two opened ones.
+    row = dict(db.get_proposal("p1"), followup_sent_history=hist)
+    assert len(rules.sent_history(row)) == 3
 
 
 def about(ts, days: float, slack=timedelta(minutes=5)) -> None:
@@ -793,7 +799,7 @@ def test_followup_signals_reads_every_touch(clean):
     add_followup("p1", "staff_note", {"action": "reassigned"}, days_ago=0)   # bookkeeping
     sig = db.followup_signals("p1")
     assert set(sig) >= {"customer_touch_at", "last_staff_followup_at", "last_staff_message_at",
-                        "followup_reminder_times", "pending_task"}
+                        "followup_sent_history", "pending_task"}
     about(sig["customer_touch_at"], 1)              # the reply, not the out-of-office
     about(sig["last_staff_message_at"], 2)          # the message, not the contract or the card
     about(sig["last_staff_followup_at"], 3)         # the call, not the note
@@ -977,9 +983,11 @@ def test_the_dry_run_reads_real_rows_and_writes_nothing(clean):
     after = db.q1("select count(*) as n from public.portal_followups")["n"]
     assert out["skipped"] == [], out["skipped"]
     assert before == after, "the dry run wrote a row"
-    by_pid = {t["proposal_id"]: t for t in out["tasks"]}
-    assert set(by_pid) == {ids[0], "solo"}, out["tasks"]
+    by_pid = {e["proposal_id"]: e for e in out["customer_emails"]}
+    assert set(by_pid) == {ids[0], "solo"}, out["customer_emails"]
     assert by_pid[ids[0]]["scope_group"] == gid and by_pid["solo"]["scope_group"] is None
+    assert sorted(by_pid[ids[0]]["recipients"]) == [f"buyer{n}@customer.example" for n in range(3)]
+    assert by_pid["solo"]["recipients"] == ["solo@customer.example"]
 
 
 # ══ the rest of the changed writes, and the worker's housekeeping on real rows ══
@@ -1048,10 +1056,12 @@ def test_housekeeping_keeps_the_decision_task_and_expires_what_moved_on(clean, m
     followup_worker._expire_stale_tasks(db_now())
 
     assert db.get_followup_task(dec)["detail"]["status"] == "pending"
+    # Every open REMINDER task is retired: the worker emails the customer itself since
+    # 2026-10-28, so a task left open would let the estimator send the same reminder by hand.
     g = db.get_followup_task(group_task)["detail"]
-    assert g["status"] == "expired" and g["reason"] == "scope_approved"
+    assert g["status"] == "expired" and g["reason"] == "auto_followups"
     s = db.get_followup_task(solo_task)["detail"]
-    assert s["status"] == "expired" and s["reason"] == "stage_changed"
+    assert s["status"] == "expired" and s["reason"] == "auto_followups"
     assert sent_staff == [], "a fresh decision task must not re-nag"
     # Board: every member now shows the decision task (the only open group task left).
     board = _board()
@@ -1314,7 +1324,7 @@ def automation_on(monkeypatch):
     monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "true")
 
 
-def test_a_tick_raises_what_the_dry_run_promised_and_a_second_tick_raises_nothing(
+def test_a_tick_emails_what_the_dry_run_promised_and_a_second_tick_sends_nothing(
         clean, outbox, automation_on):
     gid, ids = group_of_three(sent=True)
     age_group(ids)
@@ -1322,36 +1332,33 @@ def test_a_tick_raises_what_the_dry_run_promised_and_a_second_tick_raises_nothin
     add_proposal("solo")
     age_group(["solo"])
     now = in_window()
-    planned = {(t["proposal_id"], t["rule_key"])
-               for t in followup_worker.dry_run_count(now)["tasks"]}
+    dry = followup_worker.dry_run_count(now)
+    planned = {(e["proposal_id"], e["rule_key"]) for e in dry["customer_emails"]}
     assert {pid for pid, _ in planned} == {ids[0], "solo"}
+    promised = sorted(a for e in dry["customer_emails"] for a in e["recipients"])
 
     followup_worker._tick(now)
 
-    raised = all_tasks()
-    assert {(t["proposal_id"], t["detail"]["rule_key"]) for t in raised} == planned
-    by = {t["proposal_id"]: t["detail"] for t in raised}
-    g = by[ids[0]]
-    assert g["scope_group"] == gid and [s["proposal_id"] for s in g["scopes"]] == ids
-    assert g["status"] == "pending" and g["stage"] == "pre" and g["mode"] == "remind"
-    assert g["cycle"] and g["draft"]["source"] == "default" and g["draft"]["title"]
+    assert all_tasks() == [], "a reminder task was raised; the worker emails the customer itself"
+    rows = db.qall("select proposal_id, detail from public.portal_followups "
+                   "where kind = 'auto_email' and detail ->> 'audience' = 'customer'")
+    assert {(r["proposal_id"], r["detail"]["rule_key"]) for r in rows} == planned
+    by = {r["proposal_id"]: r["detail"] for r in rows}
+    assert by[ids[0]]["scope_group"] == gid and by[ids[0]]["template"] == "not_viewed"
     assert by["solo"].get("scope_group") is None
-    # REMIND-ONLY: no customer was emailed and no customer email was even reserved.
-    assert outbox.customers() == []
-    assert db.q1("select count(*) as n from public.portal_followups where kind = 'auto_email' "
-                 "and detail ->> 'audience' = 'customer'")["n"] == 0
-    # The estimator was told, and each task is echoed into its thread as an INTERNAL row.
-    assert set(outbox.to()) == {KYLE}
-    for t in raised:
+    # Exactly the customers the dry run named, one email each; nobody else, no estimator yet.
+    assert sorted(outbox.customers()) == promised
+    assert KYLE not in outbox.to()
+    # Each proposal's thread shows the reminder, to the customer (not internal).
+    for pid in ids + ["solo"]:
         echo = db.q1("select meta from public.portal_questions where proposal_id = %s "
-                     "and (meta ->> 'task_id')::bigint = %s", (t["proposal_id"], t["id"]))
-        assert echo and echo["meta"]["internal"] is True, t["proposal_id"]
+                     "and (meta ->> 'followup')::boolean", (pid,))
+        assert echo and not echo["meta"].get("internal"), pid
 
     sent_before = len(outbox.sent)
     followup_worker._tick(now)
-    assert len(all_tasks()) == len(raised)
     assert len(outbox.sent) == sent_before
-    assert followup_worker.dry_run_count(now)["tasks"] == []
+    assert followup_worker.dry_run_count(now)["customer_emails"] == []
 
 
 def test_a_tick_does_nothing_with_automation_off(clean, outbox, monkeypatch):
@@ -1360,39 +1367,40 @@ def test_a_tick_does_nothing_with_automation_off(clean, outbox, monkeypatch):
     age_group(["solo"])
     followup_worker._tick(in_window())
     assert all_tasks() == [] and outbox.sent == []
+    assert db.q1("select count(*) as n from public.portal_followups")["n"] == 0
 
 
-def test_the_group_pass_rehomes_a_stray_task_and_a_sending_one_holds_the_slot(clean, outbox):
+def test_housekeeping_retires_old_group_tasks_and_the_group_pass_emails_once(clean, outbox):
     cfg = followup_worker._settings()
     now = in_window()
-    # A pending group task on a scope that is not the home: expired, and raised on the home.
     gid, ids = group_of_three(sent=True)
     age_group(ids)
     a, b, c = ids
+    # An old pending group task on a scope (remind-only left these): retired, never sent.
     stray = db.reserve_followup_task(b, "grp:stray", {
-        "template": "followup_not_viewed", "stage": "pre", "scope_group": gid,
+        "template": "not_viewed", "stage": "pre", "scope_group": gid,
         "scopes": [{"proposal_id": i} for i in ids]})
-    followup_worker._process_group(gid, now, cfg)
-    s = db.get_followup_task(stray)["detail"]
-    assert s["status"] == "expired" and s["reason"] == "rehomed"
-    assert [t["proposal_id"] for t in db.list_open_group_tasks(gid)] == [a]
-
-    # A `sending` one is mid-send: never expired under the estimator, and it holds the slot.
-    gid2, ids2 = group_of_three(sent=True)
-    age_group(ids2)
-    busy = db.reserve_followup_task(ids2[1], "grp:busy", {
-        "template": "followup_not_viewed", "stage": "pre", "scope_group": gid2,
-        "scopes": [{"proposal_id": i} for i in ids2]})
+    # A `sending` one is mid-send by an estimator: never touched under them.
+    busy = db.reserve_followup_task(c, "grp:busy", {
+        "template": "not_viewed", "stage": "pre", "scope_group": gid,
+        "scopes": [{"proposal_id": i} for i in ids]})
     db.decide_followup_task(busy, "sending", KYLE)
-    followup_worker._process_group(gid2, now, cfg)
+    followup_worker._expire_stale_tasks(now)
+    s = db.get_followup_task(stray)["detail"]
+    assert s["status"] == "expired" and s["reason"] == "auto_followups"
     assert db.get_followup_task(busy)["detail"]["status"] == "sending"
-    assert [t["id"] for t in db.list_open_group_tasks(gid2)] == [busy]
 
-    # The chase stops when a scope is approved: the home's open reminder is expired.
-    set_cols(c, proposal_status="approved", approved_at=ago(0))
     followup_worker._process_group(gid, now, cfg)
-    assert db.list_open_group_tasks(gid) == []
-    assert outbox.customers() == []
+    followup_worker._process_group(gid, now, cfg)              # the twin container
+    assert sorted(outbox.customers()) == [f"buyer{n}@customer.example" for n in range(3)]
+    rows = db.qall("select proposal_id from public.portal_followups where kind = 'auto_email'")
+    assert [r["proposal_id"] for r in rows] == [a], "one reservation, on the home"
+
+    # Approving a scope stops the group: a week later, nothing more goes.
+    set_cols(c, proposal_status="approved", approved_at=ago(0))
+    before = len(outbox.sent)
+    followup_worker._process_group(gid, now + timedelta(days=8), cfg)
+    assert len(outbox.sent) == before
 
 
 def test_an_unanswered_decision_task_renags_once_per_period(clean, outbox):
@@ -1451,7 +1459,28 @@ def client(monkeypatch):
 
 
 def _raise_tasks() -> dict:
-    followup_worker._tick(in_window())
+    """OLD reminder tasks, as the remind-only tick (before 2026-10-28) left them open: one per due
+    proposal, a group's on its home. The tick no longer raises these; the endpoints still answer
+    for the ones in the database, which is what these tests drive."""
+    now = in_window()
+    singles, groups = followup_worker._partition(db.list_followup_candidates())
+
+    def raise_on(pid, enrolled, extra=None):
+        ck = rules.cycle_key(enrolled)
+        detail = {"audience": "customer", "template": "not_viewed", "stage": "pre",
+                  "cycle": ck, "include_status_ask": False,
+                  "draft": {"title": "Your proposal is waiting",
+                            "body": "Hi {first_name},\n\n{link}", "source": "default"}}
+        detail.update(extra or {})
+        db.reserve_followup_task(pid, ck + ":nv1", detail)
+
+    for row in singles:
+        p = db.get_proposal(row["proposal_id"])
+        raise_on(p["proposal_id"], p["followup_enrolled_at"])
+    for gid in groups:
+        view, _why, _m = followup_worker.group_state_for(gid, now)
+        raise_on(view["proposal_id"], view["followup_enrolled_at"],
+                 {"scope_group": gid, "scopes": view["scopes"]})
     return {t["proposal_id"]: t for t in all_tasks() if t["detail"]["status"] == "pending"}
 
 
@@ -1490,7 +1519,7 @@ def test_sending_a_task_emails_the_customer_once_and_records_the_touch(
     about(db.get_proposal("p1")["followup_anchor_at"], 0)
     sig = db.followup_signals("p1")
     about(sig["last_staff_followup_at"], 0)
-    assert len(sig["followup_reminder_times"]) == 1          # a SENT task counts toward the cap
+    assert len(sig["followup_sent_history"]) == 1            # a SENT task counts toward the cap
     assert sig["pending_task"] is None
     assert _echo_of("p1", tid, internal=False), "the customer's thread shows the reminder"
     assert db.list_stale_sending_tasks(0) == []
@@ -1531,7 +1560,7 @@ def test_skip_called_snooze_and_the_ai_draft_on_real_rows(clean, outbox, automat
                  "and kind = 'staff_note' and detail ->> 'action' = 'followup_skipped' "
                  "and (detail ->> 'task_id')::bigint = %s", (tid,))["n"] == 1
     sig = db.followup_signals("p-skip")
-    assert sig["followup_reminder_times"] == [], "a skipped task never counts toward the cap"
+    assert sig["followup_sent_history"] == [], "a skipped task never counts toward the cap"
     assert sig["last_staff_followup_at"] is None, "a skip is bookkeeping, not outreach"
 
     tid = tasks["p-call"]["id"]
@@ -1544,7 +1573,7 @@ def test_skip_called_snooze_and_the_ai_draft_on_real_rows(clean, outbox, automat
                  (tid,))["n"] == 1
     sig = db.followup_signals("p-call")
     about(sig["last_staff_followup_at"], 0)
-    assert len(sig["followup_reminder_times"]) == 1, "a CALLED task counts toward the cap"
+    assert len(sig["followup_sent_history"]) == 1, "a CALLED task counts toward the cap"
     about(db.get_proposal("p-call")["followup_anchor_at"], 0)
 
     tid = tasks["p-snooze"]["id"]
@@ -1712,24 +1741,108 @@ def test_a_scope_published_since_the_email_is_not_in_the_group_reminder(clean):
     assert [m["proposal_id"] for m in view["_open_members"]] == ids
 
 
-def test_a_retired_approvals_deposit_tasks_leave_the_groups_reminder_count(clean):
-    """Round 3 #4 (residual #17) on real rows: B was approved, its deposit reminders went out (SENT
-    deposit-stage tasks), then a revision put it back to sent. Its own count keeps them (the single
-    chase's deposit cap counts them); the GROUP's count -- worker and board -- leaves them out, so
-    they never use up the siblings' "Stop after N"."""
+def test_a_retired_approvals_deposit_tasks_leave_the_groups_count(clean):
+    """On real rows: B was approved, its deposit reminders went out (SENT deposit tasks), then a
+    revision put it back to sent. The sent history carries them, and the schedule leaves
+    deposit_nudge out, so they never use up the group's two."""
     gid, (a, b, c) = group_of_three(sent=True)
     for age in (6, 5):
         add_followup(b, "followup_task", task(b, status="sent", stage="deposit",
                                               template="deposit_nudge"), days_ago=age)
-    add_followup(b, "followup_task", task(b, status="sent", stage="pre", scope_group=gid),
-                 days_ago=4)
+    add_followup(b, "followup_task", task(b, status="sent", stage="pre", scope_group=gid,
+                                          template="not_viewed"), days_ago=4)
     sig = db.followup_signals(b)
-    assert len(sig["followup_reminder_times"]) == 3
-    assert len(sig["group_reminder_times"]) == 1
+    assert len(sig["followup_sent_history"]) == 3
     board = _board()
-    assert sorted(board[b]["group_reminder_times"]) == sorted(sig["group_reminder_times"])
-    add_draft("solo")
-    add_proposal("solo")
-    assert _board()["solo"]["group_reminder_times"] is None, "an ungrouped row pays nothing"
+    assert sorted(h["at"] for h in board[b]["followup_sent_history"]) == \
+        sorted(h["at"] for h in sig["followup_sent_history"])
     view, why, _ = followup_worker.group_state_for(gid, db_now())
-    assert why == "" and len(view["followup_reminder_times"]) == 1
+    assert why == "" and len(view["followup_sent_history"]) == 3
+    pl = rules.plan(view, db_now())
+    assert (pl.step, pl.sent) == (rules.NOT_OPENED, 1), pl
+
+
+def test_email_again_on_real_rows_reads_as_a_revision_of_the_live_proposals(clean, outbox, client):
+    """Hanz, 2026-10-28, on real rows and the real renderer: Epoxy and Polish and an old third
+    proposal go out in one email; the third is deleted and Polish revised. "Email again" is headed
+    "Your proposals have been revised", has one button, lists Epoxy and Polish (revised), and never
+    names the deleted one or says it went."""
+    gid = gid_new()
+    who = "dana@customer.example"
+    ids = [f"{gid}-epoxy", f"{gid}-polish", f"{gid}-old"]
+    for i, (pid, label) in enumerate(zip(ids, ("Epoxy", "Polish", "Base Bid 2"))):
+        add_draft(pid, gid, label)
+        add_proposal(pid, gid, label, days_ago=10 - i, sent=False, email=who)
+    url = f"/api/admin/scope-group/{gid}/send"
+    assert client.post(url, json={"by": KYLE}).status_code == 200
+    [first] = [m for m in outbox.sent if who in m["to"]]
+    assert re.search(r"<h2[^>]*>(.*?)</h2>", first["html"]).group(1) == "Your proposals are ready"
+    assert "Base Bid 2" in first["html"]
+
+    db.delete_proposal(ids[2])
+    set_cols(ids[1], current_revision_no=2)
+    outbox.sent.clear()
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 200, r.text
+    [m] = [m for m in outbox.sent if who in m["to"]]
+    h = m["html"]
+    assert re.search(r"<h2[^>]*>(.*?)</h2>", h).group(1) == "Your proposals have been revised"
+    assert re.findall(r'<li style="margin:4px 0">(.*?)</li>', h) == ["Epoxy", "Polish (revised)"]
+    assert len(re.findall(r"<a\b", h)) == 1, "more than one link in the email"
+    for word in ("Base Bid", "withdrawn", "unchanged"):
+        assert word not in h, word
+
+
+def test_email_again_names_a_proposal_not_republished_by_its_draft_label(clean, outbox, client):
+    """Review, 2026-10-28, on real rows: a project split before the sheet names went out as
+    "Base Bid 1"/"Base Bid 2". The tool renames them Epoxy and Polish and only Epoxy is
+    republished, so Polish's portal row still says "Base Bid 2". Email again names it Polish."""
+    gid = gid_new()
+    who = "dana@customer.example"
+    ids = [f"{gid}-a", f"{gid}-b"]
+    for i, (pid, label) in enumerate(zip(ids, ("Base Bid 1", "Base Bid 2"))):
+        add_draft(pid, gid, label)
+        add_proposal(pid, gid, label, days_ago=10 - i, sent=False, email=who)
+    url = f"/api/admin/scope-group/{gid}/send"
+    assert client.post(url, json={"by": KYLE}).status_code == 200
+
+    for pid, label in zip(ids, ("Epoxy", "Polish")):
+        db.execute("update public.drafts set data = jsonb_set(data, '{scope_group,label}', %s) "
+                   "where id = %s", (Jsonb(label), pid))
+    set_cols(ids[0], scope_label="Epoxy", current_revision_no=2)     # Epoxy alone republished
+    assert db.get_proposal(ids[1])["scope_label"] == "Base Bid 2"
+    outbox.sent.clear()
+    r = client.post(url, json={"by": KYLE})
+    assert r.status_code == 200, r.text
+    [m] = [m for m in outbox.sent if who in m["to"]]
+    assert re.findall(r'<li style="margin:4px 0">(.*?)</li>', m["html"]) == [
+        "Epoxy (revised)", "Polish"]
+    assert "Base Bid" not in m["html"]
+
+
+def test_the_draft_labels_read_is_this_groups_live_labelled_drafts(clean):
+    gid, other = gid_new(), gid_new()
+    add_draft("a", gid, "Epoxy")
+    add_draft("b", gid, None)                     # no label: the caller keeps the stored one
+    add_draft("c", gid, "Gone", deleted=True)
+    add_draft("d", other, "Elsewhere")
+    add_draft("e")                                # not grouped at all
+    assert db.list_scope_group_draft_labels(gid) == {"a": "Epoxy"}
+
+
+# ── a deleted proposal is not on the customer's list (Hanz, 2026-10-28) ────────
+def test_the_customers_list_leaves_out_a_deleted_proposal(clean):
+    """A project sent as Epoxy + Polish, plus an old proposal deleted after it was sent: the
+    customer's list (the document card's tabs, the project list, the read badge, inbound sender
+    match) holds the two live ones, never the deleted third."""
+    gid = gid_new()
+    who = "dana@customer.example"
+    for pid, label in ((f"{gid}-epoxy", "Epoxy"), (f"{gid}-polish", "Polish"), (f"{gid}-old", "Base Bid 2")):
+        add_proposal(pid, gid, label, email=who)
+    db.delete_proposal(f"{gid}-old")
+    got = sorted(r["proposal_id"] for r in db.list_proposals_by_email(who))
+    assert got == sorted([f"{gid}-epoxy", f"{gid}-polish"]), got
+    # An added recipient's view (the second leg of the union) leaves it out too.
+    db.add_recipient(f"{gid}-old", "pat@customer.example")
+    db.add_recipient(f"{gid}-epoxy", "pat@customer.example")
+    assert [r["proposal_id"] for r in db.list_proposals_by_email("pat@customer.example")] == [f"{gid}-epoxy"]

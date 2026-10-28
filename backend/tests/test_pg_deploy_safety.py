@@ -1,13 +1,13 @@
-"""Deploy-day safety (fix round PF1), EXECUTED against a real Postgres seeded with the old automatic
-ladder's history: the rows the old followup_rules left in portal_followups (kind auto_email, detail
-{audience, template, rule_key}, no `engine` mark) on proposals still in flight when remind-only ships.
+"""Deploy-day tooling, EXECUTED against a real Postgres: the dry run's read-only pool, the capability
+route's follow-up DDL check, and the out-of-office backfill. (The release-day safety of the
+follow-up EMAILS themselves, 2026-10-28, is test_pg_followup_auto.py.)
 
 Run it like test_pg_scope_groups.py (its module docstring has the recipe): a throwaway local
 Postgres, PORTAL_TEST_PG_URL pointing at it. Skipped without it.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -20,8 +20,6 @@ if pg_fixture.PG_URL:  # imported only when the tests will run
     from psycopg.types.json import Jsonb
 
     import db
-    import followup_rules as rules
-    import followup_worker
 
 KYLE = "kyle@estimator.example"
 
@@ -39,46 +37,12 @@ def clean(pgdb):
     yield
 
 
-@pytest.fixture
-def outbox(monkeypatch):
-    """Every email the code tries to send, recorded with no network."""
-    import types
-
-    import email_sender
-
-    box = types.SimpleNamespace(sent=[])
-
-    def fake_send(to, subject, html, headers=None, reply_to=None, attachments=None):
-        to = [t for t in to if t]
-        if not to:
-            return False
-        box.sent.append({"to": list(to), "subject": subject})
-        return True
-
-    def no_network(*a, **k):
-        raise AssertionError("a test reached for Resend")
-
-    monkeypatch.setattr(email_sender, "_send", fake_send)
-    monkeypatch.setattr(email_sender.httpx, "post", no_network)
-    monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "true")
-    return box
-
-
 def db_now() -> datetime:
     return db.q1("select now() as n")["n"]
 
 
 def ago(days: float) -> datetime:
     return db_now() - timedelta(days=days)
-
-
-def in_window() -> datetime:
-    """The latest noon (Central) at or before the database's now (see test_pg_scope_groups)."""
-    local = db_now().astimezone(rules.BUSINESS_TZ)
-    noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
-    if noon > local:
-        noon -= timedelta(days=1)
-    return noon.astimezone(timezone.utc)
 
 
 def add_proposal(pid, *, status="viewed", enrolled_days=60.0, **cols):
@@ -94,212 +58,6 @@ def add_proposal(pid, *, status="viewed", enrolled_days=60.0, **cols):
     db.execute("update public.portal_proposals set "
                + ", ".join("%s = %%s" % n for n in names) + " where proposal_id = %s",
                tuple(base[n] for n in names) + (pid,))
-
-
-def old_email(pid, key, *, audience="customer", template="checkin", days_ago=0.0):
-    """One row exactly as the OLD automatic ladder reserved it (followup_worker on origin/main)."""
-    db.execute("insert into public.portal_followups (proposal_id, kind, detail, created_at) "
-               "values (%s, 'auto_email', %s, now() - make_interval(secs => %s))",
-               (pid, Jsonb({"audience": audience, "template": template, "rule_key": key}),
-                float(days_ago) * 86400))
-
-
-def customer_message(pid, days_ago):
-    db.execute("insert into public.portal_questions (proposal_id, author_kind, author_email, body, "
-               "msg_type, meta, created_at) values (%s, 'customer', %s, 'Sounds good', 'text', "
-               "%s, now() - make_interval(secs => %s))",
-               (pid, pid + "@customer.example", Jsonb({"source": "email"}), float(days_ago) * 86400))
-
-
-def cycle(pid) -> str:
-    return rules.cycle_key(db.get_proposal(pid)["followup_enrolled_at"])
-
-
-def tasks(pid=None):
-    rows = db.qall("select proposal_id, detail from public.portal_followups "
-                   "where kind = 'followup_task' order by id")
-    return [r for r in rows if pid is None or r["proposal_id"] == pid]
-
-
-# ── #10: an automatic email after the reply holds the touched reminder back ────────
-def test_a_reply_weeks_ago_and_an_automatic_email_two_days_ago_raise_nothing(clean, outbox):
-    add_proposal("replied", cycle_viewed_at=ago(59))
-    customer_message("replied", 20)
-    ck = cycle("replied")
-    old_email("replied", ck + ":v1", template="next_steps", days_ago=58)
-    old_email("replied", ck + ":v2", template="second_nudge", days_ago=56)
-    old_email("replied", ck + ":vr@20990101T16", days_ago=2)      # the old ladder, 2 days ago
-    now = in_window()
-    p = dict(db.get_proposal("replied"), **{k: v for k, v in
-                                            db.followup_signals("replied").items()
-                                            if k != "pending_task"})
-    assert [d for d in rules.due_now(p, now) if d.audience == "customer"] == []
-    newest = max(rules._ts(t) for t in p["followup_reminder_times"])
-    assert rules.next_due_at(p, now) == newest + timedelta(hours=72)
-    assert followup_worker.dry_run_count(now)["tasks"] == []
-    followup_worker._tick(now)
-    assert tasks("replied") == []
-    # A reply with no automatic email after it still gets its touched reminder.
-    add_proposal("quiet", cycle_viewed_at=ago(59))
-    customer_message("quiet", 20)
-    followup_worker._tick(now)
-    got = tasks("quiet")
-    assert len(got) == 1 and ":vrt@" in got[0]["detail"]["rule_key"]
-
-
-# ── #11 / #3: a deposit chase the old cap had finished stays finished ──────────────
-def approved_job(pid, approved_days, n_recurring, *, deposit_status="pending"):
-    """An approved job whose old ladder sent dep1 + n depr@ customer emails and dep_staff +
-    n depsr@ staff emails, every 3 days from approval (the old cadence)."""
-    add_proposal(pid, status="approved", enrolled_days=approved_days + 10,
-                 cycle_viewed_at=ago(approved_days + 9), approved_at=ago(approved_days),
-                 deposit_status=deposit_status)
-    ck = cycle(pid)
-    if deposit_status == "pending":
-        old_email(pid, ck + ":dep1", template="deposit_nudge", days_ago=approved_days - 1)
-    old_email(pid, ck + ":dep_staff", audience="staff", template="staff_deposit_outstanding",
-              days_ago=approved_days - 2)
-    for i in range(1, n_recurring + 1):
-        if deposit_status == "pending":
-            old_email(pid, "%s:depr@old%02d" % (ck, i), template="deposit_nudge",
-                      days_ago=approved_days - 1 - 3 * i)
-        old_email(pid, "%s:depsr@old%02d" % (ck, i), audience="staff",
-                  template="staff_deposit_outstanding", days_ago=approved_days - 2 - 3 * i)
-
-
-def test_deposit_chases_the_old_cap_finished_do_not_restart(clean, outbox):
-    for days, n in ((70, 20), (100, 22), (150, 23)):
-        approved_job("done%d" % days, days, n)
-    approved_job("submitted", 100, 20, deposit_status="submitted")
-    approved_job("young", 30, 5)
-    now = in_window()
-    plan = followup_worker.dry_run_count(now)
-    assert {t["proposal_id"] for t in plan["tasks"]} == {"young"}
-    assert {e["proposal_id"] for e in plan["staff_emails"]} == {"young"}
-    assert plan["deposit_restarts"] == []
-    held = {(h["proposal_id"], h["audience"]) for h in plan["deposit_held"]}
-    assert held == {("done70", "customer"), ("done70", "staff"), ("done100", "customer"),
-                    ("done100", "staff"), ("done150", "customer"), ("done150", "staff"),
-                    ("submitted", "staff")}
-
-    followup_worker._tick(now)
-    assert {t["proposal_id"] for t in tasks()} == {"young"}
-    assert tasks("young")[0]["detail"]["template"] == "deposit_nudge"
-    staff_rows = db.qall("select proposal_id, detail from public.portal_followups "
-                         "where kind = 'auto_email' and detail ->> 'engine' is not null")
-    assert [r["proposal_id"] for r in staff_rows] == ["young"]
-    assert staff_rows[0]["detail"]["template"] == "staff_deposit_outstanding"
-    # Two estimator emails, both about the young job: the task and the deposit note.
-    assert len(outbox.sent) == 2 and {m["to"][0] for m in outbox.sent} == {KYLE}
-
-
-def test_the_deposit_history_signal_counts_only_the_old_ladders_staff_rows(clean):
-    approved_job("mixed", 40, 6)
-    ck = cycle("mixed")
-    db.reserve_followup("mixed", ck + ":depsr@new01", {"audience": "staff",
-                                                       "template": "staff_deposit_outstanding",
-                                                       "engine": followup_worker.ENGINE_MARK})
-    db.reserve_followup("mixed", ck + ":depst@new02", {"audience": "staff",
-                                                       "template": "staff_deposit_outstanding",
-                                                       "engine": followup_worker.ENGINE_MARK})
-    db.reserve_followup("mixed", ck + ":v48_staff", {"audience": "staff"})
-    sig = db.followup_signals("mixed")["deposit_history"]
-    counts = {k: sig[k] for k in ("customer_legacy", "staff_legacy", "staff")}
-    assert counts == {"customer_legacy": 6, "staff_legacy": 6, "staff": 9}
-    # The newest OLD row of each series (approved_job: depr@old06 / depsr@old06), never a new one.
-    for key, days in (("customer_legacy_last", 40 - 1 - 18), ("staff_legacy_last", 40 - 2 - 18)):
-        assert abs(rules._ts(sig[key]) - ago(days)) < timedelta(minutes=5), key
-    board = {r["proposal_id"]: r for r in db.list_all_portal_proposals()}
-    assert board["mixed"]["deposit_history"] == sig
-
-
-# Review of PF1: prod's REAL history. Automation was off until 2026-08-24 and the old ladder reserved
-# only the LATEST matured occurrence per tick, its index frozen at the cap: a chase it FINISHED can
-# hold one row (approved long before the first sweep) or a partial run ending at n = 20.
-def backlog_job(pid, approved_days, swept_days, stop=None):
-    """The old ladder's history on a job approved `approved_days` ago, with automation first switched
-    on `swept_days` ago and ticking ever since: the latest matured occurrence at the sweep, then
-    every later one up to the frozen n = 20, until the old code's last tick at `stop` (default now). Real
-    old keys, real reservation times."""
-    add_proposal(pid, status="approved", enrolled_days=approved_days + 10,
-                 cycle_viewed_at=ago(approved_days + 9), approved_at=ago(approved_days))
-    row = db.get_proposal(pid)
-    ck, approved, c = cycle(pid), row["approved_at"], rules._Cadence()
-    rows = 0
-    for audience, tag, off, tpl in (("customer", "depr", c.first, "deposit_nudge"),
-                                    ("staff", "depsr", c.staff_personal,
-                                     "staff_deposit_outstanding")):
-        first_n = max(1, int(((approved_days - swept_days) * 86400 - off.total_seconds())
-                             // c.recurring.total_seconds()))
-        for n in range(min(first_n, c.max_recurring), c.max_recurring + 1):
-            due = approved + off + c.recurring * n
-            at = max(due, ago(swept_days))
-            if at > (stop or db_now()):
-                break
-            old_email(pid, "%s:%s@%s" % (ck, tag, rules._stamp(due)), audience=audience,
-                      template=tpl, days_ago=(db_now() - at).total_seconds() / 86400)
-            rows += audience == "customer"
-    return rows
-
-
-def test_deposit_chases_the_old_ladder_finished_with_few_rows_do_not_restart(clean, outbox):
-    assert backlog_job("one150", 150, 57) == 1            # one row: the frozen key itself
-    assert 1 < backlog_job("part100", 100, 57) < 20       # a partial run n = 13..20
-    # Still running, and its next occurrence (every 3 days) matured after the old code's last tick.
-    assert 1 < backlog_job("young", 40, 57, stop=in_window() - timedelta(days=3)) < 20
-    frozen = rules.legacy_frozen_keys(dict(db.get_proposal("one150")), "customer")
-    assert db.followup_rule_key_exists("one150", frozen[0])
-    now = in_window()
-    plan = followup_worker.dry_run_count(now)
-    assert {t["proposal_id"] for t in plan["tasks"]} == {"young"}
-    assert {e["proposal_id"] for e in plan["staff_emails"]} == {"young"}
-    assert plan["deposit_restarts"] == []
-    held = {(h["proposal_id"], h["audience"]) for h in plan["deposit_held"]}
-    assert held == {("one150", "customer"), ("one150", "staff"),
-                    ("part100", "customer"), ("part100", "staff")}
-    followup_worker._tick(now)
-    assert {t["proposal_id"] for t in tasks()} == {"young"}
-    assert {m["to"][0] for m in outbox.sent} <= {KYLE}
-
-
-# ── #12 / #18 / #4: the entry point, run the way Hanz runs it in the container ─────
-def test_the_dry_run_script_runs_against_the_database_and_writes_nothing(clean, pgdb):
-    import json
-    import os
-    import pathlib
-    import subprocess
-    import sys
-
-    approved_job("young", 30, 5)
-    approved_job("done", 100, 20)
-    add_proposal("chat", cycle_viewed_at=ago(30))
-    customer_message("chat", 10)
-    count = "select (select count(*) from public.portal_followups) as f, " \
-            "(select count(*) from public.portal_questions) as q"
-    before = db.q1(count)
-    backend = pathlib.Path(__file__).resolve().parents[1]
-    env = dict(os.environ, DATABASE_URL=pgdb.conninfo, FOLLOWUP_AUTOMATION_ENABLED="false")
-    # Round 3 #5: evaluated at a moment INSIDE the Central send window, so the customer reminders
-    # this expects are due whatever the time of day the suite runs at.
-    when = in_window()
-    at = ["--now", when.isoformat()]
-    proc = subprocess.run([sys.executable, "ops/followup_dry_run.py", "--json"] + at,
-                          cwd=str(backend), env=env, capture_output=True, timeout=120)
-    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
-    result = json.loads(proc.stdout.decode("utf-8"))
-    assert db.q1(count) == before, "the dry run wrote a row"
-    assert result["skipped"] == []
-    assert result["at"] == when.isoformat(), "the dry run did not evaluate at --now"
-    assert {t["proposal_id"] for t in result["tasks"]} == {"young", "chat"}
-    assert [t["proposal_id"] for t in result["touched_tasks"]] == ["chat"]
-    assert sorted(e["template"] for e in result["staff_emails"]) == \
-        ["staff_deposit_outstanding", "staff_followup_due", "staff_followup_due"]
-    assert result["deposit_restarts"] == []
-    assert {h["proposal_id"] for h in result["deposit_held"]} == {"done"}
-    # The table form runs too.
-    proc = subprocess.run([sys.executable, "ops/followup_dry_run.py"] + at, cwd=str(backend),
-                          env=env, capture_output=True, timeout=120)
-    assert proc.returncode == 0 and b"estimator emails it would send .... 3" in proc.stdout
 
 
 def test_the_dry_run_pool_refuses_every_write(clean, pgdb):

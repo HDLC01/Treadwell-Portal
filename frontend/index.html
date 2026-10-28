@@ -128,12 +128,11 @@
             </div>
             <span class="badge" id="pv-status-badge"></span>
           </div>
-          <!-- The other scopes of a multi-scope project (renderScopeStrip). Empty otherwise. -->
-          <div class="scope-strip hidden" id="pv-scopes"></div>
         </div>
 
         <div class="card">
-          <h2>Status</h2>
+          <!-- "Status: Lab 1" on a project priced as several proposals (labelScopeCards). -->
+          <h2 id="status-title">Status</h2>
           <div class="tracker" id="tracker"></div>
         </div>
 
@@ -191,6 +190,8 @@
 
         <div class="card hidden" id="pdf-card">
           <h2>Official proposal document</h2>
+          <!-- One tab per proposal of a project priced as several (renderScopeTabs). Empty otherwise. -->
+          <div class="scope-tabs hidden" id="pv-scope-tabs"></div>
           <p class="muted small" style="margin-top:0">Your full Treadwell proposal, with pricing, scope, and terms. Click it to open the full-size view.</p>
           <button type="button" id="pdf-preview" class="pdf-preview" aria-label="Open the full proposal document">
             <div class="pdf-preview-frame" id="pdf-inline-wrap">
@@ -212,7 +213,7 @@
         </div>
 
         <div class="card" id="approve-card">
-          <h2>Approve this proposal</h2>
+          <h2 id="approve-title">Approve this proposal</h2>
           <div id="approve-alert" role="alert" aria-live="polite"></div>
           <!-- Budget Pricing carries no Terms and Conditions, so it cannot be e-signed. The
                server decides that and says why in prose (view.signing.blocked_reason); this

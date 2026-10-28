@@ -23,7 +23,23 @@ PUBLIC_BASE_URL = _env("PUBLIC_BASE_URL", "http://localhost:8898").rstrip("/")
 
 # ── Customer session / OTP ────────────────────────────────────────────────────
 SESSION_TTL_HOURS = int(_env("PORTAL_SESSION_TTL_HOURS", "24"))
-OTP_TTL_MINUTES = int(_env("PORTAL_OTP_TTL_MINUTES", "10"))
+OTP_TTL_MAX_MINUTES = 5
+
+
+def otp_ttl_minutes(raw: str | None) -> int:
+    """How long a login code lives: 5 minutes at most (Hanz, 2026-10-28).
+
+    PORTAL_OTP_TTL_MINUTES can shorten it, never lengthen it: a value above 5 is clamped to 5 and
+    one below 1 to 1, and anything that is not a whole number falls back to 5 rather than stopping
+    the app from starting. Codes already issued keep the expiry stored with them."""
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return OTP_TTL_MAX_MINUTES
+    return max(1, min(OTP_TTL_MAX_MINUTES, n))
+
+
+OTP_TTL_MINUTES = otp_ttl_minutes(_env("PORTAL_OTP_TTL_MINUTES", str(OTP_TTL_MAX_MINUTES)))
 OTP_MAX_ATTEMPTS = int(_env("PORTAL_OTP_MAX_ATTEMPTS", "5"))
 SESSION_COOKIE = "portal_session"
 

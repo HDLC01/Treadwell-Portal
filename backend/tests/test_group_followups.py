@@ -1,18 +1,16 @@
-"""Per-project (scope group) follow-ups, 2026-10-24 (build spec P1).
+"""Per-project (scope group) follow-ups: one project, several proposals, one email.
 
-RJ's "one project, many proposals": a project priced as several separately approved scopes is
-chased as ONE project. These pin the properties Hanz settled:
+Since 2026-10-28 a follow-up is an automatic EMAIL TO THE CUSTOMER. For a project priced as several
+separately approved proposals these pin:
 
-  * a group raises ONE task per due occurrence, filed on a stable HOME scope, listing its scopes;
-  * a touch on ANY scope re-anchors the group; only sent/called reminders count toward the cap;
-  * the group is paused only while EVERY open scope is (decision 7);
-  * approving one scope stops the group chase and raises ONE "decide the other scopes" task,
-    never closing a sibling (decisions 2 and 9), and that task survives the housekeeping;
-  * the approved scope still raises its own deposit reminder;
-  * a deleted or closed home re-homes the task;
-  * the deploy-day dry run counts without writing anything.
-
-The ungrouped path is covered by the existing remind-only files, which run unchanged.
+  * ONE email per recipient per due occurrence, listing only that recipient's open proposals,
+    reserved and recorded on a stable HOME proposal; no reminder task is raised;
+  * the group follows the same 2-per-step cap, counted across every member's sent history (and a
+    closed or deleted former home's), so re-homing never hands the group a fresh 2 + 2;
+  * the group is paused only while EVERY open scope is;
+  * approving one scope stops the siblings' emails and raises ONE "decide the other scopes" task,
+    never closing a sibling, and that task survives the housekeeping; no deposit email;
+  * the release-day dry run lists exactly who would be emailed, without writing anything.
 """
 import copy
 import re
@@ -24,11 +22,12 @@ from fastapi.testclient import TestClient
 
 import db
 import followup_rules as rules
+import followup_settings as fs
 import followup_worker as fw
 import main
 
 NOW = datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc)     # 10am Chicago, inside the send window
-ENROLLED = NOW - timedelta(hours=30)                       # the 24h not-opened step is due
+ENROLLED = NOW - timedelta(days=4)                         # the not-opened 1st email is due
 T0 = NOW - timedelta(days=5)
 GID = "grp-acme-0001"
 H = timedelta(hours=1)
@@ -142,11 +141,19 @@ class FakeDB:
 
     def followup_signals(self, pid):
         out = dict(self.signals.get(pid, {}))
-        if "followup_reminder_times" not in out:
-            out["followup_reminder_times"] = [
-                f["created_at"].isoformat() for f in self.followups
-                if f["proposal_id"] == pid and f["kind"] == "followup_task"
-                and f["detail"].get("status") in ("sent", "called")]
+        if "followup_sent_history" not in out:
+            # db._SENT_HISTORY_SQL: this cycle's customer emails and sent / called tasks.
+            enrolled = (self.rows.get(pid) or {}).get("followup_enrolled_at")
+            out["followup_sent_history"] = [
+                {"at": f["created_at"].isoformat(), "template": f["detail"].get("template"),
+                 "rule_key": f["detail"].get("rule_key")}
+                for f in self.followups
+                if f["proposal_id"] == pid
+                and (enrolled is None or f["created_at"] >= enrolled)
+                and ((f["kind"] == "followup_task"
+                      and f["detail"].get("status") in ("sent", "called"))
+                     or (f["kind"] == "auto_email"
+                         and f["detail"].get("audience") == "customer"))]
         mine = [f for f in self.followups if f["proposal_id"] == pid and self._open(f)]
         out["pending_task"] = ({"id": mine[-1]["id"], "detail": dict(mine[-1]["detail"]),
                                 "created_at": mine[-1]["created_at"]} if mine else None)
@@ -286,6 +293,27 @@ def _members(rows, **sig):
     return [dict(r, **sig.get(r["proposal_id"], {})) for r in rows]
 
 
+def _sent(at, template="next_steps"):
+    """One row of followup_sent_history (db._SENT_HISTORY_SQL)."""
+    return {"at": at.isoformat(), "template": template, "rule_key": "x"}
+
+
+def _emails(f):
+    """The customer follow-up rows the worker reserved, in order."""
+    return [x for x in f.followups if x["kind"] == "auto_email"
+            and x["detail"].get("audience") == "customer"]
+
+
+def _group_task(f, pids=("d-break", "d-lab1", "d-lab2"), home="d-break"):
+    """An OLD group reminder task (remind-only, before 2026-10-28), still open on the home."""
+    tid = f.reserve_followup_task(home, "%s:nv1" % rules.cycle_key(ENROLLED), {
+        "stage": "pre", "template": "not_viewed", "scope_group": GID,
+        "cycle": rules.cycle_key(ENROLLED),
+        "scopes": [{"proposal_id": p, "label": f.rows[p]["scope_label"], "status": "sent"}
+                   for p in pids]})
+    return [t for t in f.tasks() if t["id"] == tid][0]
+
+
 # ══ B. group_view — pure ═══════════════════════════════════════════════════════
 def test_group_view_folds_the_open_scopes_into_one_proposal_on_the_home_scope():
     rows = _three()
@@ -299,47 +327,31 @@ def test_group_view_folds_the_open_scopes_into_one_proposal_on_the_home_scope():
     assert [s["label"] for s in v["scopes"]] == ["Breakroom", "Lab 1", "Lab 2"]
 
 
-def test_a_touch_on_any_scope_reanchors_the_whole_group():
-    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
-    due = [d for d in rules.due_now(rules.group_view(viewed, NOW), NOW, ALL_DAY)
-           if d.audience == "customer"]
-    assert due, "the control case is not due, so this proves nothing"
-    touched = _members(viewed, **{"d-lab2": {"customer_touch_at": NOW - H}})
-    view = rules.group_view(touched, NOW)
-    assert view["customer_touch_at"] == NOW - H
-    assert [d for d in rules.due_now(view, NOW, ALL_DAY) if d.audience == "customer"] == []
-    assert rules.next_due_at(view, NOW, ALL_DAY) == NOW - H + rules.RECURRING
-
-
-def test_the_cap_is_per_group_and_counts_every_members_reminders():
-    """One counted reminder on Lab 1 and one on Lab 2 make two for the GROUP's stop-after-2."""
-    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H)
-    viewed[0]["followup_stop_after"] = 2
-    one = [(NOW - 290 * H).isoformat()]
-    capped = _members(viewed, **{"d-lab1": {"followup_reminder_times": one},
-                                 "d-lab2": {"followup_reminder_times": one}})
+def test_the_cap_is_per_group_and_counts_every_members_emails():
+    """One follow-up email recorded on Lab 1 and one on Lab 2 are the GROUP's two for the step."""
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
+                    followup_enrolled_at=NOW - 310 * H)
+    capped = _members(viewed, **{
+        "d-lab1": {"followup_sent_history": [_sent(NOW - 290 * H)]},
+        "d-lab2": {"followup_sent_history": [_sent(NOW - 200 * H, "second_nudge")]}})
     assert _customer_due(rules.group_view(capped, NOW)) is None
-    under = _members(viewed, **{"d-lab1": {"followup_reminder_times": one}})
-    assert _customer_due(rules.group_view(under, NOW)) is not None
+    under = _members(viewed, **{"d-lab1": {"followup_sent_history": [_sent(NOW - 290 * H)]}})
+    due = _customer_due(rules.group_view(under, NOW))
+    assert due is not None and due.template == "second_nudge"
 
 
-def test_a_retired_approvals_deposit_reminders_never_count_toward_the_groups_cap():
-    """Round 3 #4 (residual #17): Lab 1 was approved, chased for its deposit twice, then revised
-    back to an open scope. Its two SENT deposit tasks are in its own count (followup_reminder_times)
-    but not in the group's (group_reminder_times, db: deposit-stage tasks left out), so they do not
-    use up the siblings' stop-after-2."""
-    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H)
-    viewed[0]["followup_stop_after"] = 2
-    deposit = [(NOW - 290 * H).isoformat(), (NOW - 200 * H).isoformat()]
-    members = _members(viewed, **{"d-lab1": {"followup_reminder_times": deposit,
-                                             "group_reminder_times": []}})
-    view = rules.group_view(members, NOW)
-    assert view["followup_reminder_times"] == []
-    assert _customer_due(view) is not None
-    # The control: the same reminders as ordinary ones (in the group count) do cap it.
-    capped = _members(viewed, **{"d-lab1": {"followup_reminder_times": deposit,
-                                            "group_reminder_times": deposit}})
-    assert _customer_due(rules.group_view(capped, NOW)) is None
+def test_deposit_reminders_never_count_toward_the_groups_two_emails():
+    """A retired approval's deposit emails (Lab 1 approved, chased, then revised back to open) are
+    not follow-ups of the decision step and do not use up the siblings' two."""
+    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
+                    followup_enrolled_at=NOW - 310 * H)
+    deposit = [_sent(NOW - 290 * H, "deposit_nudge"), _sent(NOW - 200 * H, "deposit_nudge")]
+    view = rules.group_view(_members(viewed, **{"d-lab1": {"followup_sent_history": deposit}}),
+                            NOW)
+    assert _customer_due(view).template == "next_steps"
+    ordinary = [_sent(NOW - 290 * H), _sent(NOW - 200 * H, "second_nudge")]
+    assert _customer_due(rules.group_view(
+        _members(viewed, **{"d-lab1": {"followup_sent_history": ordinary}}), NOW)) is None
 
 
 def _customer_due(view):
@@ -347,9 +359,9 @@ def _customer_due(view):
     return got[0] if got else None
 
 
-def _reminder_times_admitted(statuses):
-    """Which follow-up rows the REAL _REMINDER_TIMES_SQL predicate counts, run by SQLite."""
-    sql = db._REMINDER_TIMES_SQL.format(pid="'p1'", enrolled="null")
+def _sent_history_admitted(statuses):
+    """Which follow-up rows the REAL _SENT_HISTORY_SQL predicate counts, run by SQLite."""
+    sql = db._SENT_HISTORY_SQL.format(pid="'p1'", enrolled="null")
     pred = sql[sql.index(" where ") + len(" where "):-1]
     con = sqlite3.connect(":memory:")
     con.execute("attach database ':memory:' as public")
@@ -360,13 +372,17 @@ def _reminder_times_admitted(statuses):
                     (i, "p1", "followup_task", '{"status": "%s"}' % st, "2026-08-01"))
     con.execute("insert into public.portal_followups values (99,'p1','auto_email',"
                 "'{\"audience\": \"customer\"}','2026-08-01')")
+    con.execute("insert into public.portal_followups values (98,'p1','auto_email',"
+                "'{\"audience\": \"staff\"}','2026-08-01')")
     got = con.execute("select f.id from public.portal_followups f where " + pred).fetchall()
-    return {statuses[i] if i < len(statuses) else "auto_email" for (i,) in got}
+    return {statuses[i] if i < len(statuses) else ("auto_email" if i == 99 else "staff_email")
+            for (i,) in got}
 
 
-def test_only_sent_and_called_reminders_count_toward_the_cap():
-    """Decision 6, run through the SQL the worker and the board both read."""
-    got = _reminder_times_admitted(
+def test_only_emails_that_reached_the_customer_count_toward_the_two():
+    """The sent history counts customer auto emails and tasks sent or answered with a call; not a
+    skipped, snoozed, expired or open task, and not a staff note."""
+    got = _sent_history_admitted(
         ["sent", "called", "skipped", "snoozed", "expired", "pending", "decided"])
     assert got == {"sent", "called", "auto_email"}, got
 
@@ -405,55 +421,40 @@ def test_the_decision_task_is_live_while_a_listed_sibling_is_open():
 
 
 # ══ C. the worker: one task per group ══════════════════════════════════════════
-def test_a_group_of_three_raises_exactly_one_task_listing_all_three(fake):
+def test_a_group_of_three_gets_one_email_listing_all_three(fake):
     f = fake(_three())
     fw._tick(NOW)
-    tasks = f.tasks()
-    assert len(tasks) == 1, tasks
-    t = tasks[0]
-    assert t["proposal_id"] == "d-break", "filed on the home scope"
-    assert t["detail"]["scope_group"] == GID
-    assert [s["label"] for s in t["detail"]["scopes"]] == ["Breakroom", "Lab 1", "Lab 2"]
-    assert t["detail"]["rule_key"] == "%s:nv1" % rules.cycle_key(ENROLLED)
-    # One estimator email for the moment, naming the scopes, with the 24h note folded into it.
-    assert [s["subject"] for s in f.sent["staff"]] == ["Follow-up due — Acme HQ"]
-    assert "Breakroom, Lab 1, Lab 2" in f.sent["staff"][0]["body"]
-    assert f.sent["customer"] == [] and f.sent["group"] == []
+    assert f.tasks() == [], "a reminder task was raised; the worker emails the customer itself"
+    (g,) = f.sent["group"]
+    assert g["to"] == "dana@acme.com" and g["scopes"] == ["Breakroom", "Lab 1", "Lab 2"]
+    assert g["body"] == fs.DEFAULT_TEMPLATES["not_viewed"]["body"]
+    (row,) = _emails(f)
+    assert row["proposal_id"] == "d-break", "reserved on the home scope"
+    assert row["detail"]["rule_key"] == "%s:a:nv1" % rules.cycle_key(ENROLLED)
+    assert row["detail"]["scope_group"] == GID and row["detail"]["template"] == "not_viewed"
+    assert f.sent["customer"] == [] and f.sent["staff"] == []
+    assert sorted(m["pid"] for m in f.messages) == ["d-break", "d-lab1", "d-lab2"], (
+        "every proposal's thread shows the reminder")
 
 
-def test_two_ticks_and_the_twin_container_raise_it_once(fake):
+def test_two_ticks_and_the_twin_container_email_once(fake):
     f = fake(_three())
     fw._tick(NOW)
     fw._tick(NOW + timedelta(minutes=15))
     fw._tick(NOW + timedelta(minutes=15))      # the twin, same moment
-    assert len(f.tasks()) == 1
-    assert len(f.sent["staff"]) == 1
+    assert len(f.sent["group"]) == 1 and len(_emails(f)) == 1
 
 
-def test_a_reply_on_any_scope_holds_the_groups_next_task(fake):
-    viewed = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
-    f = fake(viewed)
-    f.signals["d-lab2"] = {"customer_touch_at": NOW - H}
-    fw._tick(NOW)
-    assert f.tasks() == []
-    f = fake(viewed)
-    fw._tick(NOW)
-    assert len(f.tasks()) == 1, "the control case raised nothing, so this proved nothing"
-
-
-def test_an_approved_scope_still_raises_its_own_deposit_task(fake):
+def test_an_approved_scope_gets_no_deposit_email_and_stops_the_group(fake):
     rows = _three()
     rows[1].update(proposal_status="approved", approved_at=NOW - 30 * H,
                    cycle_viewed_at=NOW - 40 * H)
     f = fake(rows)
-    # Its decision task is open on the same scope: it must not hold the deposit chase's slot.
     f.reserve_followup_task("d-lab1", "sd:%s:d-lab1" % GID, {
         "stage": "decision", "template": "scope_decision", "scope_group": GID,
         "scopes": [{"proposal_id": "d-break"}, {"proposal_id": "d-lab2"}]})
     fw._tick(NOW)
-    dep = [t for t in f.tasks(template="deposit_nudge")]
-    assert [t["proposal_id"] for t in dep] == ["d-lab1"]
-    assert not f.tasks(scope_group=GID, stage="pre"), "the stopped group raised a reminder"
+    assert f.sent["group"] == [] and f.sent["customer"] == [] and _emails(f) == []
     assert f.tasks(stage="decision")[0]["detail"]["status"] == "pending"
 
 
@@ -507,57 +508,24 @@ def test_the_decision_emails_open_the_first_sibling_still_open(approve, monkeypa
     assert nag["link"].endswith("open=d-lab2"), nag["link"]
 
 
-def test_a_deleted_home_rehomes_the_task(fake):
-    f = fake(_three())
-    fw._tick(NOW)
-    first, = f.tasks()
-    assert first["proposal_id"] == "d-break"
-    f.rows["d-break"]["deleted_at"] = NOW
-    fw._tick(NOW + H)
-    assert first["detail"]["status"] == "expired" and first["detail"]["reason"] == "rehomed"
-    live = [t for t in f.tasks() if t["detail"]["status"] == "pending"]
-    assert [t["proposal_id"] for t in live] == ["d-lab1"], "not re-raised on the new home"
-    assert [s["label"] for s in live[0]["detail"]["scopes"]] == ["Lab 1", "Lab 2"]
-
-
-def test_a_closed_home_rehomes_the_task(fake):
-    f = fake(_three())
-    fw._tick(NOW)
-    first, = f.tasks()
-    f.rows["d-break"]["proposal_status"] = "closed_lost"
-    fw._tick(NOW + H)
-    assert first["detail"]["status"] == "expired"
-    assert [t["proposal_id"] for t in f.tasks() if t["detail"]["status"] == "pending"] == \
-        ["d-lab1"]
-
-
 @pytest.mark.parametrize("gone", ["closed", "deleted"])
-def test_a_rehomed_group_keeps_its_last_send_and_its_counted_reminders(fake, admin, gone):
-    """Review finding: the group's send is recorded on the HOME row (staff_email + anchor stamp)
-    and its sent task is filed there. Closing or deleting that home must not make the group forget
-    it was emailed yesterday, nor the reminders it has used of its "Stop after N"."""
-    f = fake(_three(proposal_status="viewed", cycle_viewed_at=NOW - 30 * H))
+def test_a_rehomed_group_keeps_its_count(fake, gone):
+    """The group's 1st email is recorded on the HOME. Closing or deleting that home moves the group
+    to the next scope; the 2nd email goes from there, and there is never a 3rd."""
+    f = fake(_three())
     fw._tick(NOW)
-    t, = f.tasks()
-    assert t["proposal_id"] == "d-break"
-    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
-        "title": "Checking in", "body": "Hi {first_name},\n\n{link}",
-        "by": "kyle@wetreadwell.com"})
-    assert r.status_code == 200, r.text
     if gone == "closed":
         f.rows["d-break"]["proposal_status"] = "closed_lost"
     else:
         f.rows["d-break"]["deleted_at"] = NOW + H
-    later = NOW + timedelta(days=1)
-    f.clock = later
+    f.clock = later = NOW + timedelta(days=8)
     fw._tick(later)
-    assert [x["proposal_id"] for x in f.tasks() if x["detail"]["status"] == "pending"] == [], \
-        "the re-homed group was chased again a day after it was emailed"
-    assert [s["subject"] for s in f.sent["staff"]].count("Follow-up due — Acme HQ") == 1
-    view, _why, _m = fw.group_state_for(GID, later)
-    assert view["proposal_id"] == "d-lab1"
-    assert len(view["followup_reminder_times"]) == 1, "the sent reminder left the group's cap"
-    assert view["followup_anchor_at"] == NOW
+    assert [(x["proposal_id"], x["detail"]["rule_key"].rsplit(":", 1)[1]) for x in _emails(f)] == \
+        [("d-break", "nv1"), ("d-lab1", "nv2")]
+    assert f.sent["group"][-1]["scopes"] == ["Lab 1", "Lab 2"]
+    f.clock = NOW + timedelta(days=40)
+    fw._tick(f.clock)
+    assert len(f.sent["group"]) == 2, "the re-homed group got a 3rd email"
 
 
 def test_history_rows_leave_out_a_detached_scope_that_never_held_the_groups_task():
@@ -575,10 +543,11 @@ def test_a_scope_taken_out_of_the_group_is_chased_on_its_own(fake):
     f = fake(rows, drafts=[{"id": "d-break", "archived": False},
                            {"id": "d-lab1", "archived": False}])
     fw._tick(NOW)
-    owners = sorted(t["proposal_id"] for t in f.tasks())
-    assert owners == ["d-break", "d-lab2"], owners
-    solo = [t for t in f.tasks() if t["proposal_id"] == "d-lab2"][0]
-    assert "scope_group" not in solo["detail"], "the detached scope got a group task"
+    assert sorted(x["proposal_id"] for x in _emails(f)) == ["d-break", "d-lab2"]
+    solo = [x for x in _emails(f) if x["proposal_id"] == "d-lab2"][0]
+    assert "scope_group" not in solo["detail"], "the detached scope got a group email"
+    assert [g["scopes"] for g in f.sent["group"]] == [["Breakroom", "Lab 1"]]
+    assert len(f.sent["customer"]) == 1
 
 
 def test_an_archived_scope_is_chased_neither_way(fake):
@@ -586,8 +555,8 @@ def test_an_archived_scope_is_chased_neither_way(fake):
                                {"id": "d-lab1", "archived": False},
                                {"id": "d-lab2", "archived": True}])
     fw._tick(NOW)
-    t, = f.tasks()
-    assert [s["proposal_id"] for s in t["detail"]["scopes"]] == ["d-break", "d-lab1"]
+    assert [g["scopes"] for g in f.sent["group"]] == [["Breakroom", "Lab 1"]]
+    assert f.sent["customer"] == []
 
 
 def test_an_unreadable_group_is_skipped_not_chased_per_scope(fake, monkeypatch):
@@ -595,15 +564,16 @@ def test_an_unreadable_group_is_skipped_not_chased_per_scope(fake, monkeypatch):
     monkeypatch.setattr(db, "list_scope_group_draft_states",
                         lambda gid: (_ for _ in ()).throw(RuntimeError("db blip")))
     fw._tick(NOW)
-    assert f.tasks() == []
+    assert f.tasks() == [] and _emails(f) == [] and f.sent["customer"] == []
 
 
 def test_an_ungrouped_tick_never_reads_a_scope_group(fake):
     f = fake([_scope("solo", None, 0, scope_group=None, scope_label=None)])
     fw._tick(NOW)
     assert f.reads == []
-    t, = f.tasks()
-    assert "scope_group" not in t["detail"] and "scopes" not in t["detail"]
+    (row,) = _emails(f)
+    assert "scope_group" not in row["detail"] and "scopes" not in row["detail"]
+    assert len(f.sent["customer"]) == 1 and f.sent["group"] == []
 
 
 # ══ D. approving one scope ═══════════════════════════════════════════════════
@@ -632,12 +602,11 @@ def approve(fake, monkeypatch, tmp_path):
 
 def test_approving_one_scope_raises_one_decision_task_and_stops_the_group(approve):
     f, go = approve
-    fw._tick(NOW)                                   # the group's reminder is open on the home
-    reminder, = f.tasks()
-    assert reminder["detail"]["status"] == "pending"
+    later = NOW + timedelta(days=5)              # the opened step's 1st email is due by then
+    view, _why, _m = fw.group_state_for(GID, later)
+    assert [d.audience for d in rules.due_now(view, later, ALL_DAY)] == ["customer"], (
+        "the control is not due, so this proves nothing")
     assert go().status_code == 200
-    assert reminder["detail"]["status"] == "expired"
-    assert reminder["detail"]["reason"] == "scope_approved"
     dec, = f.tasks(stage="decision")
     assert dec["proposal_id"] == "d-lab1"
     assert dec["detail"]["rule_key"] == "sd:%s:d-lab1:1" % GID, "keyed on the approval (#2)"
@@ -645,8 +614,10 @@ def test_approving_one_scope_raises_one_decision_task_and_stops_the_group(approv
     assert [s["subject"] for s in f.sent["staff"]].count("Decide the other scopes — Acme HQ") == 1
     # NEVER auto-closed.
     assert [f.rows[p]["proposal_status"] for p in ("d-break", "d-lab2")] == ["viewed", "viewed"]
-    # The chase has stopped: a later tick raises no reminder for the group.
-    fw._tick(NOW + timedelta(days=5))
+    # The emails have stopped: a later tick sends the siblings nothing.
+    f.clock = later
+    fw._tick(later)
+    assert f.sent["group"] == [] and f.sent["customer"] == [] and _emails(f) == []
     assert [t for t in f.tasks(scope_group=GID) if t["detail"]["status"] == "pending"] == [dec]
     # A double submit raises nothing more.
     go()
@@ -771,8 +742,7 @@ def test_sending_a_group_task_emails_each_recipient_only_their_scopes(fake, admi
     rows = _three()
     rows[2]["customer_email"] = "pat@acme.com"          # Lab 2 went to somebody else
     f = fake(rows)
-    fw._tick(NOW)
-    t, = f.tasks()
+    t = _group_task(f)
     r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
         "title": "Checking in", "body": "Hi {first_name},\n\nAny questions?\n\n{link}",
         "by": "kyle@wetreadwell.com"})
@@ -787,8 +757,7 @@ def test_sending_a_group_task_emails_each_recipient_only_their_scopes(fake, admi
 
 def test_a_group_task_send_is_refused_once_a_scope_is_approved(fake, admin):
     f = fake(_three())
-    fw._tick(NOW)
-    t, = f.tasks()
+    t = _group_task(f)
     f.rows["d-lab1"].update(proposal_status="approved", approved_at=NOW)
     r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
         "title": "Checking in", "body": "Hi\n\n{link}"})
@@ -813,44 +782,43 @@ def test_the_task_view_links_an_open_scope_and_lists_the_scopes(monkeypatch):
 
 def test_the_plan_is_written_to_the_home_scope(fake, admin):
     f = fake(_three())
+    day = (NOW + timedelta(days=4)).date().isoformat()
     r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
-                                  json={"interval_days": 5})
+                                  json={"next_at": day})
     assert r.status_code == 200, r.text
     assert r.json()["home_proposal_id"] == "d-break"
-    assert f.rows["d-break"].get("followup_interval_days") == 5
-    assert "followup_interval_days" not in f.rows["d-lab2"]
+    assert f.rows["d-break"].get("followup_next_at") is not None
+    assert "followup_next_at" not in f.rows["d-lab2"]
 
 
 def test_the_pipeline_shows_the_groups_schedule_on_every_open_scope(fake, admin, monkeypatch):
     rows = _three()
-    rows[0]["followup_interval_days"] = 9
+    rows[0]["followup_next_at"] = NOW + timedelta(days=2)        # "Next email on", on the home
     f = fake(rows)
     monkeypatch.setattr(main.db, "unread_counts", lambda: {})
     monkeypatch.setattr(main.db, "list_all_portal_proposals",
                         lambda: [dict(r) for r in f.rows.values()])
     out = {r["proposal_id"]: r for r in
            TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
-    nexts = {out[p]["next_followup_at"] for p in ("d-break", "d-lab1", "d-lab2")}
-    assert len(nexts) == 1, nexts
-    assert {out[p]["followup_plan"]["interval_days"] for p in out} == {9}
+    want = main._iso(NOW + timedelta(days=2))
+    assert {out[p]["next_followup_at"] for p in ("d-break", "d-lab1", "d-lab2")} == {want}
+    assert {out[p]["followup_plan"]["next_at"] for p in out} == {want}
     assert {out[p]["followup_home_id"] for p in out} == {"d-break"}
 
 
-def test_the_pipeline_keeps_a_closed_former_homes_touch_in_the_groups_date(fake, admin,
+def test_the_pipeline_keeps_a_closed_former_homes_email_in_the_groups_date(fake, admin,
                                                                          monkeypatch):
-    """The board's mirror of the re-home fix: the group's last send was stamped on a home that
-    has since been closed, so the open scopes' date runs from that touch, as the worker's does."""
+    """The group's 1st email was recorded on a home that has since been closed, so the open
+    scopes' date is the 2nd email's: 7 days after that one, as the worker's is."""
     rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 80 * H)
-    rows[0].update(proposal_status="closed_lost", followup_anchor_at=NOW - H)
+    rows[0].update(proposal_status="closed_lost", followup_sent_history=[_sent(NOW - H)])
     f = fake(rows)
     monkeypatch.setattr(main.db, "unread_counts", lambda: {})
     monkeypatch.setattr(main.db, "list_all_portal_proposals",
                         lambda: [dict(r) for r in f.rows.values()])
     out = {r["proposal_id"]: r for r in
            TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
-    view, _why, _m = fw.group_state_for(GID, NOW)
-    assert view["followup_anchor_at"] == NOW - H
-    want = main._iso(rules.next_due_at(view, NOW, main._followup_cfg()))
+    want = main._iso(NOW - H + timedelta(days=7))
     assert out["d-lab1"]["next_followup_at"] == out["d-lab2"]["next_followup_at"] == want
 
 
@@ -873,42 +841,37 @@ def test_the_pipeline_query_shows_a_groups_task_on_every_member_row():
 
 
 # ══ H. the deploy-day dry run ════════════════════════════════════════════════
-def test_the_dry_run_counts_what_the_next_tick_would_raise_and_writes_nothing(fake):
+def test_the_dry_run_lists_who_the_next_tick_would_email_and_writes_nothing(fake):
     rows = _three() + [_scope("solo", None, 9, scope_group=None, scope_label=None),
                        _scope("quiet", None, 10, scope_group=None, scope_label=None,
                               followup_enrolled_at=NOW - 2 * H)]
     rows.append(_scope("emailed", None, 11, scope_group=None, scope_label=None))
     f = fake(rows)
-    # The old automatic ladder already emailed this occurrence: the dedupe index drops it.
-    f.reserve_followup("emailed", "%s:nv1" % rules.cycle_key(ENROLLED), {"audience": "customer"})
+    # The old automatic ladder already emailed this one in its current step: nothing re-sends it.
+    f.reserve_followup("emailed", "%s:nv1" % rules.cycle_key(ENROLLED),
+                       {"audience": "customer", "template": "not_viewed"})
     before = copy.deepcopy(f.followups)
     got = fw.dry_run_count(NOW)
     assert f.followups == before, "the dry run wrote something"
-    assert f.sent["staff"] == [] and f.sent["customer"] == []
-    assert got["count"] == 2
-    assert sorted((t["proposal_id"], t["scope_group"]) for t in got["tasks"]) == \
+    assert f.sent["staff"] == [] and f.sent["customer"] == [] and f.sent["group"] == []
+    assert got["customer_email_count"] == 2 and got["count"] == 2
+    by = {e["proposal_id"]: e for e in got["customer_emails"]}
+    assert sorted((p, e["scope_group"]) for p, e in by.items()) == \
         [("d-break", GID), ("solo", None)]
+    assert by["d-break"]["recipients"] == ["dana@acme.com"]
+    assert by["d-break"]["scopes"] == ["Breakroom", "Lab 1", "Lab 2"]
+    assert by["solo"]["template"] == "not_viewed" and by["solo"]["ordinal"] == 1
     # It agrees with the real tick.
     fw._tick(NOW)
-    assert sorted(t["proposal_id"] for t in f.tasks()) == ["d-break", "solo"]
-    assert fw.dry_run_count(NOW)["count"] == 0, "an already-raised occurrence was counted again"
+    assert sorted(x["proposal_id"] for x in _emails(f) if x["detail"].get("engine")) == \
+        ["d-break", "solo"]
+    assert fw.dry_run_count(NOW)["customer_email_count"] == 0, "an email already sent was listed"
 
 
 def test_the_dry_run_runs_with_automation_off(fake, monkeypatch):
     fake(_three())
     monkeypatch.setenv("FOLLOWUP_AUTOMATION_ENABLED", "false")
     assert fw.dry_run_count(NOW)["count"] == 1
-
-
-def test_the_dry_run_reports_the_touched_burst(fake):
-    """The critic's case: a proposal with an old reply, quiet for more than one interval, matures
-    on a time-keyed occurrence no old automatic email used."""
-    viewed = _scope("solo", None, 0, scope_group=None, scope_label=None,
-                    proposal_status="viewed", cycle_viewed_at=NOW - 20 * 24 * H)
-    f = fake([viewed])
-    f.signals["solo"] = {"customer_touch_at": NOW - 10 * 24 * H}
-    got = fw.dry_run_count(NOW)
-    assert got["count"] == 1 and re.search(r"vrt@\d{8}T\d{2}$", got["tasks"][0]["rule_key"])
 
 
 def test_the_board_query_uses_the_group_aware_task_column(monkeypatch):
@@ -943,16 +906,19 @@ def test_the_group_email_lists_this_recipients_scopes_under_the_estimators_text(
     assert ok and out["to"] == ["dana@acme.com"]
     html = out["html"]
     assert "Checking in" in html and "Hi Dana," in html and "Any questions on Acme HQ?" in html
-    assert "https://p/x/tok-a" in html and "https://p/x/tok-b" in html
-    assert "Breakroom" in html and "Lab 1" in html
+    # ONE button, to the first proposal this recipient is on; the proposals named as text.
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', html) == ["https://p/x/tok-a"]
+    assert ">View &amp; approve your proposals</a>" in html
+    assert '<li style="margin:4px 0">Breakroom</li>' in html
+    assert '<li style="margin:4px 0">Lab 1</li>' in html
     assert "Not moving forward" not in html, "one scope's close button on a whole-project email"
     assert html.index("Any questions on Acme HQ?") < html.index("https://p/x/tok-a")
-    # {link} written mid-sentence: words, and the buttons still go out, after the text.
+    # {link} written mid-sentence: words, and the button still goes out, after the text.
     email_sender.send_scope_group_followup(
         "dana@acme.com", "", "Acme HQ", [{"label": "Lab 1", "url": "https://p/x/tok-b"}],
         {"title": "Hi", "body": "Use {link} when you are ready.\n\nThanks"})
     html = out["html"]
-    assert "Use the links below when you are ready." in html
+    assert "Use the link below when you are ready." in html
     assert html.index("Thanks") < html.index("https://p/x/tok-b")
 
 
@@ -969,32 +935,30 @@ def _kept(rows, approved_pid, approved_at, kept_at):
     return out
 
 
-def test_after_keep_the_approved_scopes_deposit_reminders_do_not_cap_the_siblings():
-    """#17: stop-after 3, the approved scope (once the home) has 3 deposit reminders since 'keep'.
-    The siblings' chase must not stop on them, nor be re-anchored by its deposit call."""
+def test_after_keep_the_approved_scopes_later_emails_do_not_cap_the_siblings():
+    """The approved scope (once the home) had emails AFTER its approval: they are not the
+    siblings' follow-ups and do not use up their two."""
     rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
-                  followup_stop_after=3)
+                  followup_enrolled_at=NOW - 310 * H)
     rows = _kept(rows, "d-break", NOW - 100 * H, NOW - 95 * H)
-    rows[0].update(followup_reminder_times=[(NOW - k * H).isoformat() for k in (90, 80, 70)],
-                   last_staff_followup_at=NOW - 2 * H, customer_touch_at=NOW - 3 * H)
-    rows[1]["followup_anchor_at"] = NOW - 95 * H          # keep re-anchors the (open) home
+    rows[0]["followup_sent_history"] = [_sent(NOW - 90 * H, "deposit_nudge"),
+                                        _sent(NOW - 80 * H), _sent(NOW - 70 * H)]
     v = rules.group_view(rows, NOW)
-    assert v["proposal_id"] == "d-lab1", "the group's home is still the approved scope"
-    assert v["followup_reminder_times"] == []
-    assert v["last_staff_followup_at"] is None and v["customer_touch_at"] is None
-    assert _customer_due(v) is not None, "the siblings' chase stopped on the deposit reminders"
+    assert v["proposal_id"] == "d-lab1", "the group's home moved off the approved scope"
+    assert v["followup_sent_history"] == []
+    assert _customer_due(v) is not None, "the siblings' emails stopped on the approved scope's"
 
 
-def test_an_approved_scopes_reminders_from_before_its_approval_still_count():
-    """...but what it was sent while it was an open scope of the group stays in the cap."""
+def test_an_approved_scopes_emails_from_before_its_approval_still_count():
+    """...but what was sent while it was an open scope of the group stays in the group's two."""
     rows = _three(proposal_status="viewed", cycle_viewed_at=NOW - 300 * H,
-                  followup_stop_after=1)
+                  followup_enrolled_at=NOW - 310 * H)
     rows = _kept(rows, "d-break", NOW - 100 * H, NOW - 95 * H)
-    rows[0]["followup_reminder_times"] = [(NOW - 150 * H).isoformat()]
-    rows[1]["followup_anchor_at"] = NOW - 95 * H
+    before = [_sent(NOW - 150 * H), _sent(NOW - 140 * H, "second_nudge")]
+    rows[0]["followup_sent_history"] = before
     v = rules.group_view(rows, NOW)
-    assert v["followup_reminder_times"] == [(NOW - 150 * H).isoformat()]
-    assert _customer_due(v) is None, "the group got a fresh Stop-after-N back"
+    assert v["followup_sent_history"] == before
+    assert _customer_due(v) is None, "the group got a fresh two back"
 
 
 def test_the_group_plan_is_never_written_on_an_approved_scope(fake, admin):
@@ -1041,11 +1005,6 @@ def test_the_group_reminder_never_mails_an_unannounced_scope_so_email_again_send
     import scope_groups
     f = fake(_with_unannounced())
     fw._tick(NOW)
-    t, = f.tasks()
-    assert [s["proposal_id"] for s in t["detail"]["scopes"]] == ["d-break", "d-lab1", "d-lab2"]
-    r = TestClient(main.app).post("/api/admin/followup-task/%s/send" % t["id"], json={
-        "title": "Checking in", "body": "Hi {first_name},\n\n{link}", "by": "kyle@wetreadwell.com"})
-    assert r.status_code == 200, r.text
     assert [g["scopes"] for g in f.sent["group"]] == [["Breakroom", "Lab 1", "Lab 2"]]
     assert not [m for m in f.messages if m["pid"] == "d-lab3"], "a 'Reminder sent' row on Lab 3"
     # The next combined send is Lab 3's FIRST email, so 'new' is the truth.
@@ -1091,8 +1050,7 @@ def test_a_paused_scopes_staff_email_names_the_scope_and_says_the_others_carry_o
     assert "paused for the <strong>Lab 1</strong> scope" in mail["body"]
     assert "still being followed up: <strong>Breakroom, Lab 2</strong>" in mail["body"]
     fw._tick(NOW)
-    t, = f.tasks()
-    assert [s["label"] for s in t["detail"]["scopes"]] == ["Breakroom", "Lab 2"]
+    assert [g["scopes"] for g in f.sent["group"]] == [["Breakroom", "Lab 2"]]
 
 
 def test_a_scope_closed_by_the_customer_says_only_that_scope_stopped(status):
@@ -1186,69 +1144,6 @@ def test_the_fallback_decision_key_has_full_precision(fake):
     assert [t["detail"]["status"] for t in f.tasks(stage="decision")] == ["decided", "pending"]
 
 
-def test_keep_after_the_home_is_approved_keeps_the_groups_schedule(approve, admin, monkeypatch):
-    """Round 3 #2 (Hanz's question 6: copy over). The plan lives on the home; approving the home
-    moves the home to the next open scope, which has no plan. After 'keep' the group must still
-    run every 14 days and stop after 2, on the worker AND on the board."""
-    f, go = approve
-    f.rows["d-break"].update(followup_interval_days=14, followup_stop_after=2)
-    assert go("d-break").status_code == 200
-    dec, = f.tasks(stage="decision")
-    f.clock = NOW + H
-    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, dec["id"]).status_code == 200
-    view = fw.group_state_for(GID, NOW + H)[0]
-    assert view is not None and view["proposal_id"] == "d-lab1", "the home moved off d-break"
-    assert view["followup_interval_days"] == 14
-    assert view["followup_stop_after"] == 2
-    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
-    monkeypatch.setattr(main.db, "list_all_portal_proposals",
-                        lambda: [dict(r) for r in f.rows.values()])
-    out = {r["proposal_id"]: r for r in
-           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
-    assert out["d-lab2"]["followup_plan"]["interval_days"] == 14
-    assert out["d-lab2"]["followup_plan"]["stop_after"] == 2
-    # Admin plan writes still go to the (new) home.
-    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
-                                  json={"interval_days": 7})
-    assert r.status_code == 200 and r.json()["home_proposal_id"] == "d-lab1"
-    assert f.rows["d-lab1"]["followup_interval_days"] == 7
-    assert f.rows["d-break"]["followup_interval_days"] == 14
-    view = fw.group_state_for(GID, NOW + H)[0]
-    assert (view["followup_interval_days"], view["followup_stop_after"]) == (7, 2)
-    # The response is the schedule the group really runs on (it was stop_after None here).
-    assert r.json()["followup_plan"]["stop_after"] == 2
-
-
-def test_reset_to_standard_after_the_home_moved_really_resets_the_group(approve, admin,
-                                                                       monkeypatch):
-    """PF4 review: home Breakroom (14 days, stop after 2) approved, 'keep', home -> Lab 1. "The
-    standard interval, the standard reminder limit" from Lab 2's drawer answered 200 and posted
-    the card, while the worker and the board went on with Breakroom's 14 / 2 for ever."""
-    f, go = approve
-    f.rows["d-break"].update(followup_interval_days=14, followup_stop_after=2)
-    assert go("d-break").status_code == 200
-    dec, = f.tasks(stage="decision")
-    f.clock = NOW + H
-    assert _decide({"action": "keep", "by": "kyle@wetreadwell.com"}, dec["id"]).status_code == 200
-    r = TestClient(main.app).post("/api/admin/proposal/d-lab2/followup-plan",
-                                  json={"interval_days": None, "stop_after": None})
-    assert r.status_code == 200
-    assert (r.json()["followup_plan"]["interval_days"],
-            r.json()["followup_plan"]["stop_after"]) == (None, None)
-    view = fw.group_state_for(GID, NOW + H)[0]
-    assert (view["followup_interval_days"], view["followup_stop_after"]) == (None, None)
-    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
-    monkeypatch.setattr(main.db, "list_all_portal_proposals",
-                        lambda: [dict(r) for r in f.rows.values()])
-    out = {r["proposal_id"]: r for r in
-           TestClient(main.app).get("/api/admin/pipeline").json()["proposals"]}
-    for pid in ("d-lab1", "d-lab2"):
-        assert (out[pid]["followup_plan"]["interval_days"],
-                out[pid]["followup_plan"]["stop_after"]) == (None, None), pid
-    # The approved scope's own row is untouched: it is its own deposit chase now.
-    assert f.rows["d-break"]["followup_interval_days"] == 14
-
-
 def _log(pid, kind="call"):
     return TestClient(main.app).post("/api/admin/proposal/%s/followups" % pid,
                                      json={"kind": kind, "note": "Rang Dana", "by": "kyle"})
@@ -1258,8 +1153,7 @@ def test_a_call_logged_on_any_open_scope_resolves_the_groups_task(fake, admin):
     """#14: the group's task lives on the home; a call logged from Lab 1's drawer left it open, so
     the card asking for a reminder email stayed on the bell after the phone call."""
     f = fake(_three())
-    fw._tick(NOW)
-    t, = f.tasks()
+    t = _group_task(f)
     assert t["proposal_id"] == "d-break"
     assert _log("d-lab1", "note").status_code == 200
     assert t["detail"]["status"] == "pending", "a note is not contact with the customer"

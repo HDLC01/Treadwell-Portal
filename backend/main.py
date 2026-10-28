@@ -139,8 +139,7 @@ def _followup_state(p: dict) -> dict:
         "paused_until": _iso(p.get("followup_paused_until")),
         "closed_lost_reason": p.get("closed_lost_reason"),
         "closed_at": _iso(p.get("closed_at")),
-        # Always 'remind' in v1 (decisions 1-2): a due reminder tells the estimator, and only the
-        # estimator sends. Travels so the drawer can say so instead of "automated".
+        # 'auto' (2026-10-28): a due follow-up is emailed to the customer by the worker itself.
         "mode": followup_rules.followup_mode(p),
     }
 
@@ -168,6 +167,98 @@ def _set_session_cookie(resp: Response, token: str) -> None:
 
 def _session_email(request: Request) -> Optional[str]:
     return ca.session_email(request.cookies.get(config.SESSION_COOKIE))
+
+
+# ── a deleted proposal is gone for the customer ───────────────────────────────
+# Hanz, 2026-10-28: a project sent as two proposals showed the customer THREE, the third a
+# proposal deleted after it was sent ("make sure that doesn't happen again"). The project list
+# already skips deleted rows (db.list_proposals_by_email); this closes the other door, the deleted
+# proposal's own /p/<token> link, which used to open the whole page and accept an approval.
+#
+# ONE GATE, raised rather than returned. Every customer route that starts from a token goes
+# through _customer_proposal, either directly (the page data route, the link click) or through
+# _require (every action and download). Raising means a new route built on _require refuses a
+# deleted proposal without knowing this rule exists; test_deleted_proposal.py counts the call
+# sites of db.get_proposal_by_token so a route that skips the gate fails a test.
+#
+# The db lookup itself stays unfiltered on purpose: inbound email has to SEE a deleted row to
+# route a reply to it to staff instead of filing it as unmatched, and staff/admin routes go by
+# proposal_id (db.get_proposal), which restore depends on.
+PROPOSAL_GONE_MESSAGE = ("This proposal is no longer available. If you have questions, "
+                         "reply to the email or contact Treadwell.")
+
+
+class ProposalGone(Exception):
+    """A customer route reached a deleted proposal. Answered as 410 by _proposal_gone below.
+
+    Carries the row so the answer can offer a signer their own documents (_retained_documents)."""
+
+    def __init__(self, row: dict):
+        super().__init__(row.get("proposal_id"))
+        self.row = row
+
+
+def _customer_proposal(token: str) -> Optional[dict]:
+    """The portal_proposals row behind a customer link, or None when there is none.
+
+    Raises ProposalGone for a deleted one: before any access check and before any write, so the
+    caller writes nothing. Says nothing about WHO may see it; that is _can_access."""
+    p = db.get_proposal_by_token(token)
+    if p and p.get("deleted_at"):
+        raise ProposalGone(p)
+    return p
+
+
+# THE ONE EXCEPTION: WHAT THE CUSTOMER ALREADY SIGNED. ESIGN 7001(d)/(e) says the signer must be
+# able to keep their copy of an e-signed agreement, and the approval email promises the contract
+# "can always be downloaded from your portal". Deleting a signed project off the board must not
+# take that copy back. So a deleted proposal that was APPROVED still serves its signed contract
+# and its deposit invoice -- to a session that may see it (_can_access), on those two routes only
+# (_require_kept). Every other route stays gone: nothing can be approved, paid, asked or viewed on
+# it, and anyone but its customers gets the same 410 as for any deleted proposal (not a 401, which
+# would tell a stranger holding the link that this one was signed).
+def _require_kept(request: Request, token: str):
+    """_require, except that a deleted proposal's signer may still download what they signed.
+    Only api_signed_contract_pdf and api_deposit_invoice_pdf call it."""
+    try:
+        return _require(request, token)
+    except ProposalGone as gone:
+        p = gone.row
+        if p.get("approved_at") and _can_access(request, p):
+            return p
+        raise
+
+
+def _retained_documents(request: Request, p: dict) -> list:
+    """Which of a deleted proposal's documents this visitor may still download: keys, not URLs
+    (the page builds the links from its own token). Empty unless the proposal was approved AND the
+    session may see it, so a signed-out visitor learns nothing about the proposal. Never raises:
+    it decorates a refusal and must not turn one into a 500."""
+    try:
+        if not p.get("approved_at") or not _can_access(request, p):
+            return []
+        docs = []
+        if db.get_signed_contract(p["proposal_id"]):
+            docs.append("signed_contract")
+        if p.get("deposit_invoice_no") and p.get("deposit_amount") is not None:
+            docs.append("deposit_invoice")
+        return docs
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not list the kept documents of deleted proposal %s: %s: %s",
+                  p.get("proposal_id"), type(exc).__name__, exc)
+        return []
+
+
+@app.exception_handler(ProposalGone)
+async def _proposal_gone(request: Request, exc: ProposalGone):
+    # 410 with the sentence the customer reads. No project name, price or status: the page shows
+    # this and nothing else (frontend/app.js renderGone) -- except, for the signer of an approved
+    # one, links to the contract and invoice they keep (see the note above _customer_proposal).
+    body = {"ok": False, "error": "proposal_gone", "message": PROPOSAL_GONE_MESSAGE}
+    docs = _retained_documents(request, exc.row)
+    if docs:
+        body["documents"] = docs
+    return _json(body, 410)
 
 
 def _can_access(request: Request, proposal: dict) -> bool:
@@ -453,11 +544,44 @@ def _group_cards(cards: list[dict]) -> list[dict]:
     return out
 
 
-def _customer_cards(email: str) -> list[dict]:
-    """The signed-in customer's project list. ONE builder for the three routes that return it,
-    and always off list_proposals_by_email, which is what keeps another customer's scope of the
-    same group out of it."""
+def _customer_scope_cards(email: str) -> list[dict]:
+    """Every proposal the signed-in customer can open, ONE card each, a group's kept together.
+    Always off list_proposals_by_email, which is what keeps another customer's scope of the same
+    group out of it. The proposal page's tabs read this; the project list reads _customer_cards."""
     return _group_cards([_proposal_card(r) for r in db.list_proposals_by_email(email)])
+
+
+def _project_cards(cards: list[dict]) -> list[dict]:
+    """ONE card per PROJECT: a scope group's cards fold into one, named by the project.
+
+    Hanz, 2026-10-27, on two proposals of one job listed as "Multiple proposals — Base Bid 2" and
+    "Multiple proposals — Base Bid 1": "ONE PROJECT in the customer side ... because it is still
+    two projects in the portal side". The folded card opens the group's FIRST proposal (the
+    _group_cards order, which is also the order the combined email lists them in), and carries
+    every proposal of it this customer can open in `scopes`, so the list can say how far the
+    project has got and the switcher knows the project is the one being looked at from any of its
+    tabs. Ungrouped cards pass through untouched."""
+    out, at = [], {}
+    for c in cards:
+        g = c.get("scope_group")
+        if not g:
+            out.append(c)
+            continue
+        member = {k: c.get(k) for k in ("token", "scope_label", "proposal_status",
+                                        "deposit_status", "schedule_status",
+                                        "deposit_required", "deposit_requested")}
+        if g in at:
+            at[g]["scopes"].append(member)
+            continue
+        at[g] = dict(c, display_name=c.get("project_name") or "Your Proposal", scopes=[member])
+        out.append(at[g])
+    return out
+
+
+def _customer_cards(email: str) -> list[dict]:
+    """The signed-in customer's project list: ONE builder for the three routes that return it,
+    ONE row per project (_project_cards)."""
+    return _project_cards(_customer_scope_cards(email))
 
 
 def _scope_view(p: dict, session_email: str) -> Optional[dict]:
@@ -469,7 +593,7 @@ def _scope_view(p: dict, session_email: str) -> Optional[dict]:
     group = p.get("scope_group")
     if not group:
         return None
-    sibs = [c for c in _customer_cards(session_email) if c.get("scope_group") == group]
+    sibs = [c for c in _customer_scope_cards(session_email) if c.get("scope_group") == group]
     for c in sibs:
         c["current"] = c["token"] == p["token"]
     return {"group": group, "label": p.get("scope_label") or None, "siblings": sibs}
@@ -545,9 +669,12 @@ def portal_page(token: str, request: Request) -> FileResponse:
     timestamp."""
     if request.method == "GET":
         try:
-            p = db.get_proposal_by_token(token)
+            p = _customer_proposal(token)
             if p:
                 db.mark_link_clicked(p["proposal_id"])
+        except ProposalGone:
+            pass                              # a deleted proposal's click is not a signal; the
+                                              # page itself shows the no-longer-available state
         except Exception:                     # noqa: BLE001 — never block the page
             log.warning("mark_link_clicked failed for token %s", token[:8], exc_info=True)
     return FileResponse(FRONTEND_DIR / "index.html", headers=_NO_CACHE)
@@ -725,7 +852,11 @@ async def me_feedback(request: Request) -> JSONResponse:
     pid = None
     tok = str(body.get("token") or "").strip()
     if tok:
-        p = _require(request, tok)
+        try:
+            p = _require(request, tok)
+        except ProposalGone:
+            p = None                          # feedback is about the portal, not this proposal:
+                                              # a deleted one costs the context, not the message
         if p:
             pid = p.get("proposal_id")
     try:
@@ -760,7 +891,7 @@ def me_proposals(request: Request) -> JSONResponse:
 # ── per-proposal (email-scoped access) ────────────────────────────────────────
 @app.get("/api/portal/{token}")
 def api_get_portal(token: str, request: Request) -> JSONResponse:
-    p = db.get_proposal_by_token(token)
+    p = _customer_proposal(token)     # a deleted proposal: 410 proposal_gone, signed in or not
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
     se = _session_email(request)
@@ -987,8 +1118,11 @@ def _serve_upload(proposal_id: str, file_id: str, internal: bool = False):
 
 
 def _require(request: Request, token: str):
-    """Return the proposal row if the session email may access it, else None."""
-    p = db.get_proposal_by_token(token)
+    """Return the proposal row if the session email may access it, else None.
+
+    Raises ProposalGone for a deleted proposal (410, nothing written): every customer action and
+    download starts here, so none of them can act on one."""
+    p = _customer_proposal(token)
     if not p or not _can_access(request, p):
         return None
     return p
@@ -2117,8 +2251,11 @@ def api_pdf(token: str, request: Request):
 def api_deposit_invoice_pdf(token: str, request: Request):
     """The deposit invoice document. Rendered on demand from the stored columns
     (no blob storage) — the invoice NUMBER is what's persisted, so the document is
-    always reproducible and always matches what was emailed."""
-    p = _require(request, token)
+    always reproducible and always matches what was emailed.
+
+    Still served after the project is deleted, if it was approved: the customer keeps what
+    they were billed for (_require_kept)."""
+    p = _require_kept(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     invoice_no = p.get("deposit_invoice_no")
@@ -2411,8 +2548,11 @@ def api_signed_contract_pdf(token: str, request: Request):
     email attaches it too; this is the copy that is still here when the email is not.
 
     Session-gated exactly like api_deposit_invoice_pdf -- _require checks the customer's own
-    session against this proposal, so the /p/<token> link is a deep link and not the gate."""
-    p = _require(request, token)
+    session against this proposal, so the /p/<token> link is a deep link and not the gate.
+
+    STILL SERVED AFTER THE PROJECT IS DELETED -- the one route besides the invoice that is. A
+    signer keeps their copy; deleting a job off the staff board does not take it back."""
+    p = _require_kept(request, token)
     if not p:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     pdf, err, status = _signed_contract_pdf(p)
@@ -2423,6 +2563,23 @@ def api_signed_contract_pdf(token: str, request: Request):
 
 
 # ── service endpoint (admin proposal tool -> portal) ──────────────────────────
+DELETED_REFUSAL_MESSAGE = ("This proposal was deleted, so nothing was sent to the customer. "
+                           "Restore the project first, then send it again.")
+
+
+def _deleted_refusal(proposal_id: str, what: str) -> JSONResponse:
+    """409 for a staff/service call that would email a customer about a DELETED proposal.
+
+    The customer's link answers "no longer available" (_customer_proposal), so an email pointing
+    at it is a dead link at best and, for a publish, a deleted proposal brought back without
+    anybody restoring it. Nothing is written and nothing is sent; restoring the project
+    (admin_restore_proposal, which the tool's restore calls first) clears deleted_at and the same
+    call then works."""
+    log.warning("%s refused for deleted proposal %s: nothing sent", what, proposal_id)
+    return _json({"ok": False, "error": "proposal_deleted",
+                  "message": DELETED_REFUSAL_MESSAGE}, 409)
+
+
 @app.post("/api/notify")
 async def api_notify(request: Request) -> JSONResponse:
     presented = request.headers.get("x-service-token") or ""
@@ -2432,6 +2589,9 @@ async def api_notify(request: Request) -> JSONResponse:
     p = db.get_proposal(body.get("proposal_id")) if body.get("proposal_id") else None
     if not p:
         return _json({"ok": False, "error": "not_found"}, 404)
+    if p.get("deleted_at"):
+        # No email of any kind about a deleted proposal: its link says "no longer available".
+        return _deleted_refusal(p["proposal_id"], "notify")
     kind = body.get("type")
     link = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
     primary = (p.get("customer_email") or "").strip().lower()
@@ -2644,6 +2804,39 @@ async def api_inbound_resend(request: Request):
                 f"thread.</strong></p>",
                 from_email, "", subject, body_txt, reply_to=from_email or None)
             return _json({"ok": True, "unmatched": True})
+
+    if p.get("deleted_at"):
+        # A reply to a proposal that was DELETED after it went out. Matched by its token (address
+        # or thread header; the sender fallback never offers a deleted row), and it used to be
+        # filed in that proposal's thread, where no board shows it, and a staff email would even
+        # be relayed to the customer with a link that now says "no longer available".
+        #
+        # Now: nothing is written to the thread and nothing reaches the customer. The email goes
+        # to this project's roster marked as a reply to a deleted proposal, with Reply-To set to
+        # the sender, so whoever reads it answers from their own inbox. An auto-reply is dropped,
+        # as for an unmatched email. No thread row means no dedup anchor; Svix retries only on a
+        # non-2xx, so normal traffic forwards once (the unmatched path has the same trade).
+        if fetched is None:
+            fetched = _inbound_body(email_id, data)
+            if fetched is None:
+                return _json({"ok": False, "error": "fetch_failed"}, 500)
+        body_txt, full = fetched
+        if inbound.is_auto_reply(subject, full.get("headers")):
+            log.info("inbound: auto-reply to deleted proposal %s dropped", p["proposal_id"])
+            return _json({"ok": True, "ignored": "auto_reply"})
+        project = p.get("project_name") or "proposal"
+        log.info("inbound: email from %r for DELETED proposal %s -- forwarded to staff, "
+                 "not filed", from_email, p["proposal_id"])
+        _inbound_forward(
+            email_sender._resolve_notify("general", proposal_id=p["proposal_id"]),
+            f"Reply to a deleted proposal — {project}",
+            "A reply to a deleted proposal",
+            "<p><strong>⚠ This proposal was deleted. The email was NOT added to its portal "
+            "thread and the customer was not notified. Reply from your own inbox if it needs "
+            "an answer.</strong></p>",
+            from_email, project, subject, body_txt, reply_to=from_email or None,
+            verb="replied by email")
+        return _json({"ok": True, "deleted_proposal": True})
 
     pid = p["proposal_id"]
     if db.has_email_message(pid, email_id):
@@ -2960,6 +3153,11 @@ async def admin_publish(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": str(e)}, 400)
 
     existing = db.get_proposal(draft_id)
+    if existing and existing.get("deleted_at"):
+        # Refused before anything is written or sent (review of the deleted-link change,
+        # 2026-10-28): publishing onto a deleted row would email the customer a link that
+        # answers "no longer available". The tool's restore clears deleted_at first.
+        return _deleted_refusal(draft_id, "publish")
     revised = False
     # A SCOPE JOINS ITS GROUP BEFORE ANYTHING CUSTOMER-VISIBLE IS WRITTEN (findings #24/#40). The
     # scope columns are named directly, so on a database without the scope-group DDL this refuses
@@ -3376,9 +3574,18 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
     lead = live[0]                                   # list_scope_group is in publish order
     project = lead.get("project_name") or "your project"
     by_pid = {r["proposal_id"]: r for r in live}
+    # NAMED AS THE TOOL NAMES THEM NOW (review, 2026-10-28). The email lists every live proposal of
+    # a recipient, republished or not, and the stored scope_label is only refreshed by a publish: a
+    # scope renamed in the tool since (an old split's "Base Bid 2") would be named by its old label.
+    try:
+        draft_labels = db.list_scope_group_draft_labels(group_id) or {}
+    except Exception as exc:  # noqa: BLE001 — the stored names are still right for most scopes
+        log.warning("scope group %s: draft labels unreadable: %s", group_id, exc)
+        draft_labels = {}
 
     def _label(r: dict) -> str:
-        return r.get("scope_label") or r.get("project_name") or "Proposal"
+        return (_cap(draft_labels.get(r["proposal_id"]), _SCOPE_LABEL_MAX) or r.get("scope_label")
+                or r.get("project_name") or "Proposal")
 
     def _url(r: dict) -> str:
         return f"{config.PUBLIC_BASE_URL}/p/{r['token']}"
@@ -3428,19 +3635,21 @@ async def admin_scope_group_send(group_id: str, request: Request) -> JSONRespons
         return _json({"ok": False, "error": "send_not_recorded", "emailed": []}, 503)
 
     primary = (lead.get("customer_email") or "").strip().lower()
+    on_live = {r["proposal_id"]: set(_on(r)) for r in live}
     emailed: list[str] = []
     for e, mine in per.items():
+        listed = _scope_email_list(live, on_live, e, {
+            r["proposal_id"]: kinds.get(r["proposal_id"]) for r in mine})
         try:
             ok = email_sender.send_scope_group_links(
                 e, (lead.get("customer_name") or "") if e == primary else "", project,
                 [{"label": _label(r), "url": _url(r),
                   "approved": (r.get("proposal_status") or "") == "approved",
-                  "change": None if kinds.get(r["proposal_id"]) == "first"
-                  else kinds.get(r["proposal_id"])} for r in mine],
+                  "change": change} for r, change in listed],
                 # The first of THEIR scopes, so a reply from a contact on Lab 2 alone lands in
                 # Lab 2's thread rather than in one they cannot open.
-                reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
-                note=_scope_note_for(note, mine, extras, _label), token=mine[0]["token"],
+                reply_to=email_sender.proposal_reply_to(listed[0][0]["token"]),
+                note=_scope_note_for(note, mine, extras, _label), token=listed[0][0]["token"],
                 attachments=_scope_files_for(group_atts, mine, extras) or None)
         except Exception as exc:  # noqa: BLE001 — one bad address must not stop the others
             log.warning("scope group %s: send to %s failed: %s", group_id, e, exc)
@@ -3554,6 +3763,25 @@ def _scope_send_extras(group_id: str, pending: list, note: Optional[str],
     return out
 
 
+def _scope_email_list(live: list, on_live: dict, email: str, kinds: dict) -> list:
+    """`[(row, change)]`: what one recipient's combined email lists, in publish order.
+
+    Hanz, 2026-10-28: an "Email again" reads as a revision of the project, so it names the
+    project's CURRENT live proposals that this address is on -- not only the ones being announced,
+    which made a project of three read like a project of one -- and a deleted, closed-lost or
+    removed proposal is simply not there (`live` is scope_groups.send_rows). `kinds` is
+    {proposal_id: send kind} for the scopes this email announces to this address; their `change`
+    is 'new'/'revised' on a later send (marked "(revised)") and None on the first. Every other
+    listed scope is None: the customer already has it as it stands.
+
+    Per-recipient as before: `on_live[pid]` is who that scope is addressed to, so another
+    contact's scope is never named. The announced ones (drawn from `live` by both callers) are
+    listed whatever `on_live` says, so the email always carries the proposal it was sent for."""
+    return [(r, None if kinds.get(r["proposal_id"]) in (None, "first")
+             else kinds[r["proposal_id"]])
+            for r in live if r["proposal_id"] in kinds or email in on_live.get(r["proposal_id"], ())]
+
+
 def _scope_note_for(note: Optional[str], mine: list, extras: dict, label) -> Optional[str]:
     """The note one recipient's combined email carries. The request's own message wins; otherwise
     the Files-page notes of THEIR scopes, each named when there is more than one."""
@@ -3635,20 +3863,24 @@ def _retry_scope_group_send(group_id, live, by_pid, project, lead, by, note, gro
             if e in still_on:                  # an address taken off the scope is not chased
                 per.setdefault(e, []).append(r)
     primary = (lead.get("customer_email") or "").strip().lower()
+    on_live = {r["proposal_id"]: set(_on(r)) for r in live}
     emailed: list[str] = []
     # THE ORIGINAL EMAIL'S note and files (recorded on the mark by mark_scope_group_attempt),
     # unless this request brings its own: the person it failed for gets what everyone else got.
     orig = {pid: {"note": t.get("note")} for pid, t in targets.items()}
     for e, mine in per.items():
+        # The same email the others got: every live proposal of theirs, the ones it failed for
+        # marked as that send marked them.
+        listed = _scope_email_list(live, on_live, e, {
+            r["proposal_id"]: targets[r["proposal_id"]]["kind"] for r in mine})
         try:
             ok = email_sender.send_scope_group_links(
                 e, (lead.get("customer_name") or "") if e == primary else "", project,
                 [{"label": _label(r), "url": _url(r),
                   "approved": (r.get("proposal_status") or "") == "approved",
-                  "change": None if targets[r["proposal_id"]]["kind"] == "first"
-                  else targets[r["proposal_id"]]["kind"]} for r in mine],
-                reply_to=email_sender.proposal_reply_to(mine[0]["token"]),
-                note=_scope_note_for(note, mine, orig, _label), token=mine[0]["token"],
+                  "change": change} for r, change in listed],
+                reply_to=email_sender.proposal_reply_to(listed[0][0]["token"]),
+                note=_scope_note_for(note, mine, orig, _label), token=listed[0][0]["token"],
                 attachments=_retry_files_for(group_atts, mine, targets) or None)
         except Exception as exc:  # noqa: BLE001
             log.warning("scope group %s: retry to %s failed: %s", group_id, e, exc)
@@ -3843,9 +4075,9 @@ def admin_pipeline(request: Request) -> JSONResponse:
     # The SAVED cadence, read once for the whole board rather than per row.
     #
     # `next_due_at` used to be called with no cfg, so this column was computed from the shipped
-    # constants while the worker used whatever staff had saved. Change "every 3 days" to "every 5"
-    # and every date on the board is wrong; raise `max_recurring` and it reads "Nothing scheduled"
-    # while emails keep going out. A schedule nobody can see anywhere else has to be the real one.
+    # constants while the worker used whatever staff had saved: change a number of days and every
+    # date on the board is wrong while emails keep going out on the other schedule. A schedule
+    # nobody can see anywhere else has to be the real one.
     #
     # Guarded, because an unreadable settings row must not take down the pipeline the way the
     # unguarded click columns would have — the shipped cadence is the right answer when we cannot
@@ -3925,10 +4157,10 @@ def admin_pipeline(request: Request) -> JSONResponse:
             # otherwise exists nowhere a human can see. None = nothing is coming
             # (not automated, switched off, approved, closed, or cadence exhausted).
             "next_followup_at": _iso(followup_rules.next_due_at(r, _now_utc(), followup_cfg)),
-            # Remind-only (2026-10-23). The open follow-up task, if any — the staff bell can read
-            # it here off the poll it already makes ({id, status, template, label, stage, due_at}
-            # or null; full detail at GET /api/admin/followup-task/{id}) — and this proposal's own
-            # schedule ({mode, interval_days, stop_after, next_at, anchor_at}; nulls = global).
+            # The open follow-up task, if any (since 2026-10-28 only a scope group's decision
+            # task, or an old reminder task the next tick retires) — {id, status, template, label,
+            # stage, due_at} or null; full detail at GET /api/admin/followup-task/{id} — and this
+            # proposal's own schedule ({mode, next_at, anchor_at}; next_at null = as scheduled).
             "followup_task": _task_summary(r.get("pending_task"), status_now.get),
             "followup_plan": _followup_plan(r),
             "unread": unread.get(r["proposal_id"], 0),   # customer messages awaiting a staff reply
@@ -4234,21 +4466,40 @@ def admin_get_followup_settings(request: Request) -> JSONResponse:
         # badly. Served rather than hardcoded in the editor for the same reason labels are:
         # the message that refuses a save and the heading above the form must not disagree.
         "editor_titles": dict(followup_settings.EDITOR_TITLES),
+        # Which template is which email (2026-10-28): {step: [1st email's key, 2nd email's key]}.
+        "step_templates": {k: list(v) for k, v in followup_settings.CADENCE_TEMPLATES.items()},
+        "days_range": [followup_settings.DAYS_MIN, followup_settings.DAYS_MAX],
     })
+
+
+def _saved_followup_settings() -> Optional[dict]:
+    """What is saved now, merged, as the base a save lays its fields over. None when it cannot be
+    read (the payload then stands on the shipped defaults for any field it leaves out)."""
+    try:
+        return followup_settings.merge(db.get_settings(followup_settings.ROW_ID))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[settings] could not read follow-up settings for a save: %s", exc)
+        return None
 
 
 @app.put("/api/admin/settings/followups")
 async def admin_put_followup_settings(request: Request) -> JSONResponse:
-    """Save the cadence. Returns what was actually stored, including any clamping.
+    """Save the schedule. Returns what was actually stored, so the page shows what was saved.
 
-    Returning the stored values rather than an empty ok is deliberate: numbers get pulled into
-    range on the way in, and somebody who typed 2 hours needs to see that they got 4 rather than
-    believe their edit took."""
+    A number out of range (days 1 to 90, never 0) is REFUSED with a 400 whose `error` is the
+    sentence to show ("2nd email must be 1 to 90 days after the 1st"); nothing is clamped or
+    replaced. A field the payload leaves out keeps its saved value.
+
+    RESET is explicit: `reset: true` lays the payload over the SHIPPED defaults instead of the saved
+    row, and the answer carries `reset: true` so the tool's page says "Reset" only when it was. A
+    bare empty payload is not a reset (it keeps everything as saved)."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
+    reset = isinstance(body, dict) and body.get("reset") is True
     try:
-        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body,
+                                         None if reset else _saved_followup_settings())
     except followup_settings.ValidationError as exc:
         return _json({"ok": False, "error": str(exc)}, 400)
     by = _cap(body.get("by"), 120) or None
@@ -4265,6 +4516,7 @@ async def admin_put_followup_settings(request: Request) -> JSONResponse:
         "ok": True,
         "settings": cfg,
         "saved": True,
+        "reset": reset,
         "updated_at": _iso(meta.get("updated_at")),
         "updated_by": meta.get("updated_by") or by or "",
         # ALL_TEMPLATE_KEYS, not TEMPLATE_KEYS: the editor has a tab for the "Proposal sent"
@@ -4286,7 +4538,8 @@ async def admin_preview_followup_settings(request: Request) -> JSONResponse:
         return _json({"ok": False, "error": "unauthorized"}, 401)
     body = await _body(request)
     try:
-        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body)
+        cfg = followup_settings.validate(body.get("settings") if "settings" in body else body,
+                                         _saved_followup_settings())
     except followup_settings.ValidationError as exc:
         return _json({"ok": False, "error": str(exc)}, 400)
     # ALL_TEMPLATE_KEYS, matching the GET and the PUT. This endpoint is what runs as somebody
@@ -4577,9 +4830,9 @@ def admin_list_followups(proposal_id: str, request: Request) -> JSONResponse:
 # estimator sends it from here. The staff tool proxies these with its service token, exactly like
 # every other /api/admin route.
 #
-# EVERY decision is a touch that re-anchors the schedule (followup_rules._customer_plan): the next
-# reminder lands one interval after the decision, not one interval after an anchor nobody moved.
-# Each also clears a snooze date, except the snooze itself.
+# Since 2026-10-28 the cadence no longer raises reminder tasks (the worker emails the customer), so
+# these endpoints answer only for old tasks still open and for a scope group's decision task. A
+# task SENT or answered with a CALL counts as one of its step's 2 emails (db._SENT_HISTORY_SQL).
 _TASK_LOG_KINDS = {"call": "staff_call", "text": "staff_text", "email": "staff_email",
                    "note": "staff_note"}
 _SNOOZE_MAX_DAYS = 366
@@ -4703,10 +4956,10 @@ def _task_summary(raw, status_of=None) -> Optional[dict]:
 
 
 def _followup_plan(p: dict) -> dict:
-    """This proposal's own schedule, for the drawer. None everywhere = the global cadence."""
+    """This proposal's own schedule, for the drawer: "Next email on" (`next_at`; None = as the
+    global schedule says). "Then every" and "Stop after" are gone (2026-10-28): at most 2 emails
+    per step, nothing repeats."""
     return {"mode": followup_rules.followup_mode(p),
-            "interval_days": p.get("followup_interval_days"),
-            "stop_after": p.get("followup_stop_after"),
             "next_at": _iso(p.get("followup_next_at")),
             "anchor_at": _iso(p.get("followup_anchor_at"))}
 
@@ -5368,10 +5621,12 @@ async def admin_followup_task_scope_decision(task_id: str, request: Request) -> 
 
 @app.post("/api/admin/proposal/{proposal_id}/followup-plan")
 async def admin_followup_plan(proposal_id: str, request: Request) -> JSONResponse:
-    """This proposal's own schedule. Body (every key optional; null clears it):
-    {interval_days: 1-90, stop_after: 1-60, next_at: 'YYYY-MM-DD' | ISO, by}.
+    """This proposal's "Next email on" date. Body: {next_at: 'YYYY-MM-DD' | ISO | null, by}.
 
-    stop_after is the PRE-DECISION cap only; the deposit chase keeps its own (decision 5)."""
+    `next_at` moves the NEXT follow-up email to that day (8am Central for a bare date), earlier or
+    later; null puts it back where the schedule has it. It never adds an email: a step whose 2
+    emails have gone stays done. "Then every" and "Stop after" are gone (2026-10-28):
+    `interval_days` / `stop_after` in a body are ignored and never written."""
     if not _admin_ok(request):
         return _json({"ok": False, "error": "unauthorized"}, 401)
     p = db.get_proposal(proposal_id)
@@ -5379,51 +5634,24 @@ async def admin_followup_plan(proposal_id: str, request: Request) -> JSONRespons
         return _json({"ok": False, "error": "not_found"}, 404)
     body = await _body(request)
     by = _cap(body.get("by"), 120) or None
-    kw: dict = {}
-    for key, lo, hi in (("interval_days", 1, 90), ("stop_after", 1, 60)):
-        if key in body:
-            v = body.get(key)
-            if v is None or v == "":
-                kw[key] = None
-                continue
-            try:
-                n = int(v)
-            except (TypeError, ValueError):
-                return _json({"ok": False, "error": "invalid_" + key}, 400)
-            if isinstance(v, bool) or not lo <= n <= hi:
-                return _json({"ok": False, "error": "invalid_" + key}, 400)
-            kw[key] = n
-    if "next_at" in body:
-        if body.get("next_at") in (None, ""):
-            kw["next_at"] = None
-        else:
-            when, bad = _future_when(body.get("next_at"))
-            if bad:
-                return _json({"ok": False, "error": bad}, 400)
-            kw["next_at"] = when
-    if not kw:
-        return _json({"ok": False, "error": "nothing_to_change"}, 400)
-    # A scope group is chased as ONE project, on its HOME scope's schedule (group_view reads the
-    # interval, stop-after and snooze from there), so a change made from any open scope's drawer is
-    # written to the home row. Everything else is unchanged.
+    if "next_at" not in body:
+        return _json({"ok": False, "error": "nothing_to_change",
+                      "message": "Only the next email's date can be changed here."}, 400)
+    if body.get("next_at") in (None, ""):
+        when = None
+    else:
+        when, bad = _future_when(body.get("next_at"))
+        if bad:
+            return _json({"ok": False, "error": bad}, 400)
+    # A scope group is followed up as ONE project, on its HOME proposal's row (group_view reads the
+    # date from there), so a change made from any open proposal's drawer is written to the home.
     target = _followup_home_of(p) or proposal_id
-    if kw.get("next_at") is not None:
-        db.stamp_followup_anchor(target, clear_next=False)
-    db.set_followup_plan(target, **kw)
+    db.set_followup_plan(target, next_at=when)
     who = _actor_name(by)
-    parts = []
-    if "interval_days" in kw:
-        parts.append("every %d days" % kw["interval_days"] if kw["interval_days"]
-                     else "the standard interval")
-    if "stop_after" in kw:
-        parts.append("stop after %d reminders" % kw["stop_after"] if kw["stop_after"]
-                     else "the standard reminder limit")
-    if "next_at" in kw:
-        parts.append(("next on %s" % kw["next_at"].astimezone(
-            followup_rules.BUSINESS_TZ).date().isoformat()) if kw["next_at"]
-            else "no fixed next date")
-    _crm_card(proposal_id, ("%s changed this project's follow-ups: %s." % (who, ", ".join(parts)))
-              if who else ("Follow-ups changed: %s." % ", ".join(parts)), "followup_plan")
+    part = (("next email on %s" % when.astimezone(followup_rules.BUSINESS_TZ).date().isoformat())
+            if when else "next email back on schedule")
+    _crm_card(proposal_id, ("%s changed this project's follow-ups: %s." % (who, part))
+              if who else ("Follow-ups changed: %s." % part), "followup_plan")
     fresh = db.get_proposal(target) or p
     out = {"ok": True, "followup_plan": _followup_plan(fresh)}
     if target != proposal_id:
@@ -5665,10 +5893,14 @@ def _staff_close_lost(proposal_id: str, p: dict, reason: str, note: str,
 # the Test tab onto Active with nobody touching it. Hiding the portal row is what makes the card
 # leave; the two halves have to happen together, which is what the tool's route now guarantees.
 #
-# A SOFT HIDE, not a delete, and the reversibility is the requirement rather than caution. The
-# customer's link keeps working either way — it reads portal_proposals by TOKEN and renders the
-# pinned draft_revisions snapshot, neither of which is filtered — because deleting a project off
-# our board is not the same act as revoking what somebody was already sent.
+# A SOFT HIDE, not a delete, and the reversibility is the requirement rather than caution.
+#
+# THE CUSTOMER'S LINK STOPS WORKING (changed 2026-10-28). It used to keep working ("deleting is not
+# revoking"); then a deleted proposal reached a customer as an extra tab and Hanz said "make sure
+# that doesn't happen again". The link now shows "This proposal is no longer available" and every
+# action on it is refused (_customer_proposal). Restoring brings the link back. A SIGNED one still
+# lets its customer download the signed contract and the deposit invoice (_require_kept): deleting
+# a job off the board does not take back the copy ESIGN says the signer keeps.
 @app.post("/api/admin/proposal/{proposal_id}/delete")
 async def admin_delete_proposal(proposal_id: str, request: Request) -> JSONResponse:
     """Take this proposal off the staff board and stop its follow-ups. Reversible."""
@@ -5692,9 +5924,9 @@ async def admin_delete_proposal(proposal_id: str, request: Request) -> JSONRespo
     # notification bell (list_customer_events) — the customer is told nothing about this.
     _crm_card(proposal_id,
               ("%s deleted this project. It is off the board and the follow-ups have stopped; "
-               "the link the customer already has still works." % who) if who
+               "the customer's link now says it is no longer available." % who) if who
               else ("Project deleted. It is off the board and the follow-ups have stopped; "
-                    "the link the customer already has still works."),
+                    "the customer's link now says it is no longer available."),
               "status_deleted")
     return _json({"ok": True, "deleted": True})
 
