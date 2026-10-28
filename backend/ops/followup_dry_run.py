@@ -61,6 +61,9 @@ def table(result: dict) -> str:
         "  customer emails it would send ..... %d (to %d addresses)"
         % (len(result.get("customer_emails") or []), int(result.get("recipient_count") or 0)),
         "  due but every contact opted out ... %d" % len(result.get("opted_out") or []),
+        "  2nd email skipped, they replied ... %d (%d would have gone this tick)"
+        % (len(result.get("skipped_by_reply") or []),
+           sum(1 for s in result.get("skipped_by_reply") or [] if s.get("would_have_gone_now"))),
         "  estimator emails it would send .... %d" % len(result.get("staff_emails") or []),
         "  old reminder tasks it would expire  %d" % len(result.get("tasks_to_expire") or []),
         "  rows it could not evaluate ........ %d" % len(result.get("skipped") or []),
@@ -77,6 +80,14 @@ def table(result: dict) -> str:
             lines.append("  %-30s %-13s %-5s %s" % (
                 (e.get("project_name") or e.get("proposal_id") or "")[:30], e.get("template"),
                 "%s" % e.get("ordinal"), ", ".join(e.get("recipients") or [])))
+    if result.get("skipped_by_reply"):
+        lines.append("")
+        lines.append("  %-30s %-13s %-15s %s" % ("skipped (2nd email)", "template", "because",
+                                                 "contact at"))
+        for s in result["skipped_by_reply"]:
+            lines.append("  %-30s %-13s %-15s %s" % (
+                (s.get("project_name") or s.get("proposal_id") or "")[:30], s.get("template"),
+                s.get("contact"), s.get("contact_at")))
     return "\n".join(lines)
 
 

@@ -334,3 +334,67 @@ def test_release_day_sends_no_second_estimator_note_and_never_says_not_opened(cl
     assert db.get_proposal("legacyview") is not None
     sent = [r["detail"]["template"] for r in emails("legacyview")]
     assert sent == ["next_steps"], "a customer who opened it was told it was not opened"
+
+
+# ── decision B (Hanz, 2026-10-28): a reply skips the step's 2nd email ──────────────
+def _at(sim):
+    """Stamp every row written at the database's real clock with the simulated moment."""
+    for t in ("portal_followups", "portal_questions"):
+        db.execute("update public.%s set created_at = %%s where created_at > %%s" % t, (sim, sim))
+
+
+def test_a_reply_or_logged_contact_after_the_first_email_skips_the_second(clean, outbox):
+    """A timeline over real SQL: the contact predicates are the database's (auto-reply excluded,
+    a note and a task's own row are not contact), the plan is the worker's."""
+    start = in_window() - 20 * D
+    contact_at = start + 5 * D                      # after the 1st (day 3), before the 2nd (day 10)
+    jobs = ("quiet", "reply", "ooo", "call", "text", "message", "note", "taskrow", "early")
+    for pid in jobs:
+        add_proposal(pid, enrolled_days=0)
+        set_cols(pid, followup_enrolled_at=start, created_at=start, last_sent_at=start)
+
+    def contact(sim):
+        if sim == start + D:                        # BEFORE the 1st: skips nothing
+            db.add_message("early", "customer", "early@customer.example", "Got it, thanks",
+                           msg_type="text")
+        if sim != contact_at:
+            return
+        db.add_message("reply", "customer", "reply@customer.example", "Can we talk Tuesday?",
+                       msg_type="text")
+        db.add_message("ooo", "customer", "ooo@customer.example", "I am out of the office",
+                       msg_type="text", meta={"auto_reply": True})
+        db.add_followup("call", "staff_call", {"note": "Spoke to Dana"}, KYLE)
+        db.add_followup("text", "staff_text", {"note": "Texted Dana"}, KYLE)
+        db.add_message("message", "staff", KYLE, "Happy to walk you through it.", msg_type="text")
+        db.add_followup("note", "staff_note", {"note": "Dana is on holiday"}, KYLE)
+        db.add_followup("taskrow", "staff_email",
+                        {"note": "reminder", "task_id": 1, "followup_task": True}, KYLE)
+
+    sim = start
+    while sim <= start + 20 * D:
+        contact(sim)
+        _at(sim)
+        followup_worker._tick(sim)
+        _at(sim)
+        sim += 6 * H
+
+    sent = {pid: [r["detail"]["template"] for r in emails(pid)
+                  if r["detail"]["audience"] == "customer"] for pid in jobs}
+    two, one = ["not_viewed", "not_viewed_2"], ["not_viewed"]
+    assert sent == {"quiet": two, "reply": one, "ooo": two, "call": one, "text": one,
+                    "message": one, "note": two, "taskrow": two, "early": two}, sent
+    # Every one of them told the estimator exactly once.
+    for pid in jobs:
+        staff = [r for r in emails(pid) if r["detail"]["audience"] == "staff"]
+        assert [r["detail"]["rule_key"].rsplit(":", 1)[1] for r in staff] == ["nv_est"], pid
+    # The board reads the same contact: no 2nd-email date for a skipped proposal.
+    board = {r["proposal_id"]: r for r in db.list_all_portal_proposals()}
+    for pid in ("reply", "call", "text", "message"):
+        sig = db.followup_signals(pid)
+        row = board[pid]
+        for k, _name in rules.CONTACT_KEYS:
+            assert row[k] == sig[k], (pid, k)
+        assert rules.plan(dict(row), start + 9 * D).skipped_key, pid
+    assert board["ooo"]["customer_touch_at"] is None, "an auto-reply counted as a reply"
+    assert board["note"]["last_staff_contact_at"] is None, "a note counted as contact"
+    assert board["taskrow"]["last_staff_contact_at"] is None, "a task's own row counted"

@@ -31,6 +31,14 @@ A re-send of the proposal (a revision) starts a new cycle (`followup_enrolled_at
 "NEXT EMAIL ON" (`followup_next_at`, the drawer's date) moves the NEXT customer email to that day,
 earlier or later. It applies only while it is later than the newest reminder already sent, so once
 that email has gone it is spent; it never adds an email past the cap.
+
+A REPLY SKIPS THE 2ND (Hanz, 2026-10-28: "When the customer replies, or someone logs a call, that
+step's remaining follow-up email is SKIPPED (they are talking to us already)"). Contact AFTER a
+step's 1st email and before its 2nd has gone cancels the 2nd: the step counts as handled. No
+re-anchor and no extra email; the estimator's note still follows its own switch, dated off the 1st.
+Contact is CONTACT_KEYS: a customer-authored row that is not an auto-reply, a call / email / text
+an estimator logged (not a note, not the row a reminder task's own send or call wrote), or an
+estimator's message in the thread. Contact BEFORE the 1st email skips nothing: the 1st still goes.
 """
 from __future__ import annotations
 
@@ -95,9 +103,22 @@ GROUP_TASK_TEMPLATE_DECISION = "scope_decision"
 # Every field the schedule reads. The board's query is pinned against this list
 # (test_admin_pipeline.py): a field the worker sees and the board does not is how the board comes
 # to show a date the worker will not act on.
+#
+# CONTACT: the customer and Treadwell talking, which skips a step's 2nd email. Each key is computed
+# from the DATA by one SQL predicate shared by the worker (db.followup_signals) and the board
+# (db.list_all_portal_proposals), so both see the same contact:
+#   customer_touch_at      the newest customer-authored row, out-of-office auto-replies excluded
+#   last_staff_contact_at  the newest call / email / text an estimator LOGGED (not a note, not a
+#                          bookkeeping row, not the row a reminder task's own send or call wrote)
+#   last_staff_message_at  the newest message an estimator wrote to the customer in the thread
+# The pair is (key, what the dry run calls it).
+CONTACT_KEYS = (("customer_touch_at", "customer_reply"),
+                ("last_staff_contact_at", "staff_contact"),
+                ("last_staff_message_at", "staff_message"))
+
 INPUT_KEYS = ("proposal_status", "followup_enrolled_at", "followup_disabled_at",
               "followup_paused_until", "cycle_viewed_at", "viewed_at", "last_viewed_at",
-              "followup_next_at", "followup_sent_history")
+              "followup_next_at", "followup_sent_history") + tuple(k for k, _ in CONTACT_KEYS)
 
 
 def followup_mode(p: dict) -> str:
@@ -128,6 +149,12 @@ class Plan:
     last_sent_at: Optional[datetime] = None
     paused: bool = False
     reason: str = ""
+    # The step's 2nd email, cancelled by contact after the 1st (None = nothing skipped).
+    skipped_at: Optional[datetime] = None  # the contact that skipped it
+    skipped_by: str = ""                   # CONTACT_KEYS' name for it ("customer_reply", ...)
+    skipped_due_at: Optional[datetime] = None   # when the 2nd would have gone
+    skipped_key: Optional[str] = None
+    skipped_template: Optional[str] = None
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────
@@ -304,6 +331,16 @@ def opened_at(p: dict) -> Optional[datetime]:
     return enrolled
 
 
+def contact_after(p: dict, since: datetime) -> Optional[tuple]:
+    """The newest contact (CONTACT_KEYS) strictly after `since`, as (at, name), or None."""
+    best = None
+    for key, name in CONTACT_KEYS:
+        at = _ts(p.get(key))
+        if at is not None and at > since and (best is None or at > best[0]):
+            best = (at, name)
+    return best
+
+
 def _step_of(template: str, current: str) -> str:
     """A row's step. A row whose template is unknown counts against the CURRENT step: counting it
     can only ever send fewer emails, never more."""
@@ -351,6 +388,7 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
     paused = is_paused(p, now)
 
     common = dict(step=step, sent=sent, planned=len(planned), last_sent_at=last, paused=paused)
+    skip: dict = {}
     if sent < len(planned):
         o = planned[sent]
         if o == 0:
@@ -364,20 +402,28 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
             due = nxt                               # "Next email on": moves this one email
         if resume is not None and due < resume:
             due = resume                            # never inside a pause; at its end instead
-        return Plan(next_at=due, next_template=followup_settings.CADENCE_TEMPLATES[step][o],
-                    next_key=rule_key(enrolled, _TAGS[step][o]), next_ordinal=o,
-                    reason="paused" if paused else "", **common)
+        template = followup_settings.CADENCE_TEMPLATES[step][o]
+        key = rule_key(enrolled, _TAGS[step][o])
+        # Contact after this step's 1st email skips its 2nd: they are talking to us already.
+        # Before the 1st (sent == 0) nothing is skipped, whichever email comes first.
+        contact = contact_after(p, last) if (o == 1 and sent >= 1 and last is not None) else None
+        if contact is None:
+            return Plan(next_at=due, next_template=template, next_key=key, next_ordinal=o,
+                        reason="paused" if paused else "", **common)
+        skip = dict(skipped_at=contact[0], skipped_by=contact[1], skipped_due_at=due,
+                    skipped_key=key, skipped_template=template)
 
-    # The step's emails are all sent (or all switched off): only the estimator's note is left.
+    # The step's emails are all sent, switched off or skipped: only the estimator's note is left.
+    done = "skipped_by_reply" if skip else "step_done"
     if not s["estimator_on"]:
-        return Plan(reason="step_done", **common)
+        return Plan(reason=done, **common, **skip)
     if legacy_estimator_told(p, step):          # the old ladder already told them; nothing since
-        return Plan(reason="step_done", **common)
+        return Plan(reason=done, **common, **skip)
     est = (last if last is not None else anchor) + timedelta(days=int(s["estimator_days"]))
     if resume is not None and est < resume:
         est = resume
     return Plan(estimator_at=est, estimator_key=rule_key(enrolled, _EST_TAG[step]),
-                reason="paused" if paused else "step_done", **common)
+                reason="paused" if paused else done, **common, **skip)
 
 
 def next_due_at(p: dict, now: datetime, cfg: Optional[dict] = None) -> Optional[datetime]:
@@ -629,6 +675,10 @@ def group_state(members: list, now: datetime, history: Optional[list] = None) ->
         items.extend(i for i in _history_items(m)
                      if cut is not None and _item_at(i) is not None and _item_at(i) <= cut)
     view["followup_sent_history"] = items
+    # Contact on ANY scope's thread is contact about the project: the newest of each kind across
+    # every live member and every history row (a reply into a closed former home's thread counts).
+    for key, _name in CONTACT_KEYS:
+        view[key] = _max_ts(m.get(key) for m in live + [h for h in history or [] if h])
     view.update(group_schedule(live, home))
     view["scope_group"] = home.get("scope_group")
     # A scope the customer paused is left out of the email while the others are followed up. Only

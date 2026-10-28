@@ -455,3 +455,135 @@ def test_once_this_engine_emails_in_the_step_the_estimator_note_after_it_goes():
             _old(NOW - 2 * D, "a:nv2", "not_viewed_2", "customer")]
     p = _p(followup_enrolled_at=OLD_SENT, followup_sent_history=hist)
     assert [tag(s) for s in staff(p, NOW, _mig())] == ["nv_est"]
+
+
+# ── decision B (Hanz, 2026-10-28): a reply skips the step's 2nd email ──────────────
+# "When the customer replies, or someone logs a call, that step's remaining follow-up email is
+# SKIPPED (they are talking to us already)." Contact after a step's 1st email and before its 2nd
+# cancels the 2nd; no re-anchor, no extra email. Contact before the 1st skips nothing.
+FIRST = SENT_AT + 3 * D                              # the not-opened 1st email went
+
+
+def _after_first(**over):
+    return _p(followup_sent_history=[_h(FIRST, "not_viewed")], **over)
+
+
+@pytest.mark.parametrize("key,name", [
+    ("customer_touch_at", "customer_reply"),         # they replied (not an auto-reply: SQL)
+    ("last_staff_contact_at", "staff_contact"),      # an estimator logged a call / email / text
+    ("last_staff_message_at", "staff_message"),      # an estimator wrote to them in the thread
+])
+def test_contact_between_the_first_and_second_email_skips_the_second(key, name):
+    contact = FIRST + D
+    p = _after_first(**{key: contact})
+    for at in (FIRST + 7 * D, FIRST + 8 * D, FIRST + 60 * D):
+        assert cust(p, at) == [], "the 2nd went to a customer we are already talking to"
+    assert fr.next_due_at(p, FIRST + 2 * D, ALL_DAY) is None
+    pl = fr.plan(p, FIRST + 7 * D, ALL_DAY)
+    assert (pl.skipped_by, pl.skipped_at, pl.skipped_template) == (name, contact, "not_viewed_2")
+    assert pl.skipped_key == "%s:a:nv2" % fr.cycle_key(SENT_AT)
+    assert pl.skipped_due_at == FIRST + 7 * D and pl.reason == "skipped_by_reply"
+    assert pl.sent == 1, "a skipped email is not a sent one"
+
+
+def test_without_contact_the_second_still_goes():
+    """The counterexample: the same proposal with no contact gets its 2nd (so the test above is
+    not vacuously green)."""
+    d, = cust(_after_first(), FIRST + 7 * D)
+    assert d.template == "not_viewed_2"
+    assert fr.plan(_after_first(), FIRST + 7 * D, ALL_DAY).skipped_key is None
+
+
+def test_the_estimator_note_after_a_skipped_second_follows_its_own_switch():
+    p = _after_first(customer_touch_at=FIRST + D)
+    # Dated off the 1st (the step's last email), not off the reply: no re-anchor.
+    assert staff(p, FIRST + D - H) == []
+    s, = staff(p, FIRST + D)
+    assert (tag(s), s.template) == ("nv_est", fr.ESTIMATOR_TEMPLATE)
+    assert staff(p, FIRST + 30 * D, cfg(estimator_on=False)) == []
+    assert fr.plan(p, NOW, cfg(estimator_on=False)).reason == "skipped_by_reply"
+
+
+def test_contact_before_the_first_email_skips_nothing():
+    p = _p(customer_touch_at=SENT_AT + D, last_staff_contact_at=SENT_AT + 2 * D)
+    d, = cust(p, SENT_AT + 3 * D)
+    assert d.template == "not_viewed", "contact before the 1st must not skip the 1st"
+    p["followup_sent_history"] = [_h(FIRST, "not_viewed")]
+    d, = cust(p, FIRST + 7 * D)
+    assert d.template == "not_viewed_2", "contact BEFORE the 1st skipped the 2nd"
+
+
+def test_contact_at_the_first_emails_own_moment_is_not_after_it():
+    d, = cust(_after_first(customer_touch_at=FIRST), FIRST + 7 * D)
+    assert d.template == "not_viewed_2"
+
+
+def test_contact_in_the_not_opened_step_does_not_skip_the_opened_steps_second():
+    viewed = FIRST + 2 * D
+    v1 = viewed + 3 * D
+    p = _p(proposal_status="viewed", cycle_viewed_at=viewed, customer_touch_at=FIRST + D,
+           followup_sent_history=[_h(FIRST, "not_viewed")])
+    d, = cust(p, v1)
+    assert d.template == "next_steps"
+    p["followup_sent_history"].append(_h(v1, "next_steps"))
+    d, = cust(p, v1 + 7 * D)
+    assert d.template == "second_nudge", "step 1's reply skipped step 2's 2nd"
+    # ...and contact after the OPENED step's 1st skips its 2nd.
+    p["last_staff_contact_at"] = v1 + D
+    assert cust(p, v1 + 7 * D) == []
+    assert fr.plan(p, v1 + 7 * D, ALL_DAY).skipped_template == "second_nudge"
+
+
+def test_a_skip_is_never_undone_by_next_email_on():
+    """The 2nd was cancelled; a "Next email on" date does not bring it back (fewer emails is the
+    safe side, and it never adds an email past what the step allows)."""
+    p = _after_first(customer_touch_at=FIRST + D, followup_next_at=FIRST + 4 * D)
+    for at in (FIRST + 4 * D, FIRST + 8 * D):
+        assert cust(p, at) == []
+
+
+def test_with_the_first_switched_off_the_only_email_is_not_skipped_by_earlier_contact():
+    """The 2nd is the step's ONLY email when the 1st is off; nothing went before it, so contact
+    cannot be 'after the 1st'."""
+    off1 = cfg(not_opened_first_on=False)
+    d, = cust(_p(customer_touch_at=SENT_AT + 4 * D), SENT_AT + 10 * D, off1)
+    assert d.template == "not_viewed_2"
+
+
+def test_a_skip_reads_json_timestamps_as_the_board_and_worker_pass_them():
+    p = _after_first(customer_touch_at=(FIRST + D).isoformat())
+    assert cust(p, FIRST + 7 * D) == []
+
+
+def test_the_contact_keys_are_schedule_inputs():
+    """INPUT_KEYS is what the board's query is pinned against: a contact the worker sees and the
+    board does not would show a 2nd-email date the worker will never act on."""
+    assert {"customer_touch_at", "last_staff_contact_at", "last_staff_message_at"} <= \
+        set(fr.INPUT_KEYS)
+
+
+def _group(**sig):
+    from test_group_followups import _scope
+    rows = [_scope("d-a", "Breakroom", 0, followup_enrolled_at=SENT_AT,
+                   followup_sent_history=[_h(FIRST, "not_viewed")]),
+            _scope("d-b", "Lab 1", 1, followup_enrolled_at=SENT_AT),
+            _scope("d-c", "Lab 2", 2, followup_enrolled_at=SENT_AT)]
+    return [dict(r, **sig.get(r["proposal_id"], {})) for r in rows]
+
+
+def test_a_reply_on_any_scope_of_a_project_skips_the_groups_second_email():
+    """The group's 1st email is recorded on the HOME scope; the customer answered on another
+    scope's thread. It is one conversation about one project."""
+    plain = fr.group_view(_group(), FIRST + 7 * D)
+    assert [d.template for d in cust(plain, FIRST + 7 * D)] == ["not_viewed_2"]
+    for pid in ("d-a", "d-b", "d-c"):
+        view = fr.group_view(_group(**{pid: {"customer_touch_at": FIRST + D}}), FIRST + 7 * D)
+        assert view["customer_touch_at"] == FIRST + D
+        assert cust(view, FIRST + 7 * D) == [], "a reply on %s did not skip the 2nd" % pid
+        assert fr.plan(view, FIRST + 7 * D, ALL_DAY).skipped_by == "customer_reply"
+    # A call logged on a closed former scope (a history row) is contact about the project too.
+    from test_group_followups import _scope
+    closed = _scope("d-old", "Old", -1, proposal_status="closed_lost",
+                    last_staff_contact_at=FIRST + D)
+    view = fr.group_view(_group(), FIRST + 7 * D, [closed])
+    assert cust(view, FIRST + 7 * D) == []

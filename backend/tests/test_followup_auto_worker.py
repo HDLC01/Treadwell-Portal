@@ -369,3 +369,76 @@ def test_the_dry_run_table_lists_every_customer(world):
     text = followup_dry_run.table(fw.dry_run_count(NOW))
     assert "customer emails it would send ..... 1 (to 1 addresses)" in text
     assert re.search(r"Acme HQ\s+not_viewed\s+1\s+dana@acme.com", text), text
+
+
+# ── decision B (Hanz, 2026-10-28): a reply skips the step's 2nd email ──────────────
+@pytest.mark.parametrize("key", ["customer_touch_at", "last_staff_contact_at",
+                                 "last_staff_message_at"])
+def test_contact_after_the_first_email_means_the_second_is_never_sent(world, key):
+    f = world([_solo()])
+    _tick(f, NOW)
+    assert len(f.box.customers()) == 1
+    f.signals["p1"] = {key: NOW + D + H}           # they replied / we logged a call, after the 1st
+    dry = fw.dry_run_count(NOW + 7 * D)
+    assert dry["customer_emails"] == []
+    (skip,) = dry["skipped_by_reply"]
+    assert skip["proposal_id"] == "p1" and skip["template"] == "not_viewed_2"
+    assert skip["would_have_gone_now"] is True and skip["rule_key"].endswith(":a:nv2")
+    # Outside the send window it would not have gone this tick either; it is still listed.
+    (night,) = fw.dry_run_count(datetime(2026, 10, 28, 8, 0, tzinfo=timezone.utc))[
+        "skipped_by_reply"]                         # 3am Chicago, after the 2nd's date
+    assert night["would_have_gone_now"] is False
+    for days in (7, 8, 30, 120):
+        _tick(f, NOW + days * D)
+    assert len(f.box.customers()) == 1, "the 2nd went to a customer we are already talking to"
+    assert [x["detail"]["template"] for x in _emails(f)] == ["not_viewed"]
+    assert not any(x["detail"].get("rule_key", "").endswith(":a:nv2") for x in f.followups), \
+        "a skipped email was reserved (and would count as sent)"
+    # The estimator's note still goes, once, and says why the 2nd did not.
+    (est,) = f.box.staff()
+    assert "The second one was not sent because" in est["html"]
+
+
+def test_without_contact_the_worker_sends_the_second(world):
+    """The counterexample for the test above: same proposal, no contact, two emails."""
+    f = world([_solo()])
+    _tick(f, NOW)
+    _tick(f, NOW + 7 * D)
+    assert len(f.box.customers()) == 2
+    assert fw.dry_run_count(NOW + 7 * D)["skipped_by_reply"] == []
+    _tick(f, NOW + 8 * D)
+    (est,) = f.box.staff()
+    assert "was not sent because" not in est["html"]
+
+
+def test_contact_before_the_first_email_does_not_stop_either(world):
+    f = world([_solo()])
+    f.signals["p1"] = {"customer_touch_at": SENT + D}
+    _tick(f, NOW)
+    _tick(f, NOW + 7 * D)
+    assert len(f.box.customers()) == 2
+
+
+def test_a_reply_on_another_scope_skips_the_groups_second_email(world):
+    rows = [_scope("d-a", "Breakroom", 0, followup_enrolled_at=SENT),
+            _scope("d-b", "Lab 1", 1, followup_enrolled_at=SENT)]
+    f = world(rows)
+    _tick(f, NOW)
+    assert len(f.box.sent) == 1
+    f.signals["d-b"] = {"customer_touch_at": NOW + D}
+    (skip,) = fw.dry_run_count(NOW + 7 * D)["skipped_by_reply"]
+    assert skip["proposal_id"] == "d-a" and skip["scope_group"]
+    _tick(f, NOW + 7 * D)
+    _tick(f, NOW + 9 * D)
+    assert f.box.customers() == ["dana@acme.com"], "the group's 2nd went after a reply"
+
+
+def test_the_dry_run_table_counts_the_skipped(world):
+    sys.path.insert(0, str(__import__("pathlib").Path(fw.__file__).parent / "ops"))
+    import followup_dry_run
+    f = world([_solo()])
+    _tick(f, NOW)
+    f.signals["p1"] = {"customer_touch_at": NOW + D}
+    text = followup_dry_run.table(fw.dry_run_count(NOW + 7 * D))
+    assert "2nd email skipped, they replied ... 1 (1 would have gone this tick)" in text, text
+    assert re.search(r"Acme HQ\s+not_viewed_2\s+customer_reply", text), text

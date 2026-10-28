@@ -857,6 +857,7 @@ def list_all_portal_proposals() -> list[dict[str, Any]]:
         # customer_replied_at above stays as it was for the board; this one leaves out auto-replies.
         + _CUSTOMER_TOUCH_SQL.format(pid="p.proposal_id") + " as customer_touch_at, "
         + _STAFF_MESSAGE_SQL.format(pid="p.proposal_id") + " as last_staff_message_at, "
+        + _STAFF_CONTACT_SQL.format(pid="p.proposal_id") + " as last_staff_contact_at, "
         # The sent history the schedule counts (followup_rules.plan), as the worker reads it.
         + _SENT_HISTORY_SQL.format(pid="p.proposal_id", enrolled="p.followup_enrolled_at")
         + " as followup_sent_history, "
@@ -1693,6 +1694,17 @@ _STAFF_FOLLOWUP_SQL = (
     "   where f.proposal_id = {pid} "
     "     and f.kind in ('staff_call','staff_email','staff_text','staff_note') "
     "     and f.detail->>'action' is null)")
+# STAFF CONTACT (2026-10-28): a call, email or text an estimator logged with the customer, which
+# skips a step's 2nd follow-up email (followup_rules.CONTACT_KEYS). Narrower than the outreach
+# predicate above on purpose: a NOTE is not contact with the customer (the drawer leaves an open
+# task alone for one too), and a row carrying `task_id` was written BY a reminder task's own send
+# or "I called them" -- that row is the step's reminder itself, already in the sent history, and
+# counting it as contact after itself would skip the 2nd for every task the estimator handled.
+_STAFF_CONTACT_SQL = (
+    "(select max(f.created_at) from public.portal_followups f "
+    "   where f.proposal_id = {pid} "
+    "     and f.kind in ('staff_call','staff_email','staff_text') "
+    "     and f.detail->>'action' is null and f.detail->>'task_id' is null)")
 # THE COUNT the schedule runs on (followup_rules.plan, 2026-10-28): every customer reminder of THIS
 # send cycle that reached the customer, as [{at, template, rule_key}]. The automatic customer emails
 # of every engine that ever ran (auto_email, audience customer: the old ladder's and this one's) and
@@ -1776,6 +1788,7 @@ def followup_signals(proposal_id: str) -> dict[str, Any]:
            + _CUSTOMER_TOUCH_SQL.format(pid="%s") + " as customer_touch_at, "
            + _STAFF_FOLLOWUP_SQL.format(pid="%s") + " as last_staff_followup_at, "
            + _STAFF_MESSAGE_SQL.format(pid="%s") + " as last_staff_message_at, "
+           + _STAFF_CONTACT_SQL.format(pid="%s") + " as last_staff_contact_at, "
            + _SENT_HISTORY_SQL.format(pid="%s", enrolled=enrolled)
            + " as followup_sent_history, "
            + _PENDING_TASK_SQL.format(pid="%s") + " as pending_task")

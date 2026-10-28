@@ -169,6 +169,13 @@ _STEP_SITUATION = {
     rules.OPENED: "has opened the proposal but hasn't decided",
 }
 
+# Why a step's 2nd email was skipped (rules.CONTACT_KEYS' names), for the estimator's note.
+_SKIP_WORDS = {
+    "customer_reply": "the customer replied",
+    "staff_contact": "a call, email or text with them was logged",
+    "staff_message": "an estimator messaged them in the thread",
+}
+
 
 def _send_staff(p: dict, due, info: dict | None = None) -> bool:
     """An estimator email. `p` may be a scope group's synthetic proposal (rules.group_view): it then
@@ -213,6 +220,10 @@ def _send_staff(p: dict, due, info: dict | None = None) -> bool:
             sent_line += ", and no more will be sent automatically."
         else:
             sent_line = "No follow-up emails are switched on for this step."
+        if info.get("skipped_by"):
+            # The 2nd was cancelled by contact after the 1st (rules.plan): say why it never went.
+            sent_line += (" The second one was not sent because "
+                          + _SKIP_WORDS.get(info["skipped_by"], "you are already in touch") + ".")
         subject = f"Follow-ups done — {project}"
         body = (f"<p><strong>{esc(who)}</strong> {situation} on "
                 f"<strong>{esc(project)}</strong>.</p>"
@@ -622,7 +633,8 @@ def _act_on_dues(p: dict, pid: str, dues: list, cfg: dict, now: datetime) -> Non
             if rid is None:
                 continue
             pl = rules.plan(p, now, cfg)
-            ok = _send_staff(p, due, {"step": pl.step, "sent": pl.sent})
+            ok = _send_staff(p, due, {"step": pl.step, "sent": pl.sent,
+                                      "skipped_by": pl.skipped_by})
         if not ok:
             # Nothing went out: release the claim and let the next tick try.
             db.delete_followup(rid)
@@ -667,7 +679,8 @@ def _process_group(gid: str, now: datetime, cfg: dict) -> None:
             if rid is None:
                 continue
             pl = rules.plan(view, now, cfg)
-            if not _send_staff(view, due, {"step": pl.step, "sent": pl.sent}):
+            if not _send_staff(view, due, {"step": pl.step, "sent": pl.sent,
+                                           "skipped_by": pl.skipped_by}):
                 db.delete_followup(rid)
                 continue
             _echo_to_thread(home, due)
@@ -691,6 +704,10 @@ def dry_run_count(now: datetime | None = None) -> dict:
       customer_email_count            emails (one per proposal or group, each to its recipients)
       recipient_count                 addresses those emails go to
       opted_out [{proposal_id, rule_key}]   due, but every contact has opted out: nothing goes
+      skipped_by_reply [{proposal_id, project_name, step, rule_key, template, contact,
+                         contact_at, due_at, would_have_gone_now, scope_group}]
+                                      a step's 2nd email cancelled by contact after its 1st
+                                      (rules.plan); never sent
       staff_emails [{proposal_id, rule_key, template, scope_group}], staff_email_count
       tasks_to_expire [{task_id, proposal_id, template}]   pending reminder tasks the tick retires
       skipped [...]                   rows it could not evaluate
@@ -699,7 +716,7 @@ def dry_run_count(now: datetime | None = None) -> dict:
     cfg = _settings()
     out: dict = {"at": now.isoformat(), "in_send_window": rules.in_send_window(now, cfg),
                  "customer_emails": [], "opted_out": [], "staff_emails": [],
-                 "tasks_to_expire": [], "skipped": []}
+                 "skipped_by_reply": [], "tasks_to_expire": [], "skipped": []}
 
     def _used(pid: str, key: str) -> bool:
         try:
@@ -709,6 +726,16 @@ def dry_run_count(now: datetime | None = None) -> dict:
 
     def _simulate(p: dict, pid: str, gid=None, view=None) -> None:
         pl = rules.plan(p, now, cfg)
+        if pl.skipped_key:
+            out["skipped_by_reply"].append({
+                "proposal_id": pid, "project_name": p.get("project_name"), "step": pl.step,
+                "rule_key": pl.skipped_key, "template": pl.skipped_template,
+                "contact": pl.skipped_by, "contact_at": pl.skipped_at.isoformat(),
+                "due_at": pl.skipped_due_at.isoformat(),
+                # True when this tick would have sent it, had nobody been in touch.
+                "would_have_gone_now": bool(not pl.paused and now >= pl.skipped_due_at
+                                            and rules.in_send_window(now, cfg)),
+                "scope_group": gid})
         for due in rules.due_now(p, now, cfg):
             if _used(pid, due.rule_key):
                 continue
