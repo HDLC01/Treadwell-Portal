@@ -43,7 +43,13 @@ function clearAlert(el) { if (el) { el.textContent = ""; el.className = "hidden"
 let STATE = null;
 
 // ── boot ──────────────────────────────────────────────────────────────────────
+// reveal.js holds the page-to-page cross-fade until the page is drawn. Released on EVERY way out of
+// boot (portal, gate, not found, error, gone, or a throw), or a fade waits out its whole cap.
 (async function boot() {
+  try { await bootPage(); } finally { if (window.TWReveal) window.TWReveal.done(); }
+})();
+
+async function bootPage() {
   if (!TOKEN) { renderNotFound(); return; }
   const res = await api("GET", "");
   hide($("loading"));
@@ -54,7 +60,7 @@ let STATE = null;
   if (data.authed && data.view) { renderPortal(data.view); }
   else if (data.wrong_account) { renderWrongAccount(); }
   else { renderGate(); }
-})();
+}
 
 /** Tell the shell it may build its navigation — see the note at the bottom of shell.js for why
  *  it must not build before this.
@@ -342,16 +348,46 @@ function labelScopeCards(scope) {
 /** Where a proposal tab lands: the proposal step, at the document card (jumpToDocument). */
 const DOC_HASH = "#proposal/proposal/document";
 
+/** Where the document card sat in the window when a proposal tab was clicked, handed to the page
+ *  that tab loads. sessionStorage, so it never leaves this browser tab; read once and removed. */
+const DOC_TOP_KEY = "tw_doc_top";
+
 /** Land on the document card after arriving from a proposal tab, so switching tabs keeps the
- *  reader where they were. Once per page load: a poll re-render must never move the page. */
+ *  reader where they were. Once per page load: a poll re-render must never move the page.
+ *
+ *  AT THE SAME HEIGHT IT WAS CLICKED AT, when the clicked page said where that was: the card, and
+ *  the tab row inside it, then stay exactly where they were on screen, so the page-to-page fade
+ *  changes the document and nothing moves. The cards above it differ between proposals (an approved
+ *  one has a banner and a thank-you card), which is why this aligns the card, not the scroll
+ *  position. Without the note (typed URL, email link, storage blocked) it lands at the card's top. */
 let DOC_JUMPED = false;
 function jumpToDocument() {
   if (DOC_JUMPED) return;
   DOC_JUMPED = true;
   if (location.hash.replace("#", "").split("/")[2] !== "document") return;
   const card = $("pdf-card");
-  if (card && !card.classList.contains("hidden")) card.scrollIntoView({ block: "start" });
+  if (!card || card.classList.contains("hidden")) return;
+  let top = null;
+  try {
+    const raw = sessionStorage.getItem(DOC_TOP_KEY);
+    sessionStorage.removeItem(DOC_TOP_KEY);
+    if (raw !== null && raw !== "" && isFinite(Number(raw))) top = Number(raw);
+  } catch { /* storage unavailable: the plain landing */ }
+  if (top === null) card.scrollIntoView({ block: "start" });
+  else window.scrollBy(0, card.getBoundingClientRect().top - top);
 }
+
+/** The other half of jumpToDocument: note where the card is as a proposal tab is clicked. A plain
+ *  left click only; a click that opens a new browser tab leaves this page where it is. */
+function rememberDocTop(e) {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const tab = e.target && e.target.closest ? e.target.closest("a.scope-tab") : null;
+  const card = $("pdf-card");
+  if (!tab || !card) return;
+  try { sessionStorage.setItem(DOC_TOP_KEY, String(Math.round(card.getBoundingClientRect().top))); }
+  catch { /* storage unavailable: the next page lands at the card's top */ }
+}
+document.addEventListener("click", rememberDocTop);
 
 /** Does this project involve a deposit at all?
  *

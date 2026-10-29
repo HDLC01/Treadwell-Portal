@@ -40,6 +40,10 @@ html.shell-open #shell-side{transform:translateX(0);visibility:visible;pointer-e
    stray display:block from anywhere would otherwise hand it every tap on the page. */
 #shell-back{display:none;pointer-events:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:790}
 html.shell-open #shell-back{display:block;pointer-events:auto}
+/* The rail a returning customer left open is drawn open from the start, not slid in: buildSidebar
+   sets this around its first setOpen only, so a page load (a proposal tab is one) does not shove
+   the page sideways. Opening and closing it later still slides. */
+.shell-booting body{transition:none}
 @media (min-width:900px){
   html.shell-open body{margin-left:var(--shell-w)}
   html.shell-open #shell-back{display:none}
@@ -202,7 +206,13 @@ textarea.fb-in{resize:vertical}
     // 760px, so an open drawer squeezes it.
     let saved = null;
     try { saved = localStorage.getItem("tw_portal_nav"); } catch {}
+    const root = document.documentElement;
+    root.classList.add("shell-booting");
     setOpen(wide() && saved === "1");
+    // Reading a layout value applies the open margin NOW, while transitions are off; dropping the
+    // class afterwards changes no margin, so nothing slides.
+    if (document.body) void document.body.offsetWidth;
+    root.classList.remove("shell-booting");
     // Focus goes back to the burger, or the caret is left inside a subtree the CSS has
     // just made invisible.
     const closeNav = () => {
@@ -547,8 +557,10 @@ textarea.fb-in{resize:vertical}
     injectCss();
     buildSidebar();
     buildBell();
-    fetch("/api/me/proposals", { credentials: "same-origin" })
-      .then((r) => r.json())
+    // Through TWProjects.me() where it is loaded, which shares one request with the header switcher.
+    const mine = window.TWProjects && window.TWProjects.me ? window.TWProjects.me()
+      : fetch("/api/me/proposals", { credentials: "same-origin" }).then((r) => r.json());
+    mine
       .then((d) => { if (d && d.email && $("shell-email")) $("shell-email").textContent = d.email; })
       .catch(() => {});
     poll();
