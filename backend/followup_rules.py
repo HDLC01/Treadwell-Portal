@@ -4,10 +4,18 @@ THE SCHEDULE (Hanz, 2026-10-28). A follow-up is an automatic email to the custom
 "proposal sent" until the proposal is approved, and there are at most TWO per step:
 
     NOT OPENED YET        1st email N days after sending       2nd email N days after the 1st
-    OPENED, NO DECISION   1st email N days after they open it  2nd email N days after the 1st
+    OPENED, NO DECISION   1st email N days after sending (*)   2nd email N days after the 1st
     ESTIMATOR             "Tell the estimator" N days after the last customer email of a step
 
 Every one of the five has an ON/OFF switch (followup_settings). Nothing repeats.
+
+(*) BOTH STEPS COUNT FROM THE SENT DATE (Hanz, 2026-10-29: "the days should be based off the date
+it was sent"), the send of the current cycle (`followup_enrolled_at`), not the day the customer
+opened it. Opening it only decides which wording goes (next_steps / second_nudge). Spacing: a
+step's 1st email is also never sooner than that step's 1st-email days after the newest customer
+follow-up of this send, so a customer who opens it on day 11, after both not-opened emails, gets
+the opened 1st on day 10 + N, not on the next tick. The estimator note of an opened step whose two
+emails are both switched off still runs from the day they opened it (the step's own start).
 
 IT STOPS when the proposal is approved or closed lost, while it is on hold (a pause:
 `followup_paused_until`, which is what "Project delayed" and the two hold reasons set), and when the
@@ -413,17 +421,26 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
     resume = _resume_at(p, cfg)
     paused = is_paused(p, now)
 
+    # Every step's 1st email counts from the SENT date (Hanz, 2026-10-29: "the days should be based
+    # off the date it was sent"), never from the day the customer opened it, and never from before
+    # activation. Spacing: it is also never sooner than the step's 1st-email days after the newest
+    # customer email of this send, so a customer who opens on day 11, after both not-opened emails,
+    # is not emailed again on the next tick.
+    first_due = _not_before(enrolled, act) + days[0]
+    if last_any is not None:
+        first_due = max(first_due, last_any + days[0])
+
     common = dict(step=step, sent=sent, planned=len(planned), last_sent_at=last, paused=paused)
     skip: dict = {}
     if sent < len(planned):
         o = planned[sent]
         if o == 0:
-            due = anchor + days[0]
+            due = first_due
         else:
             # The 2nd email runs from the 1st's REAL send time. With the 1st switched off it falls
             # where the 1st would have gone, plus the gap.
             # A 1st sent before activation (an older engine) starts the 2nd's clock at activation.
-            due = _not_before(last if sent >= 1 and last is not None else anchor + days[0],
+            due = _not_before(last if sent >= 1 and last is not None else first_due,
                               act) + days[1]
         nxt = _ts(p.get("followup_next_at"))
         if nxt is not None and nxt > enrolled and (last_any is None or nxt > last_any) \
