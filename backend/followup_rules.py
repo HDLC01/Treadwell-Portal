@@ -425,7 +425,10 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
     # off the date it was sent"), never from the day the customer opened it, and never from before
     # activation. Spacing: it is also never sooner than the step's 1st-email days after the newest
     # customer email of this send, so a customer who opens on day 11, after both not-opened emails,
-    # is not emailed again on the next tick.
+    # is not emailed again on the next tick. The guard keeps emails apart; it does not wait on the
+    # open. A customer who opens AFTER both dates have passed (say day 7, or day 14) gets the opened
+    # step's 1st email at the next tick inside the send window, minutes after opening. That follows
+    # from counting off the send date and is Hanz's call to change, not a bug.
     first_due = _not_before(enrolled, act) + days[0]
     if last_any is not None:
         first_due = max(first_due, last_any + days[0])
