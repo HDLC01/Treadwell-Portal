@@ -37,12 +37,23 @@ from __future__ import annotations
 import logging
 import math
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 log = logging.getLogger(__name__)
 
 TABLE = "portal_settings"
 ROW_ID = "followups"          # single row; this is one global schedule by design
+
+# ── when automatic follow-ups were switched on (Hanz, 2026-10-29: "we push these auto follow ups
+# changes and then we send the email at the time it was activated") ──────────────────────────────
+# Its OWN row, not a key in ROW_ID: the editor's PUT replaces the whole ROW_ID value with what it
+# validated, so a key kept there would be wiped by the next Save. Written once, by the first tick
+# that runs with FOLLOWUP_AUTOMATION_ENABLED=true (or by ops/followup_activate.py); followup_rules
+# starts every step's clock no earlier than it, so a proposal sent weeks before the release gets its
+# 1st email N days after activation, not on the first tick.
+ACTIVATION_ROW_ID = "followups_activation"
+ACTIVATED_KEY = "activated_at"
 
 # ── the schedule ──────────────────────────────────────────────────────────────
 # The two customer steps, in the order the page shows them. Each step has a 1st and a 2nd email.
@@ -478,6 +489,42 @@ def merge(stored: Any) -> Dict[str, Any]:
                 out["templates"][key] = validate_template(key, t[key])
             except ValidationError:
                 log.warning("[followups] stored %s template is invalid; using the default", key)
+    return out
+
+
+def activated_at_from(stored: Any):
+    """The activation moment a stored ACTIVATION_ROW_ID value holds, as an aware UTC datetime, or
+    None when there is none (never activated, or unreadable). Never raises."""
+    raw = stored.get(ACTIVATED_KEY) if isinstance(stored, dict) else None
+    if isinstance(raw, datetime):
+        at = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            at = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            log.warning("[followups] stored %s=%r is unreadable", ACTIVATED_KEY, raw)
+            return None
+    else:
+        return None
+    return (at if at.tzinfo else at.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def activation_value(at, by: Optional[str] = None) -> Dict[str, Any]:
+    """The ACTIVATION_ROW_ID value for `at` (an aware datetime): ISO UTC, plus who set it."""
+    out: Dict[str, Any] = {ACTIVATED_KEY: at.astimezone(timezone.utc).isoformat()}
+    if by:
+        out["by"] = str(by)[:120]
+    return out
+
+
+def with_activation(cfg: Optional[Dict[str, Any]], at) -> Dict[str, Any]:
+    """A copy of `cfg` carrying the activation moment followup_rules.plan reads. `at` None leaves
+    it out (the schedule then runs from each step's own start, as before activation existed)."""
+    out = dict(cfg or {})
+    if at is None:
+        out.pop(ACTIVATED_KEY, None)
+    else:
+        out[ACTIVATED_KEY] = at
     return out
 
 

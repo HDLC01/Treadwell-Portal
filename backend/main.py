@@ -4087,6 +4087,9 @@ def admin_pipeline(request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         log.warning("[pipeline] could not read the cadence, showing the shipped one: %s", exc)
         followup_cfg = followup_settings.defaults()
+    # The activation moment the worker starts every step's clock at, so the board's date is the
+    # worker's: before activation, projected to now (followup_worker.activation_for_display).
+    followup_cfg = followup_worker.activation_for_display(followup_cfg, _now_utc())
     # Recipients and who has viewed, both read ONCE for the whole board rather than per card.
     # This endpoint is polled every 25 seconds; a query per row is how a 60-proposal board turns
     # into 120 round-trips. Both degrade to {} on a database without the migration, which makes

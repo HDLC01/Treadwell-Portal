@@ -251,6 +251,8 @@ def test_the_first_tick_emails_only_what_is_owed_and_never_resends(clean, outbox
 
 def test_the_dry_run_script_names_the_customers_and_writes_nothing(clean, pgdb):
     _release_day_rows()
+    # A separate process does not see conftest's "activated long ago" stub: store it for real.
+    db.save_settings(fs.ACTIVATION_ROW_ID, fs.activation_value(ago(365)), "test")
     count = "select (select count(*) from public.portal_followups) as f, " \
             "(select count(*) from public.portal_questions) as q"
     before = db.q1(count)

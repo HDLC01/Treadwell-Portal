@@ -39,6 +39,15 @@ re-anchor and no extra email; the estimator's note still follows its own switch,
 Contact is CONTACT_KEYS: a customer-authored row that is not an auto-reply, a call / email / text
 an estimator logged (not a note, not the row a reminder task's own send or call wrote), or an
 estimator's message in the thread. Contact BEFORE the 1st email skips nothing: the 1st still goes.
+
+THE CLOCK STARTS AT ACTIVATION (Hanz, 2026-10-29: "we push these auto follow ups changes and then we
+send the email at the time it was activated"). `activated_at` (followup_settings.ACTIVATION_ROW_ID,
+put on the cfg by the worker) is when automatic follow-ups were switched on under these rules. Every
+step's clock starts at max(the step's own start, activated_at): a proposal sent three weeks before
+the release gets its 1st not-opened email N days AFTER activation, not on the first tick, and a 1st
+email an older engine sent pushes the 2nd to activation + N. Emails sent before activation still
+count toward the cap, and a step that ran out before activation gets no estimator note. A proposal
+sent after activation runs exactly as it would without it.
 """
 from __future__ import annotations
 
@@ -157,6 +166,8 @@ class Plan:
     skipped_due_at: Optional[datetime] = None   # when the 2nd would have gone
     skipped_key: Optional[str] = None
     skipped_template: Optional[str] = None
+    # The step was used up before follow-ups were activated, so no estimator note is owed for it.
+    ran_out_before_activation: bool = False
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────
@@ -232,6 +243,16 @@ def _ts(v: Any) -> Optional[datetime]:
             return None
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     return None
+
+
+def activated_at(cfg: Optional[dict]) -> Optional[datetime]:
+    """When automatic follow-ups were activated (followup_settings.with_activation put it on the
+    cfg), or None: then every step runs from its own start, as before activation existed."""
+    return _ts((cfg or {}).get(followup_settings.ACTIVATED_KEY))
+
+
+def _not_before(t: datetime, floor: Optional[datetime]) -> datetime:
+    return floor if floor is not None and t < floor else t
 
 
 def _times_list(raw: Any) -> list:
@@ -370,11 +391,14 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
         return Plan(reason="finished")
 
     s = _schedule(cfg)
+    act = activated_at(cfg)
     viewed = opened_at(p)                       # a 'viewed' row with no cycle stamp IS opened
     step = OPENED if viewed is not None else NOT_OPENED
     anchor = viewed if viewed is not None else enrolled
     if anchor < enrolled:                       # a view stamp from before this send: not this cycle
         anchor = enrolled
+    step_start = anchor                         # the step's own start, before the activation clamp
+    anchor = _not_before(anchor, act)           # no step's clock starts before activation
     pre = "%s_" % step
     on = (bool(s[pre + "first_on"]), bool(s[pre + "second_on"]))
     days = (timedelta(days=int(s[pre + "first_days"])),
@@ -398,10 +422,15 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
         else:
             # The 2nd email runs from the 1st's REAL send time. With the 1st switched off it falls
             # where the 1st would have gone, plus the gap.
-            due = (last if sent >= 1 and last is not None else anchor + days[0]) + days[1]
+            # A 1st sent before activation (an older engine) starts the 2nd's clock at activation.
+            due = _not_before(last if sent >= 1 and last is not None else anchor + days[0],
+                              act) + days[1]
         nxt = _ts(p.get("followup_next_at"))
-        if nxt is not None and nxt > enrolled and (last_any is None or nxt > last_any):
-            due = nxt                               # "Next email on": moves this one email
+        if nxt is not None and nxt > enrolled and (last_any is None or nxt > last_any) \
+                and (act is None or nxt > act):
+            # "Next email on": moves this one email. A date that had already passed when follow-ups
+            # were activated was set for an older engine, and is not a reason to send at once.
+            due = nxt
         if resume is not None and due < resume:
             due = resume                            # never inside a pause; at its end instead
         template = followup_settings.CADENCE_TEMPLATES[step][o]
@@ -421,7 +450,14 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
         return Plan(reason=done, **common, **skip)
     if legacy_estimator_told(p, step):          # the old ladder already told them; nothing since
         return Plan(reason=done, **common, **skip)
-    est = (last if last is not None else anchor) + timedelta(days=int(s["estimator_days"]))
+    # A step that ran out BEFORE activation gets no note: the release must not tell every estimator
+    # at once about chases that ended weeks ago. It ran out at its last email, at the contact that
+    # skipped its 2nd, or (every email switched off) when the step began.
+    ran_out = skip["skipped_at"] if skip else (last if last is not None else step_start)
+    if act is not None and ran_out < act:
+        return Plan(reason=done, ran_out_before_activation=True, **common, **skip)
+    est = _not_before(last if last is not None else anchor, act) \
+        + timedelta(days=int(s["estimator_days"]))
     if resume is not None and est < resume:
         est = resume
     return Plan(estimator_at=est, estimator_key=rule_key(enrolled, _EST_TAG[step]),
