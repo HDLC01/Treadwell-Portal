@@ -328,16 +328,17 @@ def test_the_dry_run_with_an_unreadable_activation_lists_nothing(world, monkeypa
 @pytest.mark.realactivation
 def test_the_ops_command_records_then_is_idempotent_then_refuses_to_move(monkeypatch, capsys):
     st = Store().install(monkeypatch)
-    assert followup_activate.main(["--at", "2026-10-20T17:00:00Z"]) == 0
+    run = lambda *a: followup_activate.run(list(a), now=ACT)
+    assert run("--at", "2026-10-20T17:00:00Z") == 0
     assert st.activated() == ACT
     assert "set activated_at to 2026-10-20T17:00:00+00:00" in capsys.readouterr().out
     # The same command again: unchanged, nothing written.
-    assert followup_activate.main(["--at", "2026-10-20T12:00:00"]) == 0   # naive = Central
+    assert run("--at", "2026-10-20T12:00:00") == 0   # naive = Central
     assert "unchanged" in capsys.readouterr().out and len(st.writes) == 1
     # A different moment: refused without --replace.
-    assert followup_activate.main(["--at", "2026-10-25T12:00:00"]) == 3
+    assert run("--at", "2026-10-25T12:00:00") == 3
     assert "refused" in capsys.readouterr().err and st.activated() == ACT
-    assert followup_activate.main(["--at", "2026-10-25T12:00:00", "--replace", "--by", "hanz"]) == 0
+    assert run("--at", "2026-10-25T12:00:00", "--replace", "--by", "hanz") == 0
     assert "moved activated_at" in capsys.readouterr().out
     assert st.activated() == datetime(2026, 10, 25, 17, 0, tzinfo=timezone.utc)
     assert st.writes[-1][2] == "hanz" and st.rows[fs.ACTIVATION_ROW_ID]["by"] == "hanz"
@@ -358,6 +359,25 @@ def test_the_ops_command_defaults_to_now(monkeypatch, capsys):
     st = Store().install(monkeypatch)
     assert followup_activate.run([], now=ACT) == 0
     assert st.activated() == ACT and st.writes[0][2] == followup_activate.DEFAULT_BY
+
+
+@pytest.mark.realactivation
+def test_the_ops_command_refuses_a_first_moment_in_the_past_unless_allowed(monkeypatch, capsys):
+    # A typo'd date (a month back) would make every old proposal due on the first tick.
+    st = Store().install(monkeypatch)
+    assert followup_activate.run(["--at", "2026-09-20T12:00:00"], now=ACT) == 2
+    assert "in the past" in capsys.readouterr().err and st.writes == []
+    # A few minutes back is the operator typing "now" by hand: accepted.
+    assert followup_activate.run(["--at", "2026-10-20T16:55:00Z"], now=ACT) == 0
+    assert st.activated() == ACT - timedelta(minutes=5)
+
+
+@pytest.mark.realactivation
+def test_the_ops_command_records_a_past_first_moment_with_allow_past_and_warns(monkeypatch, capsys):
+    st = Store().install(monkeypatch)
+    assert followup_activate.run(["--at", "2026-09-20T12:00:00", "--allow-past"], now=ACT) == 0
+    assert "PAST" in capsys.readouterr().out
+    assert st.activated() == datetime(2026, 9, 20, 17, 0, tzinfo=timezone.utc)
 
 
 # ══ the board ═════════════════════════════════════════════════════════════════

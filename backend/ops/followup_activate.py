@@ -13,6 +13,8 @@ runbook can fix the moment before the flag is switched on:
   --at <ISO>   the moment (default: now). Without an offset it is read as Central time.
   --show       print what is stored and change nothing.
   --replace    move a moment that is already stored. Without it a stored moment is never changed.
+  --allow-past record a first --at more than PAST_SLACK before now (refused without it: a typo in the
+               date would make every old proposal due on the first tick).
   --by <name>  recorded as portal_settings.updated_by (default: ops/followup_activate.py).
 
 IDEMPOTENT: when nothing is stored it records --at; when the same moment is stored it says so and
@@ -24,13 +26,14 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 DEFAULT_BY = "ops/followup_activate.py"
+PAST_SLACK = timedelta(minutes=10)   # a first --at this far back is a typo until --allow-past says not
 
 
 def _opt(argv: list, name: str):
@@ -68,11 +71,11 @@ def _fmt(at) -> str:
 
 def run(argv: list, now: datetime | None = None) -> int:
     """The command, against whatever database db.py points at. Returns the exit code."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     try:
         raw_at = _opt(argv, "--at")
         by = _opt(argv, "--by") or DEFAULT_BY
-        at = parse_at(raw_at) if raw_at is not None else \
-            (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        at = parse_at(raw_at) if raw_at is not None else now
     except ValueError as exc:
         print("followup_activate: %s" % exc, file=sys.stderr)
         return 2
@@ -85,6 +88,13 @@ def run(argv: list, now: datetime | None = None) -> int:
     if "--show" in argv:
         return 0
     if stored is None:
+        if at < now - PAST_SLACK:
+            if "--allow-past" not in argv:
+                print("refused: --at %s is in the past (now %s); every proposal sent before it would "
+                      "start its clock there. Check the date, or pass --allow-past and run "
+                      "ops/followup_dry_run.py first" % (_fmt(at), _fmt(now)), file=sys.stderr)
+                return 2
+            print("warning: activated_at is in the PAST; run ops/followup_dry_run.py before the next tick")
         got = followup_worker.claim_activation(at, by)
         if got == at:
             print("set activated_at to %s" % _fmt(got))
