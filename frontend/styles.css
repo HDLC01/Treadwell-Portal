@@ -1,7 +1,8 @@
 /* Treadwell Customer Proposal Portal — "Treadwell Industrial Modern"
    Matches Treadwell/design/design.md: Treadwell Red on warm cream, Inter,
-   tabular numerals, uppercase label-caps, soft corners, sturdy "working tool". */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap');
+   tabular numerals, uppercase label-caps, soft corners, sturdy "working tool".
+   Inter is loaded by a <link> in index.html and login.html, not an @import here: an @import is
+   only found after this file arrives, which made the two downloads one after the other. */
 
 :root {
   /* brand */
@@ -720,6 +721,23 @@ a.scope-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -
   color: var(--success);
 }
 .scope-tabs-note { margin: 8px 0 0; }
+
+/* A proposal tab is a real page load, so the browser cross-fades from one page to the next instead
+   of blanking between them (a browser without cross-document view transitions just loads the page).
+   reveal.js holds the fade until the new page has drawn and reached the document card.
+   The NAMED pieces are the chrome both pages share, so they hold their place rather than fade with
+   the page: the header, and, wherever both pages have them on screen, the tab row and the document
+   card. The header's group is raised because it is sticky: a card scrolled up under it would
+   otherwise be drawn OVER it for the length of the fade. */
+@view-transition { navigation: auto; }
+.site-header { view-transition-name: tw-header; }
+#pdf-card { view-transition-name: tw-doc-card; }
+#pv-scope-tabs { view-transition-name: tw-scope-tabs; }
+::view-transition-group(*) { animation-duration: .2s; }
+::view-transition-group(tw-header) { z-index: 2; }
+@media (prefers-reduced-motion: reduce) {
+  @view-transition { navigation: none; }
+}
 
 .hidden { display: none !important; }
 

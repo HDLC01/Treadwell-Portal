@@ -67,13 +67,25 @@
     }).join("");
   }
 
-  /** Resolves to the caller's project list ([] when signed out or on error). */
-  function load() {
-    return fetch("/api/me/proposals", { credentials: "same-origin" })
-      .then((r) => r.json())
-      .then((d) => (d && d.ok && Array.isArray(d.proposals) ? d.proposals : []))
-      .catch(() => []);
+  /** The raw `/api/me/proposals` answer, fetched ONCE per page. The proposal page asked for it
+   *  twice on every load (the header switcher here, the sidebar's email in shell.js), one after the
+   *  other in the same tick. Only a signed-in, successful answer is kept, so a failure or a
+   *  signed-out answer is asked again by the next caller exactly as before. */
+  let ME = null;
+  function me() {
+    if (!ME) {
+      ME = fetch("/api/me/proposals", { credentials: "same-origin" })
+        .then((r) => r.json())
+        .then((d) => { if (!(d && d.ok && d.authed)) ME = null; return d || {}; })
+        .catch(() => { ME = null; return {}; });
+    }
+    return ME;
   }
 
-  window.TWProjects = { status, rowsHtml, load, esc, find };
+  /** Resolves to the caller's project list ([] when signed out or on error). */
+  function load() {
+    return me().then((d) => (d && d.ok && Array.isArray(d.proposals) ? d.proposals : []));
+  }
+
+  window.TWProjects = { status, rowsHtml, load, me, esc, find };
 })();

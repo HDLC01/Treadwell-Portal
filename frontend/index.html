@@ -6,7 +6,14 @@
   <meta name="robots" content="noindex">
   <title>Treadwell — Your Proposal</title>
   <link rel="icon" href="/static/img/treadwell-bison.svg">
+  <!-- The font stylesheet is requested HERE, beside styles.css, not by an @import inside it: an
+       @import is only discovered once styles.css has arrived, so the two were fetched one after
+       the other before the page could draw. -->
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap">
   <link rel="stylesheet" href="/styles.css">
+  <!-- In <head> on purpose: it listens for `pagereveal`, which fires before the first frame. -->
+  <script src="/reveal.js"></script>
 </head>
 <body>
   <header class="site-header">

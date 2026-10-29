@@ -7,6 +7,7 @@ access gate. The admin side is the proposal tool; both share one Postgres DB.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import json
@@ -645,14 +646,88 @@ def healthz() -> dict:
 # this, browsers heuristically cached them and customers ran stale JS after a deploy.
 _NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
 
+# ── versioned assets ──────────────────────────────────────────────────────────
+# Revalidating every asset on every load was the price of never running a stale app.js, and a
+# proposal TAB is a real page load (Hanz, 2026-10-29: "why does the whole page need to reload when
+# transferring from one proposal to the other"), so every tab switch paid a conditional request per
+# script and stylesheet before the page could draw. Now the HTML names each asset as
+# `/app.js?v=<hash of its bytes>`, and ONLY a request carrying the CURRENT hash is cached for a year:
+# a deploy that changes one byte changes the URL, so it can never be outlived by a cached copy.
+# A bare `/app.js`, or an old `?v=` from a page fetched before the deploy, still gets no-cache.
+_ASSETS = frozenset({"styles.css", "app.js", "auth.js", "login.js", "projects.js", "shell.js",
+                     "reveal.js", "favicon.ico"})
+_IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
+_ASSET_REF = re.compile(r'(src|href)="/(' + "|".join(re.escape(a) for a in sorted(_ASSETS)) + r')"')
+_ASSET_VERSIONS: dict = {}
+
+
+def _asset_version(name: str) -> str:
+    """The content hash of one shell asset. The CONTENT decides, never the mtime; the mtime and size
+    only key the memo, so a file changed in place (local dev) is re-hashed rather than served under
+    its previous version."""
+    f = FRONTEND_DIR / name
+    st = f.stat()
+    key = (name, st.st_mtime_ns, st.st_size)
+    v = _ASSET_VERSIONS.get(key)
+    if v is None:
+        v = hashlib.sha256(f.read_bytes()).hexdigest()[:12]
+        _ASSET_VERSIONS[key] = v
+    return v
+
+
+def _shell_page(name: str, request: Request, headers: dict) -> Response:
+    """An HTML shell with every asset URL pinned to its content hash. The same bytes for every
+    caller and every token: nothing per-customer is ever written into it. Still revalidated on every
+    load (the caller's headers), with an ETag so an unchanged shell is a 304."""
+    text = (FRONTEND_DIR / name).read_text(encoding="utf-8")
+    body = _ASSET_REF.sub(lambda m: f'{m.group(1)}="/{m.group(2)}?v={_asset_version(m.group(2))}"',
+                          text).encode("utf-8")
+    etag = '"' + hashlib.sha256(body).hexdigest()[:20] + '"'
+    hdrs = dict(headers, ETag=etag)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=hdrs)
+    return Response(content=body, media_type="text/html; charset=utf-8", headers=hdrs)
+
 
 @app.get("/")
-def root() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "login.html", headers=_NO_CACHE)
+def root(request: Request) -> Response:
+    return _shell_page("login.html", request, _NO_CACHE)
+
+
+# ── the sibling-proposal prefetch ─────────────────────────────────────────────
+# A project priced as several proposals shows each as a tab, and a tab is a real load of that
+# proposal's /p/<token> (app.js renderScopeTabs). These rules let a supporting browser fetch those
+# pages' HTML in the background so the click does not wait on it. PREFETCH, NEVER PRERENDER: a
+# prerender runs the page's JS, and that JS is what tells the server the customer opened the
+# proposal (signalProposalViewed). A prefetch is one GET of the static shell, which portal_page
+# below refuses to count as anything (_is_speculative). Served via the Speculation-Rules response
+# header rather than an inline <script type="speculationrules">, so the CSP needs no new source.
+_SPECULATION_RULES = {"prefetch": [{
+    "source": "document",
+    "where": {"selector_matches": "a.scope-tab[href^='/p/']"},
+    "eagerness": "immediate",
+}]}
+_PAGE_HEADERS = {"Cache-Control": "private, no-cache, must-revalidate",
+                 "Speculation-Rules": '"/speculation-rules.json"'}
+
+
+def _is_speculative(request: Request) -> bool:
+    """A browser fetching this page AHEAD of a click (prefetch or prerender) rather than a person
+    opening it. Chromium sends `Sec-Purpose: prefetch` (`prefetch;prerender` for a prerender); the
+    others are the older spellings of the same thing."""
+    h = request.headers
+    said = " ".join(h.get(k) or "" for k in ("sec-purpose", "purpose", "x-purpose", "x-moz")).lower()
+    return any(w in said for w in ("prefetch", "prerender", "preview"))
+
+
+@app.get("/speculation-rules.json")
+def speculation_rules() -> Response:
+    return Response(content=json.dumps(_SPECULATION_RULES),
+                    media_type="application/speculationrules+json", headers=_NO_CACHE)
 
 
 @app.get("/p/{token}")
-def portal_page(token: str, request: Request) -> FileResponse:
+def portal_page(token: str, request: Request) -> Response:
     """The landing page for the link in every notification email.
 
     Recording the visit answers a question the Follow-ups board could not answer before: a
@@ -662,12 +737,14 @@ def portal_page(token: str, request: Request) -> FileResponse:
 
     It is only ever a SOFT signal. This serves before any login, so a click is not a read, and
     `mark_link_clicked` keeps it away from proposal_status and cycle_viewed_at for that reason.
-    HEAD is skipped because that is prefetchers and link checkers rather than people.
+    HEAD is skipped because that is prefetchers and link checkers rather than people, and so is a
+    speculative GET: the page prefetches its sibling proposals' tabs (_SPECULATION_RULES), and a
+    browser fetching a tab nobody has clicked must not stamp that proposal's link as followed.
 
     Serving the page must not depend on any of this working — a database hiccup here would
     otherwise take the customer's proposal offline, which is far worse than a missing
     timestamp."""
-    if request.method == "GET":
+    if request.method == "GET" and not _is_speculative(request):
         try:
             p = _customer_proposal(token)
             if p:
@@ -677,7 +754,7 @@ def portal_page(token: str, request: Request) -> FileResponse:
                                               # page itself shows the no-longer-available state
         except Exception:                     # noqa: BLE001 — never block the page
             log.warning("mark_link_clicked failed for token %s", token[:8], exc_info=True)
-    return FileResponse(FRONTEND_DIR / "index.html", headers=_NO_CACHE)
+    return _shell_page("index.html", request, _PAGE_HEADERS)
 
 
 @app.get("/api/public-config")
@@ -6562,7 +6639,7 @@ if FRONTEND_DIR.exists():
 
 
 @app.get("/{asset}")
-def asset(asset: str):
+def asset(asset: str, request: Request):
     """Serve top-level static assets.
 
     `no-cache` means "revalidate every time", NOT "don't cache" — the browser
@@ -6570,9 +6647,13 @@ def asset(asset: str):
     it these responses carried only an ETag/Last-Modified, so browsers applied
     HEURISTIC freshness and kept running yesterday's app.js after a deploy (a
     customer saw the old deposit card with no invoice buttons). Correctness beats
-    saving a few hundred bytes on a handful of tiny files."""
+    saving a few hundred bytes on a handful of tiny files.
+
+    The exception is a request carrying the asset's CURRENT content hash (`?v=`, written by
+    _shell_page): that URL can only ever mean these bytes, so it is cached for a year and a tab
+    switch loads the shell's scripts without asking the server anything."""
     f = FRONTEND_DIR / asset
-    if f.is_file() and asset in {"styles.css", "app.js", "auth.js", "login.js",
-                                 "projects.js", "shell.js", "favicon.ico"}:
-        return FileResponse(f, headers=_NO_CACHE)
+    if f.is_file() and asset in _ASSETS:
+        v = request.query_params.get("v")
+        return FileResponse(f, headers=_IMMUTABLE if v and v == _asset_version(asset) else _NO_CACHE)
     return _json({"ok": False, "error": "not_found"}, 404)

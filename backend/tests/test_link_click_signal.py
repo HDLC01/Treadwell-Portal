@@ -80,8 +80,9 @@ def test_mark_viewed_still_does_all_of_its_own_work(monkeypatch):
 
 # ── the route ─────────────────────────────────────────────────────────────────
 class _Req:
-    def __init__(self, method="GET"):
+    def __init__(self, method="GET", headers=None):
         self.method = method
+        self.headers = dict(headers or {})   # lower-case keys, as Starlette's lookups are
 
 
 def test_opening_the_email_link_records_the_click(monkeypatch):
@@ -117,7 +118,18 @@ def test_the_page_still_serves_when_the_database_is_unhappy(monkeypatch):
                         lambda t: (_ for _ in ()).throw(RuntimeError("db down")))
     resp = main.portal_page("tok", _Req())
     assert resp is not None
-    assert str(getattr(resp, "path", "")).endswith("index.html")
+    assert _is_the_static_shell(resp)
+
+
+def _is_the_static_shell(resp):
+    """index.html, byte for byte, apart from the `?v=<hash>` its asset URLs are pinned with
+    (main._shell_page). The page used to be a FileResponse of that file; it is now served from
+    memory so the versions can be written in, and this is the same claim made of the bytes."""
+    import pathlib
+    import re
+    shipped = (pathlib.Path(main.FRONTEND_DIR) / "index.html").read_text(encoding="utf-8")
+    served = re.sub(r"\?v=[0-9a-f]{12}\"", '"', resp.body.decode("utf-8"))
+    return resp.status_code == 200 and served == shipped
 
 
 def test_the_landing_page_still_does_not_authenticate_anyone(monkeypatch):
@@ -126,8 +138,8 @@ def test_the_landing_page_still_does_not_authenticate_anyone(monkeypatch):
     monkeypatch.setattr(main.db, "get_proposal_by_token", lambda t: {"proposal_id": "p"})
     monkeypatch.setattr(main.db, "mark_link_clicked", lambda pid: None)
     resp = main.portal_page("tok", _Req())
-    assert str(getattr(resp, "path", "")).endswith("index.html")
-    assert not getattr(resp, "body", b""), "the landing page should be the static shell only"
+    assert _is_the_static_shell(resp), "the landing page should be the static shell only"
+    assert "set-cookie" not in {k.lower() for k in resp.headers}, "the landing page set a cookie"
 
 
 # ── the row the staff board reads ─────────────────────────────────────────────
