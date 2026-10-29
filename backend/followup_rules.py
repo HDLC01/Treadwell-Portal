@@ -457,6 +457,8 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
             # "Next email on": moves this one email. A date that had already passed when follow-ups
             # were activated was set for an older engine, and is not a reason to send at once.
             due = nxt
+            if step == OPENED and o == 0:       # a date set while unopened never beats the wait
+                due = max(due, step_start + OPEN_WAIT)
         if resume is not None and due < resume:
             due = resume                            # never inside a pause; at its end instead
         template = followup_settings.CADENCE_TEMPLATES[step][o]

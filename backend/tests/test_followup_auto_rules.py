@@ -469,6 +469,45 @@ def test_a_next_email_date_from_before_this_send_is_ignored():
     assert fr.next_due_at(p, SENT_AT, ALL_DAY) == SENT_AT + 3 * D
 
 
+def test_next_email_on_never_beats_the_1_day_wait_after_the_open():
+    """A "Next email on" date set while it was unopened, and an open 5 minutes before that date:
+    the date now moves the OPENED 1st, and it still waits a day after the open."""
+    when = SENT_AT + 6 * D
+    p = _p(proposal_status="viewed", cycle_viewed_at=when - timedelta(minutes=5),
+           followup_next_at=when)
+    assert cust(p, when) == [], "thanked them 5 minutes after they opened it"
+    assert fr.next_due_at(p, when, ALL_DAY) == when - timedelta(minutes=5) + D
+    # A date later than the wait is still the date.
+    later = SENT_AT + 9 * D
+    p["followup_next_at"] = later
+    assert fr.next_due_at(p, when, ALL_DAY) == later
+    # Not opened: the date still moves it earlier than the 3 days.
+    assert fr.next_due_at(_p(followup_next_at=SENT_AT + D), SENT_AT, ALL_DAY) == SENT_AT + D
+
+
+def test_ticking_a_next_email_date_set_before_the_open_never_thanks_them_within_a_day():
+    """The review's case through the real due_now every 15 minutes, with the defaults, the
+    send window and the prod activation: sent at activation (10-27 12:45 Central), "Next email
+    on" 11-01 11:45 set while unopened, opened 11-01 11:40. The thanks goes a day after the open,
+    and its 2nd 7 days after that."""
+    c = fs.with_activation(fs.defaults(), ACT)
+    opened = datetime(2026, 11, 1, 11, 40, tzinfo=CT).astimezone(timezone.utc)
+    p = _p(followup_enrolled_at=ACT,
+           followup_next_at=datetime(2026, 11, 1, 11, 45, tzinfo=CT).astimezone(timezone.utc))
+    at, sent = ACT, []
+    while at < ACT + 20 * D:
+        if at >= opened and p["proposal_status"] == "sent":
+            p.update(proposal_status="viewed", cycle_viewed_at=opened)
+        for d in fr.due_now(p, at, c):
+            if d.audience == "customer":
+                sent.append((at, d.template))
+                p["followup_sent_history"].append(_h(at, d.template))
+        at += timedelta(minutes=15)
+    first = [at for at, t in sent if t == "next_steps"]
+    assert first and first[0] - opened >= D, sent
+    assert [t for _, t in sent] == ["next_steps", "second_nudge"], sent
+
+
 # ── the send window ───────────────────────────────────────────────────────────
 def test_customer_email_waits_for_the_central_send_window_and_the_estimator_does_not():
     hist = [_h(SENT_AT + 3 * D, "not_viewed")]
