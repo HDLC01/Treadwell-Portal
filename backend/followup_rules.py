@@ -14,7 +14,8 @@ it was sent"), the send of the current cycle (`followup_enrolled_at`), not the d
 opened it. Opening it only decides which wording goes (next_steps / second_nudge). Spacing: a
 step's 1st email is also never sooner than that step's 1st-email days after the newest customer
 follow-up of this send, so a customer who opens it on day 11, after both not-opened emails, gets
-the opened 1st on day 10 + N, not on the next tick. The estimator note of an opened step whose two
+the opened 1st on day 10 + N, not on the next tick. And it waits 1 day after the open (OPEN_WAIT),
+so a late opener is never emailed minutes after opening. The estimator note of an opened step whose two
 emails are both switched off still runs from the day they opened it (the step's own start).
 
 IT STOPS when the proposal is approved or closed lost, while it is on hold (a pause:
@@ -79,6 +80,10 @@ SEND_END_HOUR = followup_settings.DEFAULTS["send_end_hour"]
 
 NOT_OPENED = "not_opened"
 OPENED = "opened"
+
+# The opened step's 1st email never goes sooner than this after the customer opened it. A fixed
+# rule, not a setting (Hanz, 2026-10-29: "Wait 1 day after they open").
+OPEN_WAIT = timedelta(days=1)
 
 # The tag inside each rule key. `:a:` is this engine's namespace, so none of its keys can collide
 # with a row an older engine reserved (the old ladder's `nv1`, `v1`, `v2`, a skipped task's key).
@@ -425,13 +430,14 @@ def plan(p: dict, now: datetime, cfg: Optional[dict] = None) -> Plan:
     # off the date it was sent"), never from the day the customer opened it, and never from before
     # activation. Spacing: it is also never sooner than the step's 1st-email days after the newest
     # customer email of this send, so a customer who opens on day 11, after both not-opened emails,
-    # is not emailed again on the next tick. The guard keeps emails apart; it does not wait on the
-    # open. A customer who opens AFTER both dates have passed (say day 7, or day 14) gets the opened
-    # step's 1st email at the next tick inside the send window, minutes after opening. That follows
-    # from counting off the send date and is Hanz's call to change, not a bug.
+    # is not emailed again on the next tick. The opened step's 1st also waits OPEN_WAIT after the
+    # open (Hanz, 2026-10-29: "Wait 1 day after they open"), so a late opener (day 7, day 14) is
+    # never thanked for looking minutes after opening it.
     first_due = _not_before(enrolled, act) + days[0]
     if last_any is not None:
         first_due = max(first_due, last_any + days[0])
+    if step == OPENED:
+        first_due = max(first_due, step_start + OPEN_WAIT)
 
     common = dict(step=step, sent=sent, planned=len(planned), last_sent_at=last, paused=paused)
     skip: dict = {}

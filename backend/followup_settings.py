@@ -7,7 +7,8 @@ proposal is sent until it is approved. At most TWO per step:
     NOT OPENED YET        1st email N days after sending,         2nd email N days after the 1st
     OPENED, NO DECISION   1st email N days after sending,         2nd email N days after the 1st
                           (once they have opened it; never sooner than N days after the last
-                          follow-up email the customer got — followup_rules.plan)
+                          follow-up email the customer got, nor than 1 day after they open it —
+                          followup_rules.plan)
     ESTIMATOR             "Tell the estimator" N days after the last email of a step
 
 Each of the five has its own ON/OFF switch and its own number of days. Nothing repeats: there is

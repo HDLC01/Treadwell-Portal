@@ -8,7 +8,8 @@ At most 2 per step, each with its own switch; nothing repeats. Stops on approved
 (a pause) and the project's Follow-ups switch off. The count is the SENT HISTORY of the current
 send cycle, so a proposal the old ladder already emailed twice in its step gets nothing more.
 
-(*) 2026-10-29: and never sooner than 3 days after the customer's last follow-up email.
+(*) 2026-10-29: and never sooner than 3 days after the customer's last follow-up email, nor than
+    1 day after they opened it.
 """
 from datetime import date, datetime, timedelta, timezone
 
@@ -160,6 +161,79 @@ def test_the_spacing_uses_the_opened_steps_own_1st_days():
     assert fr.next_due_at(p, SENT_AT, c) == SENT_AT + 8 * D       # day 3 + 5, not sent + 5
 
 
+# ── the opened 1st waits 1 day after the open (Hanz, 2026-10-29) ──────────────────
+# "Wait 1 day after they open": the opened step's 1st is due at the LATEST of sent + 3, the last
+# customer email + 3, and the open + 1 day, so a late opener is never thanked minutes after opening.
+def _opened_1st_due_exactly_at(p, want):
+    assert fr.next_due_at(p, SENT_AT, ALL_DAY) == want
+    assert fr.plan(p, SENT_AT, ALL_DAY).next_at == want            # the board's date
+    assert cust(p, p["cycle_viewed_at"]) == [], "emailed the tick they opened it"
+    assert cust(p, want - timedelta(minutes=1)) == []
+    d, = cust(p, want)
+    assert (tag(d), d.template) == ("v1", "next_steps")
+
+
+def test_open_on_day_seven_after_the_not_opened_1st_waits_a_day_from_the_open():
+    opened = SENT_AT + 7 * D                     # sent + 3 (day 3) and day 3 + 3 (day 6) passed
+    p = _p(proposal_status="viewed", cycle_viewed_at=opened,
+           followup_sent_history=[_h(SENT_AT + 3 * D, "not_viewed")])
+    _opened_1st_due_exactly_at(p, opened + D)
+
+
+def test_open_on_day_two_and_a_half_before_any_email_is_the_later_of_sent_plus_3_and_open_plus_1():
+    opened = SENT_AT + D * 5 / 2
+    p = _p(proposal_status="viewed", cycle_viewed_at=opened)
+    _opened_1st_due_exactly_at(p, SENT_AT + D * 7 / 2)              # open + 1 day > sent + 3
+
+
+def test_open_on_day_fourteen_after_both_not_opened_emails_waits_a_day_from_the_open():
+    opened = SENT_AT + 14 * D                    # emails on day 3 and day 10; day 13 has passed
+    p = _p(proposal_status="viewed", cycle_viewed_at=opened,
+           followup_sent_history=[_h(SENT_AT + 3 * D, "not_viewed"),
+                                  _h(SENT_AT + 10 * D, "not_viewed_2")])
+    _opened_1st_due_exactly_at(p, opened + D)
+
+
+def test_the_open_wait_does_not_move_the_not_opened_step_or_the_opened_2nd():
+    # Not opened: sent + 3, whatever stale view stamps an older send left.
+    assert fr.next_due_at(_p(viewed_at=SENT_AT + 2 * D), SENT_AT, ALL_DAY) == SENT_AT + 3 * D
+    # The opened 2nd: 7 days after the 1st really went, not open + 1.
+    p = _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + 14 * D,
+           followup_sent_history=[_h(SENT_AT + 15 * D, "next_steps")])
+    assert fr.next_due_at(p, SENT_AT, ALL_DAY) == SENT_AT + 22 * D
+
+
+def test_ticking_through_every_open_time_no_opened_email_goes_within_a_day_of_the_open():
+    """The worker's tick, simulated: every 30 minutes, with the real send window (8-18 Central)
+    and the defaults, the not-opened emails going as they fall due and the customer opening it at
+    a time every 5 hours across three weeks. The opened 1st never goes less than 24 h after the
+    open, never before sent + 3, and never within 3 days of the email before it."""
+    c = fs.defaults()
+    tick = timedelta(minutes=30)
+    for k in range(0, 21 * 24, 5):
+        opened = SENT_AT + k * H
+        p = _p()
+        hist = p["followup_sent_history"]
+        at = SENT_AT
+        first_opened = None
+        while at < SENT_AT + 40 * D and first_opened is None:
+            if at >= opened and p["proposal_status"] == "sent":
+                p.update(proposal_status="viewed", cycle_viewed_at=opened)
+            for d in fr.due_now(p, at, c):
+                if d.audience != "customer":
+                    continue
+                if d.template == "next_steps":
+                    first_opened = at
+                prev = fr.sent_history(p)[-1][0] if hist else None
+                assert prev is None or at - prev >= 3 * D, (k, at, prev)
+                hist.append(_h(at, d.template))
+            at += tick
+        assert first_opened is not None, k
+        assert first_opened - opened >= D, ("opened at hour %d, emailed %s later"
+                                            % (k, first_opened - opened))
+        assert first_opened >= SENT_AT + 3 * D, k
+
+
 # ── the three live proposals at activation (prod, 2026-10-29) ─────────────────────
 ACT = datetime(2026, 10, 27, 17, 45, tzinfo=timezone.utc)          # 12:45 Central
 CT = fr.BUSINESS_TZ
@@ -234,13 +308,13 @@ def test_each_email_has_its_own_switch():
 
 def test_the_days_are_the_saved_days():
     c = cfg(not_opened_first_days=5, not_opened_second_days=2, estimator_days=4,
-            opened_first_days=1, opened_second_days=9)
+            opened_first_days=2, opened_second_days=9)
     p = _p()
     assert cust(p, SENT_AT + 5 * D - H, c) == [] and cust(p, SENT_AT + 5 * D, c)
     one = _p(followup_sent_history=[_h(SENT_AT + 5 * D, "not_viewed")])
     assert fr.next_due_at(one, NOW, c) == SENT_AT + 7 * D
-    v = _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + D)
-    assert fr.next_due_at(v, NOW, c) == SENT_AT + D          # opened_first_days after SENDING
+    v = _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + D / 2)
+    assert fr.next_due_at(v, NOW, c) == SENT_AT + 2 * D      # opened_first_days after SENDING
 
 
 def test_an_old_shape_row_means_the_same_schedule_as_its_migration():
@@ -427,6 +501,13 @@ def test_the_window_is_evaluated_in_chicago_not_utc():
     _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + 11 * D,
        followup_sent_history=[_h(SENT_AT + 3 * D, "not_viewed"),
                               _h(SENT_AT + 10 * D, "not_viewed_2")]),
+    # The opened 1st held back by the 1-day wait after a late open.
+    _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + 7 * D,
+       followup_sent_history=[_h(SENT_AT + 3 * D, "not_viewed")]),
+    _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + D * 5 / 2),
+    _p(proposal_status="viewed", cycle_viewed_at=SENT_AT + 14 * D,
+       followup_sent_history=[_h(SENT_AT + 3 * D, "not_viewed"),
+                              _h(SENT_AT + 10 * D, "not_viewed_2")]),
 ])
 def test_next_due_at_is_exactly_when_due_now_first_says_send(p):
     at = fr.next_due_at(p, SENT_AT, ALL_DAY)
@@ -482,22 +563,22 @@ def test_a_viewed_row_with_no_cycle_stamp_is_opened_not_unopened():
 
 
 def test_a_viewed_row_with_no_cycle_stamp_is_dated_by_the_views_of_this_send():
-    # The view date no longer moves the customer emails (they count from the send, 2026-10-29);
-    # it still dates the opened step itself, which is when its estimator note runs from while
-    # both of its emails are switched off.
+    # The customer emails count from the send (2026-10-29); the view date moves them only through
+    # the 1-day wait after the open (fr.OPEN_WAIT). It also dates the opened step itself, which is
+    # when its estimator note runs from while both of its emails are switched off.
     no_emails = _mig(opened_first_on=False, opened_second_on=False)
     # viewed_at (first view EVER) after the send: the step starts then.
     seen = OLD_SENT + 50 * D
     p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, viewed_at=seen,
            last_viewed_at=seen + 2 * D)
     assert fr.opened_at(p) == seen
-    assert fr.next_due_at(p, NOW, _mig()) == OLD_SENT + 3 * D
+    assert fr.next_due_at(p, NOW, _mig()) == seen + D
     assert fr.plan(p, NOW, no_emails).estimator_at == seen + D
     # viewed_at from BEFORE this send (a revision): the latest view, if it is of this send.
     p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, viewed_at=OLD_SENT - 9 * D,
            last_viewed_at=seen)
     assert fr.opened_at(p) == seen
-    assert fr.next_due_at(p, NOW, _mig()) == OLD_SENT + 3 * D
+    assert fr.next_due_at(p, NOW, _mig()) == seen + D
     assert fr.plan(p, NOW, no_emails).estimator_at == seen + D
     # No view of this send can be seen at all: the send itself.
     p = _p(proposal_status="viewed", followup_enrolled_at=OLD_SENT, viewed_at=OLD_SENT - 9 * D,

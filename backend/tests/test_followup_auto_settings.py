@@ -268,7 +268,9 @@ def _row(**over):
 
 def test_the_board_dates_come_from_the_saved_schedule(api, monkeypatch):
     monkeypatch.setattr(main.db, "unread_counts", lambda: {})
-    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [_row()])
+    # Opened on day 1, so the 1-day wait after the open (fr.OPEN_WAIT) is long past either date.
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [_row(cycle_viewed_at=NOW - 9 * D)])
     monkeypatch.setattr(main, "_now_utc", lambda: NOW)
     shipped = api["client"].get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
     assert shipped == main._iso(NOW - 7 * D), "3 days after it was sent"
