@@ -399,3 +399,82 @@ def test_the_boards_next_follow_up_date_is_the_workers(monkeypatch, stored):
     # Stored: activation + 3 days. Never activated: projected from now (the board's clock).
     want = ACT + 3 * D if stored else ACT + 5 * D
     assert datetime.fromisoformat(card["next_followup_at"].replace("Z", "+00:00")) == want
+
+
+# ══ the live proposals at the prod activation (Hanz, 2026-10-29) ═════════════════
+# Both steps count from the SENT date. Prod activated 2026-10-27 12:45 Central.
+PROD_ACT = datetime(2026, 10, 27, 17, 45, tzinfo=timezone.utc)
+CT = fr.BUSINESS_TZ
+LIVE_ROWS = (   # (proposal_id, sent Central, opened Central or None, 1st email due Central)
+    ("bass-pro", datetime(2026, 10, 27, 12, 45), None, datetime(2026, 10, 30, 12, 45)),
+    ("discover", datetime(2026, 10, 27, 12, 59), datetime(2026, 10, 27, 13, 41),
+     datetime(2026, 10, 30, 12, 59)),
+    ("bennett", datetime(2026, 10, 28, 12, 7), None, datetime(2026, 10, 31, 12, 7)),
+)
+
+
+def _ct(d):
+    return d.replace(tzinfo=CT).astimezone(timezone.utc)
+
+
+@pytest.mark.realactivation
+def test_the_board_shows_the_live_proposals_first_emails_where_the_worker_sends_them(monkeypatch):
+    import json
+
+    import main
+    from test_admin_pipeline import _row
+    rows = [_row(proposal_id=pid, proposal_status="viewed" if opened else "sent",
+                 viewed_at=_ct(opened) if opened else None,
+                 cycle_viewed_at=_ct(opened) if opened else None,
+                 created_at=_ct(sent), followup_enrolled_at=_ct(sent),
+                 followup_sent_history=[])
+            for pid, sent, opened, _due in LIVE_ROWS]
+    now = datetime(2026, 10, 29, 17, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main, "_now_utc", lambda: now)
+    Store({fs.ACTIVATION_ROW_ID: fs.activation_value(PROD_ACT)}).install(monkeypatch)
+    cards = {c["proposal_id"]: c for c in
+             json.loads(bytes(main.admin_pipeline(request=None).body).decode())["proposals"]}
+    worker_cfg = fs.with_activation(fs.defaults(), PROD_ACT)
+    for (pid, _sent, opened, due), row in zip(LIVE_ROWS, rows):
+        board = datetime.fromisoformat(cards[pid]["next_followup_at"].replace("Z", "+00:00"))
+        assert board == _ct(due), (pid, board.astimezone(CT))
+        assert board == fr.plan(row, now, worker_cfg).next_at, pid
+        # Nothing before 10-30; due at the minute the board shows, with the step's own wording.
+        assert fr.due_now(row, _ct(datetime(2026, 10, 29, 23, 59)), worker_cfg) == []
+        assert fr.due_now(row, board - timedelta(minutes=1), worker_cfg) == []
+        d, = fr.due_now(row, board, worker_cfg)
+        assert d.template == ("next_steps" if opened else "not_viewed"), pid
+
+
+@pytest.mark.realactivation
+def test_the_board_shows_a_late_openers_1st_a_day_after_the_open_where_the_worker_sends_it(
+        monkeypatch):
+    """Hanz, 2026-10-29: "Wait 1 day after they open". Sent 10-28 12:07 Central, the not-opened
+    1st went on 10-31, opened 11-04 14:30: the opened 1st is 11-05 14:30, on the board and in the
+    worker, not the next tick after the open."""
+    import json
+
+    import main
+    from test_admin_pipeline import _row
+    sent, opened = _ct(datetime(2026, 10, 28, 12, 7)), _ct(datetime(2026, 11, 4, 14, 30))
+    hist = [{"at": (sent + 3 * D).isoformat(), "template": "not_viewed", "rule_key": "x"}]
+    row = _row(proposal_id="late", proposal_status="viewed", viewed_at=opened,
+               cycle_viewed_at=opened, created_at=sent, followup_enrolled_at=sent,
+               followup_sent_history=hist)
+    now = opened + timedelta(minutes=10)
+    monkeypatch.setattr(main, "_admin_ok", lambda request: True)
+    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [dict(row)])
+    monkeypatch.setattr(main.db, "unread_counts", lambda: {})
+    monkeypatch.setattr(main, "_now_utc", lambda: now)
+    Store({fs.ACTIVATION_ROW_ID: fs.activation_value(PROD_ACT)}).install(monkeypatch)
+    card, = json.loads(bytes(main.admin_pipeline(request=None).body).decode())["proposals"]
+    board = datetime.fromisoformat(card["next_followup_at"].replace("Z", "+00:00"))
+    worker_cfg = fs.with_activation(fs.defaults(), PROD_ACT)
+    assert board == opened + D == fr.plan(row, now, worker_cfg).next_at
+    assert fr.due_now(row, now, worker_cfg) == [], "thanked them minutes after they opened it"
+    assert fr.due_now(row, board - timedelta(minutes=1), worker_cfg) == []
+    d, = fr.due_now(row, board, worker_cfg)
+    assert d.template == "next_steps"

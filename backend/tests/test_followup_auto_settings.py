@@ -78,6 +78,9 @@ def test_each_refusal_names_its_own_box():
         "Opened, no decision: the 2nd email must be 1 to 90 days after the 1st."
     assert sentences["estimator_days"] == \
         "Tell the estimator must be 1 to 90 days after the last email."
+    # 2026-10-29: the opened step's 1st counts from the SENT date, not from when they open it.
+    assert sentences["opened_first_days"] == \
+        "Opened, no decision: the 1st email must be 1 to 90 days after sending."
     assert len(set(sentences.values())) == len(sentences)
 
 
@@ -211,6 +214,10 @@ def test_get_shows_the_migrated_prod_row_and_the_pages_vocabulary(api):
                                    "opened": ["next_steps", "second_nudge"]}
     assert j["days_range"] == [1, 90]
     assert set(j["previews"]) == set(fs.ALL_TEMPLATE_KEYS)
+    # The page says what the schedule does: the opened 1st counts from the send (2026-10-29).
+    assert j["editor_titles"]["next_steps"] == \
+        "Opened, no decision — 1st email, days after sending"
+    assert not any("open it" in t for t in j["editor_titles"].values())
 
 
 def test_put_refuses_zero_with_the_sentence_and_saves_nothing(api):
@@ -261,13 +268,15 @@ def _row(**over):
 
 def test_the_board_dates_come_from_the_saved_schedule(api, monkeypatch):
     monkeypatch.setattr(main.db, "unread_counts", lambda: {})
-    monkeypatch.setattr(main.db, "list_all_portal_proposals", lambda: [_row()])
+    # Opened on day 1, so the 1-day wait after the open (fr.OPEN_WAIT) is long past either date.
+    monkeypatch.setattr(main.db, "list_all_portal_proposals",
+                        lambda: [_row(cycle_viewed_at=NOW - 9 * D)])
     monkeypatch.setattr(main, "_now_utc", lambda: NOW)
     shipped = api["client"].get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
-    assert shipped == main._iso(NOW - D), "3 days after they opened it"
+    assert shipped == main._iso(NOW - 7 * D), "3 days after it was sent"
     api["row"] = dict(SCHEDULE, opened_first_days=6)
     saved = api["client"].get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
-    assert saved == main._iso(NOW + 2 * D)
+    assert saved == main._iso(NOW - 4 * D)
     api["row"] = dict(SCHEDULE, opened_first_on=False, opened_second_on=False)
     off = api["client"].get("/api/admin/pipeline").json()["proposals"][0]["next_followup_at"]
     assert off is None
@@ -277,7 +286,11 @@ def test_the_worker_reads_the_saved_schedule(monkeypatch):
     monkeypatch.setattr(W.db, "get_settings", lambda k: dict(SCHEDULE, opened_first_on=False))
     cfg = W._settings()
     assert cfg["opened_first_on"] is False
-    p = _row(cycle_viewed_at=NOW - 4 * D)
+    # Sent 4 days ago: the opened 1st (sent + 3) would be due now; with it off the 2nd waits for
+    # sent + 3 + 7.
+    p = _row(followup_enrolled_at=NOW - 4 * D, cycle_viewed_at=NOW - 2 * D)
+    assert [d.template for d in fr.due_now(p, NOW, dict(SCHEDULE))
+            if d.audience == "customer"] == ["next_steps"], "the 1st is not due with it on"
     assert [d for d in fr.due_now(p, NOW, cfg) if d.audience == "customer"] == [], (
         "a switched-off 1st email went")
 

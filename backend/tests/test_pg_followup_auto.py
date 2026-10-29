@@ -171,7 +171,10 @@ def test_sent_opened_approved_is_at_most_two_plus_two_and_nothing_after_approval
     assert all(r["created_at"] < approved for r in rows), "an email after the approval"
     c = [r["created_at"] for r in customer]
     assert c[0] >= start + 3 * D and c[1] >= c[0] + 7 * D
-    assert c[2] >= opened + 3 * D and c[3] >= c[2] + 7 * D
+    # The opened step counts from the SEND (Hanz 2026-10-29): its 1st is due at the latest of
+    # sent + 3 d, the last follow-up + 3 d, and the open + 1 d. Here the open + 1 d wins.
+    assert c[2] >= max(start + 3 * D, c[1] + 3 * D, opened + D) and c[3] >= c[2] + 7 * D
+    assert c[2] < opened + 3 * D, "the opened 1st still counted 3 days from the open"
 
 
 def test_two_containers_ticking_at_once_send_one_email(clean, outbox):

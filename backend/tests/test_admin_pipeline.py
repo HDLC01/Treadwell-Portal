@@ -210,9 +210,12 @@ def test_the_board_query_selects_every_field_the_schedule_reads(monkeypatch):
 def test_a_viewed_proposal_shows_the_viewed_tracks_date(pipeline):
     now = dt.datetime.now(dt.timezone.utc)
     viewed = now - dt.timedelta(hours=2)
-    row = _row(proposal_status="viewed", followup_enrolled_at=now - dt.timedelta(hours=100),
-               cycle_viewed_at=viewed, viewed_at=viewed,
-               created_at=now - dt.timedelta(hours=100))
+    sent = now - dt.timedelta(hours=100)
+    nv1 = sent + dt.timedelta(days=3)             # the not-opened 1st already went
+    row = _row(proposal_status="viewed", followup_enrolled_at=sent,
+               cycle_viewed_at=viewed, viewed_at=viewed, created_at=sent,
+               followup_sent_history=[{"at": nv1.isoformat(), "template": "not_viewed",
+                                       "rule_key": "x"}])
     card, = pipeline([row])
     got = dt.datetime.fromisoformat(card["next_followup_at"])
     # Pinned against due_now's OWN math, not against next_due_at: nothing is due a minute before
@@ -222,13 +225,16 @@ def test_a_viewed_proposal_shows_the_viewed_tracks_date(pipeline):
     after = [d for d in _fr.due_now(row, got + dt.timedelta(minutes=1), _ALL_DAY)
              if d.audience == "customer"]
     assert before == [] and [d.rule_key.split(":")[-1] for d in after] == ["v1"], (got, after)
-    # The opened step's 1st email: 3 days after they open it, by default.
-    assert got == viewed + dt.timedelta(days=3)
-    # And the old computation — the same row with the view missing, as the query delivered it —
-    # really was different, so this test would have caught the bug.
-    # (Every view stamp, since a 'viewed' row with no cycle stamp is dated by viewed_at.)
-    blind = dict(row, cycle_viewed_at=None, viewed_at=None, last_viewed_at=None)
-    assert _fr.next_due_at(blind, now) != got
+    # The opened step's 1st email (2026-10-29): 3 days after it was SENT, and never sooner than 3
+    # days after the customer's last follow-up email (the not-opened 1st here).
+    assert got == nv1 + dt.timedelta(days=3)
+    # And the bug's computation — the same row read as never opened — really was different (the
+    # not-opened 2nd, 7 days after nv1), so this test would have caught it. Since 2026-10-29 the
+    # opened step counts from the send too, so only reading the row as NOT opened moves the date:
+    # a 'viewed' status with no stamp is still opened (dated by the send).
+    blind = dict(row, proposal_status="sent", cycle_viewed_at=None, viewed_at=None,
+                 last_viewed_at=None)
+    assert _fr.next_due_at(blind, now) == nv1 + dt.timedelta(days=7) != got
 
 
 def test_the_card_carries_the_open_task_and_the_plan(pipeline):

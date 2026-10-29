@@ -5,7 +5,10 @@ customer okay?" An automatic email to the customer, sent by the portal's worker,
 proposal is sent until it is approved. At most TWO per step:
 
     NOT OPENED YET        1st email N days after sending,         2nd email N days after the 1st
-    OPENED, NO DECISION   1st email N days after they open it,    2nd email N days after the 1st
+    OPENED, NO DECISION   1st email N days after sending,         2nd email N days after the 1st
+                          (once they have opened it; never sooner than N days after the last
+                          follow-up email the customer got, nor than 1 day after they open it —
+                          followup_rules.plan)
     ESTIMATOR             "Tell the estimator" N days after the last email of a step
 
 Each of the five has its own ON/OFF switch and its own number of days. Nothing repeats: there is
@@ -86,8 +89,7 @@ DAYS_MIN, DAYS_MAX = 1, 90
 _DAYS_SENTENCE = {
     "not_opened_first_days": "Not opened yet: the 1st email must be 1 to 90 days after sending.",
     "not_opened_second_days": "Not opened yet: the 2nd email must be 1 to 90 days after the 1st.",
-    "opened_first_days": ("Opened, no decision: the 1st email must be 1 to 90 days after they "
-                          "open it."),
+    "opened_first_days": "Opened, no decision: the 1st email must be 1 to 90 days after sending.",
     "opened_second_days": "Opened, no decision: the 2nd email must be 1 to 90 days after the 1st.",
     "estimator_days": "Tell the estimator must be 1 to 90 days after the last email.",
 }
@@ -148,7 +150,7 @@ EDITOR_TITLES: Dict[str, str] = {
     "sent": "Proposal sent — the first email, when you publish it",
     "not_viewed": "Not opened yet — 1st email, days after sending",
     "not_viewed_2": "Not opened yet — 2nd email, days after the 1st",
-    "next_steps": "Opened, no decision — 1st email, days after they open it",
+    "next_steps": "Opened, no decision — 1st email, days after sending",
     "second_nudge": "Opened, no decision — 2nd email, days after the 1st",
 }
 
