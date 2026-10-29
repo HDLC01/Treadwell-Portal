@@ -157,9 +157,33 @@ def test_pages_opt_into_the_cross_fade_and_reduced_motion_opts_out():
     rm = re.search(r"@media \(prefers-reduced-motion: reduce\)\s*\{\s*@view-transition\s*\{\s*"
                    r"navigation:\s*none;?\s*\}\s*\}", css)
     assert rm and rm.start() > css.index("@view-transition"), "reduced motion must come after, to win"
-    for sel, name in ((".site-header", "tw-header"), ("#pdf-card", "tw-doc-card"),
-                      ("#pv-scope-tabs", "tw-scope-tabs")):
-        assert re.search(re.escape(sel) + r"\s*\{\s*view-transition-name:\s*" + name, css), sel
+    assert re.search(r"\.site-header\s*\{\s*view-transition-name:\s*tw-header", css)
+
+
+def test_every_named_piece_is_on_screen_in_the_first_frame():
+    """A view-transition-name only pairs the two pages when the element is drawn in the NEW page's
+    first frame, because that is when the browser captures it. #pdf-card and #pv-scope-tabs ship
+    `hidden` and are shown only after the API answers, so naming them made old-only groups that
+    faded out over the page (the old card ghosting where it was, the new one fading in elsewhere).
+    Only static chrome may carry a name."""
+    css = re.sub(r"/\*.*?\*/", "", (FRONTEND / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    named = re.findall(r"([^{}]+?)\s*\{\s*view-transition-name:\s*([\w-]+)", css)
+    assert named, "the header should still be a shared element"
+    for sel, name in named:
+        sel = sel.strip()
+        m = re.fullmatch(r"([.#])([\w-]+)", sel)
+        assert m, f"{sel!r}: only a single class or id can be checked against the markup"
+        attr = "class" if m.group(1) == "." else "id"
+        for page in ("index.html", "login.html"):
+            html = (FRONTEND / page).read_text(encoding="utf-8")
+            tags = [t for t in re.findall(r"<[a-z][^>]*>", html)
+                    if re.search(attr + r'="[^"]*?\b' + re.escape(m.group(2)) + r'\b', t)]
+            if page == "index.html":
+                assert tags, f"{sel} ({name}) is not in the static markup of {page}"
+            for t in tags:
+                cls = re.search(r'class="([^"]*)"', t)
+                assert not (cls and "hidden" in cls.group(1).split()), f"{sel} ({name}) ships hidden in {page}"
+                assert not re.search(r"\shidden(\s|>|=)", t), f"{sel} ({name}) ships hidden in {page}"
 
 
 def test_reveal_js_loads_in_the_head():

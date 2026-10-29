@@ -725,14 +725,15 @@ a.scope-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -
 /* A proposal tab is a real page load, so the browser cross-fades from one page to the next instead
    of blanking between them (a browser without cross-document view transitions just loads the page).
    reveal.js holds the fade until the new page has drawn and reached the document card.
-   The NAMED pieces are the chrome both pages share, so they hold their place rather than fade with
-   the page: the header, and, wherever both pages have them on screen, the tab row and the document
-   card. The header's group is raised because it is sticky: a card scrolled up under it would
-   otherwise be drawn OVER it for the length of the fade. */
+   Only the header is NAMED, so it holds its place rather than fade with the page. A name pairs the
+   two pages only if the element is drawn in the new page's FIRST frame, when the browser captures
+   it, and the tab row and the document card are not: they ship `hidden` and app.js shows them after
+   the API answers. Named, they faded out over the page on their own. The card stays put because
+   jumpToDocument lands it at the height it was clicked at, under the whole-page fade. The header's
+   group is raised because it is sticky: a card scrolled up under it would otherwise be drawn OVER
+   it for the length of the fade. */
 @view-transition { navigation: auto; }
 .site-header { view-transition-name: tw-header; }
-#pdf-card { view-transition-name: tw-doc-card; }
-#pv-scope-tabs { view-transition-name: tw-scope-tabs; }
 ::view-transition-group(*) { animation-duration: .2s; }
 ::view-transition-group(tw-header) { z-index: 2; }
 @media (prefers-reduced-motion: reduce) {
