@@ -1179,6 +1179,24 @@ def save_settings(key: str, value: dict[str, Any], by: Optional[str] = None) -> 
     return row or {}
 
 
+def insert_settings_if_absent(key: str, value: dict[str, Any],
+                              by: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Write one settings row ONLY if it does not exist yet, and return the value that is stored
+    now: ours, or the one somebody else wrote first. Two containers racing both get the winner's.
+
+    For values that must be set exactly once (followup_settings.ACTIVATION_ROW_ID): `on conflict
+    do nothing` never overwrites, and a concurrent insert waits for the other transaction, so the
+    re-read after a conflict sees the row that won."""
+    row = q1(
+        "insert into public.portal_settings (id, value, updated_at, updated_by) "
+        "values (%s, %s, now(), %s) on conflict (id) do nothing returning value",
+        (key, Jsonb(value), by),
+    )
+    if row and isinstance(row.get("value"), dict):
+        return row["value"]
+    return get_settings(key)
+
+
 def settings_meta(key: str) -> dict[str, Any]:
     """Who last changed this, and when — for the editor to show above the form."""
     row = q1("select updated_at, updated_by from public.portal_settings where id=%s", (key,))

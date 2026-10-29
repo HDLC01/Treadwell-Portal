@@ -14,6 +14,12 @@ once a tick has run its sends are reserved and this reports nothing. So:
      tick;
   3. read the list; when it looks right, set the flag to true and restart the container.
 
+ACTIVATION. Every step's clock starts no earlier than the moment follow-ups were activated
+(followup_rules). The summary's second line says which moment this run used: the stored one, or,
+when none is stored yet, the --now itself ("not yet activated: the first enabled tick will set it
+to ..."), which is what the first enabled tick records. Record it ahead of time with
+ops/followup_activate.py --at <ISO>; right after activation the list holds nothing old.
+
 READ-ONLY, three ways: followup_worker.dry_run_count reserves, sends and writes nothing; this
 script opens its database pool with every transaction READ ONLY, so a write anywhere underneath
 would fail instead of landing; and the one function that sends email is replaced with a refusal.
@@ -55,9 +61,18 @@ def refuse_email() -> None:
 
 def table(result: dict) -> str:
     """The short human summary printed after the JSON: every customer the tick would email."""
+    if result.get("activation_error"):
+        activation = ("  activation time UNREADABLE: the tick would send nothing (%s)"
+                      % result.get("activation_error"))
+    elif result.get("activation_pending"):
+        activation = ("  not yet activated: the first enabled tick will set it to %s"
+                      % result.get("at"))
+    else:
+        activation = "  activated at ..................... %s" % result.get("activated_at")
     lines = [
         "follow-up dry run at %s (%s the customer send window)"
         % (result.get("at"), "inside" if result.get("in_send_window") else "OUTSIDE"),
+        activation,
         "  customer emails it would send ..... %d (to %d addresses)"
         % (len(result.get("customer_emails") or []), int(result.get("recipient_count") or 0)),
         "  due but every contact opted out ... %d" % len(result.get("opted_out") or []),
@@ -65,6 +80,8 @@ def table(result: dict) -> str:
         % (len(result.get("skipped_by_reply") or []),
            sum(1 for s in result.get("skipped_by_reply") or [] if s.get("would_have_gone_now"))),
         "  estimator emails it would send .... %d" % len(result.get("staff_emails") or []),
+        "  steps done before activation ...... %d (no estimator email for them)"
+        % len(result.get("done_before_activation") or []),
         "  old reminder tasks it would expire  %d" % len(result.get("tasks_to_expire") or []),
         "  rows it could not evaluate ........ %d" % len(result.get("skipped") or []),
     ]

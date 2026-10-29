@@ -135,6 +135,58 @@ def _settings() -> dict:
         return followup_settings.defaults()
 
 
+# ── when automatic follow-ups were activated ──────────────────────────────────
+# followup_rules starts every step's clock no earlier than this (Hanz, 2026-10-29: "we push these
+# auto follow ups changes and then we send the email at the time it was activated"). The FIRST tick
+# that runs enabled records it; ops/followup_activate.py can record it explicitly instead.
+
+# portal_settings.updated_by on the row the first enabled tick writes.
+ACTIVATED_BY_WORKER = "followup-worker (first enabled tick)"
+
+
+def read_activation() -> datetime | None:
+    """The stored activation moment, or None when follow-ups have never been activated. RAISES when
+    the row cannot be read: "unreadable" and "never activated" must not look alike, because the
+    second makes the tick write `now`."""
+    return followup_settings.activated_at_from(
+        db.get_settings(followup_settings.ACTIVATION_ROW_ID))
+
+
+def claim_activation(at: datetime, by: str | None = None) -> datetime:
+    """Record `at` as the activation moment unless one is recorded already, and return the one that
+    is recorded now (ours, or the twin container's that got there first). Never overwrites."""
+    stored = db.insert_settings_if_absent(
+        followup_settings.ACTIVATION_ROW_ID, followup_settings.activation_value(at, by), by)
+    got = followup_settings.activated_at_from(stored)
+    if got is None:
+        raise RuntimeError("the stored activation row has no readable %s"
+                           % followup_settings.ACTIVATED_KEY)
+    return got
+
+
+def ensure_activation(now: datetime) -> datetime:
+    """The activation moment, recording `now` if this is the first enabled tick. Raises when it can
+    be neither read nor recorded (the tick then sends nothing)."""
+    at = read_activation()
+    if at is not None:
+        return at
+    at = claim_activation(now, ACTIVATED_BY_WORKER)
+    log.info("[followup] automatic follow-ups activated at %s", at.isoformat())
+    return at
+
+
+def activation_for_display(cfg: dict, now: datetime) -> dict:
+    """`cfg` with the activation moment, for the board's "next follow-up" date. Before activation
+    (or when it cannot be read) it is projected to `now`, the moment the first enabled tick would
+    record: a date the worker would act on, never an old proposal's long-past date. Never raises."""
+    try:
+        at = read_activation()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[followup] could not read the activation time (%s); projecting now", exc)
+        at = None
+    return followup_settings.with_activation(cfg, at or now)
+
+
 def _send_customer(p: dict, due, templates: dict | None = None) -> bool:
     """One follow-up email to every follow-up recipient of `p`. True when at least one went."""
     token = p.get("token")
@@ -536,6 +588,13 @@ def _tick(now: datetime | None = None) -> None:
     now = now or datetime.now(timezone.utc)
     # One read per tick, so every proposal in this pass is judged by the same schedule.
     cfg = _settings()
+    # Fail closed: without the activation moment every old proposal looks overdue at once.
+    try:
+        cfg = followup_settings.with_activation(cfg, ensure_activation(now))
+    except Exception as exc:  # noqa: BLE001
+        log.error("[followup] could not read or record when follow-ups were activated (%s) - "
+                  "nothing sent this tick", exc)
+        return
     try:
         candidates = db.list_followup_candidates()
     except Exception as exc:  # noqa: BLE001
@@ -699,6 +758,11 @@ def dry_run_count(now: datetime | None = None) -> dict:
 
     Returns:
       at, in_send_window
+      activated_at                    the stored activation moment (ISO), or None
+      activation_pending              True when never activated: the first enabled tick records
+                                      its own clock, so this evaluates as if activated at `now`
+      activation_error                the activation row is unreadable: the tick would send
+                                      nothing, and every list below is empty
       customer_emails [{proposal_id, project_name, rule_key, template, step, ordinal,
                         recipients [...], scope_group, scopes}]
       customer_email_count            emails (one per proposal or group, each to its recipients)
@@ -709,14 +773,36 @@ def dry_run_count(now: datetime | None = None) -> dict:
                                       a step's 2nd email cancelled by contact after its 1st
                                       (rules.plan); never sent
       staff_emails [{proposal_id, rule_key, template, scope_group}], staff_email_count
+      done_before_activation [{proposal_id, step, scope_group}]   steps used up before activation:
+                                      no estimator note is owed for them
       tasks_to_expire [{task_id, proposal_id, template}]   pending reminder tasks the tick retires
       skipped [...]                   rows it could not evaluate
     `count` is customer_email_count, kept for callers of the old shape."""
     now = now or datetime.now(timezone.utc)
     cfg = _settings()
     out: dict = {"at": now.isoformat(), "in_send_window": rules.in_send_window(now, cfg),
+                 "activated_at": None, "activation_pending": False, "activation_error": None,
                  "customer_emails": [], "opted_out": [], "staff_emails": [],
-                 "skipped_by_reply": [], "tasks_to_expire": [], "skipped": []}
+                 "skipped_by_reply": [], "done_before_activation": [], "tasks_to_expire": [],
+                 "skipped": []}
+
+    def _finish() -> dict:
+        out["customer_email_count"] = len(out["customer_emails"])
+        out["recipient_count"] = sum(len(e["recipients"]) for e in out["customer_emails"])
+        out["staff_email_count"] = len(out["staff_emails"])
+        out["count"] = out["customer_email_count"]
+        return out
+
+    # The activation moment, as the tick would have it: the stored one, or (never activated) the
+    # `now` the first enabled tick would record. Unreadable: the tick sends nothing, so neither do we.
+    try:
+        act = read_activation()
+    except Exception as exc:  # noqa: BLE001
+        out["activation_error"] = str(exc)
+        return _finish()
+    out["activated_at"] = act.isoformat() if act else None
+    out["activation_pending"] = act is None
+    cfg = followup_settings.with_activation(cfg, act or now)
 
     def _used(pid: str, key: str) -> bool:
         try:
@@ -726,6 +812,9 @@ def dry_run_count(now: datetime | None = None) -> dict:
 
     def _simulate(p: dict, pid: str, gid=None, view=None) -> None:
         pl = rules.plan(p, now, cfg)
+        if pl.ran_out_before_activation:
+            out["done_before_activation"].append({"proposal_id": pid, "step": pl.step,
+                                                  "scope_group": gid})
         if pl.skipped_key:
             out["skipped_by_reply"].append({
                 "proposal_id": pid, "project_name": p.get("project_name"), "step": pl.step,
@@ -806,8 +895,4 @@ def dry_run_count(now: datetime | None = None) -> dict:
                                             "scope_group": d.get("scope_group")})
         except Exception as exc:  # noqa: BLE001
             out["skipped"].append({"task_id": t.get("id"), "error": str(exc)})
-    out["customer_email_count"] = len(out["customer_emails"])
-    out["recipient_count"] = sum(len(e["recipients"]) for e in out["customer_emails"])
-    out["staff_email_count"] = len(out["staff_emails"])
-    out["count"] = out["customer_email_count"]
-    return out
+    return _finish()

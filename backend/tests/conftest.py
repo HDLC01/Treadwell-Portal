@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 
 import pytest
 
@@ -52,6 +53,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "realwording: keep the real email-wording readers instead of the autouse stubs above")
+    config.addinivalue_line(
+        "markers",
+        "realactivation: keep the real follow-up activation read instead of the autouse stub "
+        "below (followups 'activated long ago')")
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +113,26 @@ def _no_notify_roster(request, monkeypatch):
     import db
     monkeypatch.setattr(db, "list_notify_recipients", lambda: [], raising=False)
     monkeypatch.setattr(db, "list_notify_overrides", lambda pid: [], raising=False)
+
+
+# ── when automatic follow-ups were activated ─────────────────────────────────
+# Since 2026-10-29 every follow-up step's clock starts no earlier than the activation moment
+# (followup_rules, "THE CLOCK STARTS AT ACTIVATION"), and the first enabled tick RECORDS it. Every
+# follow-up test written before that describes a system that has been running all along, so the
+# default here is "activated long ago": the schedule then runs from each step's own start, exactly
+# as those tests assert. Patched at followup_worker.read_activation, the one reader the tick, the dry
+# run and the board share. Tests of the activation itself carry `realactivation` (the pattern
+# above: patch narrowly, give the owner a way out).
+FOLLOWUPS_ACTIVATED_LONG_AGO = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _followups_activated_long_ago(request, monkeypatch):
+    if "realactivation" in request.keywords:
+        return
+    import followup_worker
+    monkeypatch.setattr(followup_worker, "read_activation",
+                        lambda: FOLLOWUPS_ACTIVATED_LONG_AGO, raising=False)
 
 
 # ── the backstop: an unstubbed call costs a second, not thirty ────────────────
