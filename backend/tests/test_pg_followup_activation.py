@@ -176,8 +176,9 @@ def test_the_ops_command_and_the_dry_run_as_real_processes(clean, pgdb):
     assert b"customer emails it would send ..... 0" in proc.stdout
     assert _activation_rows() == []
 
+    # t0 is a send-window moment, usually behind the real clock: --allow-past (refused without it).
     proc = _run("followup_activate.py", "--at", t0.isoformat(), "--by", "release-runbook",
-                pgdb=pgdb)
+                "--allow-past", pgdb=pgdb)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert b"set activated_at to" in proc.stdout
     (row,) = _activation_rows()
