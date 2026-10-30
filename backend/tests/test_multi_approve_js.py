@@ -135,6 +135,16 @@ def test_a_refusal_is_said_and_the_dialog_does_not_claim_success(ran):
     assert r["after"]["disabled"] is True
 
 
+def test_a_gateway_timeout_that_hid_a_success_shows_the_approval(ran):
+    """nginx gives up after 60 s with a 504 while the server goes on to commit. The page checks
+    what was recorded -- more than once, since the commit can land after the error -- and shows
+    the approval rather than telling the customer it failed."""
+    g = ran["gatewayTimeout"]
+    assert g["doneShown"] is True, "a committed approval was reported as a failure"
+    assert g["reads"] == 2 and g["waits"] == 1
+    assert 'href="/p/tok-a#proposal/deposit"' in g["done"] and "INV-tok-b" in g["done"]
+
+
 def test_after_approval_each_invoice_is_paid_on_its_own(ran):
     d = ran["done"]
     assert d.count("Pay this deposit") == 2, "one payment per deposit, never a merged one"
@@ -155,3 +165,21 @@ def test_the_thank_you_card_lists_the_projects_other_deposits(ran):
     assert "/api/portal/tok-b/deposit-invoice.pdf" in html and "(received)" in html
     assert "/p/tok-b#proposal/deposit" not in html, "a received deposit is not offered again"
     assert "Lab 3" not in html, "a proposal with no deposit has nothing to pay"
+
+
+def test_a_contract_still_being_built_says_so_and_appears_when_stored(ran):
+    """The approval answers before the contracts are built (2026-10-31): the result view says the
+    contract is being prepared instead of offering a download that is not there yet, asks the
+    server lightly how it is getting on, and swaps the download in once it is stored."""
+    b = ran["background"]
+    assert b["first"].count("Your signed contract is being prepared — it will be emailed to you.") == 2
+    assert "signed-contract.pdf" not in b["first"]
+    assert 'href="/p/tok-a#proposal/deposit"' in b["first"], "Pay works before the contracts"
+    assert b["firstDelay"] >= 3000, "polled harder than every few seconds"
+    assert "being prepared" in b["stillPending"] and "signed-contract.pdf" not in b["stillPending"]
+    assert 'href="/api/portal/tok-a/signed-contract.pdf"' in b["after"]
+    assert 'href="/api/portal/tok-b/signed-contract.pdf"' in b["after"]
+    assert "being prepared" not in b["after"]
+    # tok-b's invoice number arrived with the status: its invoice download is offered now.
+    assert 'href="/api/portal/tok-b/deposit-invoice.pdf"' in b["after"]
+    assert b["asked"] == 2 and b["pollingAfterDone"] == 0, "kept polling after everything was stored"

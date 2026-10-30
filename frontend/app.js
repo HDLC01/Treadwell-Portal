@@ -1539,7 +1539,7 @@ function setupDeposit() {
 // "Open the proposal before signing" carries across pages here: each proposal's document has to
 // have been opened (its own page's viewer, Terms button or new-tab link, or the links in this
 // dialog), and the server remembers that per revision (POST /document-opened).
-const MA = { rows: [], max: 6, available: false, picked: new Set(), labels: {}, preview: null,
+const MA = { rows: [], max: 20, available: false, picked: new Set(), labels: {}, preview: null,
              seq: 0, consentFor: null, batchId: null, busy: false, done: null };
 
 /** A fresh id per dialog: a double submit of the same batch is answered with its first result. */
@@ -1829,12 +1829,17 @@ async function maReloadRows() {
 }
 
 /** After the approval: every proposal with its OWN contract, its OWN invoice and its OWN payment.
- *  Never one combined payment -- each deposit is paid from its proposal's page. */
+ *  Never one combined payment -- each deposit is paid from its proposal's page.
+ *
+ *  The approval is final when this is drawn; the signed contracts are built after it, in the
+ *  background, so one not stored yet says so instead of offering a download (maPollContracts
+ *  swaps the button in when it is). */
 function maDoneHtml(approved) {
   const rows = approved.map((a) => {
     const tok = encodeURIComponent(a.token);
-    const contract = a.signed
-      ? `<a class="btn btn-secondary" href="/api/portal/${tok}/signed-contract.pdf">Download signed contract</a>` : "";
+    const contract = !a.signed ? "" : a.contract_ready
+      ? `<a class="btn btn-secondary" href="/api/portal/${tok}/signed-contract.pdf">Download signed contract</a>`
+      : `<p class="small muted" data-contract-pending="${esc(a.token)}">Your signed contract is being prepared — it will be emailed to you.</p>`;
     let dep;
     if (!a.deposit_required) {
       dep = `<p class="small muted">No deposit is required for this proposal.</p>`;
@@ -1862,6 +1867,38 @@ function renderMultiApproveDone(approved) {
   hide($("ma-form-wrap"));
   const d = $("ma-done");
   if (d) { d.innerHTML = maDoneHtml(approved); show(d); }
+  maPollContracts(MA.batchId, 0);
+}
+
+/** Ask, lightly, how the background paperwork is getting on, until every contract on the result
+ *  view is stored or the dialog closes: every few seconds at first, backing off to 15 s, for about
+ *  eight minutes. After that (or on a reload) the proposal's own contract link builds it on demand. */
+let MA_POLL = null;
+function maPollContracts(batchId, tries) {
+  clearTimeout(MA_POLL);
+  const n = tries || 0;
+  if (!batchId || !MA.done || n >= 40 || !MA.done.some((a) => a.signed && !a.contract_ready)) return;
+  MA_POLL = setTimeout(async () => {
+    if (!isMultiApproveOpen() || !MA.done) return;
+    const res = await api("GET", `/approve-several/status?batch_id=${encodeURIComponent(batchId)}`);
+    if (res.ok) maApplyStatus(res.data.approved || []);
+    maPollContracts(batchId, n + 1);
+  }, Math.min(15000, 3000 + n * 1000));
+}
+
+/** What /approve-several/status reported, onto the result view: a contract now stored gets its
+ *  download, an invoice number that arrived late its Pay row. Redrawn only when something moved. */
+function maApplyStatus(rows) {
+  let changed = false;
+  for (const s of rows) {
+    const a = (MA.done || []).find((x) => x.token === s.token);
+    if (!a) continue;
+    if (s.contract_ready && !a.contract_ready) { a.contract_ready = true; changed = true; }
+    if (s.invoice_no && !a.invoice_no) { a.invoice_no = s.invoice_no; changed = true; }
+  }
+  const d = $("ma-done");
+  if (changed && d) d.innerHTML = maDoneHtml(MA.done);
+  return changed;
 }
 
 /** Send the combined approval. Named for the same reason submitApproval is: what it puts in the
@@ -1881,7 +1918,7 @@ async function submitMultiApprove() {
   const picked = body.items.map((i) => i.token);
   const btn = $("ma-submit");
   MA.busy = true; btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Signing… this can take a minute';
+  btn.innerHTML = '<span class="spinner"></span> Signing…';
   const res = await api("POST", "/approve-several", body);
   MA.busy = false;
   if (handleExpired(res, $("ma-alert"))) return;
@@ -1890,10 +1927,21 @@ async function submitMultiApprove() {
   const why = (d.reasons || []).map((r) => r.message).join(" ");
   alertBox($("ma-alert"), "error", why ? `${d.message || "Nothing was approved."} ${why}`
     : (d.message || "We couldn't confirm your approval. Checking what was recorded…"));
+  // A dropped connection or a gateway timeout (nginx answers 504 after 60 s while the server goes on
+  // to commit) can hide a success: if every proposal sent is now approved, it went through. The
+  // commit may land a moment after the error, so an unsure answer is checked a few times.
+  const unsure = res.status === 0 || res.status >= 500;
+  const allApproved = () => {
+    const rows = MA.rows.filter((r) => picked.includes(r.token));
+    return rows.length === picked.length && rows.every((r) => r.status === "approved");
+  };
   await maReloadRows();
-  // A timeout can hide a success: if every proposal sent is now approved, it went through.
+  for (let i = 0; unsure && i < 4 && !allApproved() && isMultiApproveOpen(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await maReloadRows();
+  }
   const now = MA.rows.filter((r) => picked.includes(r.token));
-  if (res.status === 0 && now.length === picked.length && now.every((r) => r.status === "approved")) {
+  if (unsure && allApproved()) {
     renderMultiApproveDone(now.map((r) => ({
       token: r.token, label: r.label, total: (r.approved || {}).total, options: [],
       deposit_required: r.deposit_required, deposit_amount: (r.approved || {}).deposit_amount,

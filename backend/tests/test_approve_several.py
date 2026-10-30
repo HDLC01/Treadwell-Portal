@@ -17,8 +17,18 @@ THESE RUN THE REAL ROUTES through the real gate (_require -> _customer_proposal 
 the seams that leave the process are replaced: the database functions (by an in-memory world whose
 approve_batch keeps the real function's all-or-nothing contract; the SQL itself runs against a real
 Postgres in test_pg_approve_batch.py), Resend, and the proposal tool.
+
+THE PAPERWORK RUNS AFTER THE ANSWER (2026-10-31): the route commits, assigns the invoice numbers and
+hands the batch to a background job. Here the job's thread is recorded instead of started, and
+_commit runs it in place (`finish=True`), so the side effects these tests read are the background
+job's. The job's own guarantees -- answer first, resume after a restart, no duplicates, renders
+retried then reported -- are the section at the end of this file.
 """
 import copy
+import json
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -84,7 +94,9 @@ def world(monkeypatch, tmp_path):
     st = {"rows": rows, "drafts": drafts, "session": SESSION, "opens": set(),
           "approvals": [], "batch_calls": [], "messages": [], "team": [], "customer": [],
           "deposit_emails": [], "contracts": [], "certs": [], "invoices": [], "tasks": [],
-          "staff_task_emails": [], "batch_error": None, "next_id": 100}
+          "staff_task_emails": [], "batch_error": None, "next_id": 100,
+          "clock": datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc), "spawned": [],
+          "saves": 0}
     by_tok = lambda t: next((r for r in rows.values() if r["token"] == t), None)  # noqa: E731
 
     monkeypatch.setattr(main, "_session_email", lambda request: st["session"])
@@ -130,8 +142,10 @@ def world(monkeypatch, tmp_path):
         for it in items:
             st["next_id"] += 1
             out[it["proposal_id"]] = st["next_id"]
-            st["approvals"].append(dict(it["approval"], proposal_id=it["proposal_id"],
-                                        id=st["next_id"]))
+            # signed_at is the column default, now(): ONE value for every row of the transaction.
+            st["approvals"].append(dict(copy.deepcopy(it["approval"]),
+                                        proposal_id=it["proposal_id"], id=st["next_id"],
+                                        signed_at=st["clock"].isoformat()))
             pr = it["proposal"]
             rows[it["proposal_id"]].update(
                 proposal_status="approved", approved_at="2026-10-31T15:00:00+00:00",
@@ -148,7 +162,61 @@ def world(monkeypatch, tmp_path):
                             "meta": k.get("meta")}) or {"id": len(st["messages"])})
     monkeypatch.setattr(main.db, "upsert_signed_contract", lambda aid, pid, **k: st[
         "contracts"].append({"approval_id": aid, "proposal_id": pid, **k}))
-    monkeypatch.setattr(main.db, "get_signed_contract", lambda pid: None)
+
+    def get_signed_contract(pid):
+        """The real ordering: a built one first, the newest of those."""
+        mine = [c for c in st["contracts"] if c["proposal_id"] == pid]
+        built = [c for c in mine if c.get("pdf")]
+        return dict((built or mine)[-1]) if (built or mine) else None
+    monkeypatch.setattr(main.db, "get_signed_contract", get_signed_contract)
+    monkeypatch.setattr(main.db, "built_contract_ids", lambda ids: {
+        c["approval_id"] for c in st["contracts"] if c.get("pdf") and c["approval_id"] in ids})
+
+    # The background job's record, kept where the real one is: `paperwork` in the first approval
+    # row's batch. Claim and save keep the real SQL's lease rules (db.batch_paperwork_claim/_save,
+    # run against Postgres in test_pg_approve_batch.py), on this world's clock.
+    lease_lock = threading.Lock()
+    monkeypatch.setattr(main, "_paperwork_now", lambda: st["clock"])
+    monkeypatch.setattr(main, "_paperwork_spawn",
+                        lambda aid, pdfs: st["spawned"].append((aid, pdfs)))
+
+    def by_id(aid):
+        return next((a for a in st["approvals"] if a["id"] == aid), None)
+
+    def claim(aid, owner, lease_sec):
+        with lease_lock:
+            a = by_id(aid)
+            pw = ((a or {}).get("batch") or {}).get("paperwork")
+            if not pw or pw.get("state") != "pending":
+                return None
+            held = pw.get("lease") or {}
+            # Held while `until` is still ahead. A lease handed back (0 s) ends "now", and the
+            # real now() has always moved on by the next statement, so it is free at once.
+            if held.get("owner") not in (None, owner) and held["until"] > st["clock"]:
+                return None
+            pw["lease"] = {"owner": owner, "until": st["clock"] + timedelta(seconds=lease_sec)}
+            return copy.deepcopy(a["batch"])
+
+    def save(aid, owner, paperwork, lease_sec):
+        with lease_lock:
+            a = by_id(aid)
+            cur = (a["batch"].get("paperwork") or {}).get("lease") or {}
+            if cur.get("owner") != owner:
+                return False
+            # Through JSON, as jsonb stores it: a value that cannot be stored fails here too.
+            new = json.loads(json.dumps({k: v for k, v in paperwork.items() if k != "lease"}))
+            new["lease"] = {"owner": owner,
+                            "until": st["clock"] + timedelta(seconds=lease_sec)}
+            a["batch"]["paperwork"] = new
+            st["saves"] += 1
+            return True
+    monkeypatch.setattr(main.db, "batch_paperwork_claim", claim)
+    monkeypatch.setattr(main.db, "batch_paperwork_save", save)
+    monkeypatch.setattr(main.db, "batch_paperwork_pending", lambda limit=20: [
+        a["id"] for a in st["approvals"]
+        if ((a.get("batch") or {}).get("paperwork") or {}).get("state") == "pending"][:limit])
+    monkeypatch.setattr(main.db, "batch_approval_records", lambda bid: [
+        copy.deepcopy(a) for a in st["approvals"] if (a.get("batch") or {}).get("batch_id") == bid])
     monkeypatch.setattr(main.db, "get_recipients", lambda pid: [rows[pid]["customer_email"]] + (
         ["ap@acme.com"] if pid == "b" else []))
     monkeypatch.setattr(main.config, "UPLOAD_DIR", str(tmp_path), raising=False)
@@ -173,8 +241,10 @@ def world(monkeypatch, tmp_path):
                         lambda pid, amt: rows[pid].update(deposit_amount=amt))
 
     def assign(pid):
-        rows[pid]["deposit_invoice_no"] = "INV-" + pid.upper()
-        st["invoices"].append(pid)
+        """The real function's contract: minted ONCE, the stored number returned after that."""
+        if not rows[pid].get("deposit_invoice_no"):
+            rows[pid]["deposit_invoice_no"] = "INV-" + pid.upper()
+            st["invoices"].append(pid)
         return rows[pid]["deposit_invoice_no"]
     monkeypatch.setattr(db, "assign_invoice_no", assign)
     monkeypatch.setattr(db, "set_deposit_requested",
@@ -226,7 +296,9 @@ def _preview(client, spec, anchor="a"):
                                        for i in _items(client, spec)]})
 
 
-def _commit(client, spec, anchor="a", items=None, **over):
+def _commit(client, spec, anchor="a", items=None, finish=True, **over):
+    """POST the combined approval. `finish`: then run the background job it handed off, in place
+    of the thread the route would have started, and return the route's own answer."""
     pv = _preview(client, spec, anchor).json()
     body = {"batch_id": "batch-0000-0001", "items": items or _items(client, spec),
             "name": "Dana Reed", "title": "Owner", "date": "2026-10-31", "consent": True,
@@ -234,9 +306,19 @@ def _commit(client, spec, anchor="a", items=None, **over):
     body.update(over)
     for k in [k for k, v in body.items() if v is None]:
         body.pop(k)
-    return client.post("/api/portal/tok-%s/approve-several" % anchor, json=body,
-                       headers={"user-agent": "Mozilla/5.0 (Test)",
-                                "x-forwarded-for": "203.0.113.9"})
+    r = client.post("/api/portal/tok-%s/approve-several" % anchor, json=body,
+                    headers={"user-agent": "Mozilla/5.0 (Test)",
+                             "x-forwarded-for": "203.0.113.9"})
+    if finish:
+        _run_spawned(client)
+    return r
+
+
+def _run_spawned(client):
+    """What the route's thread would have done: one pass over each batch it handed off."""
+    while client.st["spawned"]:
+        aid, pdfs = client.st["spawned"].pop(0)
+        main._run_batch_paperwork(aid, pdfs)
 
 
 def _nothing_written(st):
@@ -312,13 +394,23 @@ def test_approving_two_of_three_with_one_signature(world):
     assert got["tok-a"]["total"] == 13000.0 and got["tok-a"]["deposit_amount"] == 3250.0
     assert got["tok-b"]["total"] == 8000.0 and got["tok-b"]["deposit_amount"] == 2000.0
     assert got["tok-a"]["invoice_no"] == "INV-A" and got["tok-b"]["invoice_no"] == "INV-B"
-    assert got["tok-a"]["contract_ready"] is True and got["tok-b"]["contract_ready"] is True
+    # The answer came before the contracts: they are reported by /status once stored.
+    assert out["paperwork"] == "pending"
+    assert got["tok-a"]["contract_ready"] is False and got["tok-b"]["contract_ready"] is False
+    status = world.get("/api/portal/tok-a/approve-several/status",
+                       params={"batch_id": "batch-0000-0001"}).json()
+    assert status["paperwork"] == "done"
+    assert {s["token"]: s["contract_ready"] for s in status["approved"]} == {"tok-a": True,
+                                                                             "tok-b": True}
 
     # TWO approval rows, the SAME signing event on both.
     assert [a["proposal_id"] for a in st["approvals"]] == ["a", "b"]
     a, b = st["approvals"]
-    for k in ("name", "title", "ip", "user_agent", "approver_email", "consent_version", "batch"):
+    for k in ("name", "title", "ip", "user_agent", "approver_email", "consent_version"):
         assert a[k] == b[k], k
+    # The same batch record on both; the first one alone also carries the job's own record.
+    assert {k: v for k, v in a["batch"].items() if k != "paperwork"} == b["batch"]
+    assert a["batch"]["paperwork"]["state"] == "done" and "paperwork" not in b["batch"]
     assert a["ip"] == "203.0.113.9" and a["user_agent"] == "Mozilla/5.0 (Test)"
     assert a["consent_version"] == signing.COMBINED_CONSENT_VERSION
     assert a["revision_no"] == 2 and b["revision_no"] == 3
@@ -635,6 +727,9 @@ def test_a_contract_that_cannot_be_built_costs_the_document_not_the_approval(wor
     assert r.status_code == 200
     assert all(a["contract_ready"] is False for a in r.json()["approved"])
     assert len(world.st["approvals"]) == 2
+    # Retried by the sweeps that follow, then given up on and the emails sent without them.
+    for _ in range(main._PAPERWORK_MAX_ATTEMPTS):
+        main._paperwork_sweep()
     assert "could not be built yet" in world.st["team"][0]["body"]
 
 
@@ -647,6 +742,7 @@ def test_a_combined_contract_rebuilds_with_the_sentence_it_was_signed_under(worl
     rec = world.st["approvals"][0]
     rec["signed_at"] = "2026-10-31T15:00:00+00:00"
     monkeypatch.setattr(main.db, "latest_approval_record", lambda pid: dict(rec))
+    monkeypatch.setattr(main.db, "get_signed_contract", lambda pid: None)   # never stored
     pdf, err, status = main._signed_contract_pdf(dict(world.st["rows"]["a"]))
     assert status == 200, err
     assert world.st["certs"][0]["consent_text"] == signed_text["a"]
@@ -681,6 +777,10 @@ def test_single_approve_is_unchanged(world, monkeypatch):
     assert "combined_approval" not in world.st["certs"][0]
     # Its invoice still goes out in its own email.
     assert world.st["deposit_emails"] == [SESSION]
+    # ...and all of it inside the request, as before: nothing handed to the background.
+    assert world.st["spawned"] == []
+    assert [c["proposal_id"] for c in world.st["contracts"]] == ["a"]
+    assert world.st["team"] and world.st["team"][0]["kind"] == "approved"
 
 
 # ── review fixes (2026-10-31) ────────────────────────────────────────────────
@@ -871,3 +971,561 @@ def test_the_chat_line_tells_proposals_apart_by_id_not_by_label(world):
     assert lines["a"].endswith("together with Lab 1.") and lines["c"].endswith(
         "together with Lab 1."), lines
     assert "together with ." not in " ".join(lines.values())
+
+
+# ── the paperwork in the background (2026-10-31) ─────────────────────────────
+# Hanz: lift the 6-proposal limit by building the paperwork in the background. The request answers
+# once the approvals commit; the contracts, invoices, chat lines and emails follow, durably: a
+# restart resumes the job, a second worker cannot double it, and a failed render is retried, then
+# reported, without holding up the rest.
+class _ProcessDied(BaseException):
+    """The process going down mid-render: not an Exception, so nothing on the way out catches it
+    and the job is left exactly as a killed container leaves it."""
+
+
+def _many(world, n):
+    """n more of Dana's proposals in the same project, each signable, each opened, its PDF cached.
+    Returns the spec for _commit."""
+    st = world.st
+    spec = {}
+    for i in range(1, n + 1):
+        pid, label = "p%02d" % i, "Room %02d" % i
+        st["rows"][pid] = _row(pid, label, 1)
+        st["drafts"][pid] = _draft(label, rooms=[{"name": label, "is_base": True,
+                                                  "bid": {"total": 1000.0 * i}}])
+        main._pdf_cache_put(pid, 1, b"%PDF proposal " + pid.encode())
+        _open(world, pid)
+        spec[pid] = [label]
+    return spec
+
+
+def _built(st):
+    """approval id -> how many times a BUILT contract was stored for it."""
+    out = {}
+    for c in st["contracts"]:
+        if c.get("pdf"):
+            out[c["approval_id"]] = out.get(c["approval_id"], 0) + 1
+    return out
+
+
+def _one_of_everything(st, pids, emails=(SESSION,)):
+    """The finished batch: one contract per approval, one invoice, one deposit card, one approval
+    line and one thread copy per proposal, ONE staff email, ONE email per contact."""
+    ids = {a["proposal_id"]: a["id"] for a in st["approvals"]}
+    assert set(_built(st)) == {ids[p] for p in pids}, "a contract is missing"
+    assert all(n == 1 for n in _built(st).values()), ("a contract was built twice", _built(st))
+    assert sorted(st["invoices"]) == sorted(pids), "an invoice number was minted twice"
+    for kind, pick in (("deposit card", lambda m: m["type"] == "deposit_request"),
+                       ("approval line", lambda m: m["type"] == "system"
+                        and m["body"].startswith("Approved by")),
+                       ("thread copy", lambda m: m["type"] == "text"
+                        and (m["meta"] or {}).get("system_doc"))):
+        got = sorted(m["pid"] for m in st["messages"] if pick(m))
+        assert got == sorted(pids), (kind, got)
+    assert len(st["team"]) == 1, "staff got more than one email"
+    assert sorted(m["to"] for m in st["customer"]) == sorted(emails), "a contact got two emails"
+    assert st["deposit_emails"] == [], "an invoice went out in an email of its own"
+
+
+def _anchor(st):
+    return st["approvals"][0]
+
+
+def _signed_unless(pid_failing, real, exc=None):
+    """A renderer that refuses one proposal's contract and builds every other one."""
+    def render(pdf, cert, **k):
+        if cert["proposal_id"] == pid_failing:
+            raise exc or signing.ContractUnavailable("LibreOffice timed out")
+        return real(pdf, cert, **k)
+    return render
+
+
+def test_twelve_proposals_answer_before_any_render_and_finish_in_the_background(world,
+                                                                                 monkeypatch):
+    """The 12-proposal batch the old cap refused. The renders are slow (as the tool's are); the
+    answer does not wait for one of them, and the real background thread then does all of it,
+    never more than two renders at once."""
+    st = world.st
+    spec = _many(world, 12)
+    gate = {"now": 0, "max": 0}
+    lock = threading.Lock()
+
+    def slow_render(pdf, cert, **k):
+        with lock:
+            gate["now"] += 1
+            gate["max"] = max(gate["max"], gate["now"])
+        time.sleep(0.15)
+        with lock:
+            gate["now"] -= 1
+        st["certs"].append(cert)
+        return b"%PDF-1.7 signed " + cert["proposal_id"].encode() + b"\n%%EOF"
+    monkeypatch.setattr(main.signing, "render_signed_contract", slow_render)
+    started = []
+
+    def spawn(aid, pdfs):
+        t = threading.Thread(target=main._paperwork_thread, args=(aid, pdfs), daemon=True)
+        started.append(t)
+        t.start()
+    monkeypatch.setattr(main, "_paperwork_spawn", spawn)
+
+    t0 = time.monotonic()
+    r = _commit(world, spec, anchor="p01", finish=False)
+    took = time.monotonic() - t0
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["paperwork"] == "pending"
+    assert len(body["approved"]) == 12
+    # Every deposit's number is there at once, so every Pay link works now.
+    for a in body["approved"]:
+        assert a["invoice_no"] == "INV-" + a["token"][4:].upper(), a
+        assert a["deposit_amount"] and a["deposit_required"] is True
+        assert a["signed"] is True and a["contract_ready"] is False
+    # 12 renders at 0.15 s, two at a time, is 0.9 s at the least: the answer did not wait.
+    assert took < 0.9, "the request waited for the renders (%.2fs)" % took
+
+    assert len(started) == 1
+    started[0].join(30)
+    assert not started[0].is_alive(), "the background job did not finish"
+    # The proposal tool renders two at once (LibreOffice); the background never asks for more.
+    assert 1 <= gate["max"] <= 2, "%d renders at once" % gate["max"]
+    assert _anchor(st)["batch"]["paperwork"]["state"] == "done"
+    _one_of_everything(st, list(spec))
+    staff = st["team"][0]
+    assert staff["subject"].startswith("12 proposals APPROVED")
+    assert len(staff["attachments"]) == 12
+    dana = st["customer"][0]
+    assert len(dana["attachments"]) == 24, "12 contracts and 12 invoices"
+    status = world.get("/api/portal/tok-p01/approve-several/status",
+                       params={"batch_id": "batch-0000-0001"}).json()
+    assert status["paperwork"] == "done"
+    assert all(s["contract_ready"] for s in status["approved"]) and len(status["approved"]) == 12
+
+
+def test_an_invoice_can_be_downloaded_the_moment_the_approval_answers(world):
+    """Pay works at once: the invoice number and amount are stored at commit, and the invoice
+    document is rendered from exactly those."""
+    _open(world, "a"); _open(world, "b")
+    r = _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False)
+    assert r.status_code == 200
+    assert world.st["contracts"] == [] and world.st["certs"] == [], "a render ran in the request"
+    assert world.st["team"] == [] and world.st["customer"] == []
+    pdf = world.get("/api/portal/tok-b/deposit-invoice.pdf")
+    assert pdf.status_code == 200 and pdf.content == b"%PDF invoice"
+
+
+def test_a_restart_in_the_middle_resumes_and_repeats_nothing(world, monkeypatch):
+    """The process dies during the fifth contract render (a deploy, a crash). The job is left
+    pending with its lease held; once the lease runs out the next sweep takes it over and finishes
+    it. Nothing done before the crash is done again."""
+    st = world.st
+    spec = _many(world, 12)
+    calls = {"n": 0}
+    real = main.signing.render_signed_contract
+
+    def dies_once(pdf, cert, **k):
+        calls["n"] += 1
+        if calls["n"] == 5:
+            raise _ProcessDied()
+        return real(pdf, cert, **k)
+    monkeypatch.setattr(main.signing, "render_signed_contract", dies_once)
+    assert _commit(world, spec, anchor="p01", finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    with pytest.raises(_ProcessDied):
+        main._run_batch_paperwork(aid, pdfs)
+    pw = _anchor(st)["batch"]["paperwork"]
+    assert pw["state"] == "pending" and pw["lease"]["owner"]
+    assert st["team"] == [] and st["customer"] == [], "emailed before the paperwork was done"
+    built_before = dict(_built(st))
+    assert 0 < len(built_before) < 12
+
+    # Another container, straight away: the dead worker's lease still holds it off.
+    assert main._paperwork_sweep() == {aid: "busy"}
+    st["clock"] += timedelta(seconds=main._PAPERWORK_LEASE_SEC + 1)
+    assert main._paperwork_sweep() == {aid: "done"}
+    _one_of_everything(st, list(spec))
+    # The contracts stored before the crash were not rendered again.
+    assert {k: v for k, v in _built(st).items() if k in built_before} == built_before
+    assert main._paperwork_sweep() == {}, "a finished batch was picked up again"
+
+
+def test_a_crash_after_a_render_before_its_mark_does_not_render_it_again(world, monkeypatch):
+    """The narrowest gap: the contract was STORED and the process died before the job recorded it.
+    The resumed run finds it in the database and does not build it a second time."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    real_mark = main._Paperwork.mark
+
+    def dies_on_the_first_contract_mark(self, step, key=None):
+        if step == "contracts":
+            raise _ProcessDied()
+        return real_mark(self, step, key)
+    monkeypatch.setattr(main._Paperwork, "mark", dies_on_the_first_contract_mark)
+    with pytest.raises(_ProcessDied):
+        main._run_batch_paperwork(aid, pdfs)
+    monkeypatch.setattr(main._Paperwork, "mark", real_mark)
+    renders_before = len(st["certs"])
+    assert renders_before >= 1
+    st["clock"] += timedelta(seconds=main._PAPERWORK_LEASE_SEC + 1)
+    assert main._paperwork_sweep() == {aid: "done"}
+    _one_of_everything(st, ["a", "b"], emails=(SESSION, "ap@acme.com"))
+    assert len(st["certs"]) == 2, "a stored contract was rendered again"
+
+
+def test_a_crash_after_an_invoice_was_issued_before_its_mark_does_not_issue_it_again(world,
+                                                                                    monkeypatch):
+    """The invoice's chat card and requested stamp were written and the process died before the
+    job recorded it. deposit_requested_at says it was issued: the resumed run does not post a
+    second card, and the one email still carries the invoice."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    real_mark = main._Paperwork.mark
+
+    def dies_on_the_first_invoice_mark(self, step, key=None):
+        if step == "invoices":
+            raise _ProcessDied()
+        return real_mark(self, step, key)
+    monkeypatch.setattr(main._Paperwork, "mark", dies_on_the_first_invoice_mark)
+    with pytest.raises(_ProcessDied):
+        main._run_batch_paperwork(aid, pdfs)
+    monkeypatch.setattr(main._Paperwork, "mark", real_mark)
+    assert [m["pid"] for m in st["messages"] if m["type"] == "deposit_request"]
+    st["clock"] += timedelta(seconds=main._PAPERWORK_LEASE_SEC + 1)
+    assert main._paperwork_sweep() == {aid: "done"}
+    _one_of_everything(st, ["a", "b"], emails=(SESSION, "ap@acme.com"))
+    dana = next(m for m in st["customer"] if m["to"] == SESSION)
+    assert len(dana["attachments"]) == 4, "both contracts and both invoices"
+
+
+def test_a_crash_half_way_through_the_emails_sends_the_rest_once(world, monkeypatch):
+    """The staff email and Dana's went out; the process died sending ap@'s. The resumed run sends
+    ap@'s alone: nobody hears twice."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    real_send = email_sender.send_customer_update
+    calls = {"n": 0}
+
+    def dies_on_the_second(e, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _ProcessDied()
+        return real_send(e, *a, **k)
+    monkeypatch.setattr(email_sender, "send_customer_update", dies_on_the_second)
+    with pytest.raises(_ProcessDied):
+        main._run_batch_paperwork(aid, pdfs)
+    assert len(st["team"]) == 1 and len(st["customer"]) == 1
+    st["clock"] += timedelta(seconds=main._PAPERWORK_LEASE_SEC + 1)
+    assert main._paperwork_sweep() == {aid: "done"}
+    _one_of_everything(st, ["a", "b"], emails=(SESSION, "ap@acme.com"))
+
+
+def test_two_workers_at_once_do_the_work_once(world, monkeypatch):
+    """Two containers during a deploy (or the request's thread and the sweeper) start the same batch
+    at the same moment. One holds the lease; the other stands aside."""
+    st = world.st
+    spec = _many(world, 6)
+
+    def render(pdf, cert, **k):
+        time.sleep(0.05)
+        st["certs"].append(cert)
+        return b"%PDF-1.7 signed " + cert["proposal_id"].encode() + b"\n%%EOF"
+    monkeypatch.setattr(main.signing, "render_signed_contract", render)
+    assert _commit(world, spec, anchor="p01", finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    results, go = [], threading.Barrier(2)
+
+    def worker():
+        go.wait()
+        results.append(main._run_batch_paperwork(aid, pdfs))
+    ts = [threading.Thread(target=worker) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(30)
+    assert sorted(results) == ["busy", "done"]
+    _one_of_everything(st, list(spec))
+    assert len(st["certs"]) == 6
+
+
+def test_a_worker_that_lost_its_lease_stops_without_writing(world, monkeypatch):
+    """A worker stalled past its lease, which another one then took over: its next save is refused
+    and it stops, rather than carrying on beside the new owner."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    real_recipients = main.db.get_recipients
+
+    def taken_over_meanwhile(pid):
+        _anchor(st)["batch"]["paperwork"]["lease"] = {
+            "owner": "someone-else", "until": st["clock"] + timedelta(seconds=300)}
+        return real_recipients(pid)
+    monkeypatch.setattr(main.db, "get_recipients", taken_over_meanwhile)
+    assert main._run_batch_paperwork(aid, pdfs) == "busy"
+    # The first approval line went out before its mark was refused; nothing after it did.
+    assert [m["pid"] for m in st["messages"]] == ["a"]
+    assert st["contracts"] == [] and st["team"] == [] and st["customer"] == []
+
+
+def test_a_render_that_keeps_failing_is_retried_then_reported_and_holds_nothing_up(world,
+                                                                                   monkeypatch):
+    st = world.st
+    spec = _many(world, 4)
+    monkeypatch.setattr(main.signing, "render_signed_contract",
+                        _signed_unless("p03", main.signing.render_signed_contract))
+    assert _commit(world, spec, anchor="p01").status_code == 200
+    # The other three are done; the emails wait for the fourth.
+    assert len(_built(st)) == 3 and st["team"] == []
+    pw = _anchor(st)["batch"]["paperwork"]
+    assert pw["state"] == "pending" and pw["attempts"] == {"contract:p03": 1}
+    assert main._paperwork_sweep() == {_anchor(st)["id"]: "pending"}      # attempt 2
+    assert st["team"] == []
+    assert main._paperwork_sweep() == {_anchor(st)["id"]: "done"}         # attempt 3: given up
+    assert main._paperwork_sweep() == {}
+    # REPORTED: staff read it on the proposal's thread (internal), and in the one email.
+    note = [m for m in st["messages"] if m["pid"] == "p03" and (m["meta"] or {}).get("internal")
+            and "could not be built after 3 tries" in m["body"]]
+    assert len(note) == 1 and "LibreOffice timed out" in note[0]["body"]
+    assert len(st["team"]) == 1 and len(st["customer"]) == 1
+    assert "could not be built yet" in st["team"][0]["body"]
+    assert len(st["team"][0]["attachments"]) == 3
+    assert len(st["customer"][0]["attachments"]) == 3 + 4, "3 contracts and every invoice"
+    assert sorted(st["invoices"]) == sorted(spec)
+
+
+def test_the_emails_wait_no_longer_than_the_time_limit(world, monkeypatch):
+    """A render still being retried does not hold the emails past the wait: they go with what is
+    ready, the rest linked, and the job carries on retrying without emailing again."""
+    st = world.st
+    spec = _many(world, 3)
+    real = main.signing.render_signed_contract
+    monkeypatch.setattr(main.signing, "render_signed_contract",
+                        _signed_unless("p02", real, signing.ContractUnavailable("busy")))
+    assert _commit(world, spec, anchor="p01").status_code == 200
+    assert st["team"] == []
+    st["clock"] += timedelta(seconds=main._PAPERWORK_EMAIL_WAIT_SEC)
+    assert main._paperwork_sweep() == {_anchor(st)["id"]: "pending"}   # attempt 2, still retrying
+    assert len(st["team"]) == 1 and len(st["customer"]) == 1
+    assert "could not be built yet" in st["team"][0]["body"]
+    assert len(st["team"][0]["attachments"]) == 2
+    lab2 = next(li for li in st["customer"][0]["body"].split("<li>") if "Room 02" in li)
+    assert "INV-P02" in lab2 and "Pay this deposit" in lab2
+    # It comes good on the next pass: stored and posted to its thread, no second email.
+    monkeypatch.setattr(main.signing, "render_signed_contract", real)
+    assert main._paperwork_sweep() == {_anchor(st)["id"]: "done"}
+    assert len(st["team"]) == 1 and len(st["customer"]) == 1
+    _one_of_everything(st, list(spec))
+
+
+@pytest.mark.parametrize("n,ok", [(20, True), (21, False)])
+def test_the_cap_is_twenty(world, n, ok):
+    assert main.MAX_BATCH == 20
+    spec = _many(world, n)
+    r = _commit(world, spec, anchor="p01")
+    if ok:
+        assert r.status_code == 200, r.text
+        assert len(r.json()["approved"]) == 20
+        _one_of_everything(world.st, list(spec))
+    else:
+        assert r.status_code == 400 and r.json()["error"] == "batch_size"
+        assert "between 2 and 20" in r.json()["message"]
+        _nothing_written(world.st)
+    pv = world.post("/api/portal/tok-p01/approve-several/preview", json={"items": [
+        {"token": world.st["rows"][p]["token"], "option_labels": spec[p]} for p in spec]})
+    assert pv.status_code == (200 if ok else 400)
+
+
+def test_the_status_lists_only_what_this_session_may_open(world):
+    """d is in the same project but was sent to somebody else: never listed, whatever batch_id the
+    page sends."""
+    _open(world, "a"); _open(world, "b")
+    _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]})
+    world.st["approvals"].append({"id": 999, "proposal_id": "d", "consent_version": "x",
+                                  "batch": {"batch_id": "batch-0000-0001"}})
+    s = world.get("/api/portal/tok-a/approve-several/status",
+                  params={"batch_id": "batch-0000-0001"})
+    assert s.status_code == 200
+    assert sorted(x["token"] for x in s.json()["approved"]) == ["tok-a", "tok-b"]
+    assert "Lab 3" not in s.text and "tok-d" not in s.text
+    assert world.get("/api/portal/tok-a/approve-several/status",
+                     params={"batch_id": "x"}).status_code == 400
+    world.st["session"] = "pat@other.example"
+    assert world.get("/api/portal/tok-a/approve-several/status",
+                     params={"batch_id": "batch-0000-0001"}).status_code == 401
+
+
+def test_the_job_record_rides_the_commit(world):
+    """The approvals and the record of the work they owe are written by the same transaction: the
+    first row's batch carries it, pending, and nothing else does."""
+    _open(world, "a"); _open(world, "b")
+    _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False)
+    (call,) = world.st["batch_calls"]
+    first, second = call
+    assert first["approval"]["batch"]["paperwork"]["state"] == "pending"
+    assert "paperwork" not in second["approval"]["batch"]
+    assert world.st["spawned"][0][0] == world.st["approvals"][0]["id"]
+
+
+# ── review fixes (2026-10-31) ────────────────────────────────────────────────
+def test_a_worker_whose_lease_ran_out_in_the_email_phase_does_not_send_a_second_email(world,
+                                                                                    monkeypatch):
+    """The tool is slow: every invoice rendered at issue time failed (the cards went out without a
+    document), so the email phase renders each one again for the attachment. During the first of
+    those renders the lease runs out and the sweeper -- a separate thread of the same process --
+    takes the batch over and finishes it, emails included. The first worker must stop there, not
+    send the staff email a second time."""
+    st = world.st
+    spec = _many(world, 4)
+    calls = {"n": 0, "nested": None}
+
+    def render_invoice(payload):
+        calls["n"] += 1
+        if calls["n"] <= 4:                       # issue time: the tool is down
+            raise invoice.InvoiceUnavailable("the tool timed out")
+        if calls["nested"] is None:               # the email phase's first re-render: too slow
+            calls["nested"] = "running"
+            st["clock"] += timedelta(seconds=main._PAPERWORK_LEASE_SEC + 1)
+            calls["nested"] = main._paperwork_sweep()
+        return b"%PDF invoice"
+    monkeypatch.setattr(invoice, "render_invoice_pdf", render_invoice)
+    assert _commit(world, spec, anchor="p01", finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    assert main._run_batch_paperwork(aid, pdfs) == "busy", "it carried on beside the new owner"
+    assert calls["nested"] == {aid: "done"}
+    assert len(st["team"]) == 1, "the staff email went out twice"
+    assert [m["to"] for m in st["customer"]] == [SESSION]
+    _one_of_everything(st, list(spec))
+
+
+def test_a_lease_lost_while_waiting_for_a_render_slot_issues_no_invoice(world, monkeypatch):
+    """The render slots are shared with every other batch, so a worker can wait for one past its
+    lease. Issuing an invoice posts the customer's deposit card: a worker that no longer holds the
+    batch must not issue it."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+    real = main._RENDER_SLOTS
+
+    class SlowSlots:
+        def __enter__(self):
+            real.acquire()
+            # Meanwhile the lease ran out and another container took the batch.
+            _anchor(st)["batch"]["paperwork"]["lease"] = {
+                "owner": "someone-else", "until": st["clock"] + timedelta(seconds=300)}
+            return self
+
+        def __exit__(self, *exc):
+            real.release()
+    monkeypatch.setattr(main, "_RENDER_SLOTS", SlowSlots())
+    assert main._run_batch_paperwork(aid, pdfs) == "busy"
+    assert [m for m in st["messages"] if m["type"] == "deposit_request"] == [], (
+        "a deposit card was posted by a worker that had lost the batch")
+    assert st["contracts"] == [] and st["team"] == [] and st["customer"] == []
+
+
+def test_the_email_phase_renders_earlier_invoices_only_within_its_budget(world, monkeypatch):
+    """A resumed pass holds none of the invoice documents an earlier pass issued. Rendering them
+    all again, one by one, could keep the emails waiting on the tool for minutes: past the budget
+    the email carries the number and the Pay link instead of the attachment."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}, finish=False).status_code == 200
+    (aid, pdfs), = st["spawned"]
+
+    def dies(*a, **k):                  # the process goes down as the first email is sent
+        raise _ProcessDied()
+    monkeypatch.setattr(email_sender, "notify_team", dies)
+    with pytest.raises(_ProcessDied):
+        main._run_batch_paperwork(aid, pdfs)
+    monkeypatch.setattr(email_sender, "notify_team", lambda subject, body, **k: st[
+        "team"].append({"subject": subject, "body": body, **k}) or [])
+    renders = []
+    monkeypatch.setattr(invoice, "render_invoice_pdf",
+                        lambda payload: renders.append(1) or b"%PDF invoice")
+    monkeypatch.setattr(main, "_PAPERWORK_EMAIL_RENDER_SEC", 0, raising=False)
+    st["clock"] += timedelta(seconds=main._PAPERWORK_LEASE_SEC + 1)
+    assert main._paperwork_sweep() == {aid: "done"}
+    assert renders == [], "the invoices were rendered again past the budget"
+    dana = next(m for m in st["customer"] if m["to"] == SESSION)
+    assert len(dana["attachments"]) == 2, "the two contracts, the invoices linked"
+    assert dana["body"].count("Pay this deposit") == 2 and "(attached)" not in dana["body"]
+    assert "INV-A" in dana["body"] and "INV-B" in dana["body"]
+
+
+def test_a_cold_document_does_not_hold_the_answer_and_is_hashed_by_the_background(world,
+                                                                                 monkeypatch):
+    """The documents being signed are fetched before the commit. A customer who read the proposals
+    more than ten minutes ago (or a restart) means cold renders on the tool, and twenty of those
+    would outlast nginx's 60 s: the page says it failed while the server commits. The fetch has
+    one deadline for all of them; what misses it is signed without a stored hash and the
+    background hashes the document it builds the contract from, as the download rebuild does."""
+    st = world.st
+    spec = _many(world, 3)
+    main._PDF_CACHE.clear()
+    main._pdf_cache_put("p01", 1, b"%PDF proposal p01")       # warm; p02 and p03 are cold
+    release = threading.Event()
+    real_fetch = main._proposal_pdf_bytes
+
+    def fetch(p, *, timeout=90.0):
+        if p["proposal_id"] != "p01" and not release.is_set():
+            release.wait(5)                     # a cold LibreOffice render
+            return b"%PDF proposal cold " + p["proposal_id"].encode()
+        if p["proposal_id"] != "p01":
+            return b"%PDF proposal cold " + p["proposal_id"].encode()
+        return real_fetch(p, timeout=timeout)
+    monkeypatch.setattr(main, "_proposal_pdf_bytes", fetch)
+    monkeypatch.setattr(main, "_BATCH_PDF_DEADLINE_SEC", 0.3, raising=False)
+    t0 = time.monotonic()
+    try:
+        r = _commit(world, spec, anchor="p01", finish=False)
+        took = time.monotonic() - t0
+    finally:
+        release.set()
+    assert r.status_code == 200, r.text
+    assert took < 2.5, "the answer waited for the cold renders (%.2fs)" % took
+    sha = {a["proposal_id"]: a["contract_sha256"] for a in st["approvals"]}
+    assert sha["p01"] == signing.sha256_hex(b"%PDF proposal p01")
+    assert sha["p02"] is None and sha["p03"] is None
+    _run_spawned(world)
+    assert _anchor(st)["batch"]["paperwork"]["state"] == "done"
+    _one_of_everything(st, list(spec))
+    certs = {c["proposal_id"]: c for c in st["certs"]}
+    assert certs["p02"]["proposal_pdf_sha256"] == signing.sha256_hex(b"%PDF proposal cold p02")
+    assert certs["p03"]["proposal_pdf_sha256"] == signing.sha256_hex(b"%PDF proposal cold p03")
+    assert certs["p01"]["proposal_pdf_sha256"] == sha["p01"]
+
+
+def test_the_email_wait_counts_from_the_end_of_the_first_render_pass(world, monkeypatch):
+    """A big batch's first pass can take longer than the email wait on its own. Counted from the
+    commit, one render failing once in that pass would have the emails go on the very next pass,
+    after one retry -- and the contract that then succeeds would never be emailed, although the
+    page said it would be. Counted from the end of the renders, it gets its retries first."""
+    st = world.st
+    spec = _many(world, 4)
+    real = main.signing.render_signed_contract
+    tries = {"p03": 0}
+
+    def slow(pdf, cert, **k):
+        st["clock"] += timedelta(minutes=3)     # four of these: 12 minutes for the first pass
+        if cert["proposal_id"] == "p03":
+            tries["p03"] += 1
+            if tries["p03"] < 3:
+                raise signing.ContractUnavailable("LibreOffice timed out")
+        return real(pdf, cert, **k)
+    monkeypatch.setattr(main.signing, "render_signed_contract", slow)
+    assert _commit(world, spec, anchor="p01").status_code == 200
+    assert st["team"] == [] and len(_built(st)) == 3
+    st["clock"] += timedelta(seconds=60)
+    assert main._paperwork_sweep() == {_anchor(st)["id"]: "pending"}     # attempt 2 fails
+    assert st["team"] == [] and st["customer"] == [], "emailed after a single retry"
+    st["clock"] += timedelta(seconds=60)
+    assert main._paperwork_sweep() == {_anchor(st)["id"]: "done"}        # attempt 3 builds it
+    _one_of_everything(st, list(spec))
+    assert len(st["team"][0]["attachments"]) == 4, "the late contract was not emailed"
+    assert len(st["customer"][0]["attachments"]) == 4 + 4

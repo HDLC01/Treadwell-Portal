@@ -200,8 +200,10 @@ def test_document_opens_are_per_person_per_revision(world):
     assert db.document_opened("b", DANA, None) is True
 
 
-def test_the_whole_route_against_the_real_database(world):
+def test_the_whole_route_against_the_real_database(world, monkeypatch):
     sent = world
+    spawned = []
+    monkeypatch.setattr(main, "_paperwork_spawn", lambda aid, pdfs: spawned.append((aid, pdfs)))
     client = TestClient(main.app)
     client.cookies.set(config.SESSION_COOKIE, ca.start_session(DANA))
     listing = client.get("/api/portal/tok-a/approve-several").json()
@@ -215,14 +217,33 @@ def test_the_whole_route_against_the_real_database(world):
     assert r.status_code == 200, r.text
     assert {a["token"]: a["total"] for a in r.json()["approved"]} == {"tok-a": 12000.0,
                                                                        "tok-b": 8000.0}
-    recs = db.qall("select proposal_id, name, ip, user_agent, batch, consent_version "
+    recs = db.qall("select id, proposal_id, name, ip, user_agent, batch, consent_version "
                    "from public.portal_approvals order by proposal_id")
     assert [x["proposal_id"] for x in recs] == ["a", "b"]
-    assert recs[0]["batch"] == recs[1]["batch"] and recs[0]["batch"]["count"] == 2
+    # The same batch record on both rows; the first also carries the background job, pending.
+    assert {k: v for k, v in recs[0]["batch"].items() if k != "paperwork"} == recs[1]["batch"]
+    assert recs[0]["batch"]["count"] == 2
+    assert recs[0]["batch"]["paperwork"]["state"] == "pending"
     assert recs[0]["consent_version"] is None, "Gyp is approved without an e-signature"
+    # The invoice numbers are in at commit, before any paperwork has run.
     inv = {x["proposal_id"]: x["deposit_invoice_no"] for x in db.qall(
         "select proposal_id, deposit_invoice_no from public.portal_proposals")}
     assert inv["a"] and inv["b"] and inv["a"] != inv["b"] and inv["c"] is None
+    assert db.batch_paperwork_pending() == [recs[0]["id"]]
+    assert [aid for aid, _ in spawned] == [recs[0]["id"]]
+    # The background job, run here in place of its thread, against the real tables.
+    assert main._run_batch_paperwork(recs[0]["id"]) == "done"
+    assert db.batch_paperwork_pending() == []
+    after = db.q1("select batch from public.portal_approvals where id = %s", (recs[0]["id"],))
+    assert after["batch"]["paperwork"]["state"] == "done"
+    assert {k: v for k, v in after["batch"].items() if k != "paperwork"} == recs[1]["batch"], (
+        "the job's writes touched the batch record itself")
+    # The invoices were issued under the numbers assigned at commit, not new ones.
+    issued = {x["proposal_id"]: (x["deposit_invoice_no"], x["deposit_requested_at"]) for x in
+              db.qall("select proposal_id, deposit_invoice_no, deposit_requested_at "
+                      "from public.portal_proposals")}
+    assert issued["a"][0] == inv["a"] and issued["a"][1] is not None
+    assert issued["b"][0] == inv["b"] and issued["b"][1] is not None
     # Each thread got its own approval line.
     lines = db.qall("select proposal_id from public.portal_questions "
                     "where body like %s order by proposal_id", ("Approved by Dana Reed%",))
@@ -233,3 +254,84 @@ def test_the_whole_route_against_the_real_database(world):
     assert again.status_code == 200 and again.json().get("replayed") is True
     assert db.q1("select count(*) as n from public.portal_approvals")["n"] == 2
     assert sent, "no email at all went out"
+
+
+# ── the background paperwork's job record (2026-10-31) ───────────────────────
+def _with_job(pid, total):
+    it = _item(pid, total)
+    it["approval"]["batch"] = dict(it["approval"]["batch"],
+                                   paperwork={"v": 1, "state": "pending", "done": {}})
+    return it
+
+
+def test_the_job_record_is_committed_with_the_approvals_and_found_by_the_sweep(world):
+    ids = db.approve_batch([_with_job("a", 12000.0), _item("b", 8000.0)])
+    assert db.batch_paperwork_pending() == [ids["a"]]
+    recs = db.batch_approval_records("b-1")
+    assert [r["proposal_id"] for r in recs] == ["a", "b"]
+    assert recs[0]["signed_at"] == recs[1]["signed_at"], "one transaction, one now()"
+    assert recs[0]["batch"]["paperwork"]["state"] == "pending" and "paperwork" not in recs[1]["batch"]
+
+
+def test_one_claim_at_a_time_and_a_save_needs_the_lease(world):
+    ids = db.approve_batch([_with_job("a", 12000.0), _item("b", 8000.0)])
+    aid = ids["a"]
+    got = db.batch_paperwork_claim(aid, "worker-1", 300)
+    assert got["batch_id"] == "b-1" and got["paperwork"]["lease"]["owner"] == "worker-1"
+    assert db.batch_paperwork_claim(aid, "worker-2", 300) is None, "two workers held one batch"
+    assert db.batch_paperwork_save(aid, "worker-2", {"v": 1, "state": "pending"}, 300) is False
+    # The holder saves (and renews); the rest of `batch` is never touched.
+    before = db.q1("select batch from public.portal_approvals where id = %s", (aid,))["batch"]
+    pw = {"v": 1, "state": "pending", "done": {"lines": ["a"]}, "lease": {"owner": "forged"}}
+    assert db.batch_paperwork_save(aid, "worker-1", pw, 300) is True
+    after = db.q1("select batch from public.portal_approvals where id = %s", (aid,))["batch"]
+    assert after["paperwork"]["done"] == {"lines": ["a"]}
+    assert after["paperwork"]["lease"]["owner"] == "worker-1", "a saved lease overrode the holder"
+    assert {k: v for k, v in after.items() if k != "paperwork"} == {
+        k: v for k, v in before.items() if k != "paperwork"}
+    # Handing the lease back (0 s) frees it for the next worker at once.
+    assert db.batch_paperwork_save(aid, "worker-1", after["paperwork"], 0) is True
+    assert db.batch_paperwork_claim(aid, "worker-2", 300) is not None
+    assert db.batch_paperwork_save(aid, "worker-1", after["paperwork"], 300) is False
+    # Finished: no longer pending, no longer claimable.
+    done = dict(after["paperwork"], state="done")
+    assert db.batch_paperwork_save(aid, "worker-2", done, 0) is True
+    assert db.batch_paperwork_pending() == []
+    assert db.batch_paperwork_claim(aid, "worker-3", 300) is None
+
+
+def test_an_expired_lease_is_taken_over(world):
+    ids = db.approve_batch([_with_job("a", 12000.0), _item("b", 8000.0)])
+    aid = ids["a"]
+    assert db.batch_paperwork_claim(aid, "dead-worker", 300) is not None
+    db.execute("update public.portal_approvals set batch = jsonb_set(batch, "
+               "'{paperwork,lease,until}', to_jsonb(now() - interval '1 second')) where id = %s",
+               (aid,))
+    assert db.batch_paperwork_claim(aid, "next-worker", 300) is not None
+    assert db.batch_paperwork_save(aid, "dead-worker", {"v": 1, "state": "pending"}, 300) is False
+
+
+def test_two_workers_racing_for_one_batch_get_it_once(world):
+    import threading
+
+    ids = db.approve_batch([_with_job("a", 12000.0), _item("b", 8000.0)])
+    got, go = [], threading.Barrier(8)
+
+    def claim(n):
+        go.wait()
+        if db.batch_paperwork_claim(ids["a"], "worker-%d" % n, 300) is not None:
+            got.append(n)
+    ts = [threading.Thread(target=claim, args=(n,)) for n in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert len(got) == 1, got
+
+
+def test_built_contract_ids_reads_only_built_ones(world):
+    ids = db.approve_batch([_item("a", 12000.0), _item("b", 8000.0)])
+    db.upsert_signed_contract(ids["a"], "a", pdf=b"%PDF a", pdf_sha256="x", built_at=None)
+    db.upsert_signed_contract(ids["b"], "b", pdf=None)
+    assert db.built_contract_ids([ids["a"], ids["b"]]) == {ids["a"]}
+    assert db.built_contract_ids([]) == set()

@@ -66,6 +66,8 @@ ROUTES = [
     ("POST", "/api/portal/{t}/approve-several", {"batch_id": "batch-0001", "name": "Dana",
                                                  "items": [{"token": TOKEN}, {"token": "x"}],
                                                  "consent": True}),
+    # Its paperwork, built in the background since 2026-10-31.
+    ("GET", "/api/portal/{t}/approve-several/status?batch_id=batch-0001", None),
 ]
 
 
