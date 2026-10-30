@@ -1927,10 +1927,21 @@ async function submitMultiApprove() {
   const why = (d.reasons || []).map((r) => r.message).join(" ");
   alertBox($("ma-alert"), "error", why ? `${d.message || "Nothing was approved."} ${why}`
     : (d.message || "We couldn't confirm your approval. Checking what was recorded…"));
+  // A dropped connection or a gateway timeout (nginx answers 504 after 60 s while the server goes on
+  // to commit) can hide a success: if every proposal sent is now approved, it went through. The
+  // commit may land a moment after the error, so an unsure answer is checked a few times.
+  const unsure = res.status === 0 || res.status >= 500;
+  const allApproved = () => {
+    const rows = MA.rows.filter((r) => picked.includes(r.token));
+    return rows.length === picked.length && rows.every((r) => r.status === "approved");
+  };
   await maReloadRows();
-  // A timeout can hide a success: if every proposal sent is now approved, it went through.
+  for (let i = 0; unsure && i < 4 && !allApproved() && isMultiApproveOpen(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await maReloadRows();
+  }
   const now = MA.rows.filter((r) => picked.includes(r.token));
-  if (res.status === 0 && now.length === picked.length && now.every((r) => r.status === "approved")) {
+  if (unsure && allApproved()) {
     renderMultiApproveDone(now.map((r) => ({
       token: r.token, label: r.label, total: (r.approved || {}).total, options: [],
       deposit_required: r.deposit_required, deposit_amount: (r.approved || {}).deposit_amount,

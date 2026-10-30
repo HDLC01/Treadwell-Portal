@@ -135,6 +135,16 @@ def test_a_refusal_is_said_and_the_dialog_does_not_claim_success(ran):
     assert r["after"]["disabled"] is True
 
 
+def test_a_gateway_timeout_that_hid_a_success_shows_the_approval(ran):
+    """nginx gives up after 60 s with a 504 while the server goes on to commit. The page checks
+    what was recorded -- more than once, since the commit can land after the error -- and shows
+    the approval rather than telling the customer it failed."""
+    g = ran["gatewayTimeout"]
+    assert g["doneShown"] is True, "a committed approval was reported as a failure"
+    assert g["reads"] == 2 and g["waits"] == 1
+    assert 'href="/p/tok-a#proposal/deposit"' in g["done"] and "INV-tok-b" in g["done"]
+
+
 def test_after_approval_each_invoice_is_paid_on_its_own(ran):
     d = ran["done"]
     assert d.count("Pay this deposit") == 2, "one payment per deposit, never a merged one"

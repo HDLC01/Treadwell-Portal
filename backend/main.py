@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import wait as _futures_wait
 from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -1820,6 +1821,9 @@ def _raise_scope_decision(p: dict) -> None:
 # while the request waited for every contract render (up to ~90 s each); the paperwork no longer
 # runs inside the request.
 MAX_BATCH = 20
+# How long the request spends, in all, fetching the documents being signed before it commits
+# (_approve_several_sync phase 1). Well inside nginx's 60 s proxy_read_timeout.
+_BATCH_PDF_DEADLINE_SEC = 15.0
 _BATCH_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 _BATCH_STATE_CODES = frozenset({"gone", "already_approved", "closed", "revised", "not_opened",
                                 "unavailable"})
@@ -2209,16 +2213,30 @@ def _approve_several_sync(request: Request, anchor: dict, body: dict) -> JSONRes
     signable = [it for it in items if it["sign"]["required"]]
     pdfs: dict[str, Optional[bytes]] = {}
     if signable:
-        # Usually cached: every one of them was opened (that is a gate), and the viewer caches
-        # what it served. Three at a time at most; the proposal tool shares this box.
-        with ThreadPoolExecutor(max_workers=min(3, len(signable))) as pool:
-            for it, pdf in zip(signable, pool.map(
-                    lambda i: _proposal_pdf_bytes(i["p"], timeout=30.0), signable)):
+        # Often cached: every one of them was opened (that is a gate), and the viewer caches what
+        # it served -- for ten minutes, 64 at most. A customer who read twenty proposals over half
+        # an hour, or a restart, means cold renders, and twenty of those three at a time would
+        # outlast nginx's 60 s: the customer is told it failed while it commits. So ONE DEADLINE
+        # for all of them: what is not fetched by then is signed without a stored hash and the
+        # background hashes the document it fetches for the contract, as the download rebuild
+        # always has (signed_sha or fetched_sha). A fetch still running is left to finish into the
+        # cache, where the background finds it.
+        pool = ThreadPoolExecutor(max_workers=min(3, len(signable)),
+                                  thread_name_prefix="batch-pdf")
+        try:
+            futs = {pool.submit(_proposal_pdf_bytes, it["p"], timeout=30.0): it
+                    for it in signable}
+            finished, _late = _futures_wait(futs, timeout=_BATCH_PDF_DEADLINE_SEC)
+            for fut, it in futs.items():
+                pdf = fut.result() if fut in finished else None
                 pdfs[it["p"]["proposal_id"]] = pdf
                 if pdf is None:
-                    log.warning("combined approval for %s has no proposal PDF to hash -- the "
-                                "signed contract will be built on first download",
-                                it["p"]["proposal_id"])
+                    log.warning("combined approval for %s has no proposal PDF to hash %s -- the "
+                                "background hashes the one it builds the contract from",
+                                it["p"]["proposal_id"],
+                                "yet" if fut in finished else "within the deadline")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     batch = {"batch_id": batch_id, "count": len(items),
              "proposals": [{"proposal_id": it["p"]["proposal_id"],
                             "name": signing.signing_project_name(it["p"], it["data"]),
@@ -2348,7 +2366,7 @@ def _notice_batch_siblings(group: str, items: list[dict]) -> str:
 # written by the commit itself (_new_paperwork), so the approvals never exist without the record of
 # the work they owe. No DDL. Its shape:
 #   {v, state: pending|done|abandoned, created_at, done: {step: true | [proposal ids / keys]},
-#    attempts: {"contract:<pid>": n}, errors: {...}, siblings_html, finished_at,
+#    attempts: {"contract:<pid>": n}, errors: {...}, siblings_html, renders_done_at, finished_at,
 #    lease: {owner, until}}
 #
 # WHO RUNS IT: the request starts a thread for its own batch (_paperwork_spawn), and a sweeper
@@ -2370,8 +2388,9 @@ def _notice_batch_siblings(group: str, items: list[dict]) -> str:
 #   being saved: that one line or email can repeat. Nothing else can.
 #
 # THE EMAILS WAIT FOR THE PAPERWORK, so they carry it: once every contract and invoice is done --
-# or, when one is stuck, after _PAPERWORK_EMAIL_WAIT_SEC, with what is ready attached and the rest
-# linked. Still one staff email per roster and one per customer contact, as before.
+# or, when one is stuck, _PAPERWORK_EMAIL_WAIT_SEC after the first pass got through every render,
+# with what is ready attached and the rest linked. Still one staff email per roster and one per
+# customer contact, as before. The lease is renewed right before each send (_Paperwork.renew).
 #
 # A RENDER THAT FAILS is retried on the next pass up to _PAPERWORK_MAX_ATTEMPTS, then REPORTED: an
 # internal line on that proposal's thread and an error in the log. It never holds up the other
@@ -2381,6 +2400,7 @@ def _notice_batch_siblings(group: str, items: list[dict]) -> str:
 # never asks for more than _PAPERWORK_RENDERS at a time, across every batch in this process.
 _PAPERWORK_LEASE_SEC = 300
 _PAPERWORK_EMAIL_WAIT_SEC = 600
+_PAPERWORK_EMAIL_RENDER_SEC = 120
 _PAPERWORK_MAX_ATTEMPTS = 3
 _PAPERWORK_GIVE_UP_SEC = 7 * 24 * 3600
 _PAPERWORK_SWEEP_SEC = 60
@@ -2437,6 +2457,16 @@ class _Paperwork:
         for k in ("done", "attempts", "errors"):
             pw[k] = dict(pw.get(k) or {})
         self.pw = pw
+        # The render threads renew the lease while this one marks: one writer of `pw` at a time.
+        self._lock = threading.RLock()
+
+    def renew(self) -> None:
+        """Renew the lease, or raise _LostLease when another worker holds it now. Called right
+        BEFORE every side effect that cannot be taken back (an email, an invoice issued, a
+        contract posted to a thread): a mark only checks the lease AFTER its step, and a worker
+        that sat in a slow render past _PAPERWORK_LEASE_SEC may have been replaced meanwhile --
+        the new owner would then do the same step, and the customer hear it twice."""
+        self.save()
 
     def has(self, step: str, key: Optional[str] = None) -> bool:
         v = self.pw["done"].get(step)
@@ -2449,33 +2479,38 @@ class _Paperwork:
         return list(v) if isinstance(v, list) else []
 
     def mark(self, step: str, key: Optional[str] = None) -> None:
-        if key is None:
-            self.pw["done"][step] = True
-        else:
-            lst = self.done_list(step)
-            if key not in lst:
-                lst.append(key)
-            self.pw["done"][step] = lst
-        self.save()
+        with self._lock:
+            if key is None:
+                self.pw["done"][step] = True
+            else:
+                lst = self.done_list(step)
+                if key not in lst:
+                    lst.append(key)
+                self.pw["done"][step] = lst
+            self.save()
 
     def save(self, lease_sec: Optional[float] = None) -> None:
-        if not db.batch_paperwork_save(self.anchor_id, self.owner, self.pw,
-                                       _PAPERWORK_LEASE_SEC if lease_sec is None else lease_sec):
-            raise _LostLease(self.anchor_id)
+        with self._lock:
+            if not db.batch_paperwork_save(self.anchor_id, self.owner, self.pw,
+                                           _PAPERWORK_LEASE_SEC if lease_sec is None
+                                           else lease_sec):
+                raise _LostLease(self.anchor_id)
 
     def fail(self, kind: str, it: dict, err: Optional[str]) -> None:
         """One failed render. Retried on the next pass until the attempts run out, then reported
         and given up on, so it never holds the batch (or its emails) for ever."""
         pid = it["p"]["proposal_id"]
         k = "%s:%s" % (kind, pid)
-        n = int(self.pw["attempts"].get(k) or 0) + 1
-        self.pw["attempts"][k] = n
-        self.pw["errors"][k] = _cap(err or "unknown error", 300)
+        with self._lock:
+            n = int(self.pw["attempts"].get(k) or 0) + 1
+            self.pw["attempts"][k] = n
+            self.pw["errors"][k] = _cap(err or "unknown error", 300)
         if n < _PAPERWORK_MAX_ATTEMPTS:
             log.warning("combined approval %s: %s for %s failed (attempt %d of %d): %s",
                         self.batch.get("batch_id"), kind, pid, n, _PAPERWORK_MAX_ATTEMPTS, err)
             self.save()
             return
+        self.save()         # renews the lease before the report goes on the thread
         log.error("combined approval %s: %s for %s failed %d times, giving up: %s",
                   self.batch.get("batch_id"), kind, pid, n, err)
         if kind == "contract":
@@ -2558,14 +2593,15 @@ def _pw_contract(it: dict, pdfs: dict) -> tuple[Optional[bytes], Optional[str]]:
     if signed_at is None:
         return None, "the approval's signed_at is unreadable"
     signed_sha = rec.get("contract_sha256")
-    proposal_pdf = None
-    if signed_sha:
-        # The bytes the signature hashed: in memory on the first run, else the (cached) document.
-        proposal_pdf = pdfs.get(pid) or _proposal_pdf_bytes(p)
-        if not proposal_pdf:
-            return None, "the proposal PDF could not be retrieved"
-        if signing.sha256_hex(proposal_pdf) != signed_sha:
-            return None, "the proposal PDF no longer matches the one signed"
+    # The bytes the signature hashed: in memory on the first run, else the (cached) document of
+    # the pinned revision. No stored hash (the request's fetch missed its deadline): the document
+    # fetched now is hashed, exactly as the download rebuild does (signed_sha or fetched_sha).
+    proposal_pdf = pdfs.get(pid) or _proposal_pdf_bytes(p)
+    if not proposal_pdf:
+        return None, "the proposal PDF could not be retrieved"
+    fetched_sha = signing.sha256_hex(proposal_pdf)
+    if signed_sha and fetched_sha != signed_sha:
+        return None, "the proposal PDF no longer matches the one signed"
     cert = signing.build_certificate(
         project_name=signing.signing_project_name(p, it["data"]), proposal_id=pid,
         revision_no=rec.get("revision_no") or p.get("current_revision_no"),
@@ -2575,7 +2611,8 @@ def _pw_contract(it: dict, pdfs: dict) -> tuple[Optional[bytes], Optional[str]]:
         total=it["total"],
         deposit_amount=(it["deposit_amount"] if p.get("deposit_required") is not False
                         else None),
-        proposal_pdf_sha256=signed_sha or "", revision_sha=rec.get("revision_sha256") or "",
+        proposal_pdf_sha256=signed_sha or fetched_sha,
+        revision_sha=rec.get("revision_sha256") or "",
         consent_version=signing.COMBINED_CONSENT_VERSION, combined=_combined_of(rec))
     return _store_signed_contract(pid, it["approval_id"], cert, proposal_pdf)
 
@@ -2606,24 +2643,31 @@ def _pw_invoice(it: dict) -> dict:
                                              float(amount), send_email=False) or {}
 
 
-def _pw_render(kind: str, it: dict, pdfs: dict):
+def _pw_render(job: _Paperwork, kind: str, it: dict, pdfs: dict):
     """One render job, under the shared renderer cap. An Exception is a failed attempt, never a
-    failed pass; anything harsher (the process going down) is left to propagate."""
+    failed pass; a lost lease stops the pass, and anything harsher (the process going down) is
+    left to propagate.
+
+    THE LEASE IS RENEWED ONCE THE SLOT IS HELD, before the work: the wait for a slot is shared with
+    every other batch in this process, and issuing an invoice posts the customer's deposit card."""
     try:
         with _RENDER_SLOTS:
+            job.renew()
             if kind == "invoice":
                 return True, _pw_invoice(it), None
             return _pw_contract(it, pdfs)
+    except _LostLease:
+        raise
     except Exception as exc:  # noqa: BLE001
         err = "%s: %s" % (type(exc).__name__, exc)
         return (False, None, err) if kind == "invoice" else (None, err)
 
 
-def _pw_invoice_for_email(it: dict, memo: dict) -> dict:
+def _pw_invoice_for_email(it: dict, memo: dict, render: bool = True) -> dict:
     """The invoice as the customer email shows it. From this pass when it was issued in it;
     otherwise rebuilt from the stored number and amount (a resumed run), the document rendered
-    again for the attachment -- and when that fails, the email still carries the number and the
-    Pay link."""
+    again for the attachment while `render` allows -- and when it does not, or the render fails,
+    the email still carries the number and the Pay link (the page downloads the document)."""
     pid = it["p"]["proposal_id"]
     held = memo.get(pid)
     if held is not None and (held.get("pdf") or not held.get("invoice_no")):
@@ -2637,9 +2681,10 @@ def _pw_invoice_for_email(it: dict, memo: dict) -> dict:
         return {}
     pdf = None
     try:
-        with _RENDER_SLOTS:
-            pdf = invoice.render_invoice_pdf(invoice.invoice_payload(
-                fresh, float(amount), no, draft=db.get_pinned_draft_data(fresh) or {}))
+        if render:
+            with _RENDER_SLOTS:
+                pdf = invoice.render_invoice_pdf(invoice.invoice_payload(
+                    fresh, float(amount), no, draft=db.get_pinned_draft_data(fresh) or {}))
     except Exception as exc:  # noqa: BLE001
         log.warning("invoice %s not rendered for the approval email: %s", no, exc)
     return {"invoice_no": no, "amount": float(amount), "pdf": pdf,
@@ -2698,6 +2743,12 @@ def _pw_send_emails(job: _Paperwork, items: list[dict], contracts: dict,
         approved_date = date.fromisoformat(str(rec.get("approved_date"))[:10])
     except (TypeError, ValueError):
         approved_date = date.today()
+    # Invoices issued by an EARLIER pass are rendered again for the attachment, one at a time --
+    # for a while only: past the budget the email links the rest (number + Pay link) rather than
+    # keep the customer waiting on the tool. The lease is renewed after each, and again right
+    # before every send (_notify_*_batch `ready`), so a worker that sat in these renders past its
+    # lease stops instead of sending beside whoever took the batch over.
+    until = time.monotonic() + _PAPERWORK_EMAIL_RENDER_SEC
     for it in items:
         pid = it["p"]["proposal_id"]
         req = it["sign"]["required"]
@@ -2708,14 +2759,17 @@ def _pw_send_emails(job: _Paperwork, items: list[dict], contracts: dict,
             job.pw["errors"].get("contract:" + pid) if not pdf else None, signing_required=req)
         it["staff_contract_html"], it["customer_contract_html"], it["contract_atts"] = (
             staff_html, cust_html, atts)
-        it["invoice"] = _pw_invoice_for_email(it, invoices)
+        it["invoice"] = _pw_invoice_for_email(it, invoices,
+                                              render=time.monotonic() < until)
+        job.renew()
     _notify_staff_batch(items, name=name, title=title, approver=approver,
                         approved_date=approved_date,
                         siblings_html=job.pw.get("siblings_html") or "",
-                        done=set(job.done_list("staff")), mark=lambda k: job.mark("staff", k))
+                        done=set(job.done_list("staff")), mark=lambda k: job.mark("staff", k),
+                        ready=job.renew)
     _notify_customers_batch(items, name=name, approver=approver, approved_date=approved_date,
                             done=set(job.done_list("customers")),
-                            mark=lambda k: job.mark("customers", k))
+                            mark=lambda k: job.mark("customers", k), ready=job.renew)
 
 
 def _paperwork_pass(job: _Paperwork, pdfs: dict) -> str:
@@ -2789,7 +2843,8 @@ def _paperwork_pass(job: _Paperwork, pdfs: dict) -> str:
         pool = ThreadPoolExecutor(max_workers=min(_PAPERWORK_RENDERS, len(tasks)),
                                   thread_name_prefix="batch-render")
         try:
-            futs = {pool.submit(_pw_render, kind, it, pdfs): (kind, it) for kind, it in tasks}
+            futs = {pool.submit(_pw_render, job, kind, it, pdfs): (kind, it)
+                    for kind, it in tasks}
             for fut in as_completed(futs):
                 kind, it = futs[fut]
                 pid = it["p"]["proposal_id"]
@@ -2820,14 +2875,24 @@ def _paperwork_pass(job: _Paperwork, pdfs: dict) -> str:
         if it["sign"]["required"] and job.has("contracts", pid) and not job.has("threads", pid):
             pdf = contracts.get(pid) or _pw_stored_contract(it)
             if pdf:
+                job.renew()
                 _post_contract_to_thread(pid, signing.contract_filename(
                     signing.signing_project_name(it["p"], it["data"])), pdf)
                 job.mark("threads", pid)
 
-    # 4. The emails, once all of it is done, or once the wait is over.
+    # 4. The emails, once all of it is done, or once the wait is over. THE WAIT COUNTS FROM THE
+    # END OF THE FIRST PASS THAT GOT THROUGH EVERY RENDER, not from the commit: twenty contracts
+    # take longer than the wait on their own, and counted from the commit, one render failing
+    # once in that pass would have the emails go on the very next pass, with one retry instead of
+    # _PAPERWORK_MAX_ATTEMPTS -- and a contract built after that is never emailed.
+    after_renders = _paperwork_now()
+    if not pw.get("renders_done_at"):
+        pw["renders_done_at"] = after_renders.isoformat()
+        job.save()
+    since = _approval_signed_at({"signed_at": pw.get("renders_done_at")}) or after_renders
     waiting = [it for it in items
                if open_("invoice", it) or (it["sign"]["required"] and open_("contract", it))]
-    waited = (now - created).total_seconds() >= _PAPERWORK_EMAIL_WAIT_SEC
+    waited = (after_renders - since).total_seconds() >= _PAPERWORK_EMAIL_WAIT_SEC
     if not job.has("emails") and (not waiting or waited):
         if waiting:
             log.warning("combined approval %s: emailing after %ds without the paperwork of %s",
@@ -2994,7 +3059,7 @@ def _fit_attachments(groups: list[list[tuple[str, bytes]]],
 
 def _notify_staff_batch(items: list[dict], *, name: str, title: str, approver: Optional[str],
                         approved_date: date, siblings_html: str,
-                        done: Optional[set] = None, mark=None) -> None:
+                        done: Optional[set] = None, mark=None, ready=None) -> None:
     """The staff side of a combined approval: ONE email per person, in place of the N
     "Proposal APPROVED" emails N single approvals send.
 
@@ -3003,7 +3068,8 @@ def _notify_staff_batch(items: list[dict], *, name: str, title: str, approver: O
     would have heard about. People who would hear about the same proposals share one send.
 
     `done` / `mark`: the background job's record of which sends already went out (keyed by the
-    send's addresses), so a resumed run sends each one once."""
+    send's addresses), so a resumed run sends each one once. `ready`: called right before each
+    send; it raises when this worker may no longer send (its lease was taken over)."""
     heard: dict[str, list] = {}
     for it in items:
         try:
@@ -3023,6 +3089,8 @@ def _notify_staff_batch(items: list[dict], *, name: str, title: str, approver: O
         key = ",".join(sorted((a or "").strip().lower() for a in g["to"]))
         if done and key in done:
             continue
+        if ready:
+            ready()
         _send_staff_batch_email(g["items"], g["to"], total_count=len(items), name=name,
                                 title=title, approver=approver, approved_date=approved_date,
                                 siblings_html=siblings_html)
@@ -3074,7 +3142,7 @@ def _send_staff_batch_email(its: list[dict], to: list[str], *, total_count: int,
 
 def _notify_customers_batch(items: list[dict], *, name: str, approver: Optional[str],
                             approved_date: date, done: Optional[set] = None,
-                            mark=None) -> None:
+                            mark=None, ready=None) -> None:
     """ONE confirmation per customer contact, listing ONLY the proposals that contact is on, with
     each one's contract and deposit invoice attached. A contact on one proposal of the batch hears
     about that one alone: a proposal sent to somebody else must never appear, even by name.
@@ -3097,6 +3165,8 @@ def _notify_customers_batch(items: list[dict], *, name: str, approver: Optional[
     for e, its in mine.items():
         if done and e in done:
             continue
+        if ready:
+            ready()         # outside the try below: a lost lease must stop the sends, not log
         try:
             first = its[0]["p"]
             link = f"{config.PUBLIC_BASE_URL}/p/{first['token']}"

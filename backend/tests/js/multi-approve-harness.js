@@ -294,6 +294,43 @@ const PREVIEW = (text, reasons) => ({
                     stillPicked: [...d.handle.MA.picked], after: read(d) };
   }
 
+  // -- a gateway timeout that hid a success ---------------------------------------
+  // nginx answers 504 after 60 s while the server goes on to commit; the first re-read of the rows
+  // can come before the commit lands.
+  {
+    let reads = 0;
+    const waits = [];
+    const approvedRow = (t, l) => ROW(t, l, { approvable: false, status: "approved",
+      approved: { total: 12000, deposit_amount: 3000, invoice_no: "INV-" + t }, reasons: [] });
+    const d = dialog({
+      setTimeout: (cb, ms) => { if (ms === 5000) { waits.push(ms); Promise.resolve().then(cb); } return 1; },
+      clearTimeout: () => {},
+      replies: {
+        "POST /approve-several/preview": PREVIEW(SENTENCE_1),
+        "POST /approve-several": { ok: false, status: 504, data: {} },
+        "GET /approve-several": () => {
+          reads += 1;
+          return { ok: true, status: 200, data: { ok: true, available: true, proposals: reads < 2
+            ? [ROW("tok-a", "Lab 1", { document_opened: true, reasons: [] }),
+               ROW("tok-b", "Lab 2", { document_opened: true, reasons: [] })]
+            : [approvedRow("tok-a", "Lab 1"), approvedRow("tok-b", "Lab 2")] } };
+        },
+      },
+    });
+    d.handle.setRows([ROW("tok-a", "Lab 1", { document_opened: true, reasons: [] }),
+                      ROW("tok-b", "Lab 2", { document_opened: true, reasons: [] })]);
+    d.handle.open();
+    d.handle.change({ target: { dataset: { pick: "tok-a" }, checked: true } });
+    d.handle.change({ target: { dataset: { pick: "tok-b" }, checked: true } });
+    await flush();
+    d.nodes["ma-consent"].checked = true;
+    d.nodes["ma-name"].value = "Dana Reed";
+    await d.handle.submit();
+    await flush();
+    out.gatewayTimeout = { doneShown: !d.nodes["ma-done"].classList.contains("hidden"),
+                           done: d.nodes["ma-done"].innerHTML, reads, waits: waits.length };
+  }
+
   // -- after: several invoices, each paid on its own ------------------------------
   {
     const d = dialog();
