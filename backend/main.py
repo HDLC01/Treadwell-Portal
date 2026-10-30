@@ -1502,18 +1502,23 @@ async def api_approve(token: str, request: Request) -> JSONResponse:
     if sign["required"] and proposal_pdf is None:
         log.warning("approval for %s has no proposal PDF to hash (upstream unavailable) -- "
                     "the signed contract will be built on first download", p["proposal_id"])
-    approval_id = db.add_approval(
-        p["proposal_id"], name, title, approved_date, total, option_summary,
-        _client_ip(request), approver, options=label_list,
-        consent_version=(signing.CONSENT_VERSION if sign["required"] else None),
+    # Both writes under the row lock a combined approval takes (db.approve_single): the check at the
+    # top of this route ran before a PDF fetch of up to 30 seconds, and a batch (or a second tab)
+    # that committed this proposal inside it must win alone -- never two approvals, two contracts.
+    claimed, approval_id = db.approve_single(p["proposal_id"], {
+        "name": name, "title": title, "approved_date": approved_date, "total": total,
+        "option_label": option_summary, "ip": _client_ip(request), "approver_email": approver,
+        "options": label_list,
+        "consent_version": (signing.CONSENT_VERSION if sign["required"] else None),
         # Capped: a User-Agent is attacker-controlled free text on a legal record.
-        user_agent=_cap(request.headers.get("user-agent"), 500) or None,
-        revision_no=int(revision_no) if revision_no else None,
-        revision_sha256=revision_sha,
-        contract_sha256=signing.sha256_hex(proposal_pdf) if proposal_pdf else None,
-    )
-    db.set_approved(p["proposal_id"], total, option_summary, name, title, approved_date,
-                    options=label_list, deposit_amount=deposit)
+        "user_agent": _cap(request.headers.get("user-agent"), 500) or None,
+        "revision_no": int(revision_no) if revision_no else None,
+        "revision_sha256": revision_sha,
+        "contract_sha256": signing.sha256_hex(proposal_pdf) if proposal_pdf else None,
+    }, {"total": total, "option_label": option_summary, "name": name, "title": title,
+        "approved_date": approved_date, "options": label_list, "deposit_amount": deposit})
+    if not claimed:
+        return _json({"ok": True, "already_approved": True})
 
     project_name = p.get("project_name") or "proposal"
     # "Acme HQ - Lab 1" for one scope of a multi-scope project, in every approval email (finding
@@ -1724,10 +1729,16 @@ def _raise_scope_decision(p: dict) -> None:
                 db.decide_followup_task(t["id"], "expired", None, {"reason": "scope_approved"})
     except Exception as exc:  # noqa: BLE001 — the worker's group pass expires it too
         log.warning("[followup] could not expire scope group %s's task: %s", group, exc)
-    sibs = [m for m in members if m.get("proposal_id") != pid and followup_rules.is_open(m)]
+    # A combined approval raises ONE task for all it approved (`_approved_scopes`, every
+    # {proposal_id, label}); the task and its email name every one of them, not only the first.
+    approved = [a for a in (p.get("_approved_scopes") or []) if a.get("proposal_id")]
+    done = {pid} | {a["proposal_id"] for a in approved}
+    sibs = [m for m in members if m.get("proposal_id") not in done and followup_rules.is_open(m)]
     if not sibs:
         return
     label = p.get("scope_label") or p.get("project_name") or "One scope"
+    if len(approved) > 1:
+        label = ", ".join(a.get("label") or "Proposal" for a in approved)
     scopes = [{"proposal_id": s["proposal_id"],
                "label": s.get("scope_label") or s.get("project_name") or "Proposal",
                "status": s.get("proposal_status")} for s in sibs]
@@ -1748,6 +1759,7 @@ def _raise_scope_decision(p: dict) -> None:
             "audience": "staff", "template": followup_rules.GROUP_TASK_TEMPLATE_DECISION,
             "stage": followup_rules.DECISION_STAGE, "status": "pending",
             "scope_group": group, "approved_scope": {"proposal_id": pid, "label": label},
+            **({"approved_scopes": approved} if len(approved) > 1 else {}),
             "scopes": scopes, "mode": followup_rules.followup_mode(p)})
     except Exception as exc:  # noqa: BLE001
         log.warning("[followup] could not raise the scope decision task on %s: %s", pid, exc)
@@ -1760,7 +1772,8 @@ def _raise_scope_decision(p: dict) -> None:
             # The CRM button opens the first sibling (open by construction here), where the board
             # shows the decision card -- not the approved scope, whose drawer shows its own
             # deposit task first (round 3 #3).
-            dict(p, _decision={"approved_label": label, "scopes": scopes},
+            dict(p, _decision={"approved_label": label, "scopes": scopes,
+                               "approved_count": max(1, len(approved))},
                  link_proposal_id=scopes[0]["proposal_id"]), due)
     except Exception as exc:  # noqa: BLE001 — the task is on the bell either way
         log.warning("[followup] scope decision email for %s failed: %s", pid, exc)
@@ -1797,6 +1810,9 @@ _BATCH_STATE_CODES = frozenset({"gone", "already_approved", "closed", "revised",
                                 "unavailable"})
 _NO_REV = object()
 BATCH_REFUSED_MESSAGE = "Nothing was approved. Please fix the items below and try again."
+# Raw bytes of attachments on ONE combined email (about 27 MB once base64 adds a third, under
+# Resend's 40 MB per message). Past it a proposal's paperwork is linked instead (_fit_attachments).
+_COMBINED_ATT_TOTAL = 20 * 1024 * 1024
 
 
 def _rev_of(v):
@@ -2059,6 +2075,13 @@ def _batch_replay(items: list[dict], batch_id: str) -> Optional[list[dict]]:
     if not items or not all(it.get("p") and [r["code"] for r in it["reasons"]]
                             == ["already_approved"] for it in items):
         return None
+    return _approved_by_batch(items, batch_id)
+
+
+def _approved_by_batch(items: list[dict], batch_id: str) -> Optional[list[dict]]:
+    """The result rows when EVERY item's newest approval carries this batch_id, else None. Also
+    asked after the lock refuses a copy that passed phase 0 while the first one was committing: a
+    customer must never read "Nothing was approved" over a batch that went through."""
     out = []
     for it in items:
         try:
@@ -2143,6 +2166,15 @@ def _approve_several_sync(request: Request, anchor: dict, body: dict) -> JSONRes
             extra.append({"token": None, "label": "", "code": "consent_changed",
                           "message": "The approval wording changed. Please review it and tick "
                                      "the box again."})
+        # One sentence naming "Acme HQ - Lab 1" twice cannot say which document was signed at
+        # which price. Refused rather than guessed at; each can still be approved on its own tab.
+        names = [n["name"] for n in named]
+        same = sorted({n for n in names if names.count(n) > 1})
+        if same:
+            extra.append({"token": None, "label": "", "code": "same_name", "message":
+                          f"Two of the selected proposals are both named {same[0]}, so one "
+                          f"signature cannot tell them apart. Please approve them one at a "
+                          f"time, each on its own tab."})
     if extra or any(it["reasons"] for it in items):
         return _batch_refusal(items, extra)
 
@@ -2203,6 +2235,12 @@ def _approve_several_sync(request: Request, anchor: dict, body: dict) -> JSONRes
         ids = db.approve_batch(rows)
     except db.BatchRefused as exc:
         by_pid = {it["p"]["proposal_id"]: it for it in items}
+        if ({r.get("code") for r in exc.reasons} == {"already_approved"}
+                and {r.get("proposal_id") for r in exc.reasons} == set(by_pid)):
+            replay = _approved_by_batch(items, batch_id)
+            if replay is not None:
+                return _json({"ok": True, "batch_id": batch_id, "approved": replay,
+                              "replayed": True})
         words = {"gone": "{label} is no longer available.",
                  "already_approved": "{label} is already approved.",
                  "closed": "{label} was closed. To go ahead with it, open its tab and approve it "
@@ -2268,25 +2306,52 @@ def _after_batch(items: list[dict], ids: dict, batch: dict, *, name: str, title:
     """Phase 3 of a combined approval. EVERYTHING HERE IS AFTER THE COMMIT and never raises:
     each proposal's contract, chat lines and invoice exactly as api_approve makes them, then ONE
     staff email and ONE email per customer contact. Returns the page's result rows."""
-    labels = [it["label"] for it in items]
+    # Who reads each thread. The customer-visible line names another proposal of the batch ONLY
+    # when everybody on this thread was sent that one too: a proposal sent to somebody else must
+    # never appear, even by name. An unreadable list names none. The full list goes in an
+    # internal line for staff (and in each approval row's `batch`).
+    readers: dict[str, Optional[set]] = {}
+    for it in items:
+        pid = it["p"]["proposal_id"]
+        try:
+            readers[pid] = {(e or "").strip().lower()
+                            for e in (db.get_recipients(pid) or [it["p"].get("customer_email")])
+                            if (e or "").strip()}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("recipients of %s unreadable: %s", pid, exc)
+            readers[pid] = None
     for it in items:
         p = it["p"]
-        others = [n for n in labels if n != it["label"]]
+        pid = p["proposal_id"]
+        # By proposal, not by label: two proposals may share a label.
+        rest = [o for o in items if o["p"]["proposal_id"] != pid]
+        mine = readers.get(pid)
+        shown = [o["label"] for o in rest if mine is not None
+                 and readers.get(o["p"]["proposal_id"]) is not None
+                 and mine <= readers[o["p"]["proposal_id"]]]
         sel_txt = "; ".join(f"{o['label']} (${o['total']:,.2f})" for o in it["chosen"])
+        together = (f" Signed in one approval together with {', '.join(shown)}."
+                    if shown else "")
         try:
             # "Approved by" first: app.js files the line as the customer's own event by it.
-            db.add_message(p["proposal_id"], "staff", None,
-                           f"Approved by {name} — {sel_txt}. Total ${it['total']:,.2f}. "
-                           f"Signed in one approval together with {', '.join(others)}.",
-                           msg_type="system")
+            db.add_message(pid, "staff", None,
+                           f"Approved by {name} — {sel_txt}. Total ${it['total']:,.2f}."
+                           f"{together}", msg_type="system")
+            if len(shown) < len(rest):
+                db.add_message(pid, "staff", None,
+                               f"Signed in one combined approval of {len(items)} proposals: "
+                               f"{', '.join(o['label'] for o in items)}.", msg_type="system",
+                               meta={"internal": True, "batch_id": batch.get("batch_id")})
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not post the approval line on %s: %s", p["proposal_id"], exc)
+            log.warning("could not post the approval line on %s: %s", pid, exc)
     siblings_html = _notice_batch_siblings(group, items)
     first = items[0]
     try:
         # ONE decision task for the project's still-open proposals, not one per approved one.
         _raise_scope_decision(dict(first["p"], proposal_status="approved", approved_at=signed_at,
-                                   _approval_id=ids.get(first["p"]["proposal_id"])))
+                                   _approval_id=ids.get(first["p"]["proposal_id"]),
+                                   _approved_scopes=[{"proposal_id": it["p"]["proposal_id"],
+                                                      "label": it["label"]} for it in items]))
     except Exception as exc:  # noqa: BLE001
         log.warning("scope decision after combined approval %s failed: %s",
                     batch.get("batch_id"), exc)
@@ -2366,27 +2431,86 @@ def _batch_line_html(it: dict) -> str:
             f"{dep}</li>")
 
 
+def _fit_attachments(groups: list[list[tuple[str, bytes]]],
+                     cap: Optional[int] = None) -> list[bool]:
+    """Which groups of attachments ride ONE combined email, in order, keeping the total under
+    _COMBINED_ATT_TOTAL. Resend refuses a message over 40 MB (base64 adds a third), and one refused
+    send would lose every proposal's paperwork at once. The first group always rides, as it would
+    on a single approval's own email. A group left off is linked to instead."""
+    cap = _COMBINED_ATT_TOTAL if cap is None else cap
+    used, out = 0, []
+    for g in groups:
+        size = sum(len(b or b"") for _, b in (g or []))
+        ok = not size or used == 0 or used + size <= cap
+        if ok:
+            used += size
+        out.append(ok)
+    return out
+
+
 def _notify_staff_batch(items: list[dict], *, name: str, title: str, approver: Optional[str],
                         approved_date: date, siblings_html: str) -> None:
-    """ONE staff email for the whole batch, listing every proposal with its price and deposit and
-    carrying every contract, in place of the N "Proposal APPROVED" emails N single approvals send.
-    Addressed off the first proposal (its roster and thread), like any project email."""
-    first = items[0]["p"]
+    """The staff side of a combined approval: ONE email per person, in place of the N
+    "Proposal APPROVED" emails N single approvals send.
+
+    WHO is resolved per proposal, with that proposal's own per-project adds and mutes, exactly as
+    each single approval would resolve it; each person's one email lists only the proposals they
+    would have heard about. People who would hear about the same proposals share one send."""
+    heard: dict[str, list] = {}
+    for it in items:
+        try:
+            to = email_sender._resolve_notify("approved", it["p"]["proposal_id"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("staff roster of %s unreadable: %s", it["p"]["proposal_id"], exc)
+            to = []
+        for addr in to or []:
+            key = (addr or "").strip().lower()
+            if key:
+                heard.setdefault(key, [addr, []])[1].append(it)
+    groups: dict[tuple, dict] = {}
+    for addr, its in heard.values():
+        sig = tuple(it["p"]["proposal_id"] for it in its)
+        groups.setdefault(sig, {"to": [], "items": its})["to"].append(addr)
+    for g in groups.values():
+        _send_staff_batch_email(g["items"], g["to"], total_count=len(items), name=name,
+                                title=title, approver=approver, approved_date=approved_date,
+                                siblings_html=siblings_html)
+
+
+def _send_staff_batch_email(its: list[dict], to: list[str], *, total_count: int, name: str,
+                            title: str, approver: Optional[str], approved_date: date,
+                            siblings_html: str) -> None:
+    first = its[0]["p"]
     project = first.get("project_name") or "proposal"
-    atts = [a for it in items for a in (it.get("contract_atts") or [])]
+    fits = _fit_attachments([it.get("contract_atts") or [] for it in its])
+    atts, contract_html = [], []
+    for it, fit in zip(its, fits):
+        if fit:
+            atts += list(it.get("contract_atts") or [])
+            contract_html.append(it.get("staff_contract_html") or "")
+        else:
+            contract_html.append(
+                f"<p>The signed contract for <strong>"
+                f"{html.escape(signing.signing_project_name(it['p'], it['data']))}</strong> is too "
+                f"large to attach together with the others. It is in that proposal's chat thread: "
+                f'<a href="{html.escape(_staff_link(it["p"]["proposal_id"]))}">open it</a>.</p>')
+    what = (f"{len(its)} proposals" if len(its) != 1 else "this proposal")
+    of_all = (f" They were signed in one approval of {total_count} proposals."
+              if total_count != len(its) else "")
     try:
         email_sender.notify_team(
-            f"{len(items)} proposals APPROVED — {project}",
+            (f"{len(its)} proposals APPROVED — {project}" if len(its) != 1 else
+             f"Proposal APPROVED — {scope_groups.display_project_name(first) or project}"),
             f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''}"
-            f" approved {len(items)} proposals of <strong>{html.escape(project)}</strong> in one "
+            f" approved {what} of <strong>{html.escape(project)}</strong> in one "
             f"signature on {approved_date}"
             f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}:</p>"
-            f"<ul>{''.join(_batch_line_html(it) for it in items)}</ul>"
-            "<p>Each proposal has its own approval, its own signed contract and its own deposit "
-            "invoice.</p>"
+            f"<ul>{''.join(_batch_line_html(it) for it in its)}</ul>"
+            f"<p>Each proposal has its own approval, its own signed contract and its own deposit "
+            f"invoice.{of_all}</p>"
             + siblings_html
-            + "".join(it.get("staff_contract_html") or "" for it in items),
-            kind="approved",
+            + "".join(contract_html),
+            kind="approved", recipients=list(to),
             reply_link=_staff_link(first["proposal_id"]), proposal_id=first["proposal_id"],
             reply_to=email_sender.proposal_reply_to(first.get("token")),
             token=first.get("token"), project=first.get("project_name"),
@@ -2421,7 +2545,14 @@ def _notify_customers_batch(items: list[dict], *, name: str, approver: Optional[
             first = its[0]["p"]
             link = f"{config.PUBLIC_BASE_URL}/p/{first['token']}"
             lines, atts = [], []
-            for it in its:
+
+            def _docs(it):
+                inv = it.get("invoice") or {}
+                return list(it.get("contract_atts") or []) + (
+                    [(inv.get("filename") or "Deposit invoice.pdf", inv["pdf"])]
+                    if inv.get("pdf") else [])
+            fits = _fit_attachments([_docs(it) for it in its])
+            for it, fit in zip(its, fits):
                 p = it["p"]
                 inv = it.get("invoice") or {}
                 pay = f"{config.PUBLIC_BASE_URL}/p/{p['token']}#proposal/deposit"
@@ -2430,24 +2561,31 @@ def _notify_customers_batch(items: list[dict], *, name: str, approver: Optional[
                 elif inv.get("invoice_no"):
                     dep = (f"Deposit invoice {html.escape(str(inv['invoice_no']))} — "
                            f"<strong>${float(inv.get('amount') or 0):,.2f}</strong> due"
-                           f"{' (attached)' if inv.get('pdf') else ''}. "
+                           f"{' (attached)' if inv.get('pdf') and fit else ''}. "
                            f'<a href="{html.escape(pay)}">Pay this deposit</a>.')
                 else:
                     dep = (f"A deposit of <strong>${(it.get('deposit_amount') or 0):,.2f}</strong>"
                            " (25%) reserves it on our schedule; its invoice follows separately.")
+                if not fit:
+                    page = f"{config.PUBLIC_BASE_URL}/p/{p['token']}"
+                    dep += (" Its documents were too large to attach together with the others: "
+                            f'<a href="{html.escape(page)}">download them from its page</a>.')
                 lines.append(
                     f"<li><strong>{html.escape(signing.signing_project_name(p, it['data']))}"
                     f"</strong>: {html.escape(it['option_summary'])} — "
                     f"<strong>${it['total']:,.2f}</strong>. {dep}</li>")
-                atts += list(it.get("contract_atts") or [])
-                if inv.get("pdf"):
-                    atts.append((inv.get("filename") or "Deposit invoice.pdf", inv["pdf"]))
+                if fit:
+                    atts += _docs(it)
+            attached = [it for it, fit in zip(its, fits) if fit and it.get("contract_atts")]
             contract = ("<p>Each signed contract is attached, and can always be downloaded from "
                         "its proposal's page.</p>"
-                        if any(it.get("contract_atts") for it in its) else
+                        if attached and len(attached) == sum(
+                            1 for it in its if it.get("contract_atts")) else
+                        ("<p>Each signed contract can always be downloaded from its proposal's "
+                         "page.</p>" if any(it.get("contract_atts") for it in its) else
                         ("<p>Your signed copies are being prepared. They will be available to "
                          "download from each proposal's page shortly.</p>"
-                         if any(it["sign"]["required"] for it in its) else ""))
+                         if any(it["sign"]["required"] for it in its) else "")))
             body = (f"<ul>{''.join(lines)}</ul>"
                     "<p>Each proposal is its own agreement with its own deposit; pay each one "
                     "from its own page.</p>" + contract)

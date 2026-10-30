@@ -254,7 +254,8 @@ def _send_staff(p: dict, due, info: dict | None = None) -> bool:
         dec = p.get("_decision") or {}
         subject = f"Decide the other scopes — {project}"
         body = (f"<p><strong>{esc(who)}</strong> approved the "
-                f"<strong>{esc(dec.get('approved_label') or 'one')}</strong> scope "
+                f"<strong>{esc(dec.get('approved_label') or 'one')}</strong> "
+                f"{'scopes' if int(dec.get('approved_count') or 1) > 1 else 'scope'} "
                 f"of <strong>{esc(project)}</strong>.</p>"
                 f"<p>Follow-up reminders for the other scopes have stopped: "
                 f"<strong>{_scope_names(dec.get('scopes'))}</strong>.</p>"
@@ -533,7 +534,8 @@ def _renag_decision(task: dict, now: datetime) -> None:
         p = db.get_proposal(pid) or {"proposal_id": pid}
         d = task.get("detail") or {}
         p = dict(p, _decision={"approved_label": (d.get("approved_scope") or {}).get("label"),
-                               "scopes": d.get("scopes") or []})
+                               "scopes": d.get("scopes") or [],
+                               "approved_count": len(d.get("approved_scopes") or []) or 1})
         ids = [s.get("proposal_id") for s in d.get("scopes") or []
                if isinstance(s, dict) and s.get("proposal_id")]
         try:

@@ -61,8 +61,9 @@ def _all_calls() -> list[tuple[pathlib.Path, ast.Call]]:
 
 def test_the_sources_and_the_calls_were_actually_found():
     """A walk that finds nothing passes every assertion below, so pin the count. Eleven in the
-    portal's main.py (nine moments, with "sent" and "approved" each fired from two places -- see
-    SHARED_STEPS) plus followup_worker's own explicit-recipients send."""
+    portal's main.py (nine moments, with "sent" fired from two places -- see SHARED_STEPS -- and
+    the combined approval's explicit-recipients send) plus followup_worker's own
+    explicit-recipients send."""
     found = _all_calls()
     assert [p.name for p in SOURCES] == ["email_sender.py", "followup_worker.py", "main.py"]
     by_file = {}
@@ -79,10 +80,10 @@ def test_the_sources_and_the_calls_were_actually_found():
 # a scope sends nothing. Same CRM moment -- "the proposal went out" -- so it must reach the same
 # roster bucket; a separate step would make staff opt in to scope-group sends separately.
 #
-# "approved": a single approval sends its own, and approving several proposals at once (2026-10-31)
-# sends ONE email for the whole batch instead of one per proposal. Same CRM moment -- "the customer
-# approved" -- so the same roster bucket.
-SHARED_STEPS = {"sent": 2, "approved": 2}
+# NOT "approved": approving several proposals at once (2026-10-31) resolves the "approved" roster
+# itself, once PER PROPOSAL with that proposal's own overrides (_notify_staff_batch), and passes
+# the result as recipients=, so it is not a second bucket lookup.
+SHARED_STEPS = {"sent": 2}
 
 
 def test_every_call_names_a_step_the_resolver_recognises():

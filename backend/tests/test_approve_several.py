@@ -382,11 +382,18 @@ def test_approving_two_of_three_with_one_signature(world):
     assert len(ap["attachments"]) == 2
     assert ap["heading"] == "This proposal has been approved"
 
-    # Each thread records its own approval, naming the other.
+    # Each thread records its own approval. It names the other proposal only where everybody on
+    # the thread was sent that one too: ap@ reads b's thread and was never sent Lab 1.
     lines = {m["pid"]: m["body"] for m in st["messages"]
              if m["type"] == "system" and m["body"].startswith("Approved by")}
-    assert "Total $13,000.00" in lines["a"] and "Lab 2" in lines["a"]
-    assert "Total $8,000.00" in lines["b"] and "Lab 1" in lines["b"]
+    assert "Total $13,000.00" in lines["a"] and "together with Lab 2." in lines["a"]
+    assert "Total $8,000.00" in lines["b"] and "Lab 1" not in lines["b"]
+    # The full list is still on b, for staff only.
+    internal = [m for m in st["messages"] if m["pid"] == "b" and (m["meta"] or {}).get("internal")
+                and "combined approval" in m["body"]]
+    assert len(internal) == 1 and "Lab 1, Lab 2" in internal[0]["body"]
+    assert not any((m["meta"] or {}).get("internal") and "combined approval" in m["body"]
+                   for m in st["messages"] if m["pid"] == "a"), "a names everything already"
     # ONE decision task for the open rest of the project, not one per approval.
     assert len(st["tasks"]) == 1
     assert [s["proposal_id"] for s in st["tasks"][0][2]["scopes"]] == ["c", "d"]
@@ -674,3 +681,193 @@ def test_single_approve_is_unchanged(world, monkeypatch):
     assert "combined_approval" not in world.st["certs"][0]
     # Its invoice still goes out in its own email.
     assert world.st["deposit_emails"] == [SESSION]
+
+
+# ── review fixes (2026-10-31) ────────────────────────────────────────────────
+def _batch_commits_lab1_meanwhile(world):
+    """What a combined approval of Lab 1 + Sealer and Lab 2 leaves behind when it commits."""
+    st = world.st
+    for pid, total, opts in (("a", 13000.0, ["Lab 1", "Sealer"]), ("b", 8000.0, ["Lab 2"])):
+        st["next_id"] += 1
+        st["approvals"].append({"proposal_id": pid, "id": st["next_id"], "total": total,
+                                "options": opts, "batch": {"batch_id": "batch-0000-0001"}})
+        st["rows"][pid].update(proposal_status="approved", approved_at="2026-10-31T15:00:00+00:00",
+                               approved_total=total, approved_options=opts,
+                               deposit_amount=round(total * 0.25, 2))
+
+
+def test_a_single_approval_that_loses_to_a_batch_writes_nothing(world, monkeypatch):
+    """Review finding: single approve checked approved_at, then spent up to 30 s fetching the PDF,
+    then wrote with no lock. A batch committing Lab 1 inside that window was followed by a second
+    approval row at another price and an overwritten approved_total. The writes now go through
+    db.approve_single, which re-checks under the row lock (its SQL: test_pg_approve_batch.py)."""
+    st = world.st
+    monkeypatch.setattr(main.db, "add_approval", lambda pid, *a, **k: st["approvals"].append(
+        {"proposal_id": pid, "total": a[3], "single": True}) or 99)
+    monkeypatch.setattr(main.db, "set_approved", lambda pid, total, *a, **k: st["rows"][
+        pid].update(proposal_status="approved", approved_total=total,
+                    deposit_amount=k.get("deposit_amount")))
+
+    def approve_single(pid, approval, approved):
+        """The real function's contract: re-check under the lock, write only if still open."""
+        r = st["rows"][pid]
+        if r["proposal_status"] == "approved" or r.get("approved_at"):
+            return False, None
+        return True, db.write_single_approval(pid, approval, approved)
+    monkeypatch.setattr(main.db, "approve_single", approve_single, raising=False)
+
+    def slow_pdf(p, timeout=None):
+        _batch_commits_lab1_meanwhile(world)      # the batch commits during the cold render
+        return b"%PDF proposal a"
+    monkeypatch.setattr(main, "_proposal_pdf_bytes", slow_pdf)
+
+    r = world.post("/api/portal/tok-a/approve", json={
+        "name": "Ann Colleague", "option_labels": ["Lab 1"], "consent": True})
+    assert r.status_code == 200 and r.json() == {"ok": True, "already_approved": True}
+    assert [a for a in st["approvals"] if a["proposal_id"] == "a" and a.get("single")] == [], (
+        "a second approval row was written for Lab 1")
+    assert st["rows"]["a"]["approved_total"] == 13000.0, "the batch's price was overwritten"
+    assert st["certs"] == [] and st["contracts"] == [], "a second contract was built"
+    assert st["team"] == [] and st["customer"] == [] and st["invoices"] == []
+
+
+@pytest.mark.parametrize("same_batch", [True, False])
+def test_a_copy_refused_under_the_lock_reports_what_the_first_copy_did(world, monkeypatch,
+                                                                       same_batch):
+    """Review finding: a duplicate of batch X that passed phase 0 while the first copy was
+    committing reached the lock, met already_approved on every item and answered "Nothing was
+    approved" over an approval that went through. It now answers with the first result. A
+    DIFFERENT batch over the same proposals is still a refusal."""
+    st = world.st
+    _open(world, "a"); _open(world, "b")
+    fake = main.db.approve_batch
+
+    def first_copy_commits_first(items):
+        first = copy.deepcopy(items)
+        if not same_batch:
+            for it in first:
+                it["approval"]["batch"] = dict(it["approval"]["batch"], batch_id="batch-other-01")
+        fake(first)
+        return fake(items)
+    monkeypatch.setattr(main.db, "approve_batch", first_copy_commits_first)
+    r = _commit(world, {"a": ["Lab 1", "Sealer"], "b": ["Lab 2"]})
+    if same_batch:
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["replayed"] is True and body["batch_id"] == "batch-0000-0001"
+        assert {x["token"]: x["total"] for x in body["approved"]} == {"tok-a": 13000.0,
+                                                                       "tok-b": 8000.0}
+    else:
+        assert r.status_code == 409
+        assert r.json()["message"] == main.BATCH_REFUSED_MESSAGE
+    assert len(st["approvals"]) == 2
+    assert st["team"] == [] and st["customer"] == [] and st["certs"] == []
+
+
+def test_each_proposals_own_roster_decides_who_hears_about_it(world, monkeypatch):
+    """Review finding: the one staff email was addressed from the FIRST proposal's per-project
+    overrides only. Kyle, added on Lab 2 alone, heard nothing of Lab 2; Will, muted on Lab 1,
+    missed Lab 2 too. Now each proposal's roster is resolved with its own overrides, and each
+    person gets ONE email listing only the proposals they would have heard about."""
+    st = world.st
+    monkeypatch.setattr(db, "list_notify_recipients", lambda: [
+        {"email": "hanz@wetreadwell.com", "kind": "general", "enabled": True},
+        {"email": "will@wetreadwell.com", "kind": "general", "enabled": True}])
+    overrides = {"a": [{"email": "will@wetreadwell.com", "mode": "mute"}],
+                 "b": [{"email": "kyle@wetreadwell.com", "mode": "add"}]}
+    monkeypatch.setattr(db, "list_notify_overrides", lambda pid: overrides.get(pid, []))
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}).status_code == 200
+    got = {}
+    for t in st["team"]:
+        assert t["kind"] == "approved"
+        for addr in t.get("recipients") or []:
+            got.setdefault(addr, []).append(t)
+    assert sorted(got) == ["hanz@wetreadwell.com", "kyle@wetreadwell.com",
+                           "will@wetreadwell.com"]
+    assert all(len(v) == 1 for v in got.values()), "somebody got more than one email"
+    hanz = got["hanz@wetreadwell.com"][0]
+    assert "Acme HQ - Lab 1" in hanz["body"] and "Acme HQ - Lab 2" in hanz["body"]
+    assert len(hanz["attachments"]) == 2
+    for who in ("kyle@wetreadwell.com", "will@wetreadwell.com"):
+        t = got[who][0]
+        assert "Acme HQ - Lab 2" in t["body"] and "Acme HQ - Lab 1" not in t["body"], who
+        assert [n for n, _ in t["attachments"]] == ["Acme HQ - Lab 2 - Signed Contract.pdf"]
+    assert len(st["team"]) == 2, "kyle and will hear about the same proposal: one send"
+
+
+def test_one_email_never_carries_more_than_the_attachment_cap(world, monkeypatch):
+    """Review finding: every contract (and for the customer every invoice) rode ONE email, with no
+    size check; past Resend's 40 MB the one send failed and took every proposal's paperwork with
+    it. Past the cap a proposal's documents are linked instead of attached."""
+    st = world.st
+    monkeypatch.setattr(main, "_COMBINED_ATT_TOTAL", 30, raising=False)  # one contract fits
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}).status_code == 200
+    staff = st["team"][0]
+    assert [n for n, _ in staff["attachments"]] == ["Acme HQ - Lab 1 - Signed Contract.pdf"]
+    assert "Acme HQ - Lab 2</strong> is too large to attach" in staff["body"]
+    dana = next(m for m in st["customer"] if m["to"] == SESSION)
+    assert len(dana["attachments"]) == 2, "Lab 1's contract and invoice only"
+    assert "/p/tok-b" in dana["body"] and "download them from its page" in dana["body"]
+    lab2 = next(li for li in dana["body"].split("<li>") if "Acme HQ - Lab 2" in li)
+    assert "INV-B" in lab2 and "(attached)" not in lab2, "says attached, is not"
+    # ap@ is on Lab 2 alone: its documents fit their own email.
+    ap = next(m for m in st["customer"] if m["to"] == "ap@acme.com")
+    assert len(ap["attachments"]) == 2 and "download them from its page" not in ap["body"]
+
+
+def test_the_decision_task_names_every_proposal_the_batch_approved(world, monkeypatch):
+    """Review finding: the one scope-decision task and its email named only the first approved
+    proposal, so staff read "Lab 1 was approved" and could think Lab 2 was still waiting."""
+    st = world.st
+    seen = []
+    monkeypatch.setattr(followup_worker, "_send_staff", lambda p, due: seen.append(p))
+    _open(world, "a"); _open(world, "b")
+    assert _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]}).status_code == 200
+    (_pid, _key, detail), = st["tasks"]
+    assert detail["approved_scope"]["label"] == "Lab 1, Lab 2"
+    assert [a["label"] for a in detail["approved_scopes"]] == ["Lab 1", "Lab 2"]
+    assert [s["proposal_id"] for s in detail["scopes"]] == ["c", "d"]
+    dec = seen[0]["_decision"]
+    assert dec["approved_label"] == "Lab 1, Lab 2" and dec["approved_count"] == 2
+
+
+def test_the_decision_email_says_scopes_when_several_were_approved(monkeypatch):
+    sent = []
+    monkeypatch.setattr(followup_worker.email_sender, "notify_team",
+                        lambda subject, body, **k: sent.append(body) or ["x"])
+    monkeypatch.setattr(followup_worker.email_sender, "proposal_reply_to", lambda t: None)
+    due = followup_worker.rules.Due("k", "staff", "staff_scope_decision")
+    base = {"proposal_id": "a", "assigned_estimator": "kyle@wetreadwell.com",
+            "project_name": "Acme HQ", "customer_name": "Dana Reed"}
+    followup_worker._send_staff(dict(base, _decision={
+        "approved_label": "Lab 1, Lab 2", "approved_count": 2, "scopes": []}), due)
+    followup_worker._send_staff(dict(base, _decision={
+        "approved_label": "Lab 1", "scopes": []}), due)
+    assert "<strong>Lab 1, Lab 2</strong> scopes of" in sent[0]
+    assert "<strong>Lab 1</strong> scope of" in sent[1]
+
+
+def test_two_signable_proposals_with_one_name_are_refused(world):
+    """Review finding: one consent sentence naming "Acme HQ - Lab 1" twice cannot say which
+    document was signed at which price. Refused, nothing written."""
+    world.st["rows"]["b"]["scope_label"] = "Lab 1"
+    _open(world, "a"); _open(world, "b")
+    r = _commit(world, {"a": ["Lab 1"], "b": ["Lab 2"]})
+    assert r.status_code == 400, r.text
+    assert "same_name" in [x["code"] for x in r.json()["reasons"]]
+    _nothing_written(world.st)
+
+
+def test_the_chat_line_tells_proposals_apart_by_id_not_by_label(world):
+    """Review finding: `others` filtered by label text, so two proposals sharing a label each read
+    "together with ." with an empty list."""
+    world.st["rows"]["c"]["scope_label"] = "Lab 1"     # Gyp: unsigned, so no same_name refusal
+    _open(world, "a")
+    assert _commit(world, {"a": ["Lab 1"], "c": ["Breakroom"]}).status_code == 200, "commit"
+    lines = {m["pid"]: m["body"] for m in world.st["messages"]
+             if m["type"] == "system" and m["body"].startswith("Approved by")}
+    assert lines["a"].endswith("together with Lab 1.") and lines["c"].endswith(
+        "together with Lab 1."), lines
+    assert "together with ." not in " ".join(lines.values())

@@ -141,6 +141,52 @@ def test_a_write_that_fails_half_way_rolls_back_the_first(world):
                  "where proposal_id='a'")["approved_at"] is None
 
 
+def _single(pid, total):
+    it = _item(pid, total)
+    approval = dict(it["approval"])
+    approval.pop("batch")
+    return approval, it["proposal"]
+
+
+def test_a_single_approval_writes_both_rows_and_refuses_an_approved_one(world):
+    ok, aid = db.approve_single("a", *_single("a", 12000.0))
+    assert ok is True and isinstance(aid, int)
+    assert _counts() == (1, 1)
+    row = db.q1("select approved_total, deposit_amount from public.portal_proposals "
+                "where proposal_id='a'")
+    assert float(row["approved_total"]) == 12000.0 and float(row["deposit_amount"]) == 3000.0
+    assert db.approve_single("a", *_single("a", 99.0)) == (False, None)
+    assert _counts() == (1, 1)
+    assert float(db.q1("select approved_total from public.portal_proposals "
+                       "where proposal_id='a'")["approved_total"]) == 12000.0
+
+
+def test_a_single_approval_waits_for_a_batchs_lock_and_then_writes_nothing(world):
+    """Review finding: single approve wrote with no lock, so a batch that committed during its PDF
+    fetch was followed by a second approval row and an overwritten price. approve_single now waits
+    on the row lock the batch holds, re-checks, and loses cleanly."""
+    import threading
+    import time
+
+    out = {}
+    with db.pool().connection() as conn:
+        with conn.transaction():
+            conn.execute("select 1 from public.portal_proposals where proposal_id = 'a' "
+                         "for update")
+            t = threading.Thread(target=lambda: out.update(
+                r=db.approve_single("a", *_single("a", 12000.0))))
+            t.start()
+            time.sleep(0.5)
+            assert "r" not in out, "the single approval did not wait for the lock"
+            conn.execute("update public.portal_proposals set proposal_status = 'approved', "
+                         "approved_at = now(), approved_total = 13000 where proposal_id = 'a'")
+    t.join(10)
+    assert out["r"] == (False, None)
+    assert _counts() == (0, 1)
+    assert float(db.q1("select approved_total from public.portal_proposals "
+                       "where proposal_id='a'")["approved_total"]) == 13000.0
+
+
 def test_document_opens_are_per_person_per_revision(world):
     assert db.document_opened("a", DANA, 2) is False
     db.record_document_open("a", DANA, 2)

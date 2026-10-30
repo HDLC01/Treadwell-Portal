@@ -1304,8 +1304,9 @@ def mark_viewed(proposal_id: str) -> bool:
 
 
 def set_approved(proposal_id: str, total, option_label, name, title, approved_date,
-                 options=None, deposit_amount=None) -> None:
-    execute(
+                 options=None, deposit_amount=None, conn=None) -> None:
+    # `conn`: run on approve_single's locked transaction instead of a pooled connection.
+    (execute if conn is None else conn.execute)(
         "update public.portal_proposals set proposal_status='approved', approved_at=now(), "
         "approved_total=%s, approved_option=%s, approved_options=%s, deposit_amount=%s, "
         "approved_name=%s, approved_title=%s, approved_date=%s, "
@@ -2280,7 +2281,7 @@ def clear_notify_override(proposal_id: str, email: str) -> None:
 def add_approval(proposal_id, name, title, approved_date, total, option_label, ip,
                  approver_email=None, options=None, consent_version=None,
                  user_agent=None, revision_no=None, revision_sha256=None,
-                 contract_sha256=None) -> Optional[int]:
+                 contract_sha256=None, conn=None) -> Optional[int]:
     """Record the signed acceptance, and return the new row's id.
 
     THE FIVE E-SIGNATURE COLUMNS ARE NAMED IN THE INSERT, which makes this the one place the
@@ -2298,8 +2299,10 @@ def add_approval(proposal_id, name, title, approved_date, total, option_label, i
     THE RETURN VALUE is what portal_signed_contracts hangs off. Callers must tolerate None:
     `returning id` has nothing to answer with if the insert did not happen, and a test double
     standing in for this function has no id to give either.
+
+    `conn`: run on approve_single's locked transaction instead of a pooled connection.
     """
-    row = q1(
+    row = (q1 if conn is None else (lambda sql, params: conn.execute(sql, params).fetchone()))(
         "insert into public.portal_approvals "
         "(proposal_id, name, title, approved_date, total, option_label, ip, approver_email, "
         "options, consent_version, user_agent, revision_no, revision_sha256, contract_sha256) "
@@ -2309,6 +2312,50 @@ def add_approval(proposal_id, name, title, approved_date, total, option_label, i
          consent_version, user_agent, revision_no, revision_sha256, contract_sha256),
     )
     return (row or {}).get("id")
+
+
+def write_single_approval(proposal_id: str, approval: dict[str, Any], approved: dict[str, Any],
+                          conn=None) -> Optional[int]:
+    """api_approve's two writes, add_approval then set_approved, called exactly as it always
+    called them. Returns the approval id. approve_single runs this under its lock; a test with no
+    database runs it bare (conftest.py)."""
+    a, s = approval, approved
+    on = {} if conn is None else {"conn": conn}
+    aid = add_approval(proposal_id, a["name"], a["title"], a["approved_date"], a["total"],
+                       a["option_label"], a["ip"], a.get("approver_email"),
+                       options=a.get("options"), consent_version=a.get("consent_version"),
+                       user_agent=a.get("user_agent"), revision_no=a.get("revision_no"),
+                       revision_sha256=a.get("revision_sha256"),
+                       contract_sha256=a.get("contract_sha256"), **on)
+    set_approved(proposal_id, s["total"], s["option_label"], s["name"], s["title"],
+                 s["approved_date"], options=s.get("options"),
+                 deposit_amount=s.get("deposit_amount"), **on)
+    return aid
+
+
+def approve_single(proposal_id: str, approval: dict[str, Any],
+                   approved: dict[str, Any]) -> tuple[bool, Optional[int]]:
+    """ONE proposal's approval, written at the same commit point approve_batch uses.
+
+    api_approve checks approved_at when the request arrives, then fetches the proposal PDF (up to
+    30 seconds) before writing. Without a lock, a combined approval (or a second single one) that
+    committed inside that window was followed by a second approval row, a second contract at a
+    possibly different price, and an overwritten approved_total and deposit_amount. Here the row is
+    locked `for update` (waiting for any batch holding it), approved_at and the status are checked
+    again, and the two writes happen in the same transaction. Returns (False, None) when somebody
+    else approved it first: nothing is written. (True, approval id) otherwise.
+
+    Only the approved check is repeated. A closed-lost proposal nobody signed stays approvable
+    here, as it always was on this path."""
+    with pool().connection() as conn:
+        with conn.transaction():
+            r = conn.execute(
+                "select proposal_status, approved_at from public.portal_proposals "
+                "where proposal_id = %s for update", (proposal_id,)).fetchone()
+            if r is not None and ((r.get("proposal_status") or "") == "approved"
+                                  or r.get("approved_at")):
+                return False, None
+            return True, write_single_approval(proposal_id, approval, approved, conn=conn)
 
 
 # ── approving several proposals at once (2026-10-31) ─────────────────────────
@@ -2390,7 +2437,8 @@ def approve_batch(items: list[dict[str, Any]]) -> dict[str, Optional[int]]:
     constraint): an exception inside the block is a rollback, never half a batch.
 
     THE SAME TWO WRITES single approve makes (add_approval, set_approved), with the same columns,
-    plus `batch` on the approval. Single approve is untouched: it keeps its own two statements."""
+    plus `batch` on the approval. Single approve keeps its own two statements, run under the same
+    row lock (approve_single), so a batch and a single approval of one proposal cannot both win."""
     ids = sorted({str(i["proposal_id"]) for i in items})
     out: dict[str, Optional[int]] = {}
     with pool().connection() as conn:
