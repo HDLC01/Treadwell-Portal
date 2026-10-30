@@ -60,15 +60,16 @@ def _all_calls() -> list[tuple[pathlib.Path, ast.Call]]:
 
 
 def test_the_sources_and_the_calls_were_actually_found():
-    """A walk that finds nothing passes every assertion below, so pin the count. Ten in the
-    portal's main.py (nine moments, with "sent" fired from two places -- see SHARED_STEPS) plus
-    followup_worker's own explicit-recipients send."""
+    """A walk that finds nothing passes every assertion below, so pin the count. Eleven in the
+    portal's main.py (nine moments, with "sent" fired from two places -- see SHARED_STEPS -- and
+    the combined approval's explicit-recipients send) plus followup_worker's own
+    explicit-recipients send."""
     found = _all_calls()
     assert [p.name for p in SOURCES] == ["email_sender.py", "followup_worker.py", "main.py"]
     by_file = {}
     for path, _ in found:
         by_file[path.name] = by_file.get(path.name, 0) + 1
-    assert by_file == {"followup_worker.py": 1, "main.py": 10}, by_file
+    assert by_file == {"followup_worker.py": 1, "main.py": 11}, by_file
 
 
 # Steps DELIBERATELY fired from more than one call site, each with the number of sites. Kept short
@@ -78,6 +79,10 @@ def test_the_sources_and_the_calls_were_actually_found():
 # groups, 2026-10-23) is confirmed ONCE for all its scopes by the combined send, because publishing
 # a scope sends nothing. Same CRM moment -- "the proposal went out" -- so it must reach the same
 # roster bucket; a separate step would make staff opt in to scope-group sends separately.
+#
+# NOT "approved": approving several proposals at once (2026-10-31) resolves the "approved" roster
+# itself, once PER PROPOSAL with that proposal's own overrides (_notify_staff_batch), and passes
+# the result as recipients=, so it is not a second bucket lookup.
 SHARED_STEPS = {"sent": 2}
 
 

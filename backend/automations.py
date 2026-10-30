@@ -30,7 +30,8 @@ def create_dropbox_folder(project_name: str, proposal_id: str) -> None:
 def issue_deposit_invoice(proposal_row: dict, project_name: str,
                           amount: float | None = None,
                           overrides: dict | None = None,
-                          new_number: bool = False) -> dict:
+                          new_number: bool = False,
+                          send_email: bool = True) -> dict:
     """Issue the deposit invoice: mint the number, generate the PDF, post it to
     the chat thread, and email it to every recipient with the PDF attached.
 
@@ -106,6 +107,15 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     )
     db.set_deposit_requested(pid)
 
+    if not send_email:
+        # A COMBINED APPROVAL (main.api_approve_several) sends ONE email per customer listing every
+        # proposal's contract and invoice, so it takes the document back instead of mailing it
+        # here. Everything else above -- the number, the stored amount, the chat card, the
+        # requested stamp -- is exactly what a single approval writes.
+        log.info("[deposit] issued invoice %s for $%.2f (%s), emailed by the caller",
+                 invoice_no, amount, pid)
+        return {"amount": amount, "invoice_no": invoice_no, "pdf": pdf,
+                "filename": filename, "reference": reference}
     token = fresh.get("token") or proposal_row.get("token")
     link = f"{config.PUBLIC_BASE_URL}/p/{token}"
     rt = email_sender.proposal_reply_to(token)
@@ -118,7 +128,8 @@ def issue_deposit_invoice(proposal_row: dict, project_name: str,
     return {"amount": amount, "invoice_no": invoice_no}
 
 
-def request_deposit(proposal_row: dict, project_name: str) -> None:
+def request_deposit(proposal_row: dict, project_name: str,
+                    send_email: bool = True) -> dict | None:
     """Auto-issue the deposit invoice the moment a proposal is approved (Will's
     item 15). Re-reads the proposal so it sees the deposit amount just written by
     set_approved. No-ops when there's no positive amount or the deposit was
@@ -151,9 +162,12 @@ def request_deposit(proposal_row: dict, project_name: str) -> None:
         if amount is None or float(amount) <= 0:
             log.info("[deposit:skip] no positive amount for %s", pid)
             return
-        issue_deposit_invoice(fresh, project_name, float(amount))
+        # Returned so a combined approval can put the invoice in its one email (send_email=False);
+        # the single approval ignores it, exactly as before.
+        return issue_deposit_invoice(fresh, project_name, float(amount), send_email=send_email)
     except Exception as exc:  # noqa: BLE001
         log.error("[deposit] auto-invoice on approval failed for %s: %s", pid, exc)
+    return None
 
 
 def run_on_approval(proposal_row: dict, project_name: str) -> None:

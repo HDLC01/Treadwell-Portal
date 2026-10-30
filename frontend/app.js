@@ -243,6 +243,10 @@ function renderPortal(vm) {
   applyStepPanel();       // keep the active tab showing only its own cards
   jumpToDocument();       // arrived from a proposal tab: back at the document card (once)
   mountSwitcher();        // once per session; no-op on poll re-renders
+  // Approving several proposals of this project at once. Called HERE and nowhere else in the
+  // existing code: several of the functions above are lifted verbatim by backend/tests/js
+  // harnesses, and a call to a new function inside one of them would break those.
+  loadMultiApprove();
   startPolling();
 }
 
@@ -1521,6 +1525,418 @@ function setupDeposit() {
   $("deposit-resend").onclick = reopen;
 }
 
+// ── approving several proposals at once ───────────────────────────────────────────
+// Hanz, 2026-10-31: "We must have the ability to also select and approve multiple proposals." On a
+// project priced as several proposals the customer can tick several of them, choose each one's
+// options, and sign ONCE. Each proposal keeps its own approval, contract and deposit invoice.
+//
+// THE SERVER DECIDES, this page asks. Which proposals can be selected, each one's total and
+// deposit, every reason one cannot be approved yet, and the consent sentence itself all come from
+// /approve-several and /approve-several/preview, and are rendered as received. The same gates as
+// the single approve card apply to every selected proposal (multiApproveBlocker mirrors
+// approveBlocker), and the server checks all of them again on submit.
+//
+// "Open the proposal before signing" carries across pages here: each proposal's document has to
+// have been opened (its own page's viewer, Terms button or new-tab link, or the links in this
+// dialog), and the server remembers that per revision (POST /document-opened).
+const MA = { rows: [], max: 6, available: false, picked: new Set(), labels: {}, preview: null,
+             seq: 0, consentFor: null, batchId: null, busy: false, done: null };
+
+/** A fresh id per dialog: a double submit of the same batch is answered with its first result. */
+function maNewBatchId() {
+  try { if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID(); } catch { /* fall through */ }
+  let s = "";
+  for (let i = 0; i < 4; i++) s += (i ? "-" : "") + Math.random().toString(16).slice(2, 10).padEnd(8, "0");
+  return s;
+}
+
+/** A request to ANOTHER proposal's route. Not api(): its 410 handler redraws THIS page as gone. */
+async function maFetch(method, tok, path, body) {
+  const opts = { method, headers: {}, credentials: "same-origin" };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  let res;
+  try { res = await fetch(`/api/portal/${encodeURIComponent(tok)}${path}`, opts); }
+  catch { return { ok: false, status: 0, data: {} }; }
+  let data = {};
+  try { data = await res.json(); } catch { /* not JSON */ }
+  return { ok: res.ok && data.ok !== false, status: res.status, data };
+}
+
+/** Fetch what can be approved together. From renderPortal only; never under an open dialog. */
+async function loadMultiApprove() {
+  const sibs = (STATE && STATE.scope && STATE.scope.siblings) || [];
+  if (sibs.length < 2) { MA.available = false; MA.rows = []; renderMultiApproveEntry(); return; }
+  if (isMultiApproveOpen()) return;
+  const res = await api("GET", "/approve-several");
+  MA.available = !!(res.ok && res.data.available);
+  MA.rows = (res.ok && res.data.proposals) || [];
+  if (res.ok && res.data.max) MA.max = res.data.max;
+  renderMultiApproveEntry();
+  renderProjectDeposits();
+}
+
+/** Offered only when at least two proposals of this project can still be approved. */
+function multiApproveOffer() {
+  return !!MA.available && MA.rows.filter((r) => r.approvable).length >= 2;
+}
+
+function renderMultiApproveEntry() {
+  const el = $("ma-entry");
+  if (el) el.classList.toggle("hidden", !multiApproveOffer());
+}
+
+function isMultiApproveOpen() {
+  const m = $("ma-modal");
+  return !!(m && !m.classList.contains("hidden"));
+}
+
+/** renderOptions' default: the base option, else the first. */
+function maDefaultLabels(row) {
+  const opts = row.options || [];
+  if (!opts.length) return [];
+  const base = opts.find((o) => o.is_base) || opts[0];
+  return [base.label];
+}
+
+function openMultiApprove() {
+  if (!multiApproveOffer()) return;
+  MA.picked = new Set(); MA.labels = {}; MA.preview = null; MA.consentFor = null; MA.done = null;
+  MA.batchId = maNewBatchId();
+  for (const r of MA.rows) MA.labels[r.token] = new Set(maDefaultLabels(r));
+  clearAlert($("ma-alert"));
+  show($("ma-form-wrap")); hide($("ma-done"));
+  const nm = $("ma-name");
+  if (nm && !nm.value) nm.value = (($("ap-name") || {}).value || (STATE && STATE.customer_name) || "");
+  const box = $("ma-consent");
+  if (box) box.checked = false;
+  show($("ma-modal")); show($("ma-scrim"));
+  document.body.style.overflow = "hidden";
+  renderMultiApprove();
+}
+
+function closeMultiApprove() {
+  hide($("ma-modal")); hide($("ma-scrim"));
+  document.body.style.overflow = "";
+  // After an approval the page underneath is out of date: redraw it from the server.
+  if (MA.done) {
+    MA.done = null;
+    api("GET", "").then((r) => { if (r.ok && r.data.view) renderPortal(r.data.view); });
+  }
+}
+
+/** One proposal in the dialog: the tick, its options once ticked, its document links, and the
+ *  server's sentence when it cannot be selected. Every estimator-typed string is escaped. */
+function maRowHtml(row) {
+  const tok = row.token;
+  const picked = MA.picked.has(tok);
+  const approved = row.status === "approved" || !!row.approved;
+  const blocking = (row.reasons || []).filter((r) => r.code !== "not_opened");
+  const off = !row.approvable;
+  const name = esc(row.label || row.display_name || "Proposal");
+  let html = `<div class="ma-row${picked ? " is-picked" : ""}${off ? " is-off" : ""}">
+    <label class="ma-pick"><input type="checkbox" data-pick="${esc(tok)}"${picked ? " checked" : ""}${off ? " disabled" : ""}>
+      <span class="ma-name">${name}</span>${approved ? ' <span class="scope-tab-flag">Approved</span>' : ""}</label>`;
+  if (off && !approved && blocking.length) html += `<p class="small muted ma-why">${esc(blocking[0].message)}</p>`;
+  if (!off) {
+    if (row.document_required) {
+      const rev = encodeURIComponent(row.revision_no == null ? 0 : row.revision_no);
+      const href = `/api/portal/${encodeURIComponent(tok)}/pdf?rev=${rev}`;
+      html += `<p class="small ma-doc">
+        <a class="linkbtn" data-doc="${esc(tok)}" href="${href}#view=FitH" target="_blank" rel="noopener">Open ${name}'s proposal</a>
+        · <a class="linkbtn" data-doc="${esc(tok)}" href="${href}${TERMS_HASH}" target="_blank" rel="noopener">Read its Terms and Conditions</a>
+        ${row.document_opened ? '<span class="ma-opened">Opened</span>' : '<span class="ma-unopened">Not opened yet</span>'}</p>`;
+    } else if (!(row.signing && row.signing.required)) {
+      html += `<p class="small muted">Approved without e-signature: this proposal type has no Terms and Conditions to sign.</p>`;
+    }
+    if (picked) {
+      const on = MA.labels[tok] || new Set();
+      html += `<div class="ma-opts">` + (row.options || []).map((o) => {
+        const price = isVE(o) ? veLabel(o) : money(o.total);
+        return `<label class="ma-opt"><input type="checkbox" data-opt="${esc(tok)}" data-label="${esc(o.label)}"${on.has(o.label) ? " checked" : ""}>
+          <span class="ma-opt-name">${esc(o.label)}</span><span class="ma-opt-price">${esc(price)}</span></label>`;
+      }).join("") + `</div>`;
+    }
+  }
+  return html + `</div>`;
+}
+
+/** The items as the server takes them: token, the revision this page holds, the option labels. */
+function maItems() {
+  return MA.rows.filter((r) => MA.picked.has(r.token)).map((r) => ({
+    token: r.token,
+    revision_no: r.revision_no == null ? null : r.revision_no,
+    option_labels: [...(MA.labels[r.token] || [])],
+  }));
+}
+
+/** Why the button is not pressable yet, as one sentence, or null. approveBlocker's conditions for
+ *  EACH selected proposal (an option selected, its document opened, the served sentence present,
+ *  the box ticked), plus the batch's own (at least two, at most the cap, the server's say-so). */
+function multiApproveBlocker() {
+  const picked = MA.rows.filter((r) => MA.picked.has(r.token));
+  if (picked.length < 2) return { msg: "Select at least two proposals to approve together." };
+  if (picked.length > MA.max) return { msg: `Select at most ${MA.max} proposals at a time.` };
+  for (const r of picked) {
+    if (!(MA.labels[r.token] && MA.labels[r.token].size)) return { msg: `Select at least one option for ${r.label}.` };
+  }
+  for (const r of picked) {
+    if (r.document_required && !r.document_opened) return { msg: `Open ${r.label}'s proposal before signing.` };
+  }
+  const pv = MA.preview;
+  if (!pv) return { msg: "Checking your selection…" };
+  if (pv.error) return { error: true, msg: "Something's not right — please refresh and try again." };
+  for (const pr of pv.proposals || []) {
+    const why = (pr.reasons || [])[0];
+    if (why) return { msg: why.message };
+  }
+  const required = picked.some((r) => r.signing && r.signing.required);
+  if (required && !String(pv.consent_text || "").trim()) {
+    return { error: true, msg: "Something's not right — please refresh and try again." };
+  }
+  const box = $("ma-consent");
+  if (required && !(box && box.checked)) return { msg: "Tick the box above to sign and approve." };
+  return null;
+}
+
+function maUpdateGate() {
+  const row = $("ma-consent-row");
+  const box = $("ma-consent");
+  if (row && box) row.classList.toggle("is-agreed", !!box.checked);
+  const btn = $("ma-submit");
+  if (!btn || MA.busy) return;
+  const blocked = multiApproveBlocker();
+  btn.disabled = !!blocked;
+  const n = MA.picked.size;
+  const signs = MA.rows.some((r) => MA.picked.has(r.token) && r.signing && r.signing.required);
+  btn.textContent = (signs ? "Sign and approve " : "Approve ") + (n >= 2 ? `${n} proposals` : "selected proposals");
+  const hint = $("ma-gate-hint");
+  if (!hint) return;
+  hint.textContent = blocked ? blocked.msg : "";
+  hint.classList.toggle("is-error", !!(blocked && blocked.error));
+  hint.classList.toggle("hidden", !blocked);
+}
+
+/** The review list, from the SERVER's preview: each proposal, its options, its total, its deposit. */
+function maSummaryHtml(pv) {
+  const rows = (pv && pv.proposals) || [];
+  if (!rows.length) return "";
+  const items = rows.map((r) => {
+    const opts = esc((r.chosen || []).join(", "));
+    const dep = !r.deposit_required ? "No deposit"
+      : (r.deposit_amount != null ? `Deposit (25%) ${money(r.deposit_amount)}` : "");
+    const sig = r.signing && r.signing.required ? "" : " · approved without e-signature";
+    return `<li><span class="ma-rv-name"><strong>${esc(r.label)}</strong> — ${opts}</span>
+      <span class="ma-rv-total">${r.total != null ? money(r.total) : ""}</span>
+      <span class="small muted ma-rv-dep">${esc(dep)}${esc(sig)}</span></li>`;
+  }).join("");
+  return `<h3 class="ma-rv-head">You are approving</h3><ul class="ma-review">${items}</ul>
+    <p class="small muted">Each proposal is its own agreement, billed on its own.</p>`;
+}
+
+function maApplyPreview() {
+  const pv = MA.preview;
+  const text = (pv && pv.consent_text) || "";
+  // A different sentence is a different agreement: a tick given to the old one does not carry.
+  if (text !== MA.consentFor) {
+    const box = $("ma-consent");
+    if (box) box.checked = false;
+    MA.consentFor = text;
+  }
+  const txt = $("ma-consent-text");
+  if (txt) txt.textContent = text;   // AS RECEIVED: the server's sentence, never a copy here
+  const row = $("ma-consent-row");
+  if (row) row.classList.toggle("hidden", !text);
+  const note = $("ma-plain-note");
+  if (note) note.classList.toggle("hidden", !!text);
+  const sum = $("ma-summary");
+  if (sum) { sum.innerHTML = maSummaryHtml(pv); sum.classList.toggle("hidden", !sum.innerHTML); }
+  maUpdateGate();
+}
+
+async function maRefreshPreview() {
+  const items = maItems();
+  const seq = ++MA.seq;
+  if (!items.length) { MA.preview = null; maApplyPreview(); return; }
+  MA.preview = null;
+  maUpdateGate();
+  const res = await api("POST", "/approve-several/preview",
+    { items: items.map((i) => ({ token: i.token, option_labels: i.option_labels })) });
+  if (seq !== MA.seq) return;   // a newer selection is already being checked
+  MA.preview = res.ok ? res.data : { error: true };
+  maApplyPreview();
+}
+
+function renderMultiApprove(focusTok) {
+  const list = $("ma-list");
+  if (list) {
+    list.innerHTML = MA.rows.map(maRowHtml).join("");
+    // Keep the keyboard where it was: the list is rebuilt on every tick.
+    if (focusTok) {
+      for (const el of list.querySelectorAll("input[data-pick]")) {
+        if (el.dataset.pick === focusTok) { el.focus(); break; }
+      }
+    }
+  }
+  maRefreshPreview();
+}
+
+function maOnListChange(e) {
+  const t = e.target;
+  if (!t || !t.dataset) return;
+  if (t.dataset.pick) {
+    if (t.checked) MA.picked.add(t.dataset.pick); else MA.picked.delete(t.dataset.pick);
+    renderMultiApprove(t.dataset.pick);
+    return;
+  }
+  if (t.dataset.opt) {
+    const s = MA.labels[t.dataset.opt] || (MA.labels[t.dataset.opt] = new Set());
+    if (t.checked) s.add(t.dataset.label); else s.delete(t.dataset.label);
+    maRefreshPreview();
+  }
+}
+
+/** A document link in the dialog was followed. The link still opens (target=_blank); this tells
+ *  the server THIS person opened THAT document at the revision this dialog was showing. */
+function maOnListClick(e) {
+  const a = e.target && e.target.closest ? e.target.closest("a[data-doc]") : null;
+  if (a) maMarkOpened(a.dataset.doc);
+}
+
+async function maMarkOpened(tok) {
+  const row = MA.rows.find((r) => r.token === tok);
+  if (!row) return;
+  const res = await maFetch("POST", tok, "/document-opened",
+    { revision_no: row.revision_no == null ? null : row.revision_no });
+  if (res.ok && res.data.marked) {
+    row.document_opened = true;
+    renderMultiApprove();
+  } else if (res.ok) {
+    // The proposal moved to a new revision since this dialog loaded: show the new one.
+    alertBox($("ma-alert"), "info", `${row.label} was revised. Please open the new version.`);
+    await maReloadRows();
+  }
+}
+
+/** Re-read the rows from the server, keeping the customer's ticks and options where they still apply. */
+async function maReloadRows() {
+  const res = await api("GET", "/approve-several");
+  if (!res.ok) return;
+  MA.rows = res.data.proposals || [];
+  const live = new Set(MA.rows.filter((r) => r.approvable).map((r) => r.token));
+  MA.picked = new Set([...MA.picked].filter((t) => live.has(t)));
+  for (const r of MA.rows) if (!MA.labels[r.token]) MA.labels[r.token] = new Set(maDefaultLabels(r));
+  renderMultiApprove();
+}
+
+/** After the approval: every proposal with its OWN contract, its OWN invoice and its OWN payment.
+ *  Never one combined payment -- each deposit is paid from its proposal's page. */
+function maDoneHtml(approved) {
+  const rows = approved.map((a) => {
+    const tok = encodeURIComponent(a.token);
+    const contract = a.signed
+      ? `<a class="btn btn-secondary" href="/api/portal/${tok}/signed-contract.pdf">Download signed contract</a>` : "";
+    let dep;
+    if (!a.deposit_required) {
+      dep = `<p class="small muted">No deposit is required for this proposal.</p>`;
+    } else if (a.invoice_no) {
+      dep = `<p class="small">Deposit due: <strong>${money(a.deposit_amount)}</strong> — invoice ${esc(a.invoice_no)}.</p>
+        <div class="row"><a class="btn btn-secondary" href="/api/portal/${tok}/deposit-invoice.pdf">Download invoice</a>
+        <a class="btn btn-primary" href="/p/${tok}#proposal/deposit">Pay this deposit</a></div>`;
+    } else {
+      dep = `<p class="small">Deposit due: <strong>${money(a.deposit_amount)}</strong>. Your invoice is on its way.</p>
+        <div class="row"><a class="btn btn-primary" href="/p/${tok}#proposal/deposit">Pay this deposit</a></div>`;
+    }
+    return `<li class="ma-done-row" data-done="${esc(a.token)}">
+      <div class="ma-done-head"><strong>${esc(a.label)}</strong><span>${money(a.total)}</span></div>
+      <p class="small muted">${esc((a.options || []).join(", "))}</p>
+      ${contract ? `<div class="row">${contract}</div>` : ""}${dep}</li>`;
+  }).join("");
+  return `<div class="alert success">Approved: ${approved.length} proposals. Each one is its own agreement, with its own contract and its own deposit.</div>
+    <ul class="ma-done-list">${rows}</ul>
+    <p class="small muted">Each deposit is paid on its own, from its proposal's page.</p>
+    <button class="btn btn-primary btn-block" type="button" id="ma-finish">Done</button>`;
+}
+
+function renderMultiApproveDone(approved) {
+  MA.done = approved;
+  hide($("ma-form-wrap"));
+  const d = $("ma-done");
+  if (d) { d.innerHTML = maDoneHtml(approved); show(d); }
+}
+
+/** Send the combined approval. Named for the same reason submitApproval is: what it puts in the
+ *  request (the literal `consent: true` and the digest of the sentence on screen) is a legal
+ *  artefact, and a test has to be able to execute it. */
+async function submitMultiApprove() {
+  clearAlert($("ma-alert"));
+  const name = $("ma-name").value.trim();
+  if (!name) { alertBox($("ma-alert"), "error", "Please enter your full name."); $("ma-name").focus(); return; }
+  const blocked = multiApproveBlocker();
+  if (blocked) { alertBox($("ma-alert"), "error", blocked.msg); return; }
+  const required = MA.rows.some((r) => MA.picked.has(r.token) && r.signing && r.signing.required);
+  const body = { batch_id: MA.batchId, items: maItems(), name, title: $("ma-title").value.trim(),
+                 date: new Date().toISOString().slice(0, 10) };
+  // The literal boolean and the sentence's digest, only where something is being signed.
+  if (required) { body.consent = true; body.consent_digest = MA.preview.consent_digest; }
+  const picked = body.items.map((i) => i.token);
+  const btn = $("ma-submit");
+  MA.busy = true; btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Signing… this can take a minute';
+  const res = await api("POST", "/approve-several", body);
+  MA.busy = false;
+  if (handleExpired(res, $("ma-alert"))) return;
+  if (res.ok) { renderMultiApproveDone(res.data.approved || []); return; }
+  const d = res.data || {};
+  const why = (d.reasons || []).map((r) => r.message).join(" ");
+  alertBox($("ma-alert"), "error", why ? `${d.message || "Nothing was approved."} ${why}`
+    : (d.message || "We couldn't confirm your approval. Checking what was recorded…"));
+  await maReloadRows();
+  // A timeout can hide a success: if every proposal sent is now approved, it went through.
+  const now = MA.rows.filter((r) => picked.includes(r.token));
+  if (res.status === 0 && now.length === picked.length && now.every((r) => r.status === "approved")) {
+    renderMultiApproveDone(now.map((r) => ({
+      token: r.token, label: r.label, total: (r.approved || {}).total, options: [],
+      deposit_required: r.deposit_required, deposit_amount: (r.approved || {}).deposit_amount,
+      invoice_no: (r.approved || {}).invoice_no, signed: !!(r.signing && r.signing.required),
+    })));
+    clearAlert($("ma-alert"));
+  }
+}
+
+/** The other approved proposals' deposits, on this proposal's thank-you card: several invoices,
+ *  each shown and paid on its own, never merged. Hidden when there are none. */
+function renderProjectDeposits() {
+  const el = $("ma-deposits");
+  if (!el) return;
+  const others = MA.rows.filter((r) => r.token !== TOKEN && r.approved && r.deposit_required);
+  if (!others.length) { el.innerHTML = ""; el.classList.add("hidden"); return; }
+  el.innerHTML = `<p class="small" style="margin:0 0 6px"><strong>Other deposits in this project</strong></p>` +
+    others.map((r) => {
+      const tok = encodeURIComponent(r.token);
+      const a = r.approved;
+      const paid = a.deposit_status === "received";
+      return `<div class="ma-dep-row"><span>${esc(r.label)}${a.deposit_amount != null ? " — " + money(a.deposit_amount) : ""}${paid ? " (received)" : ""}</span>
+        <span class="ma-dep-actions">${a.invoice_no ? `<a class="linkbtn" href="/api/portal/${tok}/deposit-invoice.pdf">Invoice ${esc(a.invoice_no)}</a>` : ""}
+        ${paid ? "" : `<a class="linkbtn" href="/p/${tok}#proposal/deposit">Pay</a>`}</span></div>`;
+    }).join("");
+  el.classList.remove("hidden");
+}
+
+/** The customer opened THIS page's document (viewer, Terms button, new tab). Latched per revision,
+ *  like signalProposalViewed; only on a project priced as several, where it is read. */
+let DOC_OPEN_SIGNALED_REV;
+function signalDocumentOpened() {
+  if (!STATE || !STATE.has_pdf || !STATE.scope) return;
+  const rev = STATE.revision_no == null ? null : STATE.revision_no;
+  if (DOC_OPEN_SIGNALED_REV === rev) return;
+  DOC_OPEN_SIGNALED_REV = rev;
+  api("POST", "/document-opened", { revision_no: rev }).then((r) => {
+    if (!r.ok) { DOC_OPEN_SIGNALED_REV = undefined; return; }   // retry on the next open
+    const row = MA.rows.find((x) => x.token === TOKEN);
+    if (row && r.data.marked) row.document_opened = true;
+  });
+}
+
 // ── actions (handlers attach once; elements exist in the hidden #portal) ──────────
 /** Send the approval.
  *
@@ -1603,9 +2019,38 @@ for (const id of ["pdf-link", "pdf-modal-link"]) {
   const a = $(id);
   if (a) a.addEventListener("click", () => { PDF_OPENED_IN_TAB = true; updateApproveGate(); });
 }
+// The same three opening controls also tell the server, for approving several proposals at once
+// (signalDocumentOpened). Separate listeners: mountPdf and openTermsInProposal are lifted verbatim
+// by test harnesses and must not call anything new.
+$("pdf-preview").addEventListener("click", signalDocumentOpened);
+$("read-terms").addEventListener("click", signalDocumentOpened);
+for (const id of ["pdf-link", "pdf-modal-link"]) {
+  const a = $(id);
+  if (a) a.addEventListener("click", signalDocumentOpened);
+}
 $("pdf-close").addEventListener("click", closePdfModal);
 $("pdf-scrim").addEventListener("click", closePdfModal);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePdfModal(); });
+
+// Approving several proposals at once. Delegated on static containers: the list is rebuilt on
+// every tick and the result view is drawn after the approval.
+$("ma-open").addEventListener("click", openMultiApprove);
+$("ma-close").addEventListener("click", closeMultiApprove);
+$("ma-scrim").addEventListener("click", closeMultiApprove);
+$("ma-list").addEventListener("change", maOnListChange);
+$("ma-list").addEventListener("click", maOnListClick);
+$("ma-consent").addEventListener("change", maUpdateGate);
+$("ma-form").addEventListener("submit", (e) => { e.preventDefault(); submitMultiApprove(); });
+$("ma-done").addEventListener("click", (e) => {
+  const t = e.target;
+  if (t && t.id === "ma-finish") { closeMultiApprove(); return; }
+  // "Pay this deposit" on THIS page is only a hash change: close the dialog so it is seen.
+  const a = t && t.closest ? t.closest("a[href^='/p/']") : null;
+  if (a && isMultiApproveOpen()) closeMultiApprove();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && isMultiApproveOpen() && !MA.busy) closeMultiApprove();
+});
 
 // NO UPLOAD ON THIS SIDE, on purpose. Hanz, 2026-08-26: "I think we apply the sending of the
 // file attachments only to the treadwell side."

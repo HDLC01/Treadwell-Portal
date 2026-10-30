@@ -107,6 +107,21 @@ def _no_view_records(request, monkeypatch):
 # /api/admin/notify-recipients and /api/admin/proposal/{id}/notify-overrides are staging-smoke
 # territory, per the convention stated at the top of test_customer_auth.py.
 @pytest.fixture(autouse=True)
+def _approve_single_without_a_lock(request, monkeypatch):
+    # api_approve writes through db.approve_single, which takes a row lock on a pooled connection.
+    # With no database there is no lock to take, so this runs the same two writes bare
+    # (db.write_single_approval calls add_approval and set_approved exactly as api_approve always
+    # did), which keeps every test that fakes those two seeing the calls it fakes. The lock itself
+    # runs against Postgres in test_pg_approve_batch.py (`realdb`); a test that needs a lost race
+    # installs its own approve_single.
+    if "realdb" in request.keywords:
+        return
+    import db
+    monkeypatch.setattr(db, "approve_single", lambda pid, approval, approved: (
+        True, db.write_single_approval(pid, approval, approved)), raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_notify_roster(request, monkeypatch):
     if "realdb" in request.keywords:
         return
