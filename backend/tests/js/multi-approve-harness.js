@@ -79,7 +79,7 @@ function dialog(opts) {
   const alerts = [];
   const scope = new Function(
     "STATE_IN", "$", "api", "alertBox", "clearAlert", "handleExpired", "renderPortal", "window",
-    "TOKEN", "document", "show", "hide", "fetch",
+    "TOKEN", "document", "show", "hide", "fetch", "setTimeout", "clearTimeout",
     `let STATE = STATE_IN;
      ${grabEsc()}
      ${grabConst("money")}
@@ -104,6 +104,9 @@ function dialog(opts) {
      ${fn("maOnListChange")}
      ${fn("maDoneHtml")}
      ${fn("renderMultiApproveDone")}
+     let MA_POLL = null;
+     ${fn("maPollContracts")}
+     ${fn("maApplyStatus")}
      ${fn("submitMultiApprove")}
      ${fn("maReloadRows")}
      ${fn("renderProjectDeposits")}
@@ -111,6 +114,7 @@ function dialog(opts) {
               rowHtml: maRowHtml, blocker: multiApproveBlocker, gate: maUpdateGate,
               applyPreview: maApplyPreview, refresh: maRefreshPreview, change: maOnListChange,
               submit: submitMultiApprove, doneHtml: maDoneHtml, deposits: renderProjectDeposits,
+              done: renderMultiApproveDone, applyStatus: maApplyStatus, poll: maPollContracts,
               setRows: (rows) => { MA.rows = rows; MA.available = true; } };`);
   const handle = scope(
     o.state || { customer_name: "Dana Reed", scope: { siblings: [{}, {}] } }, $, api,
@@ -120,7 +124,8 @@ function dialog(opts) {
     { crypto: { randomUUID: () => "11111111-2222-3333-4444-555555555555" } },
     o.token || "tok-a", { body: { style: {} } },
     (x) => x && x.classList.remove("hidden"), (x) => x && x.classList.add("hidden"),
-    () => Promise.reject(new Error("no network")));
+    () => Promise.reject(new Error("no network")),
+    o.setTimeout || setTimeout, o.clearTimeout || clearTimeout);
   return { handle, nodes, calls, alerts };
 }
 
@@ -308,6 +313,42 @@ const PREVIEW = (text, reasons) => ({
     d.handle.deposits();
     out.deposits = { html: d.nodes["ma-deposits"].innerHTML,
                      hidden: d.nodes["ma-deposits"].classList.contains("hidden") };
+  }
+
+  // -- after, while the contracts are still being built in the background -----------
+  {
+    const timers = [];
+    let ready = false;
+    const d = dialog({
+      setTimeout: (cb, ms) => { timers.push({ cb, ms }); return timers.length; },
+      clearTimeout: () => {},
+      replies: {
+        "GET /approve-several/status?batch_id=batch-0000-0042": () => ({ ok: true, status: 200, data: {
+          ok: true, paperwork: ready ? "done" : "pending", approved: [
+            { token: "tok-a", signed: true, contract_ready: ready, invoice_no: "INV-A" },
+            { token: "tok-b", signed: true, contract_ready: ready, invoice_no: "INV-B" }] } }),
+      },
+    });
+    d.handle.setRows([ROW("tok-a", "Lab 1"), ROW("tok-b", "Lab 2")]);
+    d.handle.open();
+    d.handle.MA.batchId = "batch-0000-0042";
+    d.handle.done([
+      { token: "tok-a", label: "Lab 1", total: 12000, options: ["Lab 1"], deposit_required: true,
+        deposit_amount: 3000, invoice_no: "INV-A", signed: true, contract_ready: false },
+      { token: "tok-b", label: "Lab 2", total: 8000, options: ["Lab 2"], deposit_required: true,
+        deposit_amount: 2000, invoice_no: null, signed: true, contract_ready: false },
+    ]);
+    const first = d.nodes["ma-done"].innerHTML;
+    const run = async () => { const t = timers.shift(); await t.cb(); await flush(); return t.ms; };
+    const firstDelay = await run();                 // asked once: still being prepared
+    const stillPending = d.nodes["ma-done"].innerHTML;
+    ready = true;
+    await run();                                    // asked again: both stored
+    out.background = {
+      first, stillPending, after: d.nodes["ma-done"].innerHTML, firstDelay,
+      asked: d.calls.filter((c) => c.path.startsWith("/approve-several/status")).length,
+      pollingAfterDone: timers.length,
+    };
   }
 
   console.log(JSON.stringify(out));

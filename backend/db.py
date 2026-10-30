@@ -2508,6 +2508,76 @@ def latest_approval_record(proposal_id: str) -> Optional[dict[str, Any]]:
     return (row or {}).get("fields") or None
 
 
+# ── a combined approval's paperwork, done in the background (2026-10-31) ─────
+# The job record is `paperwork` inside the batch jsonb of the batch's FIRST approval row (the
+# anchor), written by approve_batch in the same transaction as the approvals, so an approval never
+# exists without its job. NO DDL: `batch` is already there. The rest of `batch` (the list signed,
+# the consent digest) is evidence and is never touched here: every write below replaces the
+# `paperwork` key alone, through jsonb_set.
+#
+# ONE WORKER AT A TIME, by a lease: `paperwork.lease = {owner, until}`. claim takes it only when it
+# is free or expired, and every save is conditional on still holding it (and renews it), so two
+# containers during a deploy, or the request's own thread and the sweeper, never run one batch at
+# once. A worker that dies holding it is replaced when `until` passes.
+def batch_paperwork_pending(limit: int = 20) -> list[int]:
+    """The anchor approval ids of every batch whose paperwork is not finished, oldest first."""
+    rows = qall("select id from public.portal_approvals "
+                "where batch #>> '{paperwork,state}' = 'pending' order by id limit %s",
+                (int(limit),))
+    return [int(r["id"]) for r in rows]
+
+
+def batch_paperwork_claim(approval_id: int, owner: str, lease_sec: float) -> Optional[dict]:
+    """Take the lease on one batch's paperwork. Returns the whole `batch` jsonb when taken, None
+    when another worker holds it or there is nothing pending. One UPDATE, so two claimers racing
+    serialise on the row lock and the second re-reads the first one's lease and gets nothing."""
+    row = q1(
+        "update public.portal_approvals set batch = jsonb_set(batch, '{paperwork,lease}', "
+        "jsonb_build_object('owner', %s::text, 'until', "
+        "to_jsonb(now() + make_interval(secs => %s::double precision)))) "
+        "where id = %s and batch #>> '{paperwork,state}' = 'pending' and ("
+        "batch #>> '{paperwork,lease,owner}' is null "
+        "or batch #>> '{paperwork,lease,owner}' = %s "
+        "or (batch #>> '{paperwork,lease,until}')::timestamptz < now()) "
+        "returning batch",
+        (owner, float(lease_sec), int(approval_id), owner))
+    return (row or {}).get("batch") or None
+
+
+def batch_paperwork_save(approval_id: int, owner: str, paperwork: dict,
+                         lease_sec: float) -> bool:
+    """Replace `paperwork` (all of it but the lease) and renew the lease for `lease_sec` (0 hands
+    it back). False when this worker no longer holds the lease: nothing was written, and the
+    caller must stop rather than act on a batch somebody else is now running."""
+    pw = {k: v for k, v in (paperwork or {}).items() if k != "lease"}
+    row = q1(
+        "update public.portal_approvals set batch = jsonb_set(batch, '{paperwork}', "
+        "%s::jsonb || jsonb_build_object('lease', jsonb_build_object('owner', %s::text, "
+        "'until', to_jsonb(now() + make_interval(secs => %s::double precision))))) "
+        "where id = %s and batch #>> '{paperwork,lease,owner}' = %s returning id",
+        (Jsonb(pw), owner, float(lease_sec), int(approval_id), owner))
+    return bool(row)
+
+
+def batch_approval_records(batch_id: str) -> list[dict[str, Any]]:
+    """Every approval row carrying this batch_id, every column (to_jsonb, as
+    latest_approval_record reads them), oldest first. The caller narrows them to ONE batch by the
+    shared signed_at: the rows of one transaction share now()."""
+    rows = qall("select to_jsonb(a) as fields from public.portal_approvals a "
+                "where a.batch ->> 'batch_id' = %s order by a.id", (str(batch_id),))
+    return [r["fields"] for r in rows if r.get("fields")]
+
+
+def built_contract_ids(approval_ids: list[int]) -> set[int]:
+    """Which of these approvals have a BUILT signed contract. Never reads the blob itself."""
+    ids = [int(i) for i in approval_ids if i is not None]
+    if not ids:
+        return set()
+    rows = qall("select approval_id from public.portal_signed_contracts "
+                "where approval_id = any(%s) and pdf is not null", (ids,))
+    return {int(r["approval_id"]) for r in rows}
+
+
 # -- the built signed contract ------------------------------------------------
 def upsert_signed_contract(approval_id, proposal_id, pdf=None, pdf_sha256=None,
                            built_at=None) -> None:
