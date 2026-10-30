@@ -140,3 +140,11 @@ grant select, insert, update, delete on public.portal_signed_contracts to portal
 drop policy if exists portal_app_rw on public.portal_signed_contracts;
 create policy portal_app_rw on public.portal_signed_contracts
   for all to portal_app using (true) with check (true);
+
+-- 3f) Approving several proposals at once (2026-10-31): who opened which document, at which
+--     revision. RLS is enabled in schema.sql, so the POLICY is required, as for 3e. Apply the
+--     schema.sql CREATE (portal_document_opens) and ALTER (portal_approvals.batch) first.
+grant select, insert, update, delete on public.portal_document_opens to portal_app;
+drop policy if exists portal_app_rw on public.portal_document_opens;
+create policy portal_app_rw on public.portal_document_opens
+  for all to portal_app using (true) with check (true);

@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -22,6 +23,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -1765,6 +1767,709 @@ def _raise_scope_decision(p: dict) -> None:
     followup_worker._echo_to_thread(pid, due, {"task_id": rid})
 
 
+# ── approving several proposals at once (2026-10-31) ──────────────────────────
+# Hanz: "We must have the ability to also select and approve multiple proposals." On a project
+# priced as several proposals (a scope group), the customer may tick several of the proposals they
+# can open, choose each one's options, and sign ONCE. What stays per proposal, exactly as a single
+# approval: its approval row (same columns, same IP / user agent / time on every row of the batch),
+# its signed contract, its deposit invoice, its card on the board, its chat lines. What becomes ONE:
+# the signature and consent tick, the staff email, and each customer's confirmation email.
+#
+# THREE PHASES, so a batch is all of its proposals or none of them:
+#   0. CHECK, writing nothing: every gate api_approve and the approve card enforce, per proposal,
+#      every failure collected (not first-fail) and returned as reasons.
+#   1. FETCH, writing nothing: the proposal PDFs the signature hashes.
+#   2. COMMIT, one database transaction (db.approve_batch): every row locked, every state gate
+#      re-checked under the lock, every approval row and status update written, or none.
+#   3. EVERYTHING ELSE, best-effort and after the commit, as in api_approve: contracts, chat lines,
+#      invoices, emails. A failure there costs that document or that email, never an approval.
+#
+# THE SERVER DECIDES EVERYTHING; the page is a convenience. Which proposals may be in a batch comes
+# from the session's own project list (_scope_view), never from the request; totals come from
+# proposals.resolve_selection; the consent sentence is built here and the page returns its digest.
+#
+# STRICTER THAN SINGLE APPROVE IN TWO PLACES, on purpose: a closed-lost proposal is refused (single
+# approve still takes one back), and "the document was opened" is checked server-side against
+# portal_document_opens at the proposal's current revision (single approve trusts its page).
+MAX_BATCH = 6
+_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+_BATCH_STATE_CODES = frozenset({"gone", "already_approved", "closed", "revised", "not_opened",
+                                "unavailable"})
+_NO_REV = object()
+BATCH_REFUSED_MESSAGE = "Nothing was approved. Please fix the items below and try again."
+
+
+def _rev_of(v):
+    """A revision number as /viewed compares it: legacy rows have none, and None is a real value."""
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _batch_labels(raw) -> list[str]:
+    """The option labels for one proposal, read exactly as api_approve reads `option_labels`."""
+    if not isinstance(raw, list):
+        return []
+    return [_cap(x, 200) for x in raw if isinstance(x, str) and x.strip()]
+
+
+def _batch_scope(request: Request, anchor: dict) -> tuple[Optional[str], list[str]]:
+    """(group, the tokens of every proposal of it THIS session may open), from the session's own
+    list -- the same list the proposal tabs are drawn from. (None, []) for an ungrouped proposal."""
+    se = _session_email(request)
+    group = anchor.get("scope_group")
+    if not group or not se:
+        return None, []
+    view = _scope_view(anchor, se) or {}
+    return group, [c["token"] for c in (view.get("siblings") or []) if c.get("token")]
+
+
+def _batch_item(request: Request, tok, group: str, sib_tokens: list[str], *,
+                labels: Optional[list[str]] = None, expected_rev=_NO_REV) -> dict:
+    """One proposal of a combined approval, checked. Writes nothing.
+
+    `reasons` is every gate it fails, each `{"code", "message"}` with a sentence the page shows as
+    is. A proposal this session may not open, or one of another project, is described WITHOUT its
+    name: a scope sent to somebody else must never appear, even in a refusal. Raises
+    _GroupUnreadable when the group's drafts cannot be read (the caller refuses the whole batch)."""
+    out: dict[str, Any] = {"token": tok if isinstance(tok, str) else None, "label": "",
+                           "reasons": []}
+
+    def refuse(code: str, msg: str) -> dict:
+        out["reasons"].append({"code": code, "message": msg})
+        return out
+
+    hidden = "One of the selected proposals is not available on this project."
+    if not isinstance(tok, str) or tok not in sib_tokens:
+        return refuse("unavailable", hidden)
+    try:
+        p = _require(request, tok)
+    except ProposalGone:
+        return refuse("gone", "One of the selected proposals is no longer available.")
+    if not p:
+        return refuse("unavailable", hidden)
+    if (p.get("scope_group") or None) != group or _active_scope_group(p) != group:
+        return refuse("unavailable", hidden)
+    data = db.get_pinned_draft_data(p) or {}
+    label = p.get("scope_label") or p.get("project_name") or "This proposal"
+    options = proposals.pricing_options(data)
+    sign = signing.signing_block(p, data)
+    # The same two sources the page's has_pdf comes from (api_get_portal, build_view_model).
+    has_pdf = bool(config.PROPOSAL_TOOL_URL or p.get("pdf_path"))
+    rev = p.get("current_revision_no")
+    status = p.get("proposal_status") or ""
+    approved = status == "approved" or bool(p.get("approved_at"))
+    out.update(p=p, data=data, label=label, options=options, addons=proposals.addons(data),
+               sign=sign, has_pdf=has_pdf, revision_no=rev, status=status,
+               display_name=_scope_name(p.get("project_name"), p.get("scope_label")),
+               deposit_required=p.get("deposit_required") is not False)
+    if approved:
+        # The guard api_approve opens with, approved_at included (a signed job filed as lost).
+        refuse("already_approved", f"{label} is already approved.")
+    elif status == "closed_lost":
+        refuse("closed", f"{label} was closed. To go ahead with it, open its tab and approve it "
+                         f"there on its own.")
+    if not options:
+        # The approve card is hidden on such a proposal (renderOptions): nothing to approve.
+        refuse("no_pricing", f"Pricing for {label} is being finalized.")
+    if expected_rev is not _NO_REV and _rev_of(expected_rev) != _rev_of(rev):
+        refuse("revised", f"{label} was revised since you opened it. Please open the new version "
+                          f"before signing.")
+    if labels is not None and options:
+        picked = list(labels)
+        if not picked and len(options) == 1:
+            picked = [options[0]["label"]]          # api_approve's single-option auto-select
+        try:
+            chosen, total = proposals.resolve_selection(data, picked)
+        except ValueError:
+            refuse("selection", f"Select at least one option for {label}.")
+        else:
+            out.update(chosen=chosen, total=total, deposit_amount=proposals.deposit_amount(total))
+    # THE PAGE'S proposalWasOpened, on the server: required only where the card requires it -- a
+    # signable proposal with a document to open.
+    needs_open = bool(sign["required"] and has_pdf)
+    opened = True
+    if needs_open:
+        try:
+            opened = db.document_opened(p["proposal_id"], _session_email(request), rev)
+        except Exception as exc:  # noqa: BLE001 -- unreadable is "not shown it", never "shown it"
+            log.warning("could not read the document opens of %s: %s: %s",
+                        p["proposal_id"], type(exc).__name__, exc)
+            opened = False
+    out.update(document_required=needs_open, document_opened=opened)
+    if needs_open and not opened and not approved:
+        refuse("not_opened", f"Open {label}'s proposal before signing.")
+    return out
+
+
+def _batch_row(it: dict) -> dict:
+    """The page's view of one checked proposal. No proposal id: the page only ever knows tokens."""
+    p = it.get("p") or {}
+    sign = it.get("sign") or {}
+    blocking = [r for r in it["reasons"] if r["code"] != "not_opened"]
+    row = {
+        "token": it.get("token"), "label": it.get("label"),
+        "display_name": it.get("display_name"), "revision_no": it.get("revision_no"),
+        "status": it.get("status"), "options": it.get("options") or [],
+        "addons": it.get("addons") or [],
+        "signing": {"required": bool(sign.get("required")),
+                    "blocked_reason": sign.get("blocked_reason")},
+        "has_pdf": bool(it.get("has_pdf")),
+        "document_required": bool(it.get("document_required")),
+        "document_opened": bool(it.get("document_opened")),
+        "deposit_required": bool(it.get("deposit_required", True)),
+        # Selectable once its document is opened: every other reason is not the customer's to fix
+        # here. The commit re-checks all of them regardless.
+        "approvable": bool(p) and not blocking,
+        "reasons": it["reasons"],
+    }
+    if "total" in it:
+        row.update(chosen=[o["label"] for o in it["chosen"]], total=it["total"],
+                   deposit_amount=(it["deposit_amount"] if row["deposit_required"] else None))
+    if it.get("status") == "approved" or p.get("approved_at"):
+        row["approved"] = {"name": p.get("approved_name"),
+                           "total": _float_or_none(p.get("approved_total")),
+                           "invoice_no": p.get("deposit_invoice_no"),
+                           "deposit_amount": _float_or_none(p.get("deposit_amount")),
+                           "deposit_status": p.get("deposit_status")}
+    return row
+
+
+def _batch_consent(items: list[dict]) -> tuple[Optional[str], Optional[str], list[dict]]:
+    """(sentence, digest, the list it names) for the e-signable proposals of a batch, in order.
+    (None, None, []) when none of them can be signed (Budget, Gyp, GC: approved without one)."""
+    named = [{"proposal_id": it["p"]["proposal_id"],
+              "name": signing.signing_project_name(it["p"], it["data"]),
+              "total": it.get("total")}
+             for it in items if it.get("p") and (it.get("sign") or {}).get("required")]
+    if not named:
+        return None, None, []
+    text = signing.combined_consent_text(named)
+    return text, signing.consent_digest(text), named
+
+
+def _batch_refusal(items: list[dict], extra: Optional[list[dict]] = None) -> JSONResponse:
+    reasons = [{"token": it.get("token"), "label": it.get("label") or "",
+                **r} for it in items for r in it["reasons"]] + list(extra or [])
+    state = any(r["code"] in _BATCH_STATE_CODES for r in reasons)
+    return _json({"ok": False, "error": "batch_refused", "message": BATCH_REFUSED_MESSAGE,
+                  "reasons": reasons}, 409 if state else 400)
+
+
+@app.post("/api/portal/{token}/document-opened")
+async def api_document_opened(token: str, request: Request) -> JSONResponse:
+    """The customer opened this proposal's DOCUMENT (the full-size viewer, the Terms button, or a
+    new tab), at the revision their page shows. What the combined approval checks, per proposal, in
+    place of the single approve card's page-local flag.
+
+    The /viewed rules: the session decides who, a revision the row no longer holds is a 200
+    {marked:false} (a stale tab must not vouch for a document it never showed), and a failed write
+    is logged and swallowed -- it costs the customer a combined approval, never the page."""
+    p = _require(request, token)
+    if not p:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    raw = (await _body(request)).get("revision_no")
+    if _rev_of(raw) != _rev_of(p.get("current_revision_no")):
+        return _json({"ok": True, "marked": False})
+    try:
+        db.record_document_open(p["proposal_id"], _session_email(request),
+                                p.get("current_revision_no"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not record the document open of %s: %s: %s",
+                    p["proposal_id"], type(exc).__name__, exc)
+        return _json({"ok": True, "marked": False})
+    return _json({"ok": True, "marked": True})
+
+
+@app.get("/api/portal/{token}/approve-several")
+def api_approve_several_list(token: str, request: Request) -> JSONResponse:
+    """Every proposal of this project the signed-in customer may open, with what the combined
+    approval needs to show for each: options, signing, document opened, deposit, and whether it can
+    be selected (with the reason when it cannot). `available` is false for an ungrouped proposal
+    and on a database without the combined-approval DDL, and the page then offers nothing."""
+    anchor = _require(request, token)
+    if not anchor:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    group, sibs = _batch_scope(request, anchor)
+    if not group or len(sibs) < 2 or not db.approve_several_ready():
+        return _json({"ok": True, "available": False, "proposals": []})
+    try:
+        rows = [_batch_row(_batch_item(request, t, group, sibs)) for t in sibs]
+    except _GroupUnreadable as exc:
+        log.warning("scope group %s unreadable for the combined approval: %s", group, exc)
+        return _json({"ok": True, "available": False, "proposals": []})
+    # A proposal the session cannot open (gone since the list was read) is simply not listed.
+    rows = [r for r in rows if r["label"]]
+    return _json({"ok": True, "available": len(rows) >= 2, "max": MAX_BATCH, "proposals": rows})
+
+
+@app.post("/api/portal/{token}/approve-several/preview")
+async def api_approve_several_preview(token: str, request: Request) -> JSONResponse:
+    """Read-only: the server's totals, deposits and blockers for a selection, and the ONE consent
+    sentence that selection would be signed under, with its digest. The page shows these as
+    received, so the summing rule and the legal wording each have exactly one copy (here)."""
+    anchor = _require(request, token)
+    if not anchor:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    body = await _body(request)
+    group, sibs = _batch_scope(request, anchor)
+    raw_items = body.get("items")
+    if not group or not isinstance(raw_items, list) or len(raw_items) > MAX_BATCH:
+        return _json({"ok": False, "error": "bad_request"}, 400)
+    try:
+        items = [_batch_item(request, (r or {}).get("token") if isinstance(r, dict) else None,
+                             group, sibs,
+                             labels=_batch_labels((r or {}).get("option_labels")
+                                                  if isinstance(r, dict) else None))
+                 for r in raw_items]
+    except _GroupUnreadable:
+        return _json({"ok": False, "error": "project_unreadable"}, 503)
+    text, digest, _named = _batch_consent([it for it in items if not it["reasons"]
+                                           or all(r["code"] == "not_opened"
+                                                  for r in it["reasons"])])
+    return _json({"ok": True, "proposals": [_batch_row(it) for it in items],
+                  "consent_text": text, "consent_digest": digest,
+                  "consent_version": signing.COMBINED_CONSENT_VERSION if text else None})
+
+
+@app.post("/api/portal/{token}/approve-several")
+async def api_approve_several(token: str, request: Request) -> JSONResponse:
+    """Approve several proposals of one project with ONE signature. All of them, or none.
+
+    Body: {batch_id, items: [{token, revision_no, option_labels[]}], name, title, date,
+    consent: true (when any item is e-signable), consent_digest}.
+
+    `async` only to read the body. The work runs in the thread pool: it makes blocking calls to the
+    proposal tool (a PDF fetch, a contract render and an invoice render per proposal), and doing
+    those on the event loop would freeze the portal for every other customer while they ran."""
+    anchor = _require(request, token)
+    if not anchor:
+        return _json({"ok": False, "error": "unauthorized"}, 401)
+    if not ratelimit.allow_ip(_client_ip(request), config.RATE_REQUESTS_PER_IP,
+                              config.RATE_WINDOW_SEC):
+        return _json({"ok": False, "error": "Too many requests. Please wait and try again."}, 429)
+    body = await _body(request)
+    return await run_in_threadpool(_approve_several_sync, request, anchor, body)
+
+
+def _batch_replay(items: list[dict], batch_id: str) -> Optional[list[dict]]:
+    """A double submit of a batch that already went through: every item approved BY THIS batch.
+    Returns what the first request returned, so the page shows the result instead of a refusal."""
+    if not items or not all(it.get("p") and [r["code"] for r in it["reasons"]]
+                            == ["already_approved"] for it in items):
+        return None
+    out = []
+    for it in items:
+        try:
+            rec = db.latest_approval_record(it["p"]["proposal_id"]) or {}
+        except Exception:  # noqa: BLE001
+            return None
+        if ((rec.get("batch") or {}).get("batch_id")) != batch_id:
+            return None
+        fresh = db.get_proposal(it["p"]["proposal_id"]) or it["p"]
+        out.append(_batch_result(it, fresh.get("deposit_invoice_no"), None))
+    return out
+
+
+def _batch_result(it: dict, invoice_no, contract_pdf) -> dict:
+    p = it["p"]
+    sign = (it.get("sign") or {}).get("required")
+    return {"token": it["token"], "label": it["label"],
+            "options": [o["label"] for o in it.get("chosen") or []] or
+            list(p.get("approved_options") or []),
+            "total": it.get("total") if it.get("total") is not None
+            else _float_or_none(p.get("approved_total")),
+            "deposit_required": p.get("deposit_required") is not False,
+            "deposit_amount": (it.get("deposit_amount") if it.get("deposit_amount") is not None
+                               else _float_or_none(p.get("deposit_amount")))
+            if p.get("deposit_required") is not False else None,
+            "invoice_no": invoice_no, "signed": bool(sign),
+            "contract_ready": bool(contract_pdf) if sign else False}
+
+
+def _approve_several_sync(request: Request, anchor: dict, body: dict) -> JSONResponse:
+    se = _session_email(request)
+    if not db.approve_several_ready():
+        return _json({"ok": False, "error": "unavailable", "message":
+                      "Approving several proposals at once is not available yet. Please approve "
+                      "each proposal on its own tab."}, 503)
+    group, sibs = _batch_scope(request, anchor)
+    if not group:
+        return _json({"ok": False, "error": "not_a_project"}, 400)
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list) or not all(isinstance(r, dict) for r in raw_items):
+        return _json({"ok": False, "error": "bad_request"}, 400)
+    tokens = [r.get("token") for r in raw_items]
+    if len(raw_items) < 2 or len(raw_items) > MAX_BATCH:
+        return _json({"ok": False, "error": "batch_size", "message":
+                      "Select between 2 and %d proposals to approve together." % MAX_BATCH}, 400)
+    if len(set(map(str, tokens))) != len(tokens):
+        return _json({"ok": False, "error": "duplicate_proposal",
+                      "message": "Each proposal can be selected once."}, 400)
+    batch_id = str(body.get("batch_id") or "")
+    if not _BATCH_ID_RE.match(batch_id):
+        return _json({"ok": False, "error": "bad_request"}, 400)
+    try:
+        items = [_batch_item(request, r.get("token"), group, sibs,
+                             labels=_batch_labels(r.get("option_labels")),
+                             expected_rev=r.get("revision_no")) for r in raw_items]
+    except _GroupUnreadable as exc:
+        # FAIL CLOSED: without the drafts nobody can say which proposals belong to this project.
+        log.warning("scope group %s unreadable; combined approval refused: %s", group, exc)
+        return _json({"ok": False, "error": "project_unreadable", "message":
+                      "We could not check this project just now. Nothing was approved; please "
+                      "try again shortly."}, 503)
+    replay = _batch_replay(items, batch_id)
+    if replay is not None:
+        return _json({"ok": True, "batch_id": batch_id, "approved": replay, "replayed": True})
+
+    extra: list[dict] = []
+    name = _cap(body.get("name"), 120)
+    title = _cap(body.get("title"), 120)
+    if not name:
+        extra.append({"token": None, "label": "", "code": "name",
+                      "message": "Type your full name to sign."})
+    text, digest, named = _batch_consent(items)
+    if text is not None:
+        # The literal boolean, as api_approve demands, AND the sentence on screen: the digest of
+        # the sentence this server builds for exactly this selection. A page showing an older
+        # sentence (a changed option, a changed price) is refused rather than signed under it.
+        if body.get("consent") is not True:
+            extra.append({"token": None, "label": "", "code": "consent",
+                          "message": "Tick the box to sign and approve these proposals."})
+        elif not hmac.compare_digest(str(body.get("consent_digest") or "").encode("utf-8"),
+                                     digest.encode("utf-8")):
+            extra.append({"token": None, "label": "", "code": "consent_changed",
+                          "message": "The approval wording changed. Please review it and tick "
+                                     "the box again."})
+    if extra or any(it["reasons"] for it in items):
+        return _batch_refusal(items, extra)
+
+    # ── phase 1: what is being signed, fetched and hashed before anything is written ──────────
+    signed_at = _now_utc()
+    ip = _client_ip(request)
+    ua = _cap(request.headers.get("user-agent"), 500) or None
+    try:
+        approved_date = date.fromisoformat(body["date"]) if body.get("date") else date.today()
+    except (ValueError, TypeError):
+        approved_date = date.today()
+    signable = [it for it in items if it["sign"]["required"]]
+    pdfs: dict[str, Optional[bytes]] = {}
+    if signable:
+        # Usually cached: every one of them was opened (that is a gate), and the viewer caches
+        # what it served. Three at a time at most; the proposal tool shares this box.
+        with ThreadPoolExecutor(max_workers=min(3, len(signable))) as pool:
+            for it, pdf in zip(signable, pool.map(
+                    lambda i: _proposal_pdf_bytes(i["p"], timeout=30.0), signable)):
+                pdfs[it["p"]["proposal_id"]] = pdf
+                if pdf is None:
+                    log.warning("combined approval for %s has no proposal PDF to hash -- the "
+                                "signed contract will be built on first download",
+                                it["p"]["proposal_id"])
+    batch = {"batch_id": batch_id, "count": len(items),
+             "proposals": [{"proposal_id": it["p"]["proposal_id"],
+                            "name": signing.signing_project_name(it["p"], it["data"]),
+                            "total": it["total"], "signed": bool(it["sign"]["required"])}
+                           for it in items],
+             "signed": [{"proposal_id": n["proposal_id"], "name": n["name"], "total": n["total"]}
+                        for n in named],
+             "consent_sha256": digest}
+    rows = []
+    for it in items:
+        p, req = it["p"], it["sign"]["required"]
+        pdf = pdfs.get(p["proposal_id"])
+        it["option_summary"] = ", ".join(o["label"] for o in it["chosen"])
+        it["revision_sha"] = signing.revision_sha256(it["data"]) if req else None
+        rev = p.get("current_revision_no")
+        rows.append({
+            "proposal_id": p["proposal_id"], "expected_revision_no": rev,
+            "approval": {"name": name, "title": title, "approved_date": approved_date,
+                         "total": it["total"], "option_label": it["option_summary"], "ip": ip,
+                         "approver_email": se,
+                         "options": [o["label"] for o in it["chosen"]],
+                         "consent_version": signing.COMBINED_CONSENT_VERSION if req else None,
+                         "user_agent": ua, "revision_no": int(rev) if rev else None,
+                         "revision_sha256": it["revision_sha"],
+                         "contract_sha256": signing.sha256_hex(pdf) if pdf else None,
+                         "batch": batch},
+            "proposal": {"total": it["total"], "option_label": it["option_summary"],
+                         "options": [o["label"] for o in it["chosen"]],
+                         "deposit_amount": it["deposit_amount"], "name": name, "title": title,
+                         "approved_date": approved_date}})
+
+    # ── phase 2: the commit point ─────────────────────────────────────────────────────────────
+    try:
+        ids = db.approve_batch(rows)
+    except db.BatchRefused as exc:
+        by_pid = {it["p"]["proposal_id"]: it for it in items}
+        words = {"gone": "{label} is no longer available.",
+                 "already_approved": "{label} is already approved.",
+                 "closed": "{label} was closed. To go ahead with it, open its tab and approve it "
+                           "there on its own.",
+                 "revised": "{label} was revised since you opened it. Please open the new "
+                            "version before signing."}
+        for r in exc.reasons:
+            it = by_pid.get(r.get("proposal_id"))
+            if it is not None:
+                it["reasons"].append({"code": r["code"], "message": words.get(
+                    r["code"], "{label} cannot be approved right now.").format(label=it["label"])})
+        return _batch_refusal(items)
+    except Exception as exc:  # noqa: BLE001 -- the transaction rolled back: nothing was written
+        log.error("combined approval %s failed to commit: %s: %s", batch_id,
+                  type(exc).__name__, exc)
+        return _json({"ok": False, "error": "not_recorded", "message":
+                      "We could not record your approval just now. Nothing was approved; please "
+                      "try again."}, 503)
+
+    # ── phase 3: everything else, best-effort, as api_approve after its writes ───────────────
+    results = _after_batch(items, ids, batch, name=name, title=title, approver=se,
+                           signed_at=signed_at, approved_date=approved_date, ip=ip, ua=ua,
+                           pdfs=pdfs, group=group)
+    return _json({"ok": True, "batch_id": batch_id, "approved": results})
+
+
+def _notice_batch_siblings(group: str, items: list[dict]) -> str:
+    """_notice_scope_siblings for a whole batch: ONE card on each proposal of the project still
+    open, naming every proposal just approved, and ONE line for the staff email. "" when the
+    batch left nothing open. Best-effort, like the single version."""
+    names = [it["label"] for it in items]
+    done = {it["p"]["proposal_id"] for it in items}
+    try:
+        open_sibs = [s for s in db.list_scope_group(group)
+                     if s.get("proposal_id") not in done
+                     and (s.get("proposal_status") or "") in ("sent", "viewed")]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read scope group %s after a combined approval: %s", group, exc)
+        return ""
+    joined = ", ".join(names)
+    for s in open_sibs:
+        try:
+            db.add_message(s["proposal_id"], "staff", None,
+                           f"{joined} were approved; follow-up reminders for this scope have "
+                           f"stopped until somebody decides what to do with it.",
+                           msg_type="system",
+                           meta={"internal": True, "scope_group": group,
+                                 "approved_scopes": sorted(done)})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not post the scope notice on %s: %s", s.get("proposal_id"), exc)
+    if not open_sibs:
+        return "<p>No other proposal in this project is still open.</p>"
+    others = ", ".join(html.escape(s.get("scope_label") or s.get("project_name") or "a scope")
+                       for s in open_sibs)
+    return (f"<p>These proposals have not been approved, and their follow-up reminders have "
+            f"stopped: <strong>{others}</strong>. Nothing has been closed; a task asks you to "
+            f"decide what to do with them.</p>")
+
+
+def _after_batch(items: list[dict], ids: dict, batch: dict, *, name: str, title: str,
+                 approver: Optional[str], signed_at: datetime, approved_date: date, ip: str,
+                 ua: Optional[str], pdfs: dict, group: str) -> list[dict]:
+    """Phase 3 of a combined approval. EVERYTHING HERE IS AFTER THE COMMIT and never raises:
+    each proposal's contract, chat lines and invoice exactly as api_approve makes them, then ONE
+    staff email and ONE email per customer contact. Returns the page's result rows."""
+    labels = [it["label"] for it in items]
+    for it in items:
+        p = it["p"]
+        others = [n for n in labels if n != it["label"]]
+        sel_txt = "; ".join(f"{o['label']} (${o['total']:,.2f})" for o in it["chosen"])
+        try:
+            # "Approved by" first: app.js files the line as the customer's own event by it.
+            db.add_message(p["proposal_id"], "staff", None,
+                           f"Approved by {name} — {sel_txt}. Total ${it['total']:,.2f}. "
+                           f"Signed in one approval together with {', '.join(others)}.",
+                           msg_type="system")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not post the approval line on %s: %s", p["proposal_id"], exc)
+    siblings_html = _notice_batch_siblings(group, items)
+    first = items[0]
+    try:
+        # ONE decision task for the project's still-open proposals, not one per approved one.
+        _raise_scope_decision(dict(first["p"], proposal_status="approved", approved_at=signed_at,
+                                   _approval_id=ids.get(first["p"]["proposal_id"])))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("scope decision after combined approval %s failed: %s",
+                    batch.get("batch_id"), exc)
+
+    # Each contract on its own: its own certificate (its price, its options, its fingerprints),
+    # the combined sentence and the combined_approval field naming the others.
+    def _contract(it):
+        p = it["p"]
+        pid = p["proposal_id"]
+        try:
+            cert = signing.build_certificate(
+                project_name=signing.signing_project_name(p, it["data"]), proposal_id=pid,
+                revision_no=p.get("current_revision_no"), signer_name=name, signer_title=title,
+                signer_email=approver, signed_at=signed_at, ip_address=ip, user_agent=ua or "",
+                options_summary=it["option_summary"], total=it["total"],
+                deposit_amount=(it["deposit_amount"] if p.get("deposit_required") is not False
+                                else None),
+                proposal_pdf_sha256=signing.sha256_hex(pdfs[pid]) if pdfs.get(pid) else "",
+                revision_sha=it["revision_sha"] or "",
+                consent_version=signing.COMBINED_CONSENT_VERSION, combined=batch)
+        except Exception as exc:  # noqa: BLE001
+            log.error("certificate for %s not built: %s: %s", pid, type(exc).__name__, exc)
+            return None, "%s: %s" % (type(exc).__name__, exc)
+        return _store_signed_contract(pid, ids.get(pid), cert, pdfs.get(pid))
+
+    signable = [it for it in items if it["sign"]["required"]]
+    if signable:
+        with ThreadPoolExecutor(max_workers=min(3, len(signable))) as pool:
+            for it, (pdf, err) in zip(signable, pool.map(_contract, signable)):
+                it["contract_pdf"], it["contract_error"] = pdf, err
+    for it in items:
+        p = it["p"]
+        staff_html, cust_html, atts = _contract_email_parts(
+            signing.signing_project_name(p, it["data"]), it.get("contract_pdf"),
+            it.get("contract_error"), signing_required=it["sign"]["required"])
+        it["staff_contract_html"], it["customer_contract_html"], it["contract_atts"] = (
+            staff_html, cust_html, atts)
+        if atts:
+            _post_contract_to_thread(p["proposal_id"], atts[0][0], atts[0][1])
+        project_name = p.get("project_name") or "proposal"
+        if p.get("deposit_required") is False:
+            try:
+                db.add_message(p["proposal_id"], "staff", None,
+                               "Approved — thank you! Please add your project contacts so we "
+                               "can schedule the work.", msg_type="system")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not post the contacts prompt for %s: %s", p["proposal_id"], exc)
+        try:
+            automations.create_dropbox_folder(project_name, p["proposal_id"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("approval automations failed: %s", exc)
+        # The invoice exactly as a single approval issues it (number, chat card, requested stamp),
+        # except that its email is this batch's one email instead of one of its own.
+        it["invoice"] = automations.request_deposit(p, project_name, send_email=False) or {}
+
+    _notify_staff_batch(items, name=name, title=title, approver=approver,
+                        approved_date=approved_date, siblings_html=siblings_html)
+    _notify_customers_batch(items, name=name, approver=approver, approved_date=approved_date)
+    out = []
+    for it in items:
+        inv = (it.get("invoice") or {}).get("invoice_no")
+        if not inv:
+            try:
+                inv = (db.get_proposal(it["p"]["proposal_id"]) or {}).get("deposit_invoice_no")
+            except Exception:  # noqa: BLE001
+                inv = None
+        out.append(_batch_result(it, inv, it.get("contract_pdf")))
+    return out
+
+
+def _batch_line_html(it: dict) -> str:
+    deposit_due = it["p"].get("deposit_required") is not False
+    dep = (f" Deposit (25%): <strong>${it['deposit_amount']:,.2f}</strong>." if deposit_due
+           and it.get("deposit_amount") is not None else " No deposit required.")
+    return (f"<li><strong>{html.escape(signing.signing_project_name(it['p'], it['data']))}</strong>"
+            f": {html.escape(it['option_summary'])} at <strong>${it['total']:,.2f}</strong>."
+            f"{dep}</li>")
+
+
+def _notify_staff_batch(items: list[dict], *, name: str, title: str, approver: Optional[str],
+                        approved_date: date, siblings_html: str) -> None:
+    """ONE staff email for the whole batch, listing every proposal with its price and deposit and
+    carrying every contract, in place of the N "Proposal APPROVED" emails N single approvals send.
+    Addressed off the first proposal (its roster and thread), like any project email."""
+    first = items[0]["p"]
+    project = first.get("project_name") or "proposal"
+    atts = [a for it in items for a in (it.get("contract_atts") or [])]
+    try:
+        email_sender.notify_team(
+            f"{len(items)} proposals APPROVED — {project}",
+            f"<p><strong>{html.escape(name)}</strong>{(', ' + html.escape(title)) if title else ''}"
+            f" approved {len(items)} proposals of <strong>{html.escape(project)}</strong> in one "
+            f"signature on {approved_date}"
+            f"{(' (signed in as ' + html.escape(approver) + ')') if approver else ''}:</p>"
+            f"<ul>{''.join(_batch_line_html(it) for it in items)}</ul>"
+            "<p>Each proposal has its own approval, its own signed contract and its own deposit "
+            "invoice.</p>"
+            + siblings_html
+            + "".join(it.get("staff_contract_html") or "" for it in items),
+            kind="approved",
+            reply_link=_staff_link(first["proposal_id"]), proposal_id=first["proposal_id"],
+            reply_to=email_sender.proposal_reply_to(first.get("token")),
+            token=first.get("token"), project=first.get("project_name"),
+            attachments=atts or None)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("combined approval staff email failed: %s", exc)
+
+
+def _notify_customers_batch(items: list[dict], *, name: str, approver: Optional[str],
+                            approved_date: date) -> None:
+    """ONE confirmation per customer contact, listing ONLY the proposals that contact is on, with
+    each one's contract and deposit invoice attached. A contact on one proposal of the batch hears
+    about that one alone: a proposal sent to somebody else must never appear, even by name.
+
+    The signer gets the receipt; every other contact gets the "{name} approved" version, as
+    _notify_customer does for a single approval."""
+    actor = (approver or "").strip().lower()
+    mine: dict[str, list[dict]] = {}
+    for it in items:
+        p = it["p"]
+        try:
+            people = db.get_recipients(p["proposal_id"]) or [p.get("customer_email")]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("recipients of %s unreadable: %s", p["proposal_id"], exc)
+            people = [p.get("customer_email")]
+        for e in people:
+            key = (e or "").strip().lower()
+            if key:
+                mine.setdefault(key, []).append(it)
+    for e, its in mine.items():
+        try:
+            first = its[0]["p"]
+            link = f"{config.PUBLIC_BASE_URL}/p/{first['token']}"
+            lines, atts = [], []
+            for it in its:
+                p = it["p"]
+                inv = it.get("invoice") or {}
+                pay = f"{config.PUBLIC_BASE_URL}/p/{p['token']}#proposal/deposit"
+                if p.get("deposit_required") is False:
+                    dep = "No deposit is needed for this one."
+                elif inv.get("invoice_no"):
+                    dep = (f"Deposit invoice {html.escape(str(inv['invoice_no']))} — "
+                           f"<strong>${float(inv.get('amount') or 0):,.2f}</strong> due"
+                           f"{' (attached)' if inv.get('pdf') else ''}. "
+                           f'<a href="{html.escape(pay)}">Pay this deposit</a>.')
+                else:
+                    dep = (f"A deposit of <strong>${(it.get('deposit_amount') or 0):,.2f}</strong>"
+                           " (25%) reserves it on our schedule; its invoice follows separately.")
+                lines.append(
+                    f"<li><strong>{html.escape(signing.signing_project_name(p, it['data']))}"
+                    f"</strong>: {html.escape(it['option_summary'])} — "
+                    f"<strong>${it['total']:,.2f}</strong>. {dep}</li>")
+                atts += list(it.get("contract_atts") or [])
+                if inv.get("pdf"):
+                    atts.append((inv.get("filename") or "Deposit invoice.pdf", inv["pdf"]))
+            contract = ("<p>Each signed contract is attached, and can always be downloaded from "
+                        "its proposal's page.</p>"
+                        if any(it.get("contract_atts") for it in its) else
+                        ("<p>Your signed copies are being prepared. They will be available to "
+                         "download from each proposal's page shortly.</p>"
+                         if any(it["sign"]["required"] for it in its) else ""))
+            body = (f"<ul>{''.join(lines)}</ul>"
+                    "<p>Each proposal is its own agreement with its own deposit; pay each one "
+                    "from its own page.</p>" + contract)
+            who = name or _first_name_of(approver) or "Someone on your team"
+            if e == actor and actor:
+                heading = "Thank you — your proposals are approved"
+                body = (f"<p>We've recorded your approval of {len(its)} proposal"
+                        f"{'s' if len(its) != 1 else ''} by {html.escape(name)} on "
+                        f"{approved_date}, signed once for all of them:</p>" + body)
+            else:
+                heading = ("These proposals have been approved" if len(its) != 1
+                           else "This proposal has been approved")
+                body = (f"<p><strong>{html.escape(who)}</strong> approved the following on "
+                        f"{approved_date}:</p>" + body)
+            email_sender.send_customer_update(
+                e, link, first.get("project_name") or "your project", heading, body,
+                reply_to=email_sender.proposal_reply_to(first["token"]), token=first["token"],
+                attachments=atts or None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("combined approval email to a contact failed: %s", exc)
+
+
 # ── why a bid died, and whether it died at all ────────────────────────────────
 # THE CANONICAL MAP. Key to label for every reason a job can be closed LOST under, and the only
 # spelling any staff screen renders.
@@ -2577,7 +3282,10 @@ def _signed_contract_pdf(p: dict) -> tuple[Optional[bytes], Optional[str], int]:
             # The version THIS customer ticked. An approval taken before e-signature existed
             # has none, and falls back to the current wording -- which is honest only because
             # such a row also has no consent to certify; the log line is how that surfaces.
-            consent_version=approval.get("consent_version"))
+            consent_version=approval.get("consent_version"),
+            # A combined approval (api_approve_several) quotes the sentence that named every
+            # proposal signed with this one; the list it named is on the approval row.
+            combined=approval.get("batch") or None)
     except signing.UnknownConsentVersion as exc:
         log.error("cannot rebuild the contract for %s: %s", pid, exc)
         return None, ("Your signed contract cannot be rebuilt by this version of the portal. "

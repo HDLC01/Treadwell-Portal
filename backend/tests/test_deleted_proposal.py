@@ -59,6 +59,13 @@ ROUTES = [
     ("GET", "/api/portal/{t}/pdf", None),
     ("GET", "/api/portal/{t}/deposit-invoice.pdf", None),
     ("GET", "/api/portal/{t}/signed-contract.pdf", None),
+    # Approving several proposals at once (2026-10-31): the page's token is the anchor.
+    ("POST", "/api/portal/{t}/document-opened", {"revision_no": 2}),
+    ("GET", "/api/portal/{t}/approve-several", None),
+    ("POST", "/api/portal/{t}/approve-several/preview", {"items": [{"token": TOKEN}]}),
+    ("POST", "/api/portal/{t}/approve-several", {"batch_id": "batch-0001", "name": "Dana",
+                                                 "items": [{"token": TOKEN}, {"token": "x"}],
+                                                 "consent": True}),
 ]
 
 

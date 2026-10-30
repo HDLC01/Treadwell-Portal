@@ -827,3 +827,42 @@ alter table public.portal_proposals add column if not exists scope_group text;
 alter table public.portal_proposals add column if not exists scope_label text;
 create index if not exists portal_proposals_scope_group_idx
   on public.portal_proposals (scope_group) where scope_group is not null;
+
+-- == Approving several proposals at once (2026-10-31) ==========================================
+--
+-- Hanz: "We must have the ability to also select and approve multiple proposals." On a project
+-- priced as several proposals the customer may tick several of them and sign ONCE; each proposal
+-- still gets its own approval row, its own signed contract and its own deposit invoice. See
+-- main.py api_approve_several.
+--
+-- WHO OPENED WHICH DOCUMENT, AT WHICH REVISION. The single approve card refuses to sign until the
+-- proposal has been opened on that page (app.js proposalWasOpened), a flag that lives in one page
+-- load. A combined approval covers proposals that were each opened on THEIR OWN page, so the
+-- server has to remember the opening: one row per (proposal, person, revision). revision_no is 0
+-- for a proposal that predates revisions, the same 0 the PDF cache keys on, so the unique index
+-- never has to compare a NULL. The session decides the email, never a request body.
+create table if not exists public.portal_document_opens (
+  id              bigint generated always as identity primary key,
+  proposal_id     text not null references public.portal_proposals(proposal_id) on delete cascade,
+  email           text not null,
+  revision_no     int not null default 0,
+  first_opened_at timestamptz not null default now(),
+  last_opened_at  timestamptz not null default now(),
+  open_count      int not null default 1
+);
+create unique index if not exists portal_document_opens_unique_idx
+  on public.portal_document_opens (proposal_id, lower(email), revision_no);
+alter table public.portal_document_opens enable row level security;
+-- Grant AND policy, together, for the reason portal_proposal_views above gives.
+grant select, insert, update, delete on public.portal_document_opens to portal_app;
+drop policy if exists portal_app_rw on public.portal_document_opens;
+create policy portal_app_rw on public.portal_document_opens
+  for all to portal_app using (true) with check (true);
+
+-- THE COMBINED APPROVAL, ON EVERY APPROVAL ROW IT PRODUCED. NULL for every ordinary approval.
+-- {batch_id, count, proposals: [{proposal_id, name, total}], consent_sha256}: enough for each
+-- contract to stand alone -- it says it was signed together with the others, names them, and
+-- lets a later rebuild quote the exact combined consent sentence (signing.COMBINED_CONSENT_VERSION).
+-- Only the combined insert (db.approve_batch) names this column, so a database without it refuses
+-- a combined approval outright (nothing written) and leaves the single approval untouched.
+alter table public.portal_approvals add column if not exists batch jsonb;

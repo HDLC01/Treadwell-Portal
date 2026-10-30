@@ -2311,6 +2311,139 @@ def add_approval(proposal_id, name, title, approved_date, total, option_label, i
     return (row or {}).get("id")
 
 
+# ── approving several proposals at once (2026-10-31) ─────────────────────────
+def record_document_open(proposal_id: str, email: str, revision_no: Optional[int]) -> None:
+    """THIS person opened THIS proposal's document at THIS revision (portal_document_opens).
+
+    The server half of the approve card's "open the proposal before signing" gate, for the
+    combined approval, which signs proposals that were each opened on their own page. `email` is
+    the session's. Raises on failure; the route decides that a failed write costs nothing."""
+    if not proposal_id or not (email or "").strip():
+        return
+    execute(
+        "insert into public.portal_document_opens (proposal_id, email, revision_no) "
+        "values (%s, %s, %s) on conflict (proposal_id, lower(email), revision_no) do update set "
+        "last_opened_at = now(), open_count = public.portal_document_opens.open_count + 1",
+        (proposal_id, email.strip(), int(revision_no or 0)))
+
+
+def document_opened(proposal_id: str, email: str, revision_no: Optional[int]) -> bool:
+    """Has this person opened this proposal's document at this revision? RAISES when it cannot be
+    read: a combined approval refuses rather than assume an opening it cannot see."""
+    if not proposal_id or not (email or "").strip():
+        return False
+    row = q1("select 1 as ok from public.portal_document_opens where proposal_id = %s "
+             "and lower(email) = lower(%s) and revision_no = %s",
+             (proposal_id, email.strip(), int(revision_no or 0)))
+    return bool(row)
+
+
+_APPROVE_SEVERAL_CACHE: dict = {"at": None, "value": False}
+
+
+def approve_several_ready(max_age: float = 30.0) -> bool:
+    """Does this database have the combined-approval DDL (portal_document_opens and
+    portal_approvals.batch)? Prod applies its DDL by hand, so the code can arrive first; until it
+    does the customer page simply does not offer "approve several". Read only, cached, any
+    failure is "no"."""
+    import time
+
+    now = time.monotonic()
+    at = _APPROVE_SEVERAL_CACHE["at"]
+    if at is not None and now - at < max_age:
+        return _APPROVE_SEVERAL_CACHE["value"]
+    try:
+        q1("select batch from public.portal_approvals limit 0")
+        q1("select revision_no from public.portal_document_opens limit 0")
+        value = True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("combined-approval DDL not readable: %s", exc)
+        value = False
+    _APPROVE_SEVERAL_CACHE.update(at=now, value=value)
+    return value
+
+
+class BatchRefused(Exception):
+    """A combined approval failed its re-check under the row lock. Nothing was written: the
+    transaction rolled back. `reasons` is `[{"proposal_id", "code"}]`, every failure, not the
+    first."""
+
+    def __init__(self, reasons: list[dict[str, Any]]):
+        super().__init__("; ".join("%s: %s" % (r.get("proposal_id"), r.get("code"))
+                                   for r in reasons))
+        self.reasons = reasons
+
+
+def approve_batch(items: list[dict[str, Any]]) -> dict[str, Optional[int]]:
+    """Record several approvals as ONE transaction: all of them, or none.
+
+    `items` are `{"proposal_id", "expected_revision_no", "approval": {...add_approval's fields...,
+    "batch"}, "proposal": {total, option_label, options, deposit_amount, name, title,
+    approved_date}}`. Returns `{proposal_id: approval id}`.
+
+    THE COMMIT POINT. Every proposal is locked `for update` in one fixed order (proposal_id, so
+    two overlapping batches cannot deadlock), then re-checked against what the route checked
+    without a lock: still there, not deleted, not already approved, not closed lost, and still at
+    the revision the customer opened. Any failure raises BatchRefused AFTER collecting every
+    reason, and the `with conn.transaction()` block rolls back everything written so far -- which
+    is also what happens to an insert that fails half way (a missing `batch` column, a broken
+    constraint): an exception inside the block is a rollback, never half a batch.
+
+    THE SAME TWO WRITES single approve makes (add_approval, set_approved), with the same columns,
+    plus `batch` on the approval. Single approve is untouched: it keeps its own two statements."""
+    ids = sorted({str(i["proposal_id"]) for i in items})
+    out: dict[str, Optional[int]] = {}
+    with pool().connection() as conn:
+        with conn.transaction():
+            locked = {r["proposal_id"]: r for r in conn.execute(
+                "select proposal_id, proposal_status, approved_at, current_revision_no, "
+                "(to_jsonb(p) ->> 'deleted_at') as deleted_at "
+                "from public.portal_proposals p where proposal_id = any(%s) "
+                "order by proposal_id for update", (ids,)).fetchall()}
+            reasons: list[dict[str, Any]] = []
+            for it in items:
+                pid = str(it["proposal_id"])
+                r = locked.get(pid)
+                if r is None or r.get("deleted_at"):
+                    reasons.append({"proposal_id": pid, "code": "gone"})
+                elif (r.get("proposal_status") or "") == "approved" or r.get("approved_at"):
+                    reasons.append({"proposal_id": pid, "code": "already_approved"})
+                elif (r.get("proposal_status") or "") == "closed_lost":
+                    reasons.append({"proposal_id": pid, "code": "closed"})
+                elif (r.get("current_revision_no") or None) != (it.get("expected_revision_no")
+                                                                or None):
+                    reasons.append({"proposal_id": pid, "code": "revised"})
+            if reasons:
+                raise BatchRefused(reasons)
+            for it in items:
+                pid = str(it["proposal_id"])
+                a, pr = it["approval"], it["proposal"]
+                row = conn.execute(
+                    "insert into public.portal_approvals "
+                    "(proposal_id, name, title, approved_date, total, option_label, ip, "
+                    "approver_email, options, consent_version, user_agent, revision_no, "
+                    "revision_sha256, contract_sha256, batch) "
+                    "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
+                    (pid, a.get("name"), a.get("title"), a.get("approved_date"), a.get("total"),
+                     a.get("option_label"), a.get("ip"), a.get("approver_email"),
+                     Jsonb(a["options"]) if a.get("options") is not None else None,
+                     a.get("consent_version"), a.get("user_agent"), a.get("revision_no"),
+                     a.get("revision_sha256"), a.get("contract_sha256"),
+                     Jsonb(a["batch"]) if a.get("batch") is not None else None)).fetchone()
+                out[pid] = (row or {}).get("id")
+                conn.execute(
+                    "update public.portal_proposals set proposal_status='approved', "
+                    "approved_at=now(), approved_total=%s, approved_option=%s, "
+                    "approved_options=%s, deposit_amount=%s, approved_name=%s, "
+                    "approved_title=%s, approved_date=%s, updated_at=now() "
+                    "where proposal_id=%s",
+                    (pr.get("total"), pr.get("option_label"),
+                     Jsonb(pr["options"]) if pr.get("options") is not None else None,
+                     pr.get("deposit_amount"), pr.get("name"), pr.get("title"),
+                     pr.get("approved_date"), pid))
+    return out
+
+
 def latest_approval_record(proposal_id: str) -> Optional[dict[str, Any]]:
     """EVERY column on the newest approval, read through to_jsonb.
 

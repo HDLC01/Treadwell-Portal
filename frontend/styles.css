@@ -740,6 +740,61 @@ a.scope-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -
   @view-transition { navigation: none; }
 }
 
+/* Approving several proposals at once (app.js "approving several"). The dialog borrows the PDF
+   popup's scrim and head; the rows are the pricing options' look at a smaller size. */
+.ma-entry {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 12px;
+  padding: 10px 12px; border: 1px solid var(--surface-highest); border-radius: var(--radius);
+  background: var(--surface-low); font-size: .9rem;
+}
+.ma-entry .ma-open { min-height: 38px; padding: 0 14px; font-size: .88rem; }
+#ma-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 900; }
+#ma-modal {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  width: min(720px, 96vw); max-height: 94vh; z-index: 901;
+  background: var(--surface); border-radius: var(--radius-lg); overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,.4); display: flex; flex-direction: column;
+}
+.ma-body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px; }
+.ma-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.ma-row {
+  border: 2px solid var(--surface-highest); border-radius: var(--radius-lg); padding: 12px 14px;
+  background: var(--surface); min-width: 0;
+}
+.ma-row.is-picked { border-color: var(--primary); }
+.ma-row.is-off { background: var(--surface-low); }
+.ma-pick { display: flex; align-items: center; gap: 10px; margin: 0; cursor: pointer;
+  text-transform: none; letter-spacing: 0; font-size: 1rem; color: var(--fg); }
+.ma-pick input { width: 20px; height: 20px; margin: 0; flex: none; accent-color: var(--primary); }
+.ma-row.is-off .ma-pick { cursor: default; color: var(--secondary); }
+.ma-name { font-weight: 700; overflow-wrap: anywhere; }
+.ma-why, .ma-doc { margin: 6px 0 0 30px; }
+.ma-opened { color: var(--success); font-weight: 700; margin-left: 6px; }
+.ma-unopened { color: var(--secondary); margin-left: 6px; }
+.ma-opts { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 0 30px; }
+.ma-opt { display: flex; align-items: center; gap: 10px; margin: 0; cursor: pointer;
+  text-transform: none; letter-spacing: 0; font-size: .92rem; color: var(--fg); font-weight: 400; }
+.ma-opt input { width: 18px; height: 18px; margin: 0; flex: none; accent-color: var(--primary); }
+.ma-opt-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ma-opt-price { font-variant-numeric: tabular-nums; font-weight: 600; }
+.ma-summary { border-top: 1px solid var(--surface-highest); padding-top: 12px; margin-bottom: 12px; }
+.ma-rv-head { font-size: 1rem; margin: 0 0 8px; }
+.ma-review { list-style: none; margin: 0 0 6px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.ma-review li { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
+.ma-rv-name { min-width: 0; overflow-wrap: anywhere; }
+.ma-rv-total { font-weight: 700; color: var(--primary); font-variant-numeric: tabular-nums; }
+.ma-rv-dep { grid-column: 1 / -1; }
+.ma-done-list { list-style: none; margin: 12px 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.ma-done-row { border: 1px solid var(--surface-highest); border-radius: var(--radius-lg); padding: 12px 14px; }
+.ma-done-head { display: flex; justify-content: space-between; gap: 12px; }
+.ma-done-row .row { margin-top: 8px; flex-wrap: wrap; gap: 8px; }
+.ma-deposits { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--surface-highest); }
+.ma-dep-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; font-size: .9rem; padding: 4px 0; }
+.ma-dep-actions { display: flex; gap: 12px; }
+@media (max-width: 620px) {
+  #ma-modal { width: 100vw; max-height: 100dvh; height: 100dvh; border-radius: 0; top: 0; left: 0; transform: none; }
+}
+
 .hidden { display: none !important; }
 
 @media (max-width: 620px) { .tracker { grid-template-columns: 1fr 1fr; } }

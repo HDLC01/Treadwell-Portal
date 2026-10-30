@@ -73,6 +73,52 @@ _CONSENT_TEMPLATE = (
 # editing one silently rewrites the record of every signature already taken under it.
 _CONSENT_TEMPLATES: dict[str, str] = {CONSENT_VERSION: _CONSENT_TEMPLATE}
 
+# ── one signature over several proposals (2026-10-31) ────────────────────────
+# Hanz: "We must have the ability to also select and approve multiple proposals." On a project
+# priced as several proposals the customer may sign ONCE for several of them. Each proposal still
+# gets its own approval row and its own contract, and each contract quotes THIS sentence, which
+# names every proposal signed in the same act with its own price -- so any one contract read on its
+# own says what else was agreed alongside it and that each is a separate agreement.
+#
+# ITS OWN VERSION, never a reuse of CONSENT_VERSION: the wording differs, and the version on a row
+# has to say which sentence that customer ticked. Same attorney review pending as 2026-09-v1.
+COMBINED_CONSENT_VERSION = "2026-11-combined-v1"
+
+_COMBINED_CONSENT_TEMPLATE = (
+    "I have reviewed each of the following {count} proposals, including the Terms and Conditions "
+    "of each: {proposals}. I agree to be bound by each of them as a separate agreement at its own "
+    "price. I intend my typed name to be my electronic signature on each of them. I agree to "
+    "conduct this transaction electronically and to receive my copy of each signed agreement by "
+    "email and in this portal. I confirm I am authorized to sign on behalf of the customer named "
+    "in the proposals."
+)
+
+_CONSENT_TEMPLATES[COMBINED_CONSENT_VERSION] = _COMBINED_CONSENT_TEMPLATE
+
+
+def _money(v: Any) -> str:
+    try:
+        return "${:,.2f}".format(float(v))
+    except (TypeError, ValueError):
+        return "$0.00"
+
+
+def combined_consent_text(proposals: list[dict[str, Any]]) -> str:
+    """The one sentence ticked for a combined approval, naming each proposal and its price.
+
+    `proposals` is `[{"name", "total"}]` in the order the customer sees them. ONE builder, used by
+    the page (via the preview route), by the server's check of what was ticked, and by every
+    certificate of the batch -- including a contract rebuilt years later from the stored list."""
+    names = "; ".join("%s (%s)" % ((str(p.get("name") or "").strip() or "this project"),
+                                   _money(p.get("total")))
+                      for p in (proposals or []))
+    return _COMBINED_CONSENT_TEMPLATE.format(count=len(proposals or []), proposals=names)
+
+
+def consent_digest(text: str) -> str:
+    """What the page sends back to prove which sentence was on screen when the box was ticked."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
 
 class UnknownConsentVersion(KeyError):
     """Asked for consent wording this build does not carry.
@@ -90,7 +136,9 @@ def consent_text(project_name: Optional[str], version: Optional[str] = None) -> 
     verbatim: two copies of a legal sentence become two sentences the moment either is edited,
     and the certificate would then quote wording the customer never saw."""
     template = _CONSENT_TEMPLATES.get(version or CONSENT_VERSION)
-    if template is None:
+    if template is None or template is _COMBINED_CONSENT_TEMPLATE:
+        # The combined sentence names the proposals signed together, which a project name alone
+        # cannot supply; it is built by combined_consent_text, from the batch record.
         raise UnknownConsentVersion("no consent wording on file for version %r" % (version,))
     project = (project_name or "this project").strip() or "this project"
     return template.format(project=project)
@@ -218,7 +266,8 @@ def build_certificate(*, project_name: Optional[str], proposal_id: str,
                       user_agent: Optional[str], options_summary: Optional[str],
                       total: Optional[float], deposit_amount: Optional[float],
                       proposal_pdf_sha256: str, revision_sha: str,
-                      consent_version: Optional[str] = None) -> dict[str, Any]:
+                      consent_version: Optional[str] = None,
+                      combined: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """The evidence page's field set, exactly as the proposal tool's
     /api/admin/signed-contract expects it.
 
@@ -230,6 +279,27 @@ def build_certificate(*, project_name: Optional[str], proposal_id: str,
     # start quoting a sentence its signer was never shown.
     version = consent_version or CONSENT_VERSION
     utc = signed_at.astimezone(timezone.utc)
+    # A COMBINED APPROVAL (portal_approvals.batch): the sentence ticked names every proposal signed
+    # in the same act, and the certificate says so in its own field too. The proposal tool ignores
+    # keys it does not know, so `combined_approval` rides in the JSON without a change there.
+    if version == COMBINED_CONSENT_VERSION:
+        # `signed` is the list the sentence named (the e-signable proposals of the batch, in the
+        # order shown); `proposals` is every proposal the batch approved. No list, no sentence:
+        # a certificate quoting "the following 0 proposals" would misstate what was agreed.
+        signed = (combined or {}).get("signed") or []
+        if not signed:
+            raise UnknownConsentVersion("combined consent %r without the proposals it named"
+                                        % (version,))
+        sign = combined_consent_text(signed)
+    else:
+        sign = consent_text(project_name, version)
+    extra: dict[str, Any] = {}
+    if combined:
+        extra["combined_approval"] = {
+            "batch_id": combined.get("batch_id"),
+            "count": combined.get("count") or len(combined.get("proposals") or []),
+            "proposals": [str(p.get("name") or "") for p in (combined.get("proposals") or [])],
+        }
     return {
         "project_name": (project_name or "").strip(),
         "proposal_id": proposal_id,
@@ -244,10 +314,11 @@ def build_certificate(*, project_name: Optional[str], proposal_id: str,
         "options_summary": (options_summary or "").strip(),
         "total": None if total is None else float(total),
         "deposit_amount": None if deposit_amount is None else float(deposit_amount),
-        "consent_text": consent_text(project_name, version),
+        "consent_text": sign,
         "consent_version": version,
         "proposal_pdf_sha256": proposal_pdf_sha256,
         "revision_sha256": revision_sha,
+        **extra,
     }
 
 
